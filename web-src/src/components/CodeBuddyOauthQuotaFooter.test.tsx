@@ -38,19 +38,15 @@ async function render(product: "workbuddy_oauth" | "codebuddy_oauth", inline = t
 }
 
 describe.each(["workbuddy_oauth", "codebuddy_oauth"] as const)("%s quota", (product) => {
-  it.each([true, false])("renders packages, accurate small percentages and independently dated official usage (inline=%s)", async (inline) => {
+  it.each([true, false])("shows package amounts and today's/monthly usage without duplicate details (inline=%s)", async (inline) => {
     const view = await render(product, inline);
     try {
       const text = view.container.textContent!;
       expect(text).toContain("CodeBuddy个人体验版");
-      expect(text).toContain("0.5/500 credits 0.1%");
-      expect(text).toContain("cycle ends");
-      expect(text).toContain("expires");
-      expect(text).toContain("today 0.45");
-      expect(text).toContain("2026-10-04 – 2026-11-03 · 132 requests");
-      expect(text).toContain("2026-11-03 19:12:58 UTC+8");
-      expect(text).toContain("2026-11-03 19:42:57 UTC+8");
-      expect(text).toContain("including other shares and clients");
+      expect(text).toContain("Resource packages: CodeBuddy个人体验版 0.5/500 credits");
+      expect(text).toContain("Official usage (account): today 0.45 · this month 0.45 credits");
+      expect(text.match(/CodeBuddy个人体验版/g)).toHaveLength(1);
+      expect(text).not.toMatch(/%|cycle ends|expires|7 days|requests|collected|2026-|UTC|including other shares/);
     } finally { await view.close(); }
   });
 
@@ -59,9 +55,9 @@ describe.each(["workbuddy_oauth", "codebuddy_oauth"] as const)("%s quota", (prod
     const view = await render(product);
     try {
       expect(view.container.textContent).toContain("0.5/500 credits");
-      expect(view.container.textContent).toContain("Official per-request usage is temporarily unavailable");
+      expect(view.container.textContent).toContain("Official usage is temporarily unavailable");
       expect(view.container.textContent).not.toContain("today 0.00");
-      expect(view.container.textContent).toContain("2026-11-03 11:42:57 UTC");
+      expect(view.container.textContent).not.toContain("collected");
     } finally { await view.close(); }
   });
 
@@ -84,14 +80,13 @@ describe.each(["workbuddy_oauth", "codebuddy_oauth"] as const)("%s quota", (prod
     } finally { await view.close(); }
   });
 
-  it("labels the two accounting views and time range in Chinese", async () => {
+  it("labels the core accounting values in Chinese", async () => {
     await i18n.changeLanguage("zh");
     const view = await render(product);
     try {
-      expect(view.container.textContent).toContain("资源包额度（账号）");
-      expect(view.container.textContent).toContain("今日 0.45");
-      expect(view.container.textContent).toContain("2026-10-04 至 2026-11-03");
-      expect(view.container.textContent).toContain("132 次");
+      expect(view.container.textContent).toContain("资源包： CodeBuddy个人体验版 0.5/500 credits");
+      expect(view.container.textContent).toContain("官方用量（账号）：今日 0.45 · 本月 0.45 credits");
+      expect(view.container.textContent).not.toMatch(/采集|请求数|7 日|到期|周期结束|2026-|132 次/);
     } finally { await view.close(); }
   });
 });

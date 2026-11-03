@@ -1838,10 +1838,9 @@ fn account_context_for_share(
 }
 
 fn account_display_label(account: &Account) -> Option<String> {
-    // Buddy cards identify the exact managed account, independently of optional
-    // vendor display names, email metadata or the Provider's editable name.
+    // Reuse the Server account view's safe label for the exact bound account.
     if account.provider_type.is_buddy_oauth() {
-        return Some(account.id.clone());
+        return crate::domain::codebuddy::buddy_account_display_name(account);
     }
     account.email.clone().or_else(|| {
         let profile = account.profile.as_ref()?;
@@ -2483,79 +2482,112 @@ mod tests {
     }
 
     #[test]
-    fn buddy_descriptor_identifies_only_the_bound_account_in_all_projections() {
+    fn buddy_descriptor_uses_the_bound_accounts_safe_display_name_in_all_projections() {
         use crate::domain::accounts::buddy_quota::test_buddy_account;
         use crate::domain::codebuddy::CodeBuddySite;
 
         for product in [ProviderType::WorkBuddyOAuth, ProviderType::CodeBuddyOAuth] {
             for site in [CodeBuddySite::Cn, CodeBuddySite::Intl] {
                 for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
-                    let mut account = test_buddy_account(product, site);
-                    account.email = Some("owner@example.com".into());
-                    let profile = account.profile.as_mut().unwrap();
-                    profile["name"] = json!(crate::domain::codebuddy::buddy_product_label(product));
-                    profile["nickname"] = json!("optional-nickname");
-                    let expected_id = account.id.clone();
-                    let mut provider = test_provider(product);
-                    provider.app = app;
-                    provider
-                        .provider
-                        .meta
-                        .as_mut()
-                        .unwrap()
-                        .auth_binding
-                        .as_mut()
-                        .unwrap()
-                        .account_id = Some(expected_id.clone());
-                    let providers = ProviderStore {
-                        providers: vec![provider],
-                        ..Default::default()
-                    };
-                    let mut share = test_share(product, None);
-                    share.app = app;
-                    share.bindings[0].app = app;
-                    let mut accounts = AccountStore {
-                        accounts: vec![account],
-                        ..Default::default()
-                    };
-                    let descriptor = descriptor_for_share_with_accounts_and_usage(
-                        &share,
-                        &providers,
-                        Some(&accounts),
-                        None,
-                    );
-                    for runtime in descriptor
-                        .upstream_provider
-                        .iter()
-                        .chain(descriptor.app_runtimes.claude.iter())
-                        .chain(descriptor.app_runtimes.codex.iter())
-                        .chain(descriptor.app_runtimes.gemini.iter())
-                    {
-                        assert_eq!(runtime.account_label.as_deref(), Some(expected_id.as_str()));
-                        assert_eq!(runtime.account_email.as_deref(), Some("owner@example.com"));
-                    }
-                    let app_providers = descriptor
-                        .app_providers
-                        .claude
-                        .iter()
-                        .chain(&descriptor.app_providers.codex)
-                        .chain(&descriptor.app_providers.gemini)
-                        .collect::<Vec<_>>();
-                    assert_eq!(app_providers.len(), 1);
-                    assert_eq!(
-                        app_providers[0].account_label.as_deref(),
-                        Some(expected_id.as_str())
-                    );
+                    for (email, metadata, expected_label) in [
+                        (None, json!({"nickname":"中文昵称"}), "中文昵称"),
+                        (
+                            Some("owner@example.com"),
+                            json!({"nickname":"中文昵称", "phoneNumber":"13800000000"}),
+                            "owner@example.com",
+                        ),
+                        (
+                            None,
+                            json!({"email":"profile@example.com", "nickname":"中文昵称"}),
+                            "profile@example.com",
+                        ),
+                        (
+                            None,
+                            json!({"phoneNumber":"13800000000", "nickname":"中文昵称"}),
+                            "138****0000",
+                        ),
+                        (None, json!({}), "buddy-fixture"),
+                        (
+                            None,
+                            json!({"nickname":{"$wbEncrypted":"opaque"}, "phoneNumber":{"$wbEncrypted":"opaque"}}),
+                            "buddy-fixture",
+                        ),
+                    ] {
+                        let mut account = test_buddy_account(product, site);
+                        account.email = email.map(str::to_string);
+                        account
+                            .profile
+                            .as_mut()
+                            .unwrap()
+                            .as_object_mut()
+                            .unwrap()
+                            .extend(metadata.as_object().unwrap().clone());
+                        let expected_id = account.id.clone();
+                        let mut provider = test_provider(product);
+                        provider.app = app;
+                        provider
+                            .provider
+                            .meta
+                            .as_mut()
+                            .unwrap()
+                            .auth_binding
+                            .as_mut()
+                            .unwrap()
+                            .account_id = Some(expected_id.clone());
+                        let providers = ProviderStore {
+                            providers: vec![provider],
+                            ..Default::default()
+                        };
+                        let mut share = test_share(product, None);
+                        share.app = app;
+                        share.bindings[0].app = app;
+                        share.account_email = None;
+                        let mut accounts = AccountStore {
+                            accounts: vec![account],
+                            ..Default::default()
+                        };
+                        let descriptor = descriptor_for_share_with_accounts_and_usage(
+                            &share,
+                            &providers,
+                            Some(&accounts),
+                            None,
+                        );
+                        for runtime in descriptor
+                            .upstream_provider
+                            .iter()
+                            .chain(descriptor.app_runtimes.claude.iter())
+                            .chain(descriptor.app_runtimes.codex.iter())
+                            .chain(descriptor.app_runtimes.gemini.iter())
+                        {
+                            assert_eq!(runtime.account_label.as_deref(), Some(expected_label));
+                            assert_eq!(runtime.account_email.as_deref(), email);
+                        }
+                        let app_providers = descriptor
+                            .app_providers
+                            .claude
+                            .iter()
+                            .chain(&descriptor.app_providers.codex)
+                            .chain(&descriptor.app_providers.gemini)
+                            .collect::<Vec<_>>();
+                        assert_eq!(app_providers.len(), 1);
+                        assert_eq!(
+                            app_providers[0].account_label.as_deref(),
+                            Some(expected_label)
+                        );
+                        let wire = serde_json::to_string(&descriptor).unwrap();
+                        assert!(!wire.contains("13800000000"));
+                        assert!(!wire.contains("opaque"));
 
-                    // A stale binding must not expose any other account's ID.
-                    accounts.accounts[0].auth_identity_generation += 1;
-                    let stale = descriptor_for_share_with_accounts_and_usage(
-                        &share,
-                        &providers,
-                        Some(&accounts),
-                        None,
-                    );
-                    assert!(stale.upstream_provider.unwrap().account_label.is_none());
+                        // A stale binding must not expose any other account's label.
+                        accounts.accounts[0].auth_identity_generation += 1;
+                        let stale = descriptor_for_share_with_accounts_and_usage(
+                            &share,
+                            &providers,
+                            Some(&accounts),
+                            None,
+                        );
+                        assert!(stale.upstream_provider.unwrap().account_label.is_none());
+                    }
                 }
             }
         }

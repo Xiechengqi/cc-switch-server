@@ -410,21 +410,12 @@ export function formatCompactTier(
     COMPACT_TIER_LABELS[tier.name] ||
     (t && TIER_I18N_KEYS[tier.name] ? t(TIER_I18N_KEYS[tier.name]) : tier.name);
   const buddyPackage = /^codebuddy_package_[1-9]\d*$/.test(tier.name);
+  const amount = formatCompactTierAmount(tier);
+  if (buddyPackage && amount) return `${label} ${amount}`;
   const utilization = buddyPackage && tier.utilization > 0 && tier.utilization < 0.1
     ? "<0.1%"
     : `${buddyPackage ? Math.round(tier.utilization * 10) / 10 : Math.round(tier.utilization)}%`;
-  const deadline = (at: string | null | undefined, key: string, fallback: string) => {
-    if (!at || !Number.isFinite(Date.parse(at))) return "";
-    const time = countdownStr(at, nowMs) || (t ? t("subscription.expired") : "expired");
-    return t ? t(key, { time }) : `${fallback} ${time}`;
-  };
-  const countdown = buddyPackage
-    ? [
-        tier.resetsAt !== tier.expiresAt ? deadline(tier.resetsAt, "provider.buddyPackageCycleEnds", "cycle ends") : "",
-        deadline(tier.expiresAt, "provider.buddyPackageExpires", "expires"),
-      ].filter(Boolean).join(" · ")
-    : countdownStr(tier.resetsAt, nowMs);
-  const amount = formatCompactTierAmount(tier);
+  const countdown = buddyPackage ? null : countdownStr(tier.resetsAt, nowMs);
   return [label, amount, utilization, countdown].filter(Boolean).join(" ");
 }
 
@@ -724,13 +715,13 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   const summaryUnobservedTiers = inline
     ? unobservedTiers.filter((tier) => !HIDDEN_INLINE_TIERS.has(tier.name))
     : unobservedTiers;
-  const summaryText = formatQuotaSummary(
-    quota,
-    summaryTiers,
-    t,
-    now,
-    summaryUnobservedTiers,
-  );
+  const summaryText = buddy
+    ? [
+        ...summaryTiers.map((tier) => formatCompactTier(tier, t, now)),
+        ...summaryUnobservedTiers.map((tier) => formatUnobservedQuotaTier(tier, t)),
+        quota.quotaStatus === "partial" ? t("subscription.quotaPartial") : null,
+      ].filter(Boolean).join(" · ") || t("subscription.numericQuotaNotExposed")
+    : formatQuotaSummary(quota, summaryTiers, t, now, summaryUnobservedTiers);
   const fablePoolHelp =
     summaryTiers.some((tier) => tier.name === "seven_day_fable") ||
     summaryUnobservedTiers.some((tier) => tier.name === "seven_day_fable")
@@ -738,6 +729,28 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
     : undefined;
   if (tiers.length === 0 && unobservedTiers.length === 0 && !summaryText)
     return null;
+
+  if (buddy) {
+    return (
+      <div className="flex min-w-0 items-start justify-between gap-2 text-xs">
+        <span className="min-w-0 break-words">
+          {t("provider.buddyPackageHeading")} {summaryText}
+        </span>
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            void handleRefresh();
+          }}
+          disabled={effectiveLoading}
+          className="flex-shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted disabled:opacity-50"
+          title={refreshTitle}
+        >
+          <RefreshCw size={12} className={effectiveLoading ? "animate-spin" : ""} />
+        </button>
+      </div>
+    );
+  }
 
   // ── inline 模式：紧凑两行显示 ──
   if (inline) {
