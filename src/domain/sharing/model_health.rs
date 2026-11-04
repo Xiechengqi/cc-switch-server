@@ -131,10 +131,14 @@ fn provider_snapshot_result(
     }
 
     let logs = health_logs_for_binding(share, app, provider, usage);
-    let status = match (health.available, health.status) {
-        (true, ProviderHealthStatus::Degraded) => "degraded",
-        (true, _) => "success",
-        (false, _) => "failed",
+    // effective availability deliberately tolerates a first transient failure.
+    // That scheduling decision must never turn a real 429/failed probe into a
+    // successful observation (or overwrite Router's immutable cycle evidence).
+    let status = match health.status {
+        ProviderHealthStatus::Healthy => "success",
+        ProviderHealthStatus::Degraded => "degraded",
+        ProviderHealthStatus::Unhealthy => "failed",
+        ProviderHealthStatus::Unknown => return None,
     };
     let requested_model = health
         .model
@@ -144,6 +148,10 @@ fn provider_snapshot_result(
     let mut recent_results = vec![status.to_string()];
     recent_results.extend(
         logs.iter()
+            .filter(|log| {
+                ms_to_seconds(log.created_at_ms)
+                    < health.checked_at_ms.map(ms_to_seconds).unwrap_or_default()
+            })
             .take(RECENT_RESULT_LIMIT.saturating_sub(1))
             .map(|log| status_for_log(log).to_string()),
     );
@@ -155,7 +163,7 @@ fn provider_snapshot_result(
         recent_results,
         status_code: health.last_status_code,
         latency_ms: health.probe_latency_ms.unwrap_or(0),
-        error_message: (!health.available).then_some(health.reason).flatten(),
+        error_message: (status == "failed").then_some(health.reason).flatten(),
         checked_at: health.checked_at_ms.map(ms_to_seconds).unwrap_or_default(),
         source: health
             .source
@@ -531,6 +539,7 @@ mod tests {
         );
         let provider = test_provider(AppKind::Codex, "p-codex", ProviderType::Codex);
         let log = health_log(&share, &provider, 200, false, None, Some("gpt-5.5"), None);
+        let checked_at = log.created_at_ms;
         let mut usage = UsageStore {
             logs: vec![log],
             ..Default::default()
@@ -539,7 +548,7 @@ mod tests {
             &mut usage,
             &provider,
             ProviderHealthStatus::Healthy,
-            now_ms(),
+            checked_at,
             "cc-switch-scheduled",
             false,
             Some(200),
@@ -556,7 +565,7 @@ mod tests {
         assert_eq!(result.requested_model, "gpt-5.5");
         assert_eq!(result.actual_model, "glm-5.2");
         assert_eq!(result.status, "success");
-        assert_eq!(result.recent_results, vec!["success", "success"]);
+        assert_eq!(result.recent_results, vec!["success"]);
     }
 
     #[test]
@@ -599,6 +608,53 @@ mod tests {
 
         assert_eq!(result.requested_model, "codex");
         assert_eq!(result.actual_model, "codex");
+    }
+
+    #[test]
+    fn first_transient_429_remains_a_failed_observation_even_while_scheduling_is_allowed() {
+        let share = test_share(
+            "share-1",
+            AppKind::Codex,
+            "p-codex",
+            ProviderType::Codex,
+            None,
+        );
+        let provider = test_provider(AppKind::Codex, "p-codex", ProviderType::Codex);
+        let mut usage = UsageStore::default();
+        let checked_at = now_ms();
+        record_snapshot(
+            &mut usage,
+            &provider,
+            ProviderHealthStatus::Unhealthy,
+            checked_at,
+            "cc-switch-router-cycle:utc-test",
+            true,
+            Some(429),
+            Some("rate limited"),
+        );
+        let snapshot = usage
+            .provider_health
+            .get(AppKind::Codex, "p-codex")
+            .unwrap();
+        assert!(snapshot.effective_available);
+        assert!(snapshot.confirmation_pending);
+        let mut log = health_log(&share, &provider, 429, false, None, Some("gpt-5.5"), None);
+        log.created_at_ms = checked_at;
+        usage.logs.push(log);
+        let providers = ProviderStore {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let summary = summary_for_share(&share, &providers, None, Some(&usage));
+        let result = &summary.codex[0];
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.status_code, Some(429));
+        assert_eq!(result.error_message.as_deref(), Some("rate limited"));
+        assert_eq!(
+            result.recent_results,
+            ["failed"],
+            "same probe must not be counted twice"
+        );
     }
 
     #[test]

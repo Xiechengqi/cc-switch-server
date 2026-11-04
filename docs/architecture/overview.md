@@ -160,6 +160,8 @@ Router 主调度 UTC 半小时槽，Server 本地 scheduler 兜底：同一 App/
 
 旧 `testApp` 字段只保留 wire/storage 兼容，不再允许人工指定自动检查接口；Web UI 只读显示自动结果，无探针时显示不支持。旧接口的 Bundle 测试模型不自动迁到新的代表 App；模型优先级为本 App override → 属于本 App 的 Bundle override → 本 App Server 默认值。每 App 的 `modelProbe` 仍服务手动诊断，手动连接测试可逐接口执行，不改变自动调度策略。历史其他接口记录保持真实，不删除或重写为新策略的结果。代表性探测不证明其他未测接口可用；本策略减少重复探测，不消除上游免费模型的全局限流。
 
+检查结果、调度资格和隧道连通性是独立信号。Share runtime 保留真实的 Healthy／Degraded／Unhealthy 观测；即使首个瞬态失败仍暂时允许调度，HTTP 429 也不能显示为成功。Router 以当前代表 App 和当前配置的固定周期证据统一卡片颜色：检查异常先黄，最近三次全失败红，证据缺失或过期灰，恢复需逐步排出最近失败；不据此改动 Server 的瞬态容错或市场资金结算。
+
 ## 5. 相关文档
 
 - 协议与 Router 契约：[`router-contract.md`](router-contract.md)

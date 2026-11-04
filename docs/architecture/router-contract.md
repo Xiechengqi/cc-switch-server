@@ -2,7 +2,7 @@
 
 > 状态：**权威文档（Server 侧）**。线格式、字段定义与 Router 内部行为以 `cc-switch-router/PROTOCOL.md` 为准；本文只描述 Server 实现了什么、在哪里实现、以及 Server 侧的判定规则。
 >
-> 最后核对：2026-11-03。
+> 最后核对：2026-11-04。
 
 ## 1. 实现位置
 
@@ -57,6 +57,8 @@ Router 主动调用 Server 的 `/_ctl/*` 端点：
 单目标请求使用 `x-cc-switch-share-id` 定位 Share；batch 从 HMAC 签名 body 的 `targets[]` 定位，不依赖单 Share 头。v2 要求 `contractVersion=2`，按 Provider runtime 去重执行并返回稳定的 SHA-256 `observationId`、outcome、failure domain、reason 和 evidence version。失效 Share 目标或单个 Provider 组异常只省略对应结果，不中断其他组。
 
 Router 半小时探针与“连接”弹窗共用 Share Contract v4 的 `modelProbe` 测试模型和 Provider 策略，但执行范围不同：前者是 Server 内部 Provider 测试，后者经公开 Share URL 做端到端连接测试。Server 本地半小时 scheduler 在 45 分钟内已有 Router cycle 时跳过相同 Provider。
+
+Share runtime 的 `modelHealth` 必须报告实际检查状态，而不是 Provider 的调度资格：首个瞬态 429 即使仍允许调度、等待二次确认，也必须保留 failed、HTTP 状态与失败说明，不能投影为 success。最近记录不重复计入当前 snapshot 对应的同秒日志。Router 卡片另从当前代表 App、当前 probe epoch 的 immutable observation 生成只读 `modelHealthStatus`（绿／黄／红／灰及 65 分钟新鲜度），不使用主 App 的空记录冒充成功；runtime 摘要不得覆盖其固定槽证据。该修正不改变 Server 既有瞬态失败确认或调度容错。
 
 ## 5. IngressContext
 
