@@ -83,7 +83,9 @@ thinking.disabled 和合法冲突），在最终模型选定后显式发送精�
 但观察到的 reasoning tokens 与显式默认不同，不能保证同等推理能力。因此不使用纯省略
 替代目录默认。该单账号观察不代表 CodeBuddy/国际站或新二进制的完整真实验收。
 
-11128 独立处理：只在 Claude→Buddy 的首条 system 开头规范逐字匹配、独占一行的默认
-Claude Code 身份句，允许前置 billing 元数据；其余指令、正文与工具数据保持。不因 11128
-刷新或重试。完整合同见 [CodeBuddy §5.6](codebuddy-oauth.md)，
+11128 独立处理：Claude→Buddy 只清理首条 system 开头的合法 `x-anthropic-billing-header:`
+CLI 元数据行/块（须含 `cc_version` 与 `cc_entrypoint`），并规范逐字匹配、独占一行的默认
+Claude Code 身份句。CN 同账号对照证实保留该 billing 元数据仍会被上游拒绝；其他指令、
+正文、工具数据、非开头或不符合元数据格式的同名文本保持。不因 11128 刷新或重试。
+完整合同见 [CodeBuddy §5.6](codebuddy-oauth.md)，
 目录/最小对照证据见 `PROTOCOL_EVIDENCE.md`。

@@ -1,5 +1,46 @@
 # Protocol evidence policy
 
+## 2026-11-04 Claude CLI billing 元数据导致 Buddy 11128
+
+线上只读核对确认 Server 已运行 `02bb7571e806`，不是缺少上一轮推理策略修复。两个
+WorkBuddy Share 精确绑定同一 CN 账号，分别固定 kimi-k3-1 / deepseek-v4-pro；失败记录
+已将客户端 medium 正确解析为目录默认 medium / high，每次只有一个上游 attempt。
+
+本地 Claude CLI 2.1.305 在隔离空 Git 仓库、独立配置和假凭据下向回环接收器生成请求，
+不读取用户项目或复用真实客户端上下文。其首条 system 有独立的
+`x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli;` 文本块。使用本仓已构建
+Adapter 转换后，默认 Claude Code 身份句已规范，但该 billing 元数据仍在出站正文中。
+
+用精确绑定的同一 WorkBuddy CN 账号、现行 CLI 2.142.0 受审请求头、原固定模型及目录
+默认档位做少量合成对照，统一 max_tokens=32，并消费响应至 EOF。DeepSeek 的完整
+Adapter 请求返回 400/11128/unapproved channel；只去掉首条 system 的 billing 块，保留
+其余 system、工具与用户上下文，得到 200、finish_reason=stop、DONE、正常 EOF。
+将内容数组变为字符串、删除 tools 或只精简 user 均仍为 400/11128。Kimi 同一完整请求
+在保留/仅去掉该块时也分别返回 400/11128 与 200/DONE/EOF；后者因 32-token 限制为
+length，仅证明该合成请求的通道接受性，不计作下游完整完成通过。另一个最小 DeepSeek
+对照只在普通 coding system 前增删该 billing 行，也分别得到 400/11128 与 200/stop。
+单独 SDK 身份句或 Git 主分支提示未复现拒绝，因此不引入参考的广泛 WAF 改写。
+
+修复只作用于 Claude→Buddy：清理首条 system 开头、带 cc_version 与 cc_entrypoint
+的合法 billing 元数据行/块，兼容字符串、独立 text 块、块内前缀行、CRLF 和连续前缀；
+其后仍只规范逐字匹配的默认身份句。字段名和值做 ASCII 格式验证，允许额外元数据
+字段参与识别；畸形或非开头同名文本、其他指令、缓存标记及用户/工具/历史数据保持。
+原生 OpenAI/Gemini、固定模型、目录默认档位、账号/站点、受审 HTTP 身份、严格终态及
+11128 不刷新/不重试的边界保持。修复在原有双产品/双站/流非流回环回归中验证，真实
+对照仍限 WorkBuddy CN，不能外推为 CodeBuddy 或国际站的真实通过。
+
+最终验证：本轮 Rust 全量 4246 项通过、3 项既有忽略；`cargo check`、`cargo build`、
+`cargo fmt --check` 与含 include! 源文件的 rustfmt 检查通过。`scripts/static-checks.sh`
+整体通过，含 all-targets 严格 Clippy、Node 审计 2128 项、smoke 单测 13 项、Web 单测
+367 项、前端类型检查及 Provider/Writer/覆盖矩阵、引用与依赖边界审计。
+`scripts/smoke/smoke-local.sh` 的启动、认证、Provider/Share 创建验证通过。用本轮重建
+的公开 Adapter 转换同一隔离 CLI 完整请求，精确比较确认仅少一个前置 billing 块，
+其余转换字段及 13 个工具完全一致。整体 review 未发现需进一步修改的问题；前缀
+范围、元数据语法与线性处理、空 system 的既有 fallback、缓存/历史保留及严格终态均核对。
+离线 readiness 为 failures=0、decision=blocked：RUN_TESTS=0 明确跳过脚本内本地套件，
+且缺完整真实验收输入并未执行部署检查；上述单独执行的本地验证不能冒充发布门禁通过。
+实现与验证阶段未部署或修改生产配置，真实对照范围仍仅为前述 WorkBuddy CN。
+
 ## 2026-11-04 Buddy 账号用量摘要移除重复前缀
 
 Server / Router 的 CodeBuddy、WorkBuddy 正常账号用量摘要直接从官方资源包名称开始，

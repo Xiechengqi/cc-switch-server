@@ -328,7 +328,11 @@ POST {endpoint}/v2/chat/completions
 - `stream_options.include_usage=true` 是末帧 usage 的来源；实现若需用量统计必须带上。
 - 回填轮的 assistant / tool 消息带非标准 `messageId`、`model`、`requestModelId`、`requestModelName`、`traceId`、`conversationRequestId`、`agent`。这些**不是必需的**，反代可不透传。
 
-2026-11-04 的 WorkBuddy CN 最小对照确认：同账号、模型和受审请求头下，Claude CLI 固定身份句触发 `11128 / Illegal API invocation from an unapproved channel`，普通 coding system 成功。Claude→Buddy 仅规范首条 system 开头独占一行的 `You are Claude Code, Anthropic's official CLI for Claude.` 为 `You are a helpful coding assistant.`，兼容前置 billing 元数据；其余 system、用户/工具/历史正文和原生 OpenAI/Gemini 请求保持。此为默认客户端身份句的窄范围例外，不采纳参考的全局品牌、WAF 关键词或任意正文改写。11128 不刷新或重试；该 CN 对照不代表双站联合验收。
+2026-11-04 的 WorkBuddy CN 最小对照确认：同账号、模型和受审请求头下，Claude CLI 固定身份句触发 `11128 / Illegal API invocation from an unapproved channel`，普通 coding system 成功。Claude→Buddy 仅规范首条 system 开头独占一行的 `You are Claude Code, Anthropic's official CLI for Claude.` 为 `You are a helpful coding assistant.`。
+
+随后对 Claude CLI 2.1.305 在隔离空仓库生成的请求做同账号对照：上述身份句已规范后，首条 system 开头保留 `x-anthropic-billing-header:` 仍使 Kimi/DeepSeek 返回 400/11128；只删除该前置元数据块即获 HTTP 200，工具、其余指令和用户上下文均保持。改变内容数组形式、移除工具或只精简 user 不能消除错误；单独 SDK 身份句或 Git 主分支提示没有复现，不能据此扩大 WAF 改写。
+
+因此 Claude→Buddy 还会清理首条 system 开头的合法 CLI billing 元数据行/块：精确前缀 `x-anthropic-billing-header:`、分号分隔的非空 `key=value` 字段，须同时含 `cc_version` 和 `cc_entrypoint`；字段名限 ASCII 字母/数字/下划线，值限非空 ASCII 可见字符。兼容字符串、独立 text 块及块内前缀行，连续前置元数据一次线性清理。非开头或畸形同名文本、其余 system、用户/工具/历史正文、缓存标记及原生 OpenAI/Gemini 请求保持。此为客户端传输元数据与固定身份句的窄范围例外，不采纳全局品牌、WAF 关键词或任意正文改写；11128 不刷新、重试、换模型或换账号。该 CN 对照不代表双产品双站完整验收。
 
 **响应 SSE**：`object: "chat.completion.chunk"`，delta 为**稠密**结构，每帧都带全部键 `content` / `reasoning_content` / `function_call` / `refusal` / `tool_calls` / `extra_fields`。
 

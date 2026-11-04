@@ -54,7 +54,11 @@ fn buddy_claude_fixed_reasoning_preferences_use_the_catalog_level() {
                             codebuddy_headers("fixed-effort-share", "owner@example.com", "fixed-effort"),
                             Bytes::from(json!({
                                 "model":"claude-opus-5-5","stream":stream,"max_tokens":4096,
-                                "system":"You are Claude Code, Anthropic's official CLI for Claude.\nKeep all project instructions.",
+                                "system":[
+                                    {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.305; cc_entrypoint=cli;"},
+                                    {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+                                    {"type":"text","text":"Keep all project instructions.","cache_control":{"type":"ephemeral"}}
+                                ],
                                 "thinking":{"type":"adaptive"},"output_config":{"effort":effort},
                                 "messages":[{"role":"user","content":"ping"}]
                             }).to_string()),
@@ -69,7 +73,13 @@ fn buddy_claude_fixed_reasoning_preferences_use_the_catalog_level() {
                             let sent = &observations.last().unwrap().body;
                             assert_eq!(sent["model"], model);
                             assert_eq!(sent["reasoning_effort"], fixed_effort);
-                            assert_eq!(sent["messages"][0]["content"], "You are a helpful coding assistant.\nKeep all project instructions.");
+                            assert_eq!(
+                                sent["messages"][0]["content"],
+                                json!([
+                                    {"type":"text","text":"You are a helpful coding assistant."},
+                                    {"type":"text","text":"Keep all project instructions.","cache_control":{"type":"ephemeral"}}
+                                ])
+                            );
                             if !stream {
                                 let usage = state.usage_snapshot().await;
                                 let log = usage.logs.last().unwrap();
