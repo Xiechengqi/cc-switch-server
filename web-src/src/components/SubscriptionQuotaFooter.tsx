@@ -739,7 +739,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
     return (
       <div className="flex min-w-0 items-start justify-between gap-2 text-xs">
         <span className="min-w-0 break-words">
-          {t("provider.buddyPackageHeading")} {summaryText}
+          {summaryText}
           {buddyUsageSummary ? <> · {buddyUsageSummary}</> : null}
         </span>
         <button

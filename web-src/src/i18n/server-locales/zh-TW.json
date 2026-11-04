@@ -333,7 +333,6 @@
     "apiKeyAccountDisplay": "API Key 帳號：{{account}}",
     "apiKeyAccountResolving": "API Key 帳號",
     "codeBuddyUsageSummary": "官方用量（帳號）：今日 {{today}} · 本月 {{month}} credits",
-    "buddyPackageHeading": "資源包：",
     "codeBuddyUsageUnavailable": "官方用量暫時無法使用",
     "codingPlanQuota": {
       "fiveHour": "5 小時",
