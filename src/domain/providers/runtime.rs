@@ -499,6 +499,8 @@ pub struct ProviderRuntimePlan {
     pub endpoint: String,
     pub upstream_protocol: UpstreamProtocol,
     pub outbound_identity_policy: OutboundIdentityPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_policy: Option<super::registry::ProviderReasoningPolicy>,
     pub auth_ref: RuntimeAuthRef,
     pub model_policy: RuntimeModelPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -741,7 +743,7 @@ pub fn compile_runtime_plan_with_defaults(
         }
     };
     let provider_key = super::registry::ProviderKey::new(stored.app, &stored.provider.id)?;
-    let runtime_fingerprint = runtime_fingerprint(&json!({
+    let mut fingerprint_input = json!({
         "providerKey": &provider_key,
         "profileId": &profile_id,
         "profileSchemaRevision": profile_schema_revision,
@@ -759,7 +761,13 @@ pub fn compile_runtime_plan_with_defaults(
         "transportPolicy": &transport_policy,
         "extraHeaders": &extra_headers,
         "driverOptions": &driver_options,
-    }))?;
+    });
+    // Preserve existing fingerprints for every other Driver. Only Buddy's
+    // new server-owned policy changes its runtime/health/cache identity.
+    if let Some(policy) = driver.reasoning_policy {
+        fingerprint_input["reasoningPolicy"] = serde_json::to_value(policy)?;
+    }
+    let runtime_fingerprint = runtime_fingerprint(&fingerprint_input)?;
 
     Ok(ProviderRuntimePlan {
         provider_key,
@@ -771,6 +779,7 @@ pub fn compile_runtime_plan_with_defaults(
         endpoint,
         upstream_protocol: driver.upstream_protocol,
         outbound_identity_policy,
+        reasoning_policy: driver.reasoning_policy,
         auth_ref,
         model_policy,
         coding_plan,
@@ -2110,6 +2119,23 @@ mod tests {
                 let mut stored =
                     provider(&format!("{}.{}", app.as_str(), product.as_str()), product);
                 stored.app = app;
+                let plan = compile_runtime_plan(&stored, &AccountStore::default()).unwrap();
+                assert_eq!(
+                    plan.reasoning_policy,
+                    Some(super::super::registry::ProviderReasoningPolicy::BuddyUpstreamDefaultV1)
+                );
+                assert_eq!(plan.driver_contract_revision, 4);
+                let wire = serde_json::to_value(&plan).unwrap();
+                assert_eq!(wire["reasoningPolicy"], "buddy_upstream_default_v1");
+                // The policy is Registry-owned even for existing records with
+                // conflicting legacy/request-like fields in their settings.
+                stored.provider.settings_config["reasoningPolicy"] = json!("exact");
+                assert_eq!(
+                    compile_runtime_plan(&stored, &AccountStore::default())
+                        .unwrap()
+                        .runtime_fingerprint,
+                    plan.runtime_fingerprint
+                );
                 stored.provider.settings_config["modelMapping"] =
                     json!({"mode":"single","upstreamModel":"auto"});
                 stored.provider.settings_config["testModel"] = json!("gpt-5.6-luna@low");

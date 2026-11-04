@@ -9,10 +9,15 @@ use crate::domain::codebuddy::{buddy_product_policy, CodeBuddyAccountProfile, Co
 use crate::domain::providers::model::ProviderType;
 use crate::infra::resident_memory::ResidentMemoryBudget;
 
+mod claude;
 mod images;
+mod reasoning;
 mod resident;
 
-pub(crate) use images::validate_buddy_source_images;
+pub(crate) use claude::transform_buddy_claude_request;
+pub(crate) use images::{has_image_input, validate_buddy_source_images};
+pub use reasoning::BuddyReasoningDefaultSource;
+pub(crate) use reasoning::{clear_buddy_reasoning_controls, requested_buddy_reasoning_effort};
 
 const MAX_RUNTIME_ENTRIES: usize = 128;
 const MAX_MODEL_CATALOG_ENTRIES: usize = 256;
@@ -168,6 +173,8 @@ pub struct CodeBuddyModelCapability {
     pub display_name: Option<String>,
     pub reasoning_efforts: Vec<String>,
     pub default_reasoning_effort: Option<String>,
+    pub reasoning_default_source: Option<BuddyReasoningDefaultSource>,
+    pub reasoning_capability_known: bool,
     pub max_input_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub supports_tools: bool,
@@ -498,7 +505,7 @@ pub fn parse_buddy_model_catalog(
             "supportsToolCall": capability.supports_tools,
             "supportsImages": capability.supports_images,
             "supportsReasoning": capability.supports_reasoning,
-            "reasoning": {"supportedEfforts": capability.reasoning_efforts},
+            "reasoning": {"supportedEfforts": capability.reasoning_efforts, "defaultEffort": capability.default_reasoning_effort},
             "maxInputTokens": capability.max_input_tokens,
             "maxOutputTokens": capability.max_output_tokens,
             "onlyReasoning": capability.only_reasoning,
@@ -550,59 +557,117 @@ fn codebuddy_model_capability(
     object: &Map<String, Value>,
 ) -> Result<CodeBuddyModelCapability, String> {
     let only_reasoning = bool_field(object, "onlyReasoning")?.unwrap_or(false);
-    let can_disable_thinking = !only_reasoning
-        && object
-            .get("reasoning")
-            .and_then(Value::as_object)
-            .map(|reasoning| bool_field(reasoning, "canDisableThinking"))
-            .transpose()?
-            .flatten()
-            .unwrap_or(false);
-    let supports_reasoning = bool_field(object, "supportsReasoning")?
-        .unwrap_or(only_reasoning || object.get("reasoning").is_some_and(Value::is_object));
-    if only_reasoning && !supports_reasoning {
-        return Err("CodeBuddy catalog has contradictory reasoning capabilities".to_string());
+    let reasoning = match object.get("reasoning") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(reasoning)) => Some(reasoning),
+        Some(_) => return Err(format!("CodeBuddy model {id} reasoning must be an object")),
+    };
+    let advertised_reasoning = bool_field(object, "supportsReasoning")?;
+    let reasoning_capability_known =
+        advertised_reasoning.is_some() || only_reasoning || reasoning.is_some();
+    let supports_reasoning = advertised_reasoning.unwrap_or(only_reasoning || reasoning.is_some());
+    let can_disable_thinking = reasoning
+        .map(|reasoning| bool_field(reasoning, "canDisableThinking"))
+        .transpose()?
+        .flatten()
+        .unwrap_or(false);
+    if only_reasoning && can_disable_thinking {
+        return Err(format!(
+            "CodeBuddy model {id} has contradictory reasoning capabilities"
+        ));
     }
-    let mut reasoning_efforts = object
-        .get("reasoning")
-        .and_then(Value::as_object)
-        .and_then(|reasoning| reasoning.get("supportedEfforts"))
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty() && value.len() <= 32)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let default_reasoning_effort =
-        object
-            .get("reasoning")
-            .and_then(Value::as_object)
-            .and_then(|reasoning| {
-                let default = reasoning.get("defaultEffort");
-                if default.is_some_and(|value| !value.is_null() && !value.is_string()) {
-                    return None;
+    let parse_effort = |value: &Value| -> Result<Option<String>, String> {
+        match value {
+            Value::Null => Ok(None),
+            Value::String(value) if value.trim().is_empty() => Ok(None),
+            Value::String(value) => {
+                let value = value.trim().to_ascii_lowercase();
+                if matches!(
+                    value.as_str(),
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                ) {
+                    Ok(Some(value))
+                } else {
+                    Err(format!(
+                        "CodeBuddy model {id} has an unreviewed reasoning effort"
+                    ))
                 }
-                default
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty() && value.len() <= 32)
-                    .or_else(|| reasoning.get("effort").and_then(Value::as_str))
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty() && value.len() <= 32)
-                    .map(str::to_string)
-            });
-    if reasoning_efforts.is_empty() {
-        if let Some(default) = &default_reasoning_effort {
+            }
+            _ => Err(format!(
+                "CodeBuddy model {id} reasoning effort must be a string"
+            )),
+        }
+    };
+    let mut reasoning_efforts = match reasoning
+        .and_then(|reasoning| reasoning.get("supportedEfforts"))
+    {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                parse_effort(value)?
+                    .ok_or_else(|| format!("CodeBuddy model {id} has an empty reasoning effort"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(format!(
+                "CodeBuddy model {id} supportedEfforts must be an array"
+            ))
+        }
+    };
+    let mut seen_efforts = std::collections::BTreeSet::new();
+    reasoning_efforts.retain(|effort| seen_efforts.insert(effort.clone()));
+    let declared_default = reasoning
+        .and_then(|value| value.get("defaultEffort"))
+        .map(parse_effort)
+        .transpose()?
+        .flatten();
+    let legacy_effort = reasoning
+        .and_then(|value| value.get("effort"))
+        .map(parse_effort)
+        .transpose()?
+        .flatten();
+    let (default_reasoning_effort, reasoning_default_source) =
+        if let Some(default) = declared_default {
+            (
+                Some(default),
+                Some(BuddyReasoningDefaultSource::DeclaredDefault),
+            )
+        } else if let Some(default) = legacy_effort {
+            (Some(default), Some(BuddyReasoningDefaultSource::Legacy))
+        } else if reasoning_efforts.len() == 1 {
+            (
+                reasoning_efforts.first().cloned(),
+                Some(BuddyReasoningDefaultSource::SoleAllowed),
+            )
+        } else {
+            (None, None)
+        };
+    if !supports_reasoning
+        && (only_reasoning
+            || can_disable_thinking
+            || !reasoning_efforts.is_empty()
+            || default_reasoning_effort.is_some())
+    {
+        return Err(format!(
+            "CodeBuddy model {id} has contradictory reasoning capabilities"
+        ));
+    }
+    if let Some(default) = &default_reasoning_effort {
+        if !reasoning_efforts.is_empty() && !reasoning_efforts.contains(default) {
+            return Err(format!(
+                "CodeBuddy model {id} default reasoning effort is outside supportedEfforts"
+            ));
+        }
+        if reasoning_efforts.is_empty() {
             reasoning_efforts.push(default.clone());
         }
     }
-    let mut seen_efforts = std::collections::BTreeSet::new();
-    reasoning_efforts.retain(|effort| seen_efforts.insert(effort.clone()));
+    if reasoning_efforts.iter().any(|effort| effort == "none") && !can_disable_thinking {
+        return Err(format!(
+            "CodeBuddy model {id} cannot advertise none without allowing thinking to be disabled"
+        ));
+    }
     let max_input_tokens = positive_u64(object.get("maxInputTokens"));
     let context = object.get("contextWindow").and_then(Value::as_object);
     let mut context_window_lengths: Vec<u64> = context
@@ -632,6 +697,8 @@ fn codebuddy_model_capability(
             .map(str::to_string),
         reasoning_efforts,
         default_reasoning_effort,
+        reasoning_default_source,
+        reasoning_capability_known,
         max_input_tokens,
         max_output_tokens: positive_u64(object.get("maxOutputTokens")),
         // Missing capability evidence cannot authorize a tool-bearing request.
@@ -676,6 +743,7 @@ pub fn resolve_codebuddy_model_id(
     catalog: &FetchedCodeBuddyModelCatalog,
     request: &Value,
 ) -> Result<String, String> {
+    requested_buddy_reasoning_effort(request)?;
     let requested = requested
         .trim()
         .strip_prefix("codebuddy/")
@@ -696,15 +764,6 @@ pub fn resolve_codebuddy_model_id(
             .and_then(Value::as_array)
             .is_some_and(|tools| !tools.is_empty());
         let has_images = images::has_image_input(request);
-        let has_reasoning = request
-            .get("reasoning")
-            .is_some_and(|value| !value.is_null())
-            || request.get("reasoning_effort").is_some_and(|value| {
-                !value.is_null()
-                    && !value
-                        .as_str()
-                        .is_some_and(|effort| effort.trim().is_empty())
-            });
         return std::iter::once(default_model)
             .chain(catalog.preferred_models.iter().map(String::as_str))
             .find(|id| {
@@ -712,8 +771,7 @@ pub fn resolve_codebuddy_model_id(
                     && catalog.capabilities.get(*id).is_some_and(|capability| {
                         (!has_tools || capability.supports_tools)
                             && (!has_images || capability.supports_images)
-                            && (!has_reasoning || capability.supports_reasoning)
-                            && codebuddy_reasoning_effort(request, id, capability).is_ok()
+                            && capability.upstream_default_reasoning_effort().is_ok()
                     })
             })
             .map(str::to_string)
@@ -784,92 +842,12 @@ pub fn build_codebuddy_payload(
     request.insert("model".to_string(), Value::String(model_id.to_string()));
     request.insert("stream".to_string(), Value::Bool(true));
     request.insert("stream_options".to_string(), json!({"include_usage": true}));
-    request.remove("reasoning");
-    request.remove("reasoning_effort");
-    if let Some(effort) = codebuddy_reasoning_effort(canonical_chat_request, model_id, capability)?
-    {
-        request.insert("reasoning_effort".to_string(), Value::String(effort));
+    let mut payload = Value::Object(request);
+    clear_buddy_reasoning_controls(&mut payload)?;
+    if let Some(effort) = capability.upstream_default_reasoning_effort()? {
+        payload["reasoning_effort"] = Value::String(effort.to_string());
     }
-    Ok(Value::Object(request))
-}
-
-fn codebuddy_reasoning_effort(
-    request: &Value,
-    model_id: &str,
-    capability: &CodeBuddyModelCapability,
-) -> Result<Option<String>, String> {
-    let explicit_effort = match request.get("reasoning_effort") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim()),
-        Some(Value::String(_)) => None,
-        Some(_) => {
-            return Err("CodeBuddy reasoning_effort must be a string".to_string());
-        }
-    };
-    let canonical_reasoning = request.get("reasoning");
-    let (canonical_requested, canonical_effort) = match canonical_reasoning {
-        None | Some(Value::Null) => (false, None),
-        Some(Value::Object(reasoning)) => {
-            let effort = match reasoning.get("effort") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim()),
-                Some(Value::String(_)) => None,
-                Some(_) => return Err("CodeBuddy reasoning.effort must be a string".to_string()),
-            };
-            (true, effort)
-        }
-        Some(_) => return Err("CodeBuddy reasoning must be an object".to_string()),
-    };
-    if let (Some(explicit), Some(canonical)) = (&explicit_effort, &canonical_effort) {
-        if !explicit.eq_ignore_ascii_case(canonical) {
-            return Err(
-                "CodeBuddy request contains conflicting reasoning effort values".to_string(),
-            );
-        }
-    }
-    let effort = explicit_effort.or(canonical_effort).or_else(|| {
-        canonical_requested
-            .then_some(capability.default_reasoning_effort.as_deref())
-            .flatten()
-    });
-    if canonical_requested && effort.is_none() {
-        return Err(format!(
-            "CodeBuddy model {model_id} has no reviewed default reasoning effort"
-        ));
-    }
-    if let Some(effort) = effort {
-        if !capability.supports_reasoning {
-            return Err(format!(
-                "CodeBuddy model {model_id} does not advertise reasoning support"
-            ));
-        }
-        if effort.eq_ignore_ascii_case("none") && !capability.can_disable_thinking {
-            return Err(format!(
-                "CodeBuddy model {model_id} cannot disable thinking"
-            ));
-        }
-        if capability.reasoning_efforts.is_empty()
-            && !(effort.eq_ignore_ascii_case("none") && capability.can_disable_thinking)
-        {
-            return Err(format!(
-                "CodeBuddy model {model_id} has no reviewed reasoning effort menu"
-            ));
-        }
-        if !(effort.eq_ignore_ascii_case("none") && capability.can_disable_thinking) {
-            let Some(supported) = capability
-                .reasoning_efforts
-                .iter()
-                .find(|supported| supported.eq_ignore_ascii_case(effort))
-            else {
-                return Err(format!(
-                    "CodeBuddy model {model_id} does not support reasoning effort {effort:?}"
-                ));
-            };
-            return Ok(Some(supported.clone()));
-        }
-        return Ok(Some("none".to_string()));
-    }
-    Ok(None)
+    Ok(payload)
 }
 
 /// Internal response metadata for a control-plane probe. It is never emitted
@@ -1171,6 +1149,8 @@ mod tests {
             display_name: Some("Default".to_string()),
             reasoning_efforts: vec!["low".to_string(), "high".to_string()],
             default_reasoning_effort: Some("high".to_string()),
+            reasoning_default_source: Some(BuddyReasoningDefaultSource::DeclaredDefault),
+            reasoning_capability_known: true,
             max_input_tokens: Some(200_000),
             max_output_tokens: Some(24_000),
             supports_tools: true,
@@ -1367,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_empty_default_effort_falls_back_to_legacy_effort_for_requested_reasoning() {
+    fn catalog_empty_default_effort_falls_back_to_legacy_effort_for_all_requests() {
         for default_effort in [Value::Null, json!("  ")] {
             let catalog = parse_codebuddy_model_catalog(
                 &json!({"data":{"models":[{
@@ -1397,26 +1377,22 @@ mod tests {
                 capability,
             )
             .unwrap();
-            assert!(unrequested.get("reasoning_effort").is_none());
+            assert_eq!(unrequested["reasoning_effort"], "high");
         }
 
-        for (default_effort, expected) in [(json!("low"), Some("low")), (json!(42), None)] {
-            let catalog = parse_codebuddy_model_catalog(
-                &json!({"data":{"models":[{
-                    "id":"default-model",
-                    "supportsReasoning":true,
-                    "reasoning":{"defaultEffort":default_effort,"effort":"high"}
-                }]}}),
-                CodeBuddySite::Intl,
-            )
-            .unwrap();
-            assert_eq!(
-                catalog.capabilities["default-model"]
-                    .default_reasoning_effort
-                    .as_deref(),
-                expected
-            );
-        }
+        let invalid = json!({"data":{"models":[{"id":"default-model","supportsReasoning":true,
+            "reasoning":{"defaultEffort":42,"effort":"high"}}]}});
+        assert!(parse_codebuddy_model_catalog(&invalid, CodeBuddySite::Intl).is_err());
+        let valid = json!({"data":{"models":[{"id":"default-model","supportsReasoning":true,
+            "reasoning":{"defaultEffort":"low","effort":"high"}}]}});
+        assert_eq!(
+            parse_codebuddy_model_catalog(&valid, CodeBuddySite::Intl)
+                .unwrap()
+                .capabilities["default-model"]
+                .default_reasoning_effort
+                .as_deref(),
+            Some("low")
+        );
     }
 
     #[test]
@@ -1574,8 +1550,11 @@ mod tests {
             (CodeBuddySite::Intl, "default-model"),
             (CodeBuddySite::Cn, "default"),
         ] {
-            let catalog =
-                parse_codebuddy_model_catalog(&json!({"models":[{"id":model}]}), site).unwrap();
+            let catalog = parse_codebuddy_model_catalog(
+                &json!({"models":[{"id":model,"supportsReasoning":false}]}),
+                site,
+            )
+            .unwrap();
             assert_eq!(
                 resolve_codebuddy_model_id(site, "auto", &catalog, &json!({})).unwrap(),
                 model
@@ -1592,7 +1571,7 @@ mod tests {
     #[test]
     fn buddy_auto_uses_reviewed_cli_order_when_default_is_outside_the_channel() {
         let value = json!({"data":{
-            "models":[{"id":"default"},{"id":"glm-5.2"},{"id":"hy3"},{"id":"hy4-preview"}],
+            "models":[{"id":"default","supportsReasoning":false},{"id":"glm-5.2","supportsReasoning":false},{"id":"hy3","supportsReasoning":false},{"id":"hy4-preview"}],
             "agents":[{"name":"cli","models":["hy4-preview","hy3","glm-5.2"]}]
         }});
         for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
@@ -1632,10 +1611,10 @@ mod tests {
     }
 
     #[test]
-    fn buddy_auto_preserves_requested_tool_and_reasoning_capabilities() {
+    fn buddy_auto_preserves_tools_and_uses_catalog_reasoning_defaults() {
         let catalog = parse_codebuddy_model_catalog(&json!({"data":{
             "models":[
-                {"id":"default","supportsToolCall":false},
+                {"id":"default","supportsToolCall":false,"supportsReasoning":false},
                 {"id":"hy3","supportsToolCall":true,"supportsReasoning":true,"reasoning":{"supportedEfforts":["high"]}},
                 {"id":"glm-5.2","supportsToolCall":true,"supportsReasoning":true,"reasoning":{"supportedEfforts":["low","high"]}}
             ],"agents":[{"name":"cli","models":["default","hy3","glm-5.2"]}]
@@ -1663,19 +1642,22 @@ mod tests {
                 &json!({"tools":tools,"reasoning_effort":"low"})
             )
             .unwrap(),
-            "glm-5.2"
+            "hy3"
         );
-        assert!(resolve_codebuddy_model_id(
-            CodeBuddySite::Cn,
-            "auto",
-            &catalog,
-            &json!({"reasoning_effort":"max"})
-        )
-        .is_err());
+        assert_eq!(
+            resolve_codebuddy_model_id(
+                CodeBuddySite::Cn,
+                "auto",
+                &catalog,
+                &json!({"reasoning_effort":"max"})
+            )
+            .unwrap(),
+            "default"
+        );
     }
 
     #[test]
-    fn payload_normalizes_named_tool_choice_and_validates_reasoning_effort() {
+    fn payload_normalizes_named_tool_choice_and_overrides_client_reasoning_effort() {
         let payload = build_codebuddy_payload(
             &json!({
                 "messages":[{"role":"user","content":"run"}],
@@ -1693,7 +1675,7 @@ mod tests {
         assert_eq!(payload["tool_choice"], "required");
         assert_eq!(payload["tools"].as_array().unwrap().len(), 1);
         assert_eq!(payload["tools"][0]["function"]["name"], "shell");
-        assert_eq!(payload["reasoning_effort"], "low");
+        assert_eq!(payload["reasoning_effort"], "high");
         assert!(payload.get("reasoning").is_none());
 
         let canonicalized = build_codebuddy_payload(
@@ -1714,7 +1696,7 @@ mod tests {
             &text_capability(),
         )
         .unwrap();
-        assert_eq!(equivalent_dual_form["reasoning_effort"], "low");
+        assert_eq!(equivalent_dual_form["reasoning_effort"], "high");
 
         let defaulted = build_codebuddy_payload(
             &json!({"messages":[{"role":"user","content":"x"}],"reasoning":{}}),
@@ -1724,19 +1706,21 @@ mod tests {
         .unwrap();
         assert_eq!(defaulted["reasoning_effort"], "high");
 
-        assert!(build_codebuddy_payload(
-            &json!({"messages":[{"role":"user","content":"x"}],"reasoning_effort":"medium"}),
-            "default-model",
-            &text_capability(),
-        )
-        .is_err());
-        assert!(build_codebuddy_payload(
-            &json!({"messages":[{"role":"user","content":"x"}],"reasoning_effort":"low","reasoning":{"effort":"high"}}),
-            "default-model",
-            &text_capability(),
-        )
-        .unwrap_err()
-        .contains("conflicting"));
+        for controls in [
+            json!({"reasoning_effort":"medium"}),
+            json!({"reasoning_effort":"low","reasoning":{"effort":"high"}}),
+        ] {
+            let mut input = json!({"messages":[{"role":"user","content":"x"}]});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            assert_eq!(
+                build_codebuddy_payload(&input, "default-model", &text_capability()).unwrap()
+                    ["reasoning_effort"],
+                "high"
+            );
+        }
         assert!(build_codebuddy_payload(
             &json!({"messages":[{"role":"user","content":"x"}],"reasoning_effort":3}),
             "default-model",
@@ -2102,9 +2086,9 @@ mod tests {
     }
 
     #[test]
-    fn codebuddy_reasoning_and_context_metadata_preserve_client_intent() {
+    fn codebuddy_reasoning_defaults_and_context_metadata_remain_separate() {
         let value = json!({"data":{"models":[{"id":"default-model","onlyReasoning":true,"supportsReasoning":true,
-            "reasoning":{"canDisableThinking":true,"defaultEffort":"high","supportedEfforts":["low","high"]},
+            "reasoning":{"canDisableThinking":false,"defaultEffort":"high","supportedEfforts":["low","high"]},
             "maxInputTokens":128000,"maxOutputTokens":8192,
             "contextWindow":{"defaultLength":64000,"supportedLengths":[64000,128000,256000]}}]}});
         let catalog = parse_codebuddy_model_catalog(&value, CodeBuddySite::Intl).unwrap();
@@ -2114,22 +2098,21 @@ mod tests {
         assert_eq!(caps.context_window, Some(64000));
         assert_eq!(caps.context_window_lengths, vec![64000, 128000]);
         let request = json!({"messages":[{"role":"user","content":"hello"}]});
-        assert!(build_codebuddy_payload(&request, "default-model", caps)
-            .unwrap()
-            .get("reasoning_effort")
-            .is_none());
-        let mut disabled = request.clone();
-        disabled["reasoning_effort"] = json!("none");
-        assert!(build_codebuddy_payload(&disabled, "default-model", caps).is_err());
-        let mut low = request;
-        low["reasoning_effort"] = json!("low");
         assert_eq!(
-            build_codebuddy_payload(&low, "default-model", caps).unwrap()["reasoning_effort"],
-            "low"
+            build_codebuddy_payload(&request, "default-model", caps).unwrap()["reasoning_effort"],
+            "high"
         );
+        for effort in ["none", "low", "max", "xhigh"] {
+            let mut input = request.clone();
+            input["reasoning_effort"] = json!(effort);
+            assert_eq!(
+                build_codebuddy_payload(&input, "default-model", caps).unwrap()["reasoning_effort"],
+                "high"
+            );
+        }
         let mut unknown = caps.clone();
-        unknown.reasoning_efforts.clear();
-        assert!(build_codebuddy_payload(&low, "default-model", &unknown).is_err());
+        unknown.default_reasoning_effort = None;
+        assert!(build_codebuddy_payload(&request, "default-model", &unknown).is_err());
     }
 
     #[test]

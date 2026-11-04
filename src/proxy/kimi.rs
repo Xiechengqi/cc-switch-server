@@ -485,6 +485,7 @@ mod tests {
             endpoint: crate::domain::kimi_cli::KIMI_API_BASE_URL.to_string(),
             upstream_protocol: UpstreamProtocol::Special,
             outbound_identity_policy: OutboundIdentityPolicy::ServerIdentity,
+            reasoning_policy: None,
             auth_ref: RuntimeAuthRef::Missing,
             model_policy: policy,
             coding_plan: None,

@@ -5,7 +5,7 @@ import { ChevronDown, LoaderCircle, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { providersApi, type BuddyProviderType } from "@/lib/api/providers";
+import { providersApi, type BuddyAccountModels, type BuddyProviderType } from "@/lib/api/providers";
 import { managedAccountKeys } from "@/lib/query/accounts";
 
 export function useBuddyModelCatalog(
@@ -48,6 +48,24 @@ export function useBuddyModelCatalog(
 
 export type BuddyModelCatalogControl = ReturnType<typeof useBuddyModelCatalog>;
 
+type BuddyModel = BuddyAccountModels["models"][number];
+
+function BuddyReasoningDefault({ model, stale }: { model?: BuddyModel; stale?: boolean }) {
+  const { t } = useTranslation();
+  const caps = model?.raw?.capabilities;
+  return <span className="block text-xs text-muted-foreground">
+    {caps?.reasoningCapabilityKnown === true && caps.reasoning === false
+      ? t("buddyModels.reasoningNone")
+      : caps?.reasoningDefault ? t(stale ? "buddyModels.reasoningCachedDefault" : "buddyModels.reasoningDefault", { effort: caps.reasoningDefault })
+      : t("buddyModels.reasoningUnknown")}
+  </span>;
+}
+
+export function BuddyReasoningNotice({ catalog }: { catalog?: BuddyModelCatalogControl }) {
+  const { t } = useTranslation();
+  return catalog?.supported ? <p className="text-xs text-muted-foreground">{t("buddyModels.reasoningPolicy")}</p> : null;
+}
+
 /** Keeps the existing editable value; discovery never changes or saves it. */
 export function UpstreamModelInput({ catalog, value, onValueChange, className, ...input }: {
   catalog?: BuddyModelCatalogControl;
@@ -68,7 +86,7 @@ export function UpstreamModelInput({ catalog, value, onValueChange, className, .
   const selected = value.trim();
   const needle = search.trim().toLowerCase();
   const options = [
-    { id: "auto", displayName: t("buddyModels.auto"), raw: undefined },
+    { id: "auto", upstreamModel: "auto", displayName: t("buddyModels.auto"), raw: undefined },
     ...models.filter((model) => model.id !== "auto"),
   ].filter((model) => `${model.id} ${model.displayName ?? ""}`.toLowerCase().includes(needle));
   const missing = catalog.data && !catalog.error && !catalog.data.stale && selected
@@ -107,6 +125,7 @@ export function UpstreamModelInput({ catalog, value, onValueChange, className, .
                 {t(model.raw?.capabilities?.images === true ? "buddyModels.imageInput"
                   : model.raw?.capabilities?.images === false ? "buddyModels.textInput" : "buddyModels.unknownImageInput")}
               </span> : null}
+              {model.id !== "auto" ? <BuddyReasoningDefault model={model} stale={catalog.data?.stale} /> : null}
             </button>)}
             {!options.length ? <p className="p-2 text-xs text-muted-foreground">{t("buddyModels.noMatch")}</p> : null}
           </div>
@@ -118,6 +137,9 @@ export function UpstreamModelInput({ catalog, value, onValueChange, className, .
       </Button>
     </div>
     <p className="text-xs text-muted-foreground">{t("buddyModels.autoHint")}</p>
+    <BuddyReasoningNotice catalog={catalog} />
+    {selected === "auto" ? <p className="text-xs text-muted-foreground">{t("buddyModels.reasoningAuto")}</p>
+      : <BuddyReasoningDefault model={models.find((model) => model.id === selected)} stale={catalog.data?.stale} />}
     <div role="status" className="text-xs text-muted-foreground">
       {!catalog.ready ? t("buddyModels.selectAccount") : catalog.isFetching ? t("buddyModels.loading")
         : catalog.error ? t("buddyModels.failed", { message: catalog.error.message })

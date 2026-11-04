@@ -428,7 +428,7 @@
     "imageInput": "Image input supported",
     "textInput": "Text input only",
     "unknownImageInput": "Image support unknown",
-    "autoHint": "auto selects a model from this account’s catalog for the request’s image, tool and reasoning needs. A fixed model rejects images if unsupported. You can also enter a model ID.",
+    "autoHint": "auto selects a model from this account’s catalog compatible with images, tools and its catalog reasoning default. A fixed model fails explicitly if incompatible. You can also enter a model ID.",
     "selectAccount": "Select an OAuth account to load its models.",
     "loading": "Loading account models…",
     "failed": "Could not load the model catalog: {{message}}. The current value is preserved; retry with refresh.",
@@ -436,7 +436,13 @@
     "updated": "Account catalog updated {{time}}.",
     "empty": "This account currently has no available models. auto also requires an available model.",
     "missing": "The current model is absent from this account’s latest catalog. Its value is preserved; choose an available model before use.",
-    "noMatch": "No matching models."
+    "noMatch": "No matching models.",
+    "reasoningPolicy": "Server uses the upstream model’s catalog default for reasoning. Client effort, budget and on/off controls are ignored.",
+    "reasoningDefault": "Default reasoning effort: {{effort}}",
+    "reasoningCachedDefault": "Cached default reasoning effort: {{effort}}",
+    "reasoningNone": "This upstream model has no reasoning capability; no reasoning parameters are sent.",
+    "reasoningUnknown": "The catalog reasoning default is unconfirmed; requests fail explicitly if it cannot be confirmed.",
+    "reasoningAuto": "auto uses the catalog default of the model selected for the request."
   },
   "providerBundle": {
     "authAdvanced": "Advanced compatibility (usually unnecessary)",

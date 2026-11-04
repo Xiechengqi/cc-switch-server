@@ -928,7 +928,7 @@ const registry = JSON.parse(
 const truth = contract.registryTruth;
 const driver = registry.drivers.find((item) => item.driverId === truth.driverId);
 assert(driver, "CodeBuddy driver is absent from the registry");
-assert(driver.driverContractRevision === 3, "CodeBuddy image-input driver revision must be 3");
+assert(driver.driverContractRevision === 4, "CodeBuddy reasoning-default driver revision must be 4");
 assert(
   JSON.stringify(driver.operations) === JSON.stringify(truth.operations),
   "CodeBuddy operation support drifted",
@@ -1082,7 +1082,7 @@ assert(imageInput.limits?.images === 16 && imageInput.limits.inlineImageDecodedB
   "Buddy image-input limits changed");
 for (const id of ["special.codebuddy_oauth", "special.workbuddy_oauth"]) {
   const current = registry.drivers.find((item) => item.driverId === id);
-  assert(current?.driverContractRevision === 3 && current.capabilities.images === true,
+  assert(current?.driverContractRevision === 4 && current.reasoningPolicy === "buddy_upstream_default_v1" && current.capabilities.images === true,
     `${id} must declare catalog-gated image-input support`);
 }
 const imageSource = imageInput.source;

@@ -336,7 +336,17 @@ pub struct DriverSpec {
     pub operations: DriverOperations,
     pub capabilities: DriverCapabilities,
     pub outbound_identity_policy: OutboundIdentityPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_policy: Option<ProviderReasoningPolicy>,
     pub option_schema_id: String,
+}
+
+/// Server-owned request policy. Provider settings and request metadata cannot
+/// override this contract or persist a live catalog's dynamic default level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReasoningPolicy {
+    BuddyUpstreamDefaultV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -749,6 +759,18 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
         validate_registry_id(driver.driver_id.as_str(), "driver")?;
         if driver.driver_contract_revision == 0 {
             bail!("driver {} has revision zero", driver.driver_id);
+        }
+        let buddy_driver = matches!(
+            driver.driver_id.as_str(),
+            "special.codebuddy_oauth" | "special.workbuddy_oauth"
+        );
+        if buddy_driver
+            != (driver.reasoning_policy == Some(ProviderReasoningPolicy::BuddyUpstreamDefaultV1))
+        {
+            bail!(
+                "driver {} has an invalid server reasoning policy",
+                driver.driver_id
+            );
         }
         if !driver_ids.insert(driver.driver_id.as_str()) {
             bail!("duplicate driver id {}", driver.driver_id);
@@ -1597,6 +1619,31 @@ const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 48] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buddy_reasoning_policy_cannot_be_removed_or_assigned_to_another_driver() {
+        for id in [
+            "special.codebuddy_oauth",
+            "special.workbuddy_oauth",
+            "oauth.openai_codex",
+        ] {
+            let mut registry = provider_registry().clone();
+            let driver = registry
+                .drivers
+                .iter_mut()
+                .find(|driver| driver.driver_id.as_str() == id)
+                .unwrap();
+            driver.reasoning_policy = if driver.reasoning_policy.is_some() {
+                None
+            } else {
+                Some(ProviderReasoningPolicy::BuddyUpstreamDefaultV1)
+            };
+            assert!(validate_registry(&registry)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid server reasoning policy"));
+        }
+    }
 
     #[test]
     fn embedded_registry_is_valid_and_has_expected_inventory() {

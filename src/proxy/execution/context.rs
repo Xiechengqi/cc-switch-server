@@ -604,6 +604,7 @@ mod tests {
                 },
                 model_policy: RuntimeModelPolicy::Passthrough,
                 coding_plan: None,
+                reasoning_policy: None,
                 test_model: None,
                 probe_policy_fingerprint: String::new(),
                 aws_region: None,

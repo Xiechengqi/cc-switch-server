@@ -15,7 +15,10 @@ export interface BuddyAccountModels {
   accountId: string;
   authIdentityGeneration: number;
   models: Array<{ id: string; upstreamModel: string; displayName?: string;
-    raw?: { capabilities?: { images?: boolean } } }>;
+    raw?: { capabilities?: { images?: boolean; reasoning?: boolean;
+      reasoningCapabilityKnown?: boolean; reasoningEfforts?: string[];
+      reasoningDefault?: string | null; reasoningDefaultSource?: string | null;
+      reasoningPolicy?: "buddy_upstream_default_v1" } } }>;
   source: string;
   stale: boolean;
   fetchedAtMs: number;
@@ -155,6 +158,7 @@ export interface ProviderRuntimePlan {
   endpoint: string;
   upstreamProtocol: string;
   outboundIdentityPolicy: unknown;
+  reasoningPolicy?: "buddy_upstream_default_v1";
   authRef: unknown;
   modelPolicy:
     | { mode: "passthrough" }

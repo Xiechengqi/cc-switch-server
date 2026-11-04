@@ -428,7 +428,7 @@
     "imageInput": "支援圖片輸入",
     "textInput": "僅文字輸入",
     "unknownImageInput": "圖片能力未知",
-    "autoHint": "auto 會依目前帳號目錄選擇支援本次圖片、工具及推理需求的模型；固定模型不支援圖片時會明確報錯。也可手動輸入模型 ID。",
+    "autoHint": "auto 會依目前帳號目錄選擇相容圖片、工具及目錄預設推理等級的模型；固定模型不符合能力時會明確回報錯誤。亦可手動輸入模型 ID。",
     "selectAccount": "請先選擇 OAuth 帳號以取得模型清單。",
     "loading": "正在取得帳號模型…",
     "failed": "模型目錄取得失敗：{{message}}。已保留目前值，可重新整理重試。",
@@ -436,7 +436,13 @@
     "updated": "帳號目錄更新於 {{time}}。",
     "empty": "目前帳號沒有可用模型，auto 同樣需要帳號中有可用模型。",
     "missing": "目前模型不在此帳號的最新目錄中。已保留原值，請於使用前選擇可用模型。",
-    "noMatch": "沒有符合的模型。"
+    "noMatch": "沒有符合的模型。",
+    "reasoningPolicy": "推理等級由 Server 使用上游模型的目錄預設值；用戶端的等級、預算和開關均會被忽略。",
+    "reasoningDefault": "預設推理等級：{{effort}}",
+    "reasoningCachedDefault": "快取的預設推理等級：{{effort}}",
+    "reasoningNone": "上游模型無推理能力，不傳送推理參數。",
+    "reasoningUnknown": "目錄預設推理能力待確認；無法確認時會明確回報錯誤。",
+    "reasoningAuto": "auto 使用最終選中模型的目錄預設推理等級。"
   },
   "providerBundle": {
     "authAdvanced": "進階相容設定（通常無需修改）",

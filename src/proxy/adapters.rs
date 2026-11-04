@@ -1167,6 +1167,16 @@ fn transform_body_for_upstream(
             },
         )?;
     }
+    let buddy_requested_effort = if stored.provider_type.is_buddy_oauth() {
+        super::codebuddy_runtime::clear_buddy_reasoning_controls(&mut input).map_err(|error| {
+            ProxyError::bad_request(error.replace(
+                "CodeBuddy",
+                crate::domain::codebuddy::buddy_product_label(stored.provider_type),
+            ))
+        })?
+    } else {
+        None
+    };
     if stored.provider_type == ProviderType::QoderCosy
         && stored.app == AppKind::Codex
         && route == Some(ProxyRoute::CodexResponses)
@@ -1193,7 +1203,11 @@ fn transform_body_for_upstream(
             }
         }
         (AppKind::Claude, UpstreamFormat::OpenAiChat) => {
-            transforms::anthropic_to_openai_chat(&input)
+            if stored.provider_type.is_buddy_oauth() {
+                super::codebuddy_runtime::transform_buddy_claude_request(&input)
+            } else {
+                transforms::anthropic_to_openai_chat(&input)
+            }
         }
         (AppKind::Claude, UpstreamFormat::GeminiNative) => {
             transforms::anthropic_to_gemini_native(&input)
@@ -1254,6 +1268,12 @@ fn transform_body_for_upstream(
         _ => Ok(input),
     }
     .map_err(|error| ProxyError::bad_request(format!("request transform failed: {error}")))?;
+
+    if let Some(effort) = buddy_requested_effort {
+        // Diagnostic only. Model selection and final serialization always use
+        // the bound account's catalog default, never this client preference.
+        output["reasoning_effort"] = Value::String(effort);
+    }
 
     if let Some(reasoning) = antigravity_responses_reasoning {
         super::providers::antigravity::apply_responses_reasoning_summary(
@@ -5338,6 +5358,7 @@ mod tests {
             },
             model_policy: crate::domain::providers::runtime::RuntimeModelPolicy::Passthrough,
             coding_plan: None,
+            reasoning_policy: None,
             test_model: None,
             probe_policy_fingerprint: "fixture".to_string(),
             aws_region: None,

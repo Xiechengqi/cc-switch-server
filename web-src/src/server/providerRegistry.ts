@@ -115,6 +115,7 @@ export interface ProviderRegistryDriver {
   >;
   capabilities: { stream: boolean; tools: boolean; images: boolean };
   outboundIdentityPolicy: ProviderOutboundIdentityPolicy;
+  reasoningPolicy?: "buddy_upstream_default_v1";
   optionSchemaId: string;
 }
 

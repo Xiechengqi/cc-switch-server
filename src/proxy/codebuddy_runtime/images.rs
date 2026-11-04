@@ -202,7 +202,7 @@ fn image_part(part: &Value) -> bool {
     .any(|key| part.get(key).is_some())
 }
 
-pub(super) fn has_image_input(request: &Value) -> bool {
+pub(crate) fn has_image_input(request: &Value) -> bool {
     request["messages"]
         .as_array()
         .into_iter()

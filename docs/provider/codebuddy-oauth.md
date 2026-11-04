@@ -285,6 +285,8 @@ POST {endpoint}/v2/chat/completions
 
 ### 5.4 首条消息必须是 system prompt
 
+11128 也用于正文触发的 unapproved channel，不能仅凭业务码认定首条角色或 token 有错；2026-11-04 默认 Claude CLI 身份句的最小对照与兼容边界见 §5.6。
+
 **新增硬约束【D】**：若 `messages[0].role != "system"`，上游返回 **HTTP 400** + `{"code":11128,"msg":"first message is not system prompt"}`。
 
 在注入固定非空 system 前，revision 2 会删除 content 缺失、null、空白字符串或空数组且不承载协议语义的 message，避免上游 `11151`。assistant 的有效 `tool_calls` 与带非空 `tool_call_id` 的 tool result 即使 content 为空也必须保留；清理后为空时只注入固定最小 system，不改写普通 prompt。该差分来自只读 `cli2api@e5893f0`，目标实现采用更严格的 tool-result 保留边界。
@@ -317,11 +319,16 @@ POST {endpoint}/v2/chat/completions
 ```
 
 - `reasoning_effort` 是**顶层字符串**（非 `reasoning:{effort}` 对象）。
-- 下游 canonical `reasoning.effort` 会归一为顶层 `reasoning_effort`；同时出现且值冲突、类型错误、或 effort 不在实时目录的 `supportedEfforts` 时，本地 400。仅在下游明确请求 reasoning 且未指定 effort 时采用目录非空 `defaultEffort`，该字段缺失、`null` 或空白时回退到非空 `reasoning.effort`；不会无请求自动开启推理。显式非字符串 `defaultEffort` 不通过这条回退获得授权。
+- 两类 Buddy Driver revision 4 统一使用 Registry 的 `buddy_upstream_default_v1`。Claude、Codex Chat/Responses、Gemini 的流/非流入口均忽略客户端请求级 effort、预算及开关，包括 none / thinking.disabled；合法控制之间冲突不再报菜单错误，结构/类型非法仍本地 400。未知短字符串档位也忽略，日志只记 unrecognized。转换前清理已知控制位置，保留历史思考内容、工具数据/参数、结构化输出、max_tokens 和其他设置；不改其他供应商。
+- 最终模型按精确绑定目录的有效 `reasoning.defaultEffort` → 非空旧 `reasoning.effort` → 唯一允许档位确定默认，并显式发送顶层 `reasoning_effort`。max / xhigh 保持独立；不取多档菜单第一项、不猜档位。明确无推理能力时省略参数；未知能力或多档无默认时固定模型生成前 502，auto 按既有权限、CLI 顺序、图片/工具约束跳过此候选，客户端 effort 不参与筛选。畸形或矛盾目录失效；不换固定模型、账号或站点。
+- 策略版本进入运行指纹，动态默认值不固化进 Provider 配置。管理 API/模型选择器展示只读默认及非推理/未知状态，auto 使用最终所选模型的默认；Web 不提供手填档位或开关。现有 requested/effective 日志记录客户端意图和实际档位，结构化运行日志记录 defaultEffort / effort / soleEffort / no_reasoning 来源及 stale 标记，不记正文。Server 测试模型复用此策略，保持既有严格终态及探针专用 length 判断。
+- 2026-11-04 WorkBuddy CN 最小对照中，Kimi 完全省略/显式 medium 的 reasoning tokens 为 1/4，DeepSeek 完全省略/显式 high 为 0/29，四次均正常完成。这不能证明省略等于目录默认，也不代表双产品双站完整验收；因此显式发送目录默认，不采纳纯省略策略或未经相应站点/模型验证的额外出站字段。详见 `PROTOCOL_EVIDENCE.md`。
 - OpenAI named `tool_choice` 会先确认目标函数存在，再把 `tools` 缩减到该函数并映射为上游支持的 `"required"`；缺失/未知函数或畸形类型在发网前失败。
 - `tools: null`/`[]` 会与失去依附的 `tool_choice` 一起删除；`tool_choice: none` 同步删除 tools，`auto`/`required` 仅在非空 tools 存在时保留。named function 继续执行名字格式和声明存在性校验，不能借清理降级为 auto。
 - `stream_options.include_usage=true` 是末帧 usage 的来源；实现若需用量统计必须带上。
 - 回填轮的 assistant / tool 消息带非标准 `messageId`、`model`、`requestModelId`、`requestModelName`、`traceId`、`conversationRequestId`、`agent`。这些**不是必需的**，反代可不透传。
+
+2026-11-04 的 WorkBuddy CN 最小对照确认：同账号、模型和受审请求头下，Claude CLI 固定身份句触发 `11128 / Illegal API invocation from an unapproved channel`，普通 coding system 成功。Claude→Buddy 仅规范首条 system 开头独占一行的 `You are Claude Code, Anthropic's official CLI for Claude.` 为 `You are a helpful coding assistant.`，兼容前置 billing 元数据；其余 system、用户/工具/历史正文和原生 OpenAI/Gemini 请求保持。此为默认客户端身份句的窄范围例外，不采纳参考的全局品牌、WAF 关键词或任意正文改写。11128 不刷新或重试；该 CN 对照不代表双站联合验收。
 
 **响应 SSE**：`object: "chat.completion.chunk"`，delta 为**稠密**结构，每帧都带全部键 `content` / `reasoning_content` / `function_call` / `refusal` / `tool_calls` / `extra_fields`。
 
@@ -518,7 +525,8 @@ bundle 中的 `ProductFeature` 全集【A】：`Artifact`、`ImageGen`、`ImageE
   ```json
   {
     "driverId": "special.codebuddy_oauth",
-    "driverContractRevision": 3,
+    "driverContractRevision": 4,
+    "reasoningPolicy": "buddy_upstream_default_v1",
     "upstreamProtocol": "special",
     "acceptedAuthSchemes": ["oauth"],
     "operations": { "forward": "supported", "test": "supported",
@@ -528,7 +536,7 @@ bundle 中的 `ProductFeature` 全集【A】：`Artifact`、`ImageGen`、`ImageE
     "optionSchemaId": "special.codebuddy_oauth.v1"
   }
   ```
-revision 3 的 `capabilities.images=true` 表示 Driver 能转发图片输入，实际授权仍要求受审 CLI 模型的 `supportsImages=true`。图像/视频生成模型仍关闭；历史 U5/U11 图像生成证据不能推导图片输入可用或不可用。
+revision 4 保留的 `capabilities.images=true` 表示 Driver 能转发图片输入，实际授权仍要求受审 CLI 模型的 `supportsImages=true`。图像/视频生成模型仍关闭；历史 U5/U11 图像生成证据不能推导图片输入可用或不可用。
 - `profiles` +3：`claude.codebuddy_oauth` / `codex.codebuddy_oauth` / `gemini.codebuddy_oauth`，`formComposition: "managed_account"`、`endpointPolicy: "fixed"`、`credentialPolicy: { mode: "managed_account", accountProviderType: "codebuddy_oauth" }`、`modelPolicy: "single"`、`allowedModelPolicies: ["single","passthrough"]`、`maturity: "experimental"`、`defaultUpstreamModel: "auto"`。`auto` 只是表单必需的站点中立 sentinel，运行时必须按绑定 Account 的 site 解析，绝不能直接发往上游。
 - Registry conformance 当前三项均为 `fixture_verified`，只表达本地实现与 fixture 等级；独立的 `assets/contract/provider-conformance-evidence.json` 将三项 live gate 保持为 `live_pending`，receipt 为空。两类状态不得再写回同一字段或相互冒充。
 
@@ -833,7 +841,7 @@ CORE-03统一观察见增强计划§20.10.7：两站独立send/headers/read和�
 
 ## 2026-11-02 增强
 
-公开 signed-Share `/v1/models` 与管理发现使用同一精确绑定 runtime，成功空目录权威；传播真实 context/output 上限至 Gemini，未知值省略而不再编造固定容量。目录严格区分缺失 agents 与显式空 allowlist，保留 onlyReasoning、canDisableThinking 和 contextWindow 菜单；未知 reasoning effort 菜单拒绝任意级别，不自动开启或提高 effort。11148 / 11153 返回客户端 400，11140 返回账号受限 403，11133 继续按既有权益证据返回 403；429 保留有界 Retry-After / 明确重置措辞与显式时区的未来 reset，已知终态不触发认证恢复。
+公开 signed-Share `/v1/models` 与管理发现使用同一精确绑定 runtime，成功空目录权威；传播真实 context/output 上限至 Gemini，未知值省略而不再编造固定容量。目录严格区分缺失 agents 与显式空 allowlist，保留 onlyReasoning、canDisableThinking 和 contextWindow 菜单；推理策略后续由 2026-11-04 的 §5.6 统一目录默认规则替代，未知能力和多档无默认仍不授权请求。11148 / 11153 返回客户端 400，11140 返回账号受限 403，11133 继续按既有权益证据返回 403；429 保留有界 Retry-After / 明确重置措辞与显式时区的未来 reset，已知终态不触发认证恢复。
 
 WorkBuddy 已作为独立产品接入，见 [WorkBuddy 合同](workbuddy-oauth.md)。CodeBuddy 的 CLI 身份、旧账号和 CB-N4 真实门禁保持；未将新参考 Desktop 身份或模型接受性标成真实通过。
 

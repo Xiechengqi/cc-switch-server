@@ -4088,6 +4088,10 @@ pub(in crate::api) fn buddy_catalog_models(
                                 "images": capability.supports_images,
                                 "reasoning": capability.supports_reasoning,
                                 "reasoningEfforts": capability.reasoning_efforts,
+                                "reasoningDefault": capability.default_reasoning_effort,
+                                "reasoningDefaultSource": capability.reasoning_default_source.map(|source| source.as_str()),
+                                "reasoningCapabilityKnown": capability.reasoning_capability_known,
+                                "reasoningPolicy": "buddy_upstream_default_v1",
                                 "contextWindow": capability.context_window,
                                 "maxInputTokens": capability.max_input_tokens,
                                 "contextWindowLengths": capability.context_window_lengths,
@@ -5874,7 +5878,7 @@ mod tests {
                                             "name": "Default fixture",
                                             "supportsToolCall": true,
                                             "supportsReasoning": true,
-                                            "reasoning": {"supportedEfforts": ["low", "high"]},
+                                            "reasoning": {"defaultEffort":"high", "supportedEfforts": ["low", "high"]},
                                             "maxInputTokens": 200000,
                                             "maxOutputTokens": 8192,
                                             "Uin": "must-not-surface"
@@ -5945,6 +5949,18 @@ mod tests {
                 .raw
                 .pointer("/capabilities/reasoningEfforts/1"),
             Some(&json!("high"))
+        );
+        assert_eq!(
+            fetched.models[0].raw["capabilities"]["reasoningDefault"],
+            "high"
+        );
+        assert_eq!(
+            fetched.models[0].raw["capabilities"]["reasoningDefaultSource"],
+            "defaultEffort"
+        );
+        assert_eq!(
+            fetched.models[0].raw["capabilities"]["reasoningPolicy"],
+            "buddy_upstream_default_v1"
         );
         assert!(!fetched.models[0]
             .raw
@@ -6065,7 +6081,7 @@ mod tests {
                 };
                 for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
                     let catalog = json!({"code":0,"data":{
-                        "models":[{"id":default_model},{"id":"glm-5.2"},{"id":"hy3"},{"id":"unreviewed-model"}],
+                        "models":[{"id":default_model,"supportsReasoning":false},{"id":"glm-5.2","supportsReasoning":false},{"id":"hy3","supportsReasoning":true,"reasoning":{"effort":"high"}},{"id":"unreviewed-model"}],
                         "agents":[{"name":"cli","models":["unreviewed-model","hy3","glm-5.2"]}]
                     }});
                     let (origin, observations, server) =
@@ -6126,9 +6142,9 @@ mod tests {
                     assert_eq!(generation.len(), 2);
                     for entry in generation {
                         assert_eq!(entry["body"]["model"], "hy3");
-                        assert!(
-                            entry["body"].get("reasoning_effort").is_none(),
-                            "global modifier leaked: {entry}"
+                        assert_eq!(
+                            entry["body"]["reasoning_effort"], "high",
+                            "probe must use the catalog default, not the global low modifier"
                         );
                     }
                     assert_eq!(observations.len(), 3, "no refresh or extra catalog calls");
@@ -6148,7 +6164,7 @@ mod tests {
             for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
                 let (origin, observations, server) = serve_buddy_provider_api_fixture_with_finish(
                     Some(json!({"code":0,"data":{
-                        "models":[{"id":"hy3"}],
+                        "models":[{"id":"hy3","supportsReasoning":true,"reasoning":{"effort":"high"}}],
                         "agents":[{"name":"cli","models":["hy3"]}]
                     }})),
                     "hy3",

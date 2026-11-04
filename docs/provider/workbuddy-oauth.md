@@ -69,16 +69,21 @@ Router 新字段须显式协商，旧 reader 省略；具体字段、刷新和�
 
 本轮 `scripts/smoke/smoke-local.sh` 启动验证通过；首次调用因初次编译超过脚本 30 秒启动等待而中止，预先完成可执行文件构建后重跑成功。所有最终源码与 review 时冻结的 Rust 摘要一致；验证阶段未部署，双站真实验收保持 `live_pending`。
 
-## 2026-11-03 图片输入按账号目录授权
+## 2026-11-04 目录默认推理与 Claude CLI 兼容
 
-`special.workbuddy_oauth` 与 `special.codebuddy_oauth` Driver revision 3 支持图片输入，不新增图片生成接口或模型。只读取现有受审 CLI 通道模型的布尔 `supportsImages`，缺失为 false，畸形类型使目录失败；其他客户端或未受审模型的图片能力不能授权当前账号。`auto` 在同一账号有效目录内同时匹配图片、工具和推理需求；固定模型及显式 ID 不支持图片时返回明确 400，不换模型、账号、供应商或站点。
+两类 Buddy Driver revision 4 均采用 Registry 的 `buddy_upstream_default_v1`，覆盖 Claude、
+Codex Chat/Responses、Gemini 及流/非流。忽略客户端请求级推理档位、预算和开关（含 none、
+thinking.disabled 和合法冲突），在最终模型选定后显式发送精确目录默认档位。结构/类型
+非法仍 400；默认按 defaultEffort → 旧 effort → 唯一档位解析，不猜菜单首项。明确非推理
+模型省略参数，未知/多档无默认的固定模型在出站前 502，auto 按既有约束跳过该候选。
+固定模型、账号/站点、工具/图片权限、历史思考、其他设置和严格终态保持。策略进入运行
+指纹，既有 Provider 自动生效；API/选择器只读展示默认值，不增加配置开关。
 
-四入口在共用 Chat 边界完整保留图片 URI、文本与适用的 detail；转换前拒绝缺字段、歧义和会被共享 bridge 跳过的原生图片块。只检查原生内容块，不扫描工具 Schema、工具参数或 JSON 文本中的同名字段。上游支持的图片内容可来自 user 或 tool 轮次；完整工具轮次及现有媒体迁移规则继续生效。
+本次 CN 对照中 kimi-k3-1 默认 medium、deepseek-v4-pro 默认 high；完全省略参数可调用，
+但观察到的 reasoning tokens 与显式默认不同，不能保证同等推理能力。因此不使用纯省略
+替代目录默认。该单账号观察不代表 CodeBuddy/国际站或新二进制的完整真实验收。
 
-允许原样转发的 HTTPS 图片 URL 或 base64 图片 data URI，Server 不下载、压缩或重编码图片。每请求最多 16 张；每张内嵌图片最多 20 MiB 解码数据、合计最多 32 MiB；校验 base64、图片签名与 MIME。HTTPS URL 最长 16 KiB，禁止 userinfo 与 fragment；无法在本地确认远程图片实际大小，由上游验证。原请求体与请求生命周期内存上限同时适用，不能因图片能力绕过。错误不反射图片数据、完整 URL 或签名参数。
-
-管理目录与公开模型列表从同一模型能力投影 `images` / `inputModalities`；Web 固定模型列表显示支持图片、仅文字或能力未知，并保留缓存与刷新状态。参考仅为 `cli2api@fb2eb35b779770b2b3454bbdbe95e0b9ac6cfb70` 的目录字段与图片保留测试，摘要及本地证据见 append-only `imageInputExtension`；不采用参考的正文改写或放宽模型准入。
-
-receipt schema 仍为 2，当前 harness revision 3 由 `imageInputExtension` 声明，将旧的多模态全禁用决策更新为图片输入按目录授权、生成关闭；旧回执不能冒充当前策略的验收。历史 realAcceptance/harness revision 2 与既有结果保留不改。文本回执不证明识图接受性；本次没有任何产品、站点或精确模型的真实图片回执，均保持 `live_pending`，实际验证需使用无敏感信息的测试图片。
-
-最终本地验证：Rust 4213 项通过、3 项既有忽略，Node 审计 2128 项、smoke 单测 13 项、Web 单测 352 项全部通过；严格 Clippy、全源格式检查、类型检查、生产构建、完整静态审计和本地启动冒烟通过。双产品 × 双站 × 四入口 × stream/nonstream 的图片回环矩阵，以及固定文字模型拒绝、能力撤销、工具结果图片、畸形块与内存上限回归通过。整体 review 发现的问题已修正，详情见 `PROTOCOL_EVIDENCE.md`。
+11128 独立处理：只在 Claude→Buddy 的首条 system 开头规范逐字匹配、独占一行的默认
+Claude Code 身份句，允许前置 billing 元数据；其余指令、正文与工具数据保持。不因 11128
+刷新或重试。完整合同见 [CodeBuddy §5.6](codebuddy-oauth.md)，
+目录/最小对照证据见 `PROTOCOL_EVIDENCE.md`。

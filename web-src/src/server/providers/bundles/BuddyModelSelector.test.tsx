@@ -44,6 +44,27 @@ beforeEach(() => {
 });
 
 describe("Buddy model selection", () => {
+  it.each(["codebuddy_oauth", "workbuddy_oauth"])("shows the server reasoning policy and exact catalog default for %s", async (product) => {
+    mocks.fetch.mockResolvedValue({ ...fixture("a"), models: [
+      { id: "hy3", upstreamModel: "hy3", raw: { capabilities: { reasoning: true, reasoningCapabilityKnown: true, reasoningDefault: "max", reasoningDefaultSource: "defaultEffort" } } },
+      { id: "text", upstreamModel: "text", raw: { capabilities: { reasoning: false, reasoningCapabilityKnown: true } } },
+      { id: "unknown", upstreamModel: "unknown" },
+    ] });
+    const view = await mount();
+    try {
+      await view.render({ product, initial: "hy3" });
+      expect(view.container.textContent).toContain(i18n.t("buddyModels.reasoningPolicy"));
+      expect(view.container.textContent).toContain(i18n.t("buddyModels.reasoningDefault", { effort: "max" }));
+      await act(async () => view.container.querySelector<HTMLButtonElement>(`button[aria-label="${i18n.t("buddyModels.choose")}"]`)!.click());
+      const options = Array.from(document.querySelectorAll<HTMLButtonElement>('[role="option"]'));
+      for (const [id, label] of [["text", "reasoningNone"], ["unknown", "reasoningUnknown"]]) {
+        const option = options.find((option) => option.querySelector(".font-mono")?.textContent === id)!;
+        expect(option.textContent).toContain(i18n.t(`buddyModels.${label}`));
+      }
+      expect(view.container.querySelector<HTMLInputElement>("input")!.value).toBe("hy3");
+    } finally { await view.close(); }
+  });
+
   it.each(["codebuddy_oauth", "workbuddy_oauth"])("shows catalog image capabilities for %s without changing the model", async (product) => {
     mocks.fetch.mockResolvedValue({ ...fixture("a"), models: [
       { id: "vision", upstreamModel: "vision", raw: { capabilities: { images: true } } },

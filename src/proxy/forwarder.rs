@@ -19553,7 +19553,12 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
             .await;
         }
     };
-    let canonical = codebuddy_provider::prepare_canonical_request(&adapter_request)?;
+    let canonical = codebuddy_provider::prepare_canonical_request(
+        &adapter_request,
+        execution.plan.reasoning_policy,
+    )?;
+    request_context.requested_reasoning_effort =
+        super::codex_request_policy::extract_intent(&canonical.body).requested_reasoning_effort;
     if let Some(memory) = canonical_memory.as_ref() {
         if let Err(error) = memory.resize(canonical.retained_bytes()) {
             return qoder_fail_before_commit(
@@ -19723,6 +19728,22 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
 
         adapter_request.actual_model = Some(model_id.clone());
         adapter_request.actual_model_source = Some("codebuddy_live_catalog".to_string());
+        let capability = &runtime.catalog.capabilities[&model_id];
+        tracing::debug!(
+            provider_type = stored.provider_type.as_str(),
+            model = %model_id,
+            reasoning_policy = "buddy_upstream_default_v1",
+            requested_effort = ?request_context.requested_reasoning_effort,
+            effective_effort = ?capability.default_reasoning_effort,
+            default_source = capability.reasoning_default_source.map(|source| source.as_str()).unwrap_or("no_reasoning"),
+            catalog_stale = runtime.catalog.stale,
+            "Buddy upstream reasoning default resolved"
+        );
+        request_context.effective_reasoning_effort = prepared
+            .payload
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         if let Err(error) = ensure_share_model_available(
             &state,
             &execution,

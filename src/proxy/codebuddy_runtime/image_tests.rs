@@ -43,7 +43,7 @@ fn buddy_auto_image_selection_intersects_image_tool_and_reasoning_capabilities()
         };
         let catalog = parse_codebuddy_model_catalog(&json!({"models":[
             {"id":default,"supportsToolCall":true,"supportsImages":false},
-            {"id":"hy3","supportsImages":true},
+            {"id":"hy3","supportsImages":true,"supportsReasoning":false},
             {"id":"glm-5.2","supportsToolCall":true,"supportsImages":true,"supportsReasoning":true,"reasoning":{"supportedEfforts":["high"]}}],
             "agents":[{"name":"cli","models":[default,"hy3","glm-5.2"]}]}), site).unwrap();
         let mut request = json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/receipt.jpg"}}]}]});

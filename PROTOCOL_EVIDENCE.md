@@ -1,5 +1,80 @@
 # Protocol evidence policy
 
+## 2026-11-04 Buddy 目录默认推理策略与 Claude CLI 默认身份兼容
+
+针对 Claude CLI 连续 400，先只读核对同机 Server/Router 的精确绑定配置：WorkBuddy CN
+存在固定 `kimi-k3-1` 和 `deepseek-v4-pro` 的 Provider。下游 Claude 模型或 effort 的切换
+不会改变固定上游。绑定账号 `/v3/config` GET 返回 HTTP 200 / code 0；受审模型与 CLI
+allowlist 的交集为 `kimi-k3-1`、`glm-5.2`、`minimax-m2.7`（effort=medium）及
+`deepseek-v4-pro`、`hy3`（effort=high），均 supportsReasoning / onlyReasoning=true，
+未声明多档 supportedEfforts。旧精确 effort 校验因此拒绝 Claude 的 high/low/medium。
+其他目录模型不因此开放；单个 WorkBuddy CN 账号不证明 CodeBuddy 或国际站的能力。
+
+同一账号、受审 CLI 2.142.0 身份、相同 system/user、`max_tokens=32`，仅改变推理参数
+进行了四次最小对照：Kimi 完全省略参数 / 显式 medium 的 reasoning tokens 分别为 1 / 4；
+DeepSeek 完全省略 / 显式 high 分别为 0 / 29。均 HTTP 200、finish_reason=stop、唯一
+DONE、正常 EOF，无错误事件。不刷新 token、不改生产配置。此观察说明“省略参数”不能
+保证等于目录默认推理行为；单次简单问题也不能证明省略永远关闭推理。因此采用显式目录
+默认策略，不以纯省略作为启用上游默认能力的依据。
+
+本次按 `CodeBuddy/AGENTS.md` 优先只读核对已提交源码：
+
+- `cli2api@fb2eb35b779770b2b3454bbdbe95e0b9ac6cfb70`：catalog 默认解析、统一
+  出站 mapping 与不支持档位回退最值得借鉴；控制台值只作默认，并非完全锁定。
+  `catalog.go` 对象 `0a99f3e7dc132ff8bfab0444a4d651e3ce5b3068`、`mapping.go`
+  对象 `31187544c6fecb9f91404b202783e711ab3996d8`、`reasoning.go` 对象
+  `f928c7368733a69b3a6e99fb9e8bbde346fd0e81`。排除未跟踪 proxy.html / proxy.md。
+- `workbuddy-cliproxy@6528fdcadc08878808748de1d180419cc97cbd93`：stream/nonstream
+  共用出站处理，但仅按 hy3 名称强制 high，没有实时默认证据，不复制该硬编码。
+- `codebuddy2openai@8804ad6a774be236c32647a08980866557d9b3dd`：白名单透传顶层
+  effort，缺省自然省略；没有目录默认策略，不作为完整解法。
+- `workbuddy-switch@22b318c1f44b335c2222e444abcc2d0f74e160f7`：CLI 账号桥接，
+  不负责推理数据面。以上外仓仅为研究证据，不执行或引入构建、测试、运行时依赖。
+
+Server 两类 Driver revision 4 的 Registry 合同为 `buddy_upstream_default_v1`，自动
+应用到现有及新建 Provider、Claude / Codex Chat / Codex Responses / Gemini 的流式与
+非流式请求。所有客户端请求级推理档位、预算和开关均被覆盖，包括 none、disabled 和
+合法冲突值。结构/类型非法仍本地 400；未知的短字符串档位同样忽略，日志只记
+unrecognized。转换前验证并清理已知位置，避免通用转换器先拒绝或折叠 max/xhigh。
+只读目录默认按有效 defaultEffort → 旧 effort → 唯一允许档位解析；不取多档菜单第一项，
+不猜 medium/high。明确非推理模型省略参数；能力未知或默认不明时固定模型生成前 502，
+auto 跳过此候选并沿用既有权限、CLI 顺序、图片和工具约束。同一请求仅改变客户端
+推理等级不会改变 auto 结果。畸形或互相矛盾的目录不能授权请求。
+
+出站仍用已验证的顶层 reasoning_effort，不额外加入参考的 GLM 嵌套形式、DeepSeek
+summary / verbosity 等字段。历史思考、工具内容/参数、结构化输出及 max_tokens 不因
+请求级清理而移除。运行指纹纳入策略与 Driver revision；既有 requested/effective 用量日志
+分别记客户端意图和实际档位，结构化运行日志另记目录默认来源与 stale 状态，不记录正文。
+管理 API 和模型选择器展示默认值/来源、非推理或未知状态，Web 无手填档位或模式开关。
+Server 模型测试复用同一转发策略；真实 length / response.incomplete 终态语义保持。
+
+11128 是独立问题。同一 WorkBuddy CN 账号、deepseek-v4-pro、CLI 2.142.0 请求头、
+ping / max_tokens=1 / high 的三次对照：普通 coding system 成功；只换成默认身份句
+`You are Claude Code, Anthropic's official CLI for Claude.` 得到 400 / 11128；另一参考
+身份句成功。不能泛化为所有参考正则或错误均由正文引起。Claude→Buddy 只规范首条
+system 开头、逐字匹配且独占一行的上述身份句为 `You are a helpful coding assistant.`，
+允许前置 billing 元数据块/行。其余 system 指令、user/tool/assistant 历史及工具参数
+保持；原生 OpenAI/Gemini 不改写。不换 UA、站点或账号，不因 11128 刷新、重试或换模型。
+历史 R4 快照与泛化 WAF 改写拒绝结论保留。
+
+最终本地验证：完整 Rust 测试 4,244 项通过、0 失败、3 项忽略；Web 全量 367 项通过。
+`scripts/static-checks.sh` 通过，含全部 include! 源格式、严格全目标 Clippy、Node 审计
+2,128 项、smoke 脚本单测 13 项、Web 类型及全量测试、Provider/Writer/参考证据/文档/
+翻译/产物与依赖边界检查。`cargo fmt --check`、`cargo check`、`cargo build`、生产 Web
+构建与 10 阶段本地 smoke 均通过；生成的 Web 资源随实现保留。
+
+整体 review 覆盖双产品/双站、四入口及流/非流的统一策略，客户端关闭/冲突/未知档位的
+清理与非法结构拒绝、目录默认优先级与矛盾目录拒绝、auto 选择稳定性、固定模型不替换、
+精确账号/站点隔离、图片/工具/历史思考保留、只读 UI 与 requested/effective 日志。
+已修正指纹输入，使其他 Driver 的运行指纹保持原值；严格 DONE+EOF、length 与
+response.incomplete 语义保持。未发现本次修改遗留的本地阻断项。
+
+离线 `RUN_TESTS=0 RUN_REAL=0 scripts/release-readiness.sh` 结果为 failures=0、warnings=2、
+decision=blocked、verificationState=blocked_inputs：该次脚本显式跳过本地测试，且缺少真实
+Router/Share/账号输入及部署验收；不能将独立通过的本地测试等同于发布门禁通过。
+本次实施未提交、推送或部署，也未新增真实上游调用；真实双产品/双站验收保持
+live_pending，不将此前单账号最小对照当作完整 Server 或发布门禁通过。
+
 ## 2026-11-04 Buddy 资源包倒计时与同一行用量摘要
 
 按产品展示需求，Server / Router 的 CodeBuddy、WorkBuddy 每个资源包在已用/总额后补充

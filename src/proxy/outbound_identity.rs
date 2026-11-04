@@ -194,6 +194,7 @@ mod tests {
             endpoint: "https://example.test".to_string(),
             upstream_protocol: UpstreamProtocol::OpenAiResponses,
             outbound_identity_policy: policy,
+            reasoning_policy: None,
             auth_ref: RuntimeAuthRef::Missing,
             model_policy: RuntimeModelPolicy::Passthrough,
             coding_plan: None,

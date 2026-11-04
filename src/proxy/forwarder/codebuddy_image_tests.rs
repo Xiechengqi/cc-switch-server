@@ -50,7 +50,7 @@ fn buddy_image_catalog(site: CodeBuddySite) -> Value {
         {"id":site_model(site),"supportsToolCall":true,"supportsReasoning":true,"supportsImages":false},
         {"id":"hy3","supportsImages":true,"supportsToolCall":false},
         {"id":"glm-5.2","supportsImages":true,"supportsToolCall":true,"supportsReasoning":true,
-            "reasoning":{"supportedEfforts":["low","medium","high"]}}],
+            "reasoning":{"defaultEffort":"medium","supportedEfforts":["low","medium","high"]}}],
         "agents":[{"name":"cli","models":[site_model(site),"hy3","glm-5.2"]}]}})
 }
 

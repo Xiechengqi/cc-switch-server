@@ -428,7 +428,7 @@
     "imageInput": "支持图片输入",
     "textInput": "仅文字输入",
     "unknownImageInput": "图片能力未知",
-    "autoHint": "auto 会按当前账号目录选择支持本次图片、工具和推理需求的模型；固定模型不支持图片时会明确报错。也可手动输入模型 ID。",
+    "autoHint": "auto 会按当前账号目录选择兼容图片、工具及目录默认推理档位的模型；固定模型不满足能力时会明确报错。也可手动输入模型 ID。",
     "selectAccount": "请先选择 OAuth 账号以获取模型列表。",
     "loading": "正在获取账号模型…",
     "failed": "模型目录获取失败：{{message}}。已保留当前值，可点击刷新重试。",
@@ -436,7 +436,13 @@
     "updated": "账号目录更新于 {{time}}。",
     "empty": "当前账号没有可用模型，auto 同样需要账号中有可用模型。",
     "missing": "当前模型不在该账号的最新目录中。已保留原值，请在使用前选择可用模型。",
-    "noMatch": "没有匹配的模型。"
+    "noMatch": "没有匹配的模型。",
+    "reasoningPolicy": "推理档位由 Server 使用上游模型的目录默认值；客户端的档位、预算和开关均会被忽略。",
+    "reasoningDefault": "默认推理档位：{{effort}}",
+    "reasoningCachedDefault": "缓存的默认推理档位：{{effort}}",
+    "reasoningNone": "上游模型无推理能力，不发送推理参数。",
+    "reasoningUnknown": "目录默认推理能力待确认；无法确认时会明确报错。",
+    "reasoningAuto": "auto 使用最终选中模型的目录默认推理档位。"
   },
   "providerBundle": {
     "authAdvanced": "高级兼容设置（通常无需修改）",

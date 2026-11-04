@@ -137,7 +137,7 @@ async fn workbuddy_value_setup(
     use crate::repository::server_sqlite::{self, value_quota as ledger};
     let (address, fixture, server) = spawn_codebuddy_upstream(CodeBuddySite::Intl, replies).await;
     *fixture.catalog_override.lock().unwrap() = Some(json!({"code":0,"data":{"enterpriseId":"",
-        "models":[{"id":"default-model"},{"id":"glm-5.2","supportsToolCall":true,"supportsReasoning":true,
+        "models":[{"id":"default-model","supportsReasoning":false},{"id":"glm-5.2","supportsToolCall":true,"supportsReasoning":true,
             "reasoning":{"defaultEffort":"high","supportedEfforts":["low","medium","high"]}},
             {"id":"hy3","supportsToolCall":true,"supportsReasoning":true,
             "reasoning":{"defaultEffort":"high","supportedEfforts":["low","medium","high"]}}]}}));
@@ -339,9 +339,10 @@ fn workbuddy_value_auto_can_resolve_a_named_model_and_explicit_zero_cache_is_exa
             .await;
             // Without an opaque default, auto resolves the concrete live
             // catalog model before pricing/admission, not an assumed alias.
-            *fixture.catalog_override.lock().unwrap() =
-                Some(json!({"code":0,"data":{"enterpriseId":"",
-                "models":[{"id":"glm-5.2","supportsToolCall":true,"supportsReasoning":true}]}}));
+            *fixture.catalog_override.lock().unwrap() = Some(
+                json!({"code":0,"data":{"enterpriseId":"",
+                "models":[{"id":"glm-5.2","supportsToolCall":true,"supportsReasoning":true,"reasoning":{"effort":"high"}}]}}),
+            );
             collect(
                 workbuddy_value_request(state.clone(), provider, route, streaming, "auto")
                     .await

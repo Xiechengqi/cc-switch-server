@@ -32,6 +32,7 @@ import {
 import { toast } from "sonner";
 import {
   UpstreamModelInput,
+  BuddyReasoningNotice,
   useBuddyModelCatalog,
   type BuddyModelCatalogControl,
 } from "./BuddyModelSelector";
@@ -483,7 +484,7 @@ function SurfaceModelRow({
                 )
               }
             />
-          ) : null}
+          ) : <BuddyReasoningNotice catalog={catalog} />}
         </div>
       ) : (
         <div className="flex min-w-0 items-center gap-2 text-sm">
@@ -2738,7 +2739,7 @@ export function ProviderBundleEditor({
                             )
                           }
                         />
-                      ) : null}
+                      ) : <BuddyReasoningNotice catalog={buddyCatalog} />}
                     </div>
                     {fixedModelSurfaces.length ? (
                       <div className="rounded-md border px-3">

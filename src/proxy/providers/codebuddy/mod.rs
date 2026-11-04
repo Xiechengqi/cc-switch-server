@@ -84,7 +84,15 @@ impl CanonicalRequest {
 
 pub(crate) fn prepare_canonical_request(
     request: &AdapterRequest,
+    policy: Option<crate::domain::providers::registry::ProviderReasoningPolicy>,
 ) -> Result<CanonicalRequest, ProxyError> {
+    if policy
+        != Some(crate::domain::providers::registry::ProviderReasoningPolicy::BuddyUpstreamDefaultV1)
+    {
+        return Err(ProxyError::bad_gateway(
+            "Buddy Driver is missing its upstream-default reasoning policy",
+        ));
+    }
     let body = serde_json::from_slice::<Value>(&request.body).map_err(|error| {
         ProxyError::bad_request(format!("invalid CodeBuddy Chat request: {error}"))
     })?;
@@ -198,23 +206,18 @@ pub(crate) fn prepare_generation(
             )),
         ));
     }
-    let requests_reasoning = canonical
-        .body
-        .get("reasoning")
-        .is_some_and(|value| !value.is_null())
-        || canonical.body.get("reasoning_effort").is_some_and(|value| {
-            !value.is_null()
-                && !value
-                    .as_str()
-                    .is_some_and(|effort| effort.trim().is_empty())
-        });
-    if requests_reasoning && !capability.supports_reasoning {
-        return Err(GenerationPreparationError::FailBeforeCommit(
-            ProxyError::bad_request(format!(
-                "{product} model {model_id} does not advertise reasoning support"
-            )),
-        ));
+    if runtime::has_image_input(&canonical.body) && !capability.supports_images {
+        return Err(GenerationPreparationError::FailBeforeCommit(ProxyError::bad_request(format!(
+            "{product} model {model_id} does not advertise image input support in the bound account's live catalog"
+        ))));
     }
+    capability
+        .upstream_default_reasoning_effort()
+        .map_err(|error| {
+            GenerationPreparationError::FailBeforeCommit(ProxyError::bad_gateway(
+                error.replace("CodeBuddy", product),
+            ))
+        })?;
     let payload = runtime::build_codebuddy_payload(&canonical.body, &model_id, capability)
         .map_err(|error| {
             GenerationPreparationError::Direct(ProxyError::bad_request(
@@ -294,7 +297,7 @@ mod tests {
                 "name": "Fixture",
                 "supportsToolCall": supports_tools,
                 "supportsReasoning": supports_reasoning,
-                "reasoning": {"defaultEffort":"high","supportedEfforts":["low","high"]}
+                "reasoning": supports_reasoning.then(|| json!({"defaultEffort":"high","supportedEfforts":["low","high"]}))
             }]}}),
             site,
         )
@@ -384,15 +387,12 @@ mod tests {
             tools,
             GenerationPreparationError::FailBeforeCommit(_)
         ));
-        let reasoning = prepare_generation(
+        let generation = prepare_generation(
             &runtime,
             &canonical("default-model", json!({"reasoning":{"effort":"high"}})),
             None,
         )
-        .unwrap_err();
-        assert!(matches!(
-            reasoning,
-            GenerationPreparationError::FailBeforeCommit(_)
-        ));
+        .unwrap();
+        assert!(generation.payload.get("reasoning_effort").is_none());
     }
 }
