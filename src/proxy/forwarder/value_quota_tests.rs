@@ -73,24 +73,47 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
             Some("models/text-model:generateContent".to_string()),
         ),
     ] {
-        for custom in [false, true] {
-            let (profile, binding) = if custom {
-                let protocol = match (app, route) {
-                    (AppKind::Claude, _) => "anthropic_messages",
-                    (AppKind::Codex, ProxyRoute::CodexChatCompletions) => "open_ai_chat",
-                    (AppKind::Codex, _) => "open_ai_responses",
-                    (AppKind::Gemini, _) => "gemini_native",
-                };
+        let protocols = if app == AppKind::Codex {
+            vec![
+                None,
+                Some("anthropic_messages"),
+                Some("open_ai_chat"),
+                Some("open_ai_responses"),
+            ]
+        } else {
+            vec![
+                None,
+                Some("anthropic_messages"),
+                Some("open_ai_chat"),
+                Some("open_ai_responses"),
+                Some("gemini_native"),
+            ]
+        };
+        for protocol in protocols {
+            let (profile, binding) = if let Some(protocol) = protocol {
                 (match app { AppKind::Claude=>"claude.custom_http", AppKind::Codex=>"codex.custom_http", AppKind::Gemini=>"gemini.custom_http" },
-                Some(serde_json::from_value(json!({"upstreamProtocol":protocol,"authScheme":if app==AppKind::Gemini {"api_key"} else {"bearer"}})).unwrap()))
+                Some(serde_json::from_value(json!({"upstreamProtocol":protocol,"authScheme":if protocol=="gemini_native" {"api_key"} else {"bearer"}})).unwrap()))
             } else {
                 (profile, None)
             };
-            let reply = if custom && route == ProxyRoute::CodexChatCompletions {
-                json!({"id":"chat_fixture","object":"chat.completion","model":"text-model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
-                "usage":{"prompt_tokens":1000,"completion_tokens":1000,"total_tokens":2000}})
-            } else {
-                reply.clone()
+            let (upstream_app, reply) = match protocol {
+                Some("anthropic_messages") => (
+                    AppKind::Claude,
+                    json!({"id":"msg_fixture","type":"message","role":"assistant","model":"text-model","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":1000,"output_tokens":1000}}),
+                ),
+                Some("open_ai_chat") => (
+                    AppKind::Codex,
+                    json!({"id":"chat_fixture","object":"chat.completion","model":"text-model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":1000,"total_tokens":2000}}),
+                ),
+                Some("open_ai_responses") => (
+                    AppKind::Codex,
+                    json!({"id":"resp_fixture","object":"response","status":"completed","model":"text-model","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1000,"output_tokens":1000,"total_tokens":2000}}),
+                ),
+                Some("gemini_native") => (
+                    AppKind::Gemini,
+                    json!({"modelVersion":"text-model","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1000,"candidatesTokenCount":1000,"totalTokenCount":2000}}),
+                ),
+                _ => (app, reply.clone()),
             };
             for streaming in [false, true] {
                 for mismatched_model in [false, true] {
@@ -107,7 +130,7 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                     });
                     let mut reply = reply.clone();
                     if mismatched_model {
-                        reply[if app == AppKind::Gemini {
+                        reply[if upstream_app == AppKind::Gemini {
                             "modelVersion"
                         } else {
                             "model"
@@ -151,7 +174,7 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                     let calls = Arc::new(AtomicUsize::new(0));
                     let observed_calls = Arc::clone(&calls);
                     let config_dir = state.config_dir.clone();
-                    let upstream = axum::Router::new().fallback(axum::routing::post(move || {
+                    let upstream = axum::Router::new().fallback(axum::routing::post(move |uri:axum::http::Uri, body:Bytes| {
             let calls = Arc::clone(&observed_calls);
             let config_dir = config_dir.clone();
             let reply = reply.clone();
@@ -165,13 +188,15 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                 ).unwrap();
                 assert_eq!(pending, ("100000000".into(), "pending".into()));
                 calls.fetch_add(1, Ordering::SeqCst);
-                let body = if streaming {
-                    value_quota_fixture_stream(app, &reply)
+                let sent:Value = serde_json::from_slice(&body).unwrap();
+                let upstream_stream = sent["stream"] == true || uri.path().ends_with(":streamGenerateContent");
+                let body = if upstream_stream {
+                    value_quota_fixture_stream(upstream_app, &reply)
                 } else {
                     reply.to_string()
                 };
                 Response::builder()
-                    .header(CONTENT_TYPE, if streaming {"text/event-stream"} else {"application/json"})
+                    .header(CONTENT_TYPE, if upstream_stream {"text/event-stream"} else {"application/json"})
                     .body(Body::from(body))
                     .unwrap()
             }
@@ -342,7 +367,7 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                     assert!(!error.retryable());
                     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-                    if app == AppKind::Codex {
+                    if app == AppKind::Codex && protocol.is_none() {
                         let web = install_web_session_forwarder_test_provider(
                             &state,
                             AppKind::Codex,

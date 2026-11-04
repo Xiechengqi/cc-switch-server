@@ -19,8 +19,11 @@ use crate::domain::providers::model::{AppKind, AuthBinding, Provider, ProviderMe
 use crate::domain::providers::registry::ProfileId;
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 
+include!("workbuddy_value_tests.rs");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodeBuddyGenerationReply {
+    Value(WorkBuddyValueReply),
     Success,
     SuccessZeroCache,
     HttpUnauthorized,
@@ -68,6 +71,7 @@ struct CodeBuddyFixtureState {
     account_requests: Arc<AtomicUsize>,
     upstream_body_dropped: Arc<AtomicBool>,
     observations: Arc<Mutex<Vec<CodeBuddyRequestObservation>>>,
+    value_admission_dir: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl CodeBuddyFixtureState {
@@ -82,6 +86,7 @@ impl CodeBuddyFixtureState {
             account_requests: Default::default(),
             upstream_body_dropped: Default::default(),
             observations: Default::default(),
+            value_admission_dir: Default::default(),
         }
     }
 
@@ -404,6 +409,21 @@ async fn codebuddy_generation(
     body: Bytes,
 ) -> Response {
     let body: Value = serde_json::from_slice(&body).unwrap();
+    if let Some(dir) = state.value_admission_dir.lock().unwrap().as_ref() {
+        let db = rusqlite::Connection::open(crate::repository::server_sqlite::database_path(dir))
+            .unwrap();
+        let pending: i64 = db
+            .query_row(
+                "SELECT count(*) FROM value_quota_attempts WHERE metering_status='pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pending, 1,
+            "a durable admission must exist before generation is received"
+        );
+    }
     state
         .observations
         .lock()
@@ -421,6 +441,7 @@ async fn codebuddy_generation(
         .or_else(|| state.replies.last().copied())
         .unwrap_or(CodeBuddyGenerationReply::Success);
     match reply {
+        CodeBuddyGenerationReply::Value(value) => workbuddy_value_reply(value),
         CodeBuddyGenerationReply::Success => success_response(),
         CodeBuddyGenerationReply::SuccessZeroCache => zero_cache_success_response(),
         CodeBuddyGenerationReply::HttpUnauthorized => Response::builder()

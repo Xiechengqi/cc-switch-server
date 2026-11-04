@@ -1742,16 +1742,35 @@ fn classify_log(
 ) -> (ObservedOutcome, Option<ValueTokens>, Option<&'static str>) {
     use crate::domain::usage::store::RequestKind;
     let actual = log.actual_model.as_deref().or(log.model.as_deref());
+    let missing_workbuddy_model = log
+        .profile_id
+        .as_deref()
+        .is_some_and(|p| p.ends_with(".workbuddy_oauth"))
+        && log.reported_model.is_none();
     let evidence_ok = actual == Some(model)
+        && !missing_workbuddy_model
         && !log.reported_model_mismatch.unwrap_or(false)
         && !log.reported_model_conflict.unwrap_or(false)
+        && !log.reported_service_tier_conflict.unwrap_or(false)
+        && log.usage_state != crate::domain::usage::store::UsageState::ParseError
         && log.request_kind == RequestKind::Text
         && !log.is_health_check;
     let tokens = (!log.usage_estimated)
         .then(|| tokens_for_log(log))
         .flatten();
-    let has_usage = tokens.is_some_and(|t| t != ValueTokens::default());
-    let tier = canonical_service_tier(log.effective_service_tier.as_deref());
+    // Incomplete or inconsistent usage is not proof of a free error. In
+    // particular an HTTP error may report input/cache without output usage.
+    let has_usage = tokens.is_some_and(|t| t != ValueTokens::default())
+        || log.processed_tokens() > 0
+        || log.raw_input_tokens.unwrap_or(0) > 0
+        || log.total_tokens.unwrap_or(0) > 0;
+    let uncertain_tokens =
+        tokens.or_else(|| (!log.usage_estimated && has_usage).then(|| partial_tokens(log, meta)));
+    let tier = canonical_service_tier(
+        log.reported_service_tier
+            .as_deref()
+            .or(log.effective_service_tier.as_deref()),
+    );
     let observed_tier = tier.filter(|tier| *tier != admitted_tier);
     if in_progress_log(log) && !force_terminal {
         return (
@@ -1761,11 +1780,15 @@ fn classify_log(
         );
     }
     let streamed = log.value_streamed_text_bytes.unwrap_or(0);
-    if log.status_code >= 400 && !has_usage && streamed == 0 {
+    if log.status_code >= 400
+        && !has_usage
+        && streamed == 0
+        && log.failure_kind.as_deref() != Some("upstream_outcome_unknown")
+    {
         return (ObservedOutcome::Free, None, None);
     }
     if !evidence_ok || tier.is_none() {
-        return (ObservedOutcome::Unknown, tokens, None);
+        return (ObservedOutcome::Unknown, uncertain_tokens, observed_tier);
     }
     let completed = if log.is_streaming {
         log.stream_status.as_deref() == Some("completed")
@@ -1780,7 +1803,7 @@ fn classify_log(
                 observed_tier,
             ),
             Some(tokens) => (ObservedOutcome::Final, Some(tokens), None),
-            None => (ObservedOutcome::Unknown, None, None),
+            None => (ObservedOutcome::Unknown, uncertain_tokens, observed_tier),
         };
     }
     if log.is_streaming {
@@ -1790,7 +1813,7 @@ fn classify_log(
             observed_tier,
         );
     }
-    (ObservedOutcome::Unknown, tokens, None)
+    (ObservedOutcome::Unknown, uncertain_tokens, observed_tier)
 }
 /// The usage log of one request settles the admitted attempt it belongs to
 /// (`attempt_id == attempt_count`) and nothing else.
@@ -2079,7 +2102,9 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
             .and_then(|tokens| tariff.price(tier, tokens).ok())
     };
     let unknown = || {
-        let priced = price(o.effective_tier).map_or(0, |p| p.usage_picos);
+        let priced = price(o.effective_tier)
+            .map_or(0, |p| p.usage_picos)
+            .max(o.observed_tier.and_then(price).map_or(0, |p| p.usage_picos));
         let floor = if old.8 == "pending" { old_amount } else { 0 };
         (priced.max(reserved).max(floor), "conservative")
     };
@@ -4235,6 +4260,48 @@ mod tests {
         assert_eq!(view.used_picos, "0");
         assert_eq!(view.pending_risk_picos, "20000000");
         tx.commit().unwrap();
+    }
+    #[test]
+    fn value_quota_response_tier_and_unknown_proxy_errors_cannot_be_free_or_exact() {
+        let (_, scope, _, _, _) = setup();
+        let mut log = log_for(&scope, "tier-and-error");
+        log.input_tokens = Some(10);
+        log.output_tokens = Some(3);
+        log.raw_input_tokens = Some(10);
+        log.reported_service_tier = Some("priority".into());
+        let (outcome, _, tier) = classify_log(&log, "model", "standard", None, false);
+        assert_eq!(outcome, ObservedOutcome::FinalConservative);
+        assert_eq!(tier, Some("priority"));
+        log.reported_service_tier_conflict = Some(true);
+        assert_eq!(
+            classify_log(&log, "model", "standard", None, false).0,
+            ObservedOutcome::Unknown
+        );
+        log.reported_service_tier_conflict = None;
+        log.reported_service_tier = Some("unpriced-tier".into());
+        assert_eq!(
+            classify_log(&log, "model", "standard", None, false).0,
+            ObservedOutcome::Unknown
+        );
+        log.status_code = 504;
+        log.input_tokens = None;
+        log.output_tokens = None;
+        log.raw_input_tokens = None;
+        log.reported_service_tier = None;
+        log.failure_kind = Some("upstream_outcome_unknown".into());
+        assert_eq!(
+            classify_log(&log, "model", "standard", None, false).0,
+            ObservedOutcome::Unknown
+        );
+        log.failure_kind = None;
+        assert_eq!(
+            classify_log(&log, "model", "standard", None, false).0,
+            ObservedOutcome::Free
+        );
+        log.input_tokens = Some(10);
+        let (outcome, tokens, _) = classify_log(&log, "model", "standard", None, false);
+        assert_eq!(outcome, ObservedOutcome::Unknown);
+        assert_eq!(tokens.unwrap().fresh_input, 10);
     }
     #[test]
     fn value_quota_reconcile_leaves_young_pending_attempts_reserved() {

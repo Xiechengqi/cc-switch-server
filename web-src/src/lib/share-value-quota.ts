@@ -75,10 +75,10 @@ export type ValuePreview = { ready: boolean; configRevision?: number; capability
  * consequence rather than a cause while that check is failing.
  */
 export type ValueCheck = { code: string; ready: boolean; blockedBy?: string | null; state?: string; app?: string;
-  profileId?: string | null; driverId?: string | null };
+  providerId?: string; profileId?: string | null; driverId?: string | null; model?: string; scope?: string; reasonCode?: string };
 /** Fix-first order: an earlier check usually unblocks the later ones. Unknown codes go last. */
 export const VALUE_CHECK_ORDER = ["router_protocol", "sqlite_authority", "metering_storage", "tariff_published",
-  "acknowledged_tariff", "text_surface"] as const;
+  "acknowledged_tariff", "text_surface", "model_price_coverage"] as const;
 const checkRank = (code: string) => {
   const index = (VALUE_CHECK_ORDER as readonly string[]).indexOf(code);
   return index < 0 ? VALUE_CHECK_ORDER.length : index;

@@ -1227,6 +1227,8 @@
           "metering_storage": "計量ストレージが異常です。Server ストレージを確認・復旧してください。",
           "acknowledged_tariff": "Server が現在の USD 料金表をまだ確認していません。通常 1 分以内に完了します。",
           "text_surface": "この実行バインディングはテキスト金額計量で未検証です：",
+          "model_price_coverage": "実行モデルの有効な価格がありません。Router 設定で価格を設定するか、新しい料金表の有効化を待ってください。",
+          "model_unresolved": "WorkBuddy は auto/default ではなく具体的なモデルを選び、Router 設定で価格を設定してください。不透明なルーティング別名は安全に課金できません。",
           "offline": "Server に接続できません。接続を回復してから再確認してください。",
           "timeout": "Server が時間内に応答しませんでした。再試行してください。",
           "controlAuth": "現在のセッションにはこの確認の権限がありません。再ログインしてください。",
@@ -1239,7 +1241,8 @@
             "metering_storage": "計測ストレージに問題があります",
             "tariff_published": "Router の料金表が未生成です",
             "acknowledged_tariff": "Server の料金表確認を待っています",
-            "text_surface": "USD 計測に未対応の Provider があります"
+            "text_surface": "USD 計測に未対応の Provider があります",
+            "model_price_coverage": "実行モデルの価格が未準備です"
           },
           "more": "ほか {{count}} 件",
           "waitingOn": "先に解決が必要：{{blocker}}",

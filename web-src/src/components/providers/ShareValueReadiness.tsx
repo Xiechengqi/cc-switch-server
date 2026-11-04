@@ -106,9 +106,10 @@ export function ShareValueReadiness({ state, id }: { state: ReturnType<typeof us
         <ul className="list-disc space-y-1 pl-4">{failed.map((check, index) => {
           const blocker = valueCheckBlocker(check, failed);
           return <li key={`${check.code}:${index}`} className={cn(blocker && "text-muted-foreground")}>
-            {t(prefix + (isKnownCheck(check.code) ? check.code : "failed"))}
+            {t(prefix + (check.reasonCode === "model_unresolved" ? "model_unresolved" : isKnownCheck(check.code) ? check.code : "failed"))}
             {check.code === "sqlite_authority" && check.state ? ` (${check.state})` : null}
-            {check.code === "text_surface" ? <span className="break-all font-mono"> {check.app} · {check.profileId ?? "—"} / {check.driverId ?? "—"}</span> : null}
+            {check.code === "text_surface" ? <span className="break-all font-mono"> {check.app} · {check.providerId ?? "—"} · {check.profileId ?? "—"} / {check.driverId ?? "—"}</span> : null}
+            {check.code === "model_price_coverage" ? <span className="break-all font-mono"> {check.app} · {check.providerId ?? "—"} · {check.model ?? "—"} · {check.profileId ?? "—"} / {check.driverId ?? "—"}</span> : null}
             {blocker ? <span className="block italic">{t(prefix + "waitingOn", { blocker: shortName(blocker) })}</span> : null}
           </li>;
         })}</ul>

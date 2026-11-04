@@ -2771,6 +2771,7 @@ async fn forward_with_attempt_inner(
             }
             return Box::pin(forward_codebuddy(CodeBuddyForwardOptions {
                 state,
+                value_metering,
                 execution,
                 stored,
                 adapter,
@@ -19457,6 +19458,7 @@ async fn forward_web_session(options: WebSessionForwardOptions) -> Result<Respon
 
 struct CodeBuddyForwardOptions {
     state: ServerState,
+    value_metering: bool,
     execution: ProviderExecution,
     stored: StoredProvider,
     adapter: adapters::GenericForwardingAdapter,
@@ -19514,12 +19516,13 @@ enum CodeBuddyForwardAttemptError {
 async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response, ProxyError> {
     let CodeBuddyForwardOptions {
         state,
+        value_metering,
         execution,
         stored,
         adapter,
         mut adapter_request,
         route,
-        request_context,
+        mut request_context,
         account_in_flight_guard,
         share_invocation_guard,
         started,
@@ -19570,11 +19573,16 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
         timing: timing.clone(),
         ..ForwardAttemptContext::default()
     };
+    let value_base_attempt = request_context.attempt_count.unwrap_or(1).max(1);
     let binding_accounts = state.accounts_snapshot().await;
     recovery_attempt
         .ensure_binding(&execution, &binding_accounts)
         .map_err(binding_snapshot_error_to_proxy_error)?;
     loop {
+        // Catalog/auth recovery also advances this identity. Every generation
+        // has its own durable attempt; no retry may reuse an old reservation.
+        request_context.attempt_count =
+            Some(value_base_attempt.saturating_add(recovery_attempt.attempt()));
         let runtime = match codebuddy_provider::prepare_runtime(&state, &execution, &bound).await {
             Ok(runtime) => runtime,
             Err(error)
@@ -19693,6 +19701,26 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
         };
         let model_id = prepared.model_id.clone();
 
+        if value_metering
+            && crate::domain::usage::value_pricing::value_execution_model_hint(
+                execution.plan.profile_id.as_str(),
+                &model_id,
+            )
+            .is_none()
+        {
+            return Err(value_quota_proxy_error(
+                crate::domain::usage::value_pricing::PriceRejection {
+                    reason_code: "model_unresolved",
+                    model: model_id,
+                    tier: "standard".into(),
+                    active_pricing_revision: None,
+                    pending_pricing_revision: None,
+                    effective_from_ms: None,
+                }
+                .into(),
+            ));
+        }
+
         adapter_request.actual_model = Some(model_id.clone());
         adapter_request.actual_model_source = Some("codebuddy_live_catalog".to_string());
         if let Err(error) = ensure_share_model_available(
@@ -19714,20 +19742,51 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
             .await;
         }
 
+        let mut value_attempt_guard = state
+            .admit_share_value_text(
+                &request_context,
+                &model_id,
+                crate::domain::usage::value_pricing::canonical_service_tier(
+                    prepared
+                        .payload
+                        .get("service_tier")
+                        .and_then(Value::as_str)
+                        .or(request_context.effective_service_tier.as_deref()),
+                ),
+                crate::domain::usage::value_pricing::RiskEstimate::from_request(
+                    serialized_json_bytes(&prepared.payload),
+                    Some(&prepared.payload),
+                ),
+                value_metering
+                    && crate::domain::usage::value_pricing::is_metered_text_value(
+                        &prepared.payload,
+                    ),
+            )
+            .await
+            .map_err(value_quota_proxy_error)?;
+        let mut raw_usage = StreamUsageAccumulator::default();
         let wire = match send_codebuddy_generation(
             &state,
             &execution,
             &runtime,
             &prepared.payload,
             request_memory.as_ref(),
+            value_attempt_guard.as_ref(),
+            &mut raw_usage,
         )
         .await
         {
             Ok(wire) => wire,
             Err(CodeBuddyForwardAttemptError::Upstream(error))
                 if error.is_authentication_failure()
-                    && !recovery_attempt.auth_refresh_attempted() =>
+                    && !recovery_attempt.auth_refresh_attempted()
+                    && (!value_metering
+                        || (!raw_usage.has_billable_evidence()
+                            && value_attempt_guard
+                                .as_ref()
+                                .is_some_and(|g| g.proves_no_usage()))) =>
             {
+                settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                 if !advance_audited_attempt(
                     &state,
                     route,
@@ -19770,25 +19829,29 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
             }
             Err(CodeBuddyForwardAttemptError::Upstream(error)) => {
                 let error = error.into_proxy_error();
-                record_qoder_nonstream_failure(
+                record_codebuddy_metered_failure(
                     &state,
                     &stored,
                     &adapter_request,
                     &request_context,
                     started,
                     &error,
+                    raw_usage,
+                    value_attempt_guard.as_ref(),
                 )
                 .await;
                 return Err(error);
             }
             Err(CodeBuddyForwardAttemptError::Proxy(error)) => {
-                record_qoder_nonstream_failure(
+                record_codebuddy_metered_failure(
                     &state,
                     &stored,
                     &adapter_request,
                     &request_context,
                     started,
                     &error,
+                    raw_usage,
+                    value_attempt_guard.as_ref(),
                 )
                 .await;
                 return Err(error);
@@ -19799,6 +19862,7 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
         if adapter_request.stream_requested {
             let task = tokio::spawn(forward_codebuddy_stream(CodeBuddyStreamOptions {
                 state,
+                value_attempt_guard,
                 execution,
                 runtime,
                 stored,
@@ -19826,16 +19890,29 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
             wire,
             &model_id,
             request_memory.clone(),
+            &mut raw_usage,
+            value_attempt_guard.as_ref(),
         )
         .await
         {
             Ok(aggregated) => {
+                let observed = raw_usage.finish_with_status();
+                if value_metering {
+                    request_context.value_observed_usage = Some(observed.usage);
+                }
+                request_context.response_model = Some(observed.response_model);
+                request_context.value_streamed_text_bytes = Some(observed.streamed_text_bytes);
+                request_context.usage_estimated = observed.usage_estimated;
+                if observed.parse_error {
+                    request_context.usage_state = Some(UsageState::ParseError);
+                }
                 let super::codebuddy::CodeBuddyAggregatedResponse {
                     value: canonical,
                     memory: canonical_memory,
                 } = aggregated;
-                let mut completion =
-                    tokio::spawn(finish_qoder_nonstream(QoderNonstreamFinishOptions {
+                let mut completion = tokio::spawn(async move {
+                    let _value_attempt_guard = value_attempt_guard;
+                    finish_qoder_nonstream(QoderNonstreamFinishOptions {
                         state,
                         stored,
                         adapter,
@@ -19849,7 +19926,9 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                         share_invocation_guard,
                         started,
                         request_memory,
-                    }));
+                    })
+                    .await
+                });
                 let mut abort_guard = ProviderStreamTaskAbortGuard {
                     abort_handle: completion.abort_handle(),
                     armed: true,
@@ -19865,8 +19944,13 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
             }
             Err(CodeBuddyForwardAttemptError::Upstream(error))
                 if error.is_authentication_failure()
-                    && !recovery_attempt.auth_refresh_attempted() =>
+                    && !recovery_attempt.auth_refresh_attempted()
+                    && (!value_metering || !raw_usage.has_billable_evidence()) =>
             {
+                if let Some(guard) = &value_attempt_guard {
+                    guard.mark_upstream_error();
+                }
+                settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                 if !advance_audited_attempt(
                     &state,
                     route,
@@ -19909,31 +19993,86 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
             }
             Err(CodeBuddyForwardAttemptError::Upstream(error)) => {
                 let error = error.into_proxy_error();
-                record_qoder_nonstream_failure(
+                record_codebuddy_metered_failure(
                     &state,
                     &stored,
                     &adapter_request,
                     &request_context,
                     started,
                     &error,
+                    raw_usage,
+                    value_attempt_guard.as_ref(),
                 )
                 .await;
                 return Err(error);
             }
             Err(CodeBuddyForwardAttemptError::Proxy(error)) => {
-                record_qoder_nonstream_failure(
+                record_codebuddy_metered_failure(
                     &state,
                     &stored,
                     &adapter_request,
                     &request_context,
                     started,
                     &error,
+                    raw_usage,
+                    value_attempt_guard.as_ref(),
                 )
                 .await;
                 return Err(error);
             }
         }
     }
+}
+
+/// Failed buffered WorkBuddy streams must not lose usage/model evidence, or
+/// turn a sent-but-unknown timeout into a free request. Legacy CodeBuddy keeps
+/// its existing logging/recovery behavior.
+#[allow(clippy::too_many_arguments)]
+async fn record_codebuddy_metered_failure(
+    state: &ServerState,
+    stored: &StoredProvider,
+    request: &adapters::AdapterRequest,
+    context: &UsageLogContext,
+    started: Instant,
+    error: &ProxyError,
+    raw_usage: StreamUsageAccumulator,
+    guard: Option<&crate::state::ValueAttemptGuard>,
+) {
+    let Some(guard) = guard else {
+        record_qoder_nonstream_failure(state, stored, request, context, started, error).await;
+        return;
+    };
+    let observed = raw_usage.finish_with_status();
+    let usage = observed.usage;
+    let mut failure = context.clone();
+    failure.response_model = Some(observed.response_model);
+    failure.value_streamed_text_bytes = Some(observed.streamed_text_bytes);
+    failure.usage_estimated = observed.usage_estimated;
+    failure.is_streaming = request.stream_requested;
+    failure.stream_status = request.stream_requested.then(|| "upstream_error".into());
+    failure.usage_state = observed.parse_error.then_some(UsageState::ParseError);
+    if !guard.proves_no_usage() {
+        failure.failure_kind = Some("upstream_outcome_unknown".into());
+    }
+    log_usage(
+        state,
+        stored,
+        error.status.as_u16(),
+        started.elapsed().as_millis(),
+        model_metadata(request),
+        usage,
+        failure,
+    )
+    .await;
+    record_share_invocation_result(
+        state,
+        context.share_id.as_deref(),
+        context.user_email.as_deref(),
+        context.started_at_ms,
+        usage,
+    )
+    .await;
+    record_provider_outcome(state, stored, qoder_failure_provider_outcome(error)).await;
 }
 
 fn chat_model_from_canonical(body: &[u8]) -> Option<String> {
@@ -19952,6 +20091,8 @@ async fn send_codebuddy_generation(
     runtime: &super::codebuddy_runtime::PreparedCodeBuddyRuntime,
     payload: &Value,
     request_memory: Option<&RequestMemoryBudget>,
+    value_attempt_guard: Option<&crate::state::ValueAttemptGuard>,
+    raw_usage: &mut StreamUsageAccumulator,
 ) -> Result<PreparedCodeBuddyWireResponse, CodeBuddyForwardAttemptError> {
     if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
         return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
@@ -20076,6 +20217,17 @@ async fn send_codebuddy_generation(
         timing.mark(Milestone::SendStarted);
     }
     let headers_wait = timing.as_ref().map(|timing| timing.wait(WaitKind::Headers));
+    if let Some(guard) = value_attempt_guard {
+        guard.mark_sent();
+    }
+    let send_error = |error: reqwest::Error| {
+        if error.is_connect() {
+            if let Some(guard) = value_attempt_guard {
+                guard.mark_not_sent();
+            }
+        }
+        CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_gateway(error))
+    };
     let response = match execution.stream_first_byte_timeout() {
         Some(timeout) => tokio::time::timeout(timeout, request.send())
             .await
@@ -20088,11 +20240,8 @@ async fn send_codebuddy_generation(
                     ),
                 })
             })?
-            .map_err(|error| CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
-        None => request
-            .send()
-            .await
-            .map_err(|error| CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
+            .map_err(send_error)?,
+        None => request.send().await.map_err(send_error)?,
     };
     drop(headers_wait);
     if let Some(timing) = &timing {
@@ -20105,6 +20254,9 @@ async fn send_codebuddy_generation(
     }
     let mut response = response;
     let status = response.status();
+    if let Some(guard) = value_attempt_guard {
+        guard.mark_upstream_status(status.as_u16());
+    }
     if !status.is_success() {
         let (body, _body_memory) = read_response_body_limited_with_memory(
             &mut response,
@@ -20122,6 +20274,11 @@ async fn send_codebuddy_generation(
             })
             .transpose()
             .map_err(|error| CodeBuddyForwardAttemptError::Proxy(error.into_proxy_error()))?;
+        // HTTP errors can still report billable usage. Preserve that evidence
+        // before converting their body to a client-safe error.
+        if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+            raw_usage.observe_json(&value);
+        }
         return Err(CodeBuddyForwardAttemptError::Upstream(
             super::codebuddy::CodeBuddyUpstreamError::from_status_body(status.as_u16(), &body)
                 .with_retry_after(response.headers()),
@@ -20132,6 +20289,9 @@ async fn send_codebuddy_generation(
     let mut decoder =
         super::codebuddy::CodeBuddySseDecoder::with_request_memory(request_memory.cloned())
             .map_err(CodeBuddyForwardAttemptError::Proxy)?;
+    if value_attempt_guard.is_some() {
+        decoder.enable_value_usage();
+    }
     let mut received_chunk = false;
     loop {
         let timeout = if received_chunk {
@@ -20141,14 +20301,11 @@ async fn send_codebuddy_generation(
         };
         let next = codebuddy_next_wire_chunk(&mut inner, timeout, timing.as_ref()).await?;
         let Some(chunk) = next else {
-            let tail = decoder.finish_classified().map_err(|error| match error {
-                super::codebuddy::CodeBuddySseDecodeError::Upstream(error) => {
-                    CodeBuddyForwardAttemptError::Upstream(error)
-                }
-                super::codebuddy::CodeBuddySseDecodeError::Protocol(error) => {
-                    CodeBuddyForwardAttemptError::Proxy(error)
-                }
+            let tail = decoder.finish_classified().map_err(|error| {
+                codebuddy_observed_decode_error(error, &mut decoder, raw_usage, value_attempt_guard)
             })?;
+            raw_usage.push(&tail);
+            decoder.sync_value_usage(raw_usage);
             return Ok(PreparedCodeBuddyWireResponse {
                 inner,
                 decoder,
@@ -20156,16 +20313,11 @@ async fn send_codebuddy_generation(
             });
         };
         received_chunk = true;
-        let canonical = decoder
-            .push_classified(chunk)
-            .map_err(|error| match error {
-                super::codebuddy::CodeBuddySseDecodeError::Upstream(error) => {
-                    CodeBuddyForwardAttemptError::Upstream(error)
-                }
-                super::codebuddy::CodeBuddySseDecodeError::Protocol(error) => {
-                    CodeBuddyForwardAttemptError::Proxy(error)
-                }
-            })?;
+        let canonical = decoder.push_classified(chunk).map_err(|error| {
+            codebuddy_observed_decode_error(error, &mut decoder, raw_usage, value_attempt_guard)
+        })?;
+        raw_usage.push(&canonical);
+        decoder.sync_value_usage(raw_usage);
         if !canonical.is_empty() || decoder.is_terminal() {
             if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
                 return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
@@ -20178,6 +20330,62 @@ async fn send_codebuddy_generation(
                 first_canonical: canonical,
             });
         }
+    }
+}
+
+fn codebuddy_observed_decode_error(
+    error: super::codebuddy::CodeBuddySseDecodeError,
+    decoder: &mut super::codebuddy::CodeBuddySseDecoder,
+    usage: &mut StreamUsageAccumulator,
+    guard: Option<&crate::state::ValueAttemptGuard>,
+) -> CodeBuddyForwardAttemptError {
+    if let Some(observed) = decoder.take_value_usage() {
+        *usage = observed;
+    }
+    match error {
+        super::codebuddy::CodeBuddySseDecodeError::Upstream(error) => {
+            if !usage.has_billable_evidence() {
+                if let Some(guard) = guard {
+                    guard.mark_upstream_error();
+                }
+            }
+            CodeBuddyForwardAttemptError::Upstream(error)
+        }
+        super::codebuddy::CodeBuddySseDecodeError::Protocol(error) => {
+            CodeBuddyForwardAttemptError::Proxy(error)
+        }
+    }
+}
+
+/// A declared upstream rejection after a role-only prelude is known free.
+/// Transport/protocol errors, cancellation, or any observed generation keep
+/// the unknown-outcome marker. Use the domain writer so the terminal update
+/// cannot mistake this explicit rejection for a read timeout.
+async fn mark_codebuddy_declared_stream_rejection(
+    stream: &ShareStreamInterruptGuard,
+    value_guard: Option<&crate::state::ValueAttemptGuard>,
+) {
+    let Some(value_guard) = value_guard else {
+        return;
+    };
+    if stream.usage.has_billable_evidence() {
+        return;
+    }
+    value_guard.mark_upstream_error();
+    if let Err(error) = stream
+        .state
+        .update_usage_log_if(&stream.request_id, |log| {
+            if log.failure_kind.as_deref() != Some("upstream_outcome_unknown") {
+                return false;
+            }
+            log.failure_kind = None;
+            log.reset_router_sync_state();
+            true
+        })
+        .await
+    {
+        stream.state.mark_quota_usage_degraded();
+        tracing::warn!(%error, "failed to persist a declared WorkBuddy rejection");
     }
 }
 
@@ -20265,6 +20473,7 @@ fn codebuddy_runtime_error_to_proxy_error(error: CodeBuddyRuntimeError) -> Proxy
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn aggregate_codebuddy_nonstream(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -20272,6 +20481,8 @@ async fn aggregate_codebuddy_nonstream(
     mut wire: PreparedCodeBuddyWireResponse,
     model_id: &str,
     request_memory: Option<RequestMemoryBudget>,
+    raw_usage: &mut StreamUsageAccumulator,
+    value_attempt_guard: Option<&crate::state::ValueAttemptGuard>,
 ) -> Result<super::codebuddy::CodeBuddyAggregatedResponse, CodeBuddyForwardAttemptError> {
     let timing = request_memory
         .as_ref()
@@ -20292,35 +20503,35 @@ async fn aggregate_codebuddy_nonstream(
         {
             Ok(Some(chunk)) => chunk,
             Ok(None) => {
-                let tail = wire
-                    .decoder
-                    .finish_classified()
-                    .map_err(|error| match error {
-                        super::codebuddy::CodeBuddySseDecodeError::Upstream(error) => {
-                            CodeBuddyForwardAttemptError::Upstream(error)
-                        }
-                        super::codebuddy::CodeBuddySseDecodeError::Protocol(error) => {
-                            CodeBuddyForwardAttemptError::Proxy(error)
-                        }
-                    })?;
+                let tail = wire.decoder.finish_classified().map_err(|error| {
+                    codebuddy_observed_decode_error(
+                        error,
+                        &mut wire.decoder,
+                        raw_usage,
+                        value_attempt_guard,
+                    )
+                })?;
                 aggregator
-                    .push(tail)
+                    .push({
+                        raw_usage.push(&tail);
+                        wire.decoder.sync_value_usage(raw_usage);
+                        tail
+                    })
                     .map_err(CodeBuddyForwardAttemptError::Proxy)?;
                 break;
             }
             Err(error) => return Err(error),
         };
-        let canonical = wire
-            .decoder
-            .push_classified(chunk)
-            .map_err(|error| match error {
-                super::codebuddy::CodeBuddySseDecodeError::Upstream(error) => {
-                    CodeBuddyForwardAttemptError::Upstream(error)
-                }
-                super::codebuddy::CodeBuddySseDecodeError::Protocol(error) => {
-                    CodeBuddyForwardAttemptError::Proxy(error)
-                }
-            })?;
+        let canonical = wire.decoder.push_classified(chunk).map_err(|error| {
+            codebuddy_observed_decode_error(
+                error,
+                &mut wire.decoder,
+                raw_usage,
+                value_attempt_guard,
+            )
+        })?;
+        raw_usage.push(&canonical);
+        wire.decoder.sync_value_usage(raw_usage);
         if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
             return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
                 "CodeBuddy Provider or bound account changed during inference",
@@ -20345,6 +20556,7 @@ async fn aggregate_codebuddy_nonstream(
 
 struct CodeBuddyStreamOptions {
     state: ServerState,
+    value_attempt_guard: Option<crate::state::ValueAttemptGuard>,
     execution: ProviderExecution,
     runtime: super::codebuddy_runtime::PreparedCodeBuddyRuntime,
     stored: StoredProvider,
@@ -20362,6 +20574,7 @@ struct CodeBuddyStreamOptions {
 async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Response, ProxyError> {
     let CodeBuddyStreamOptions {
         state,
+        value_attempt_guard,
         execution,
         runtime,
         stored,
@@ -20396,38 +20609,54 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
         .transpose()
         .map_err(|error| error.into_proxy_error())?;
     let mut initial_usage = StreamUsageAccumulator::default();
-    let first_transformed = match transform_qoder_stream_chunk(
+    let first_transformed = transform_qoder_stream_chunk(
         &mut stream_transform,
         &mut initial_usage,
         wire.first_canonical,
         wire.decoder.is_terminal(),
         stream_retained_memory.as_ref(),
         request_memory.as_ref(),
-    ) {
+    );
+    wire.decoder.sync_value_usage(&mut initial_usage);
+    let first_transformed = match first_transformed {
         Ok(transformed) => transformed,
         Err(error) => {
-            return qoder_fail_before_commit(
+            record_codebuddy_metered_failure(
                 &state,
                 &stored,
                 &adapter_request,
                 &request_context,
                 started,
-                error,
+                &error,
+                initial_usage,
+                value_attempt_guard.as_ref(),
             )
             .await;
+            return Err(error);
         }
     };
+    let initial_observed = value_attempt_guard
+        .as_ref()
+        .map(|_| initial_usage.snapshot());
     let request_id = log_usage(
         &state,
         &stored,
         StatusCode::OK.as_u16(),
         started.elapsed().as_millis(),
         model_metadata(&adapter_request),
-        TokenUsage::default(),
+        initial_observed
+            .as_ref()
+            .map(|v| v.usage)
+            .unwrap_or_default(),
         UsageLogContext {
             is_streaming: true,
             stream_status: Some("pending".to_string()),
             usage_state: Some(UsageState::Pending),
+            failure_kind: value_attempt_guard
+                .as_ref()
+                .map(|_| "upstream_outcome_unknown".into()),
+            response_model: initial_observed.as_ref().map(|v| v.response_model.clone()),
+            value_streamed_text_bytes: initial_observed.as_ref().map(|v| v.streamed_text_bytes),
             ..request_context.clone()
         },
     )
@@ -20435,24 +20664,28 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
     let quota_started_at_ms = request_context.started_at_ms;
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
+    // Construct before the async body is polled: dropping an unread body must
+    // also finalize its already-persisted pending log, not wait for a sweep.
+    let mut interrupt_guard = ShareStreamInterruptGuard {
+        armed: true,
+        state: state.clone(),
+        stored: stored.clone(),
+        request_id: request_id.clone(),
+        status_code: StatusCode::OK.as_u16(),
+        share_id: share_id.clone(),
+        user_email: user_email.clone(),
+        quota_started_at_ms,
+        started,
+        first_token_ms: None,
+        usage: initial_usage,
+    };
     let stream = async_stream::stream! {
+        // The guard belongs to the body, not to response-header creation.
+        let value_body_guard = value_attempt_guard;
         let _account_in_flight_guard = account_in_flight_guard;
         let _share_invocation_guard = share_invocation_guard;
         let _runtime_memory = runtime_memory;
         let _request_memory_owner = request_memory.clone();
-        let mut interrupt_guard = ShareStreamInterruptGuard {
-            armed: true,
-            state: state.clone(),
-            stored: stored.clone(),
-            request_id: request_id.clone(),
-            status_code: StatusCode::OK.as_u16(),
-            share_id: share_id.clone(),
-            user_email: user_email.clone(),
-                            quota_started_at_ms,
-            started,
-            first_token_ms: None,
-            usage: initial_usage,
-        };
         let mut first_token_ms = None;
         if !first_transformed.is_empty() {
             first_token_ms = Some(started.elapsed().as_millis());
@@ -20484,6 +20717,10 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                     let canonical = match wire.decoder.finish_classified() {
                         Ok(canonical) => canonical,
                         Err(error) => {
+                            if let Some(usage) = wire.decoder.take_value_usage() { interrupt_guard.usage = usage; }
+                            if matches!(&error, super::codebuddy::CodeBuddySseDecodeError::Upstream(_)) {
+                                mark_codebuddy_declared_stream_rejection(&interrupt_guard, value_body_guard.as_ref()).await;
+                            }
                             let error = error.into_proxy_error();
                             if let Some(frame) = finish_qoder_observed_stream_failure(
                                 &mut interrupt_guard,
@@ -20496,6 +20733,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                             return;
                         }
                     };
+                    wire.decoder.sync_value_usage(&mut interrupt_guard.usage);
                     if !codebuddy_provider::runtime_is_current(&state, &execution, &runtime).await {
                         let error = ProxyError::conflict(
                             "CodeBuddy Provider or bound account changed before response commit",
@@ -20510,14 +20748,16 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                         }
                         return;
                     }
-                    let transformed = match transform_qoder_stream_chunk(
+                    let transformed = transform_qoder_stream_chunk(
                         &mut stream_transform,
                         &mut interrupt_guard.usage,
                         canonical,
                         true,
                         stream_retained_memory.as_ref(),
                         request_memory.as_ref(),
-                    ) {
+                    );
+                    wire.decoder.sync_value_usage(&mut interrupt_guard.usage);
+                    let transformed = match transformed {
                         Ok(transformed) => transformed,
                         Err(error) => {
                             if let Some(frame) = finish_qoder_observed_stream_failure(
@@ -20580,6 +20820,8 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
             let canonical = match wire.decoder.push_classified(chunk) {
                 Ok(canonical) => canonical,
                 Err(super::codebuddy::CodeBuddySseDecodeError::Upstream(error)) => {
+                    if let Some(usage) = wire.decoder.take_value_usage() { interrupt_guard.usage = usage; }
+                    mark_codebuddy_declared_stream_rejection(&interrupt_guard, value_body_guard.as_ref()).await;
                     let error = error.into_proxy_error();
                     if let Some(frame) = finish_qoder_observed_stream_failure(
                         &mut interrupt_guard,
@@ -20592,6 +20834,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                     return;
                 }
                 Err(super::codebuddy::CodeBuddySseDecodeError::Protocol(error)) => {
+                    if let Some(usage) = wire.decoder.take_value_usage() { interrupt_guard.usage = usage; }
                     if let Some(frame) = finish_qoder_observed_stream_failure(
                         &mut interrupt_guard,
                         timing.as_ref(),
@@ -20603,6 +20846,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                     return;
                 }
             };
+            wire.decoder.sync_value_usage(&mut interrupt_guard.usage);
             if !codebuddy_provider::runtime_is_current(&state, &execution, &runtime).await {
                 let error = ProxyError::conflict(
                     "CodeBuddy Provider or bound account changed during inference",
@@ -20617,14 +20861,16 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                 }
                 return;
             }
-            let transformed = match transform_qoder_stream_chunk(
+            let transformed = transform_qoder_stream_chunk(
                 &mut stream_transform,
                 &mut interrupt_guard.usage,
                 canonical,
                 wire.decoder.is_terminal(),
                 stream_retained_memory.as_ref(),
                 request_memory.as_ref(),
-            ) {
+            );
+            wire.decoder.sync_value_usage(&mut interrupt_guard.usage);
+            let transformed = match transformed {
                 Ok(transformed) => transformed,
                 Err(error) => {
                     if let Some(frame) = finish_qoder_observed_stream_failure(
@@ -22540,6 +22786,10 @@ async fn record_qoder_nonstream_failure(
 ) {
     let memory_exhausted = error.is_request_memory_exhausted();
     let mut context = request_context.clone();
+    let usage = context.value_observed_usage.unwrap_or_default();
+    if context.value_observed_usage.is_some() {
+        context.failure_kind = Some("upstream_outcome_unknown".into());
+    }
     context.is_streaming = request.stream_requested;
     context.stream_status = request.stream_requested.then(|| {
         if memory_exhausted {
@@ -22560,7 +22810,7 @@ async fn record_qoder_nonstream_failure(
         error.status.as_u16(),
         started.elapsed().as_millis(),
         model_metadata(request),
-        TokenUsage::default(),
+        usage,
         context,
     )
     .await;
@@ -22569,7 +22819,7 @@ async fn record_qoder_nonstream_failure(
         request_context.share_id.as_deref(),
         request_context.user_email.as_deref(),
         request_context.started_at_ms,
-        TokenUsage::default(),
+        usage,
     )
     .await;
     record_provider_outcome(state, stored, qoder_failure_provider_outcome(error)).await;
@@ -22696,7 +22946,9 @@ async fn finish_qoder_nonstream(
         started,
         request_memory,
     } = options;
-    let usage = usage_from_json_with_semantics(&canonical, InputTokenSemantics::Inclusive);
+    let usage = request_context.value_observed_usage.unwrap_or_else(|| {
+        usage_from_json_with_semantics(&canonical, InputTokenSemantics::Inclusive)
+    });
     let canonical_size = serialized_json_bytes(&canonical);
     let response_memory = match request_memory
         .as_ref()

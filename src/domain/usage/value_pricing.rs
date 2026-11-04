@@ -37,6 +37,7 @@ impl PriceRejection {
             "tariff_not_effective" => "Model price update is installed and awaiting its effective time; retry after activation.",
             "tier_unknown" => "The execution service tier is not supported for USD-equivalent pricing.",
             "tier_unpriced" => "The execution service tier has no verified price in the active tariff.",
+            "model_unresolved" => "WorkBuddy must resolve to a concrete execution model for USD-equivalent quotas; select a named model instead of auto/default.",
             _ => "The execution model has no verified price in the active tariff; configure its price in Router settings.",
         }
     }
@@ -77,10 +78,46 @@ pub fn supports_value_text_runtime(profile: &str, driver: &str, coding_plan: boo
                 | ("codex.openai_api_key", "http.openai_responses")
                 | ("gemini.google_api_key", "http.gemini_native")
                 | ("claude.custom_http", "http.anthropic_messages")
+                | ("claude.custom_http", "http.openai_chat")
+                | ("claude.custom_http", "http.openai_responses")
+                | ("claude.custom_http", "http.gemini_native")
+                | ("codex.custom_http", "http.anthropic_messages")
                 | ("codex.custom_http", "http.openai_chat")
                 | ("codex.custom_http", "http.openai_responses")
+                | ("gemini.custom_http", "http.anthropic_messages")
+                | ("gemini.custom_http", "http.openai_chat")
+                | ("gemini.custom_http", "http.openai_responses")
                 | ("gemini.custom_http", "http.gemini_native")
+                | ("claude.workbuddy_oauth", "special.workbuddy_oauth")
+                | ("codex.workbuddy_oauth", "special.workbuddy_oauth")
+                | ("gemini.workbuddy_oauth", "special.workbuddy_oauth")
         )
+}
+
+/// Match the WorkBuddy resolver's identifier normalization, without pretending
+/// its opaque routing aliases name a billable model. Other runtimes keep their
+/// exact identifiers (including case and vendor prefixes).
+pub fn value_execution_model_hint(profile: &str, model: &str) -> Option<String> {
+    let model = if profile.ends_with(".workbuddy_oauth") {
+        let model = model.trim();
+        let model = model
+            .strip_prefix("workbuddy/")
+            .or_else(|| model.strip_prefix("codebuddy/"))
+            .unwrap_or(model)
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(model.as_str(), "auto" | "default" | "default-model") {
+            return None;
+        }
+        model
+    } else {
+        model.to_owned()
+    };
+    (!model.is_empty()
+        && model.len() <= 250
+        && model.trim() == model
+        && !model.chars().any(char::is_control))
+    .then_some(model)
 }
 
 /// Object keys that positively identify separately billed media, audio
@@ -1047,9 +1084,19 @@ mod tests {
             ("codex.openai_api_key", "http.openai_responses"),
             ("gemini.google_api_key", "http.gemini_native"),
             ("claude.custom_http", "http.anthropic_messages"),
+            ("claude.custom_http", "http.openai_chat"),
+            ("claude.custom_http", "http.openai_responses"),
+            ("claude.custom_http", "http.gemini_native"),
+            ("codex.custom_http", "http.anthropic_messages"),
             ("codex.custom_http", "http.openai_chat"),
             ("codex.custom_http", "http.openai_responses"),
             ("gemini.custom_http", "http.gemini_native"),
+            ("gemini.custom_http", "http.anthropic_messages"),
+            ("gemini.custom_http", "http.openai_chat"),
+            ("gemini.custom_http", "http.openai_responses"),
+            ("claude.workbuddy_oauth", "special.workbuddy_oauth"),
+            ("codex.workbuddy_oauth", "special.workbuddy_oauth"),
+            ("gemini.workbuddy_oauth", "special.workbuddy_oauth"),
         ] {
             assert!(supports_value_text_runtime(profile, driver, false));
             assert!(!supports_value_text_runtime(profile, driver, true));
@@ -1063,12 +1110,35 @@ mod tests {
             ("codex.perplexity_web_session", "web_session.perplexity"),
             ("claude.xiaomi_mimo_token_plan", "http.anthropic_messages"),
             ("codex.openai_oauth", "oauth.openai_codex"),
-            ("claude.custom_http", "http.openai_chat"),
-            ("codex.custom_http", "http.anthropic_messages"),
-            ("gemini.custom_http", "http.openai_responses"),
+            ("codex.custom_http", "http.gemini_native"),
+            ("claude.codebuddy_oauth", "special.codebuddy_oauth"),
+            ("codex.workbuddy_oauth", "special.codebuddy_oauth"),
         ] {
             assert!(!supports_value_text_runtime(profile, driver, false));
         }
+    }
+    #[test]
+    fn workbuddy_value_models_require_concrete_identity_without_changing_other_runtimes() {
+        for opaque in [
+            "auto",
+            "default",
+            "default-model",
+            "workbuddy/auto",
+            "codebuddy/default",
+        ] {
+            assert_eq!(
+                value_execution_model_hint("claude.workbuddy_oauth", opaque),
+                None
+            );
+        }
+        assert_eq!(
+            value_execution_model_hint("claude.workbuddy_oauth", "workbuddy/GLM-5.2"),
+            Some("glm-5.2".into())
+        );
+        assert_eq!(
+            value_execution_model_hint("claude.custom_http", "Vendor/My-Model"),
+            Some("Vendor/My-Model".into())
+        );
     }
     #[test]
     fn protocol_golden_vectors_freeze_snapshot_hash_aliases_and_exact_amounts() {

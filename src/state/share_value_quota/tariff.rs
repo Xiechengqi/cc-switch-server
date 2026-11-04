@@ -31,16 +31,31 @@ impl ServerStateInner {
             }
             match &plan.model_policy {
                 RuntimeModelPolicy::Single { upstream_model } => {
+                    let Some(model) =
+                        crate::domain::usage::value_pricing::value_execution_model_hint(
+                            plan.profile_id.as_str(),
+                            upstream_model,
+                        )
+                    else {
+                        checks.push(serde_json::json!({"code":"model_price_coverage","ready":false,
+                            "app":binding.app,"providerId":binding.provider_id,"profileId":plan.profile_id.as_str(),
+                            "driverId":plan.driver_id.as_str(),"model":upstream_model,
+                            "scope":"configured_model","reasonCode":"model_unresolved"}));
+                        continue;
+                    };
                     let coverage = ledger::model_coverage(
                         &self.config_dir,
                         &identity,
-                        upstream_model,
+                        &model,
                         "standard",
                         now,
                     )?;
                     let mut check = serde_json::to_value(coverage)?;
                     check["code"] = "model_price_coverage".into();
                     check["app"] = serde_json::to_value(binding.app)?;
+                    check["providerId"] = binding.provider_id.clone().into();
+                    check["profileId"] = plan.profile_id.as_str().into();
+                    check["driverId"] = plan.driver_id.as_str().into();
                     check["scope"] = "configured_model".into();
                     if check["activePricingRevision"].is_null() {
                         check["blockedBy"] = "acknowledged_tariff".into();
@@ -50,7 +65,9 @@ impl ServerStateInner {
                 RuntimeModelPolicy::Passthrough => {
                     // Caller-chosen models cannot be enumerated safely. Each
                     // request still proves its exact execution model and tier.
-                    checks.push(serde_json::json!({"code":"model_price_coverage","ready":true,"app":binding.app,"scope":"request_time"}));
+                    checks.push(serde_json::json!({"code":"model_price_coverage","ready":true,"app":binding.app,
+                        "providerId":binding.provider_id,"profileId":plan.profile_id.as_str(),
+                        "driverId":plan.driver_id.as_str(),"scope":"request_time"}));
                 }
             }
         }

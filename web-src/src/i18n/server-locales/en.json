@@ -1227,6 +1227,8 @@
           "metering_storage": "Metering storage is unhealthy; inspect and recover Server storage.",
           "acknowledged_tariff": "The Server hasn't acknowledged the current USD tariff yet; this usually follows within about a minute.",
           "text_surface": "This runtime binding is not verified for text value metering:",
+          "model_price_coverage": "The execution model needs an active price in Router settings, or its new tariff is awaiting activation.",
+          "model_unresolved": "Select a concrete WorkBuddy model instead of auto/default, and configure its price in Router settings. Opaque routing aliases cannot be priced safely.",
           "offline": "Server is unreachable. Reconnect before checking again.",
           "timeout": "The Server did not respond in time. Please retry.",
           "controlAuth": "Your session is not authorized for this check. Sign in again.",
@@ -1239,7 +1241,8 @@
             "metering_storage": "Metering storage needs attention",
             "tariff_published": "Router tariff not generated yet",
             "acknowledged_tariff": "Waiting for the Server to confirm the tariff",
-            "text_surface": "A Provider can't meter USD yet"
+            "text_surface": "A Provider can't meter USD yet",
+            "model_price_coverage": "Execution model pricing is not ready"
           },
           "more": "+{{count}} more",
           "waitingOn": "Clears once this is fixed: {{blocker}}",

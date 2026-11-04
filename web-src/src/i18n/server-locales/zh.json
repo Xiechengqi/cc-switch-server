@@ -1227,6 +1227,8 @@
           "metering_storage": "计量存储异常，请检查并恢复 Server 存储。",
           "acknowledged_tariff": "Server 尚未确认当前美元额度价目，通常一分钟内完成。",
           "text_surface": "此运行时绑定尚未通过文本金额计量验证：",
+          "model_price_coverage": "实际执行模型尚无已生效价格，请在 Router 设置中定价，或等待新价目激活。",
+          "model_unresolved": "请为 WorkBuddy 选择具体模型（不用 auto/default），并在 Router 设置中定价。不透明的路由别名无法安全计价。",
           "offline": "无法连接 Server，恢复连接后再检查。",
           "timeout": "Server 响应超时，请重试。",
           "controlAuth": "当前会话无权执行此检查，请重新登录。",
@@ -1239,7 +1241,8 @@
             "metering_storage": "计量存储异常",
             "tariff_published": "Router 价目尚未生成",
             "acknowledged_tariff": "等待 Server 确认价目",
-            "text_surface": "有 Provider 不支持美元计量"
+            "text_surface": "有 Provider 不支持美元计量",
+            "model_price_coverage": "执行模型价格尚未就绪"
           },
           "more": "+{{count}} 项",
           "waitingOn": "需先解决：{{blocker}}",

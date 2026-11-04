@@ -323,6 +323,9 @@ pub(crate) struct ValueAttemptGuard {
     phase: AtomicU8,
 }
 impl ValueAttemptGuard {
+    pub(crate) fn proves_no_usage(&self) -> bool {
+        self.outcome() != ledger::AttemptOutcome::Unknown
+    }
     /// The request is about to be written upstream.
     pub(crate) fn mark_sent(&self) {
         self.phase.store(PHASE_SENT, AtomicOrdering::Release);
@@ -530,6 +533,18 @@ impl ServerStateInner {
         )
         .await;
     }
+    #[cfg(test)]
+    pub(crate) async fn enable_value_market_trials_for_test(&self) {
+        let config = self.config_snapshot().await;
+        self.record_router_quota_capability(
+            &config,
+            client::RouterShareCapabilities {
+                share_contract_version: 10,
+                capabilities: vec!["usdEquivalentQuotaV1".into(), "marketTrialV1".into()],
+            },
+        )
+        .await;
+    }
     pub(crate) async fn router_supports_cache_creation_ttl(&self) -> bool {
         let config = self.config_snapshot().await;
         self.router_quota_capability
@@ -682,7 +697,8 @@ impl ServerStateInner {
                     )
                 });
                 serde_json::json!({"code":"text_surface", "ready":ready,
-                "app":binding.app, "profileId":plan.as_ref().map(|p|p.profile_id.as_str()),
+                "app":binding.app, "providerId":binding.provider_id, "profileId":plan.as_ref().map(|p|p.profile_id.as_str()),
+                "reasonCode":if ready {None} else {Some("runtime_unsupported")},
                 "driverId":plan.as_ref().map(|p|p.driver_id.as_str())})
             })
             .collect::<Vec<_>>();

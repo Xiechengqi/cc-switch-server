@@ -244,9 +244,23 @@ pub struct CodeBuddySseDecoder {
     sent_role: bool,
     request_memory: Option<RequestMemoryBudget>,
     buffer_memory: Option<RequestMemoryReservation>,
+    // Optional monetary observation is taken before response sanitization and
+    // survives a later error in the same network chunk.
+    value_usage: Option<super::streaming::StreamUsageAccumulator>,
 }
 
 impl CodeBuddySseDecoder {
+    pub(crate) fn enable_value_usage(&mut self) {
+        self.value_usage = Some(super::streaming::StreamUsageAccumulator::default());
+    }
+    pub(crate) fn take_value_usage(&mut self) -> Option<super::streaming::StreamUsageAccumulator> {
+        self.value_usage.take()
+    }
+    pub(crate) fn sync_value_usage(&self, usage: &mut super::streaming::StreamUsageAccumulator) {
+        if let Some(observed) = &self.value_usage {
+            usage.replace_observation(observed.snapshot());
+        }
+    }
     pub(crate) fn with_request_memory(
         request_memory: Option<RequestMemoryBudget>,
     ) -> Result<Self, ProxyError> {
@@ -264,6 +278,10 @@ impl CodeBuddySseDecoder {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         self.buffer.capacity()
+            + self
+                .value_usage
+                .as_ref()
+                .map_or(0, |usage| usage.retained_bytes())
     }
 
     /// True only after upstream EOF validated the single previously observed
@@ -279,6 +297,11 @@ impl CodeBuddySseDecoder {
             return Err(ProxyError::bad_gateway("CodeBuddy SSE decoder has failed").into());
         }
         let result = self.push_classified_inner(chunk);
+        if matches!(&result, Err(CodeBuddySseDecodeError::Protocol(_))) {
+            if let Some(usage) = &mut self.value_usage {
+                usage.mark_parse_error();
+            }
+        }
         self.failed |= result.is_err();
         if result.is_err() {
             if let Some(timing) = self
@@ -319,6 +342,11 @@ impl CodeBuddySseDecoder {
             return Err(ProxyError::bad_gateway("CodeBuddy SSE decoder has failed").into());
         }
         let result = self.finish_classified_inner();
+        if matches!(&result, Err(CodeBuddySseDecodeError::Protocol(_))) {
+            if let Some(usage) = &mut self.value_usage {
+                usage.mark_parse_error();
+            }
+        }
         self.failed |= result.is_err();
         if result.is_err() {
             if let Some(timing) = self
@@ -460,6 +488,14 @@ impl CodeBuddySseDecoder {
         let mut value = serde_json::from_str::<Value>(&data).map_err(|error| {
             ProxyError::bad_gateway(format!("invalid CodeBuddy SSE chunk: {error}"))
         })?;
+        // Observe even an error frame carrying usage, before classification
+        // or synthetic role/response fields can change the evidence.
+        if let Some(usage) = value.get_mut("usage").filter(|v| v.is_object()) {
+            canonicalize_codebuddy_cache_usage(usage);
+        }
+        if let Some(usage) = &mut self.value_usage {
+            usage.observe_json(&value);
+        }
         if let Some(error) = CodeBuddyUpstreamError::from_event(&value) {
             return Err(CodeBuddySseDecodeError::Upstream(error));
         }
@@ -469,11 +505,7 @@ impl CodeBuddySseDecoder {
                     object.remove("usage");
                 }
             }
-            Some(Value::Object(_)) => {
-                if let Some(usage) = value.get_mut("usage") {
-                    canonicalize_codebuddy_cache_usage(usage);
-                }
-            }
+            Some(Value::Object(_)) => {}
             Some(_) => {
                 return Err(
                     ProxyError::bad_gateway("CodeBuddy Chat SSE usage must be an object").into(),
@@ -534,11 +566,14 @@ impl CodeBuddySseDecoder {
     fn reserve_buffer_append(&self, additional: usize) -> Result<(), CodeBuddySseDecodeError> {
         if let Some(memory) = self.buffer_memory.as_ref() {
             memory
-                .resize(projected_vec_capacity(
-                    self.buffer.capacity(),
-                    self.buffer.len(),
-                    additional,
-                ))
+                .resize(
+                    projected_vec_capacity(self.buffer.capacity(), self.buffer.len(), additional)
+                        .saturating_add(
+                            self.value_usage
+                                .as_ref()
+                                .map_or(0, |usage| usage.retained_bytes()),
+                        ),
+                )
                 .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))?;
         }
         Ok(())

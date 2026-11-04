@@ -40,6 +40,23 @@ describe("Share USD-equivalent quotas", () => {
     expect(isValuePreview({...preview,configRevision:7},7)).toBe(true);
     for(const invalid of [null,{},[],{ready:true,configRevision:6,rows:[]},{ready:true,configRevision:7,rows:[],checks:[null]}])expect(isValuePreview(invalid,7)).toBe(false);
   });
+  it("keeps execution-model coverage as an actionable root and preserves binding identity",()=>{
+    const base = ["router_protocol", "sqlite_authority", "metering_storage", "acknowledged_tariff", "text_surface"]
+      .map(code => ({code, ready: true}));
+    const coverage: ValueCheck = {code: "model_price_coverage", ready: false, app: "codex", providerId: "buddy-provider",
+      profileId: "codex.workbuddy_oauth", driverId: "special.workbuddy_oauth", model: "auto", reasonCode: "model_unresolved"};
+    const checks = [...base, coverage];
+    expect(valueReadinessSummary(checks)).toEqual({root: coverage, more: 0});
+    expect(valueCapabilityReady({ready: true, capabilityReady: true, rows: [], checks})).toBe(false);
+    expect(valueReadinessRoots([...checks, {code: "future_check", ready: false}])).toEqual([coverage, {code: "future_check", ready: false}]);
+    const waiting = {...coverage, blockedBy: "acknowledged_tariff"};
+    const missingTariff = [...base.map(check => check.code === "acknowledged_tariff" ? {...check, ready: false} : check), waiting];
+    expect(valueReadinessRoots(missingTariff).map(check => check.code)).toEqual(["acknowledged_tariff"]);
+    expect(valueCheckBlocker(waiting, missingTariff)).toBe("acknowledged_tariff");
+    expect(isValuePreview({ready: false, capabilityReady: false, configRevision: 7, checks, rows: []}, 7)).toBe(true);
+    expect(coverage.providerId).toBe("buddy-provider");
+    expect(coverage.reasonCode).toBe("model_unresolved");
+  });
   it("names the root cause of an unready USD quota, not its consequences",()=>{
     const fail=(code:string,blockedBy?:string):ValueCheck=>({code,ready:false,...(blockedBy?{blockedBy}:{})});
     const ok=(code:string):ValueCheck=>({code,ready:true});

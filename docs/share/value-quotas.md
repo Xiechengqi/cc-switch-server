@@ -1,6 +1,6 @@
 # Share Token／USD 等值双口径额度
 
-> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-11-03（新增用户初始 USD 用量及原子保存，§13；仅本地验证）。
+> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-11-04（WorkBuddy 与已实现跨协议路径的金额计量，§14；仅本地验证）。
 
 ## 1. 含义与启用条件
 
@@ -11,7 +11,7 @@
 1. Router reader ≥10 且 heartbeat 显式声明 `usdEquivalentQuotaV1`，能力与 Router URL、installation 绑定，缓存有效期 300 秒。
 2. 本地 SQLite authority 已经 `committed`；shadow 安装只能沿用 Token。
 3. Router 从模型价格（LiteLLM 派生价 + 模型价格表中的管理员定价）自动派生并发布执行价目；Server 通过签名请求取得、校验、持久化，并收到匹配 ACK 后激活。
-4. Share 所有绑定必须通过同一个 profile／driver 能力函数。允许 `claude.anthropic_api_key` 或 `claude.custom_http` + `http.anthropic_messages`；`codex.openai_api_key` 或 `codex.custom_http` + `http.openai_responses`；`codex.custom_http` + `http.openai_chat`；`gemini.google_api_key` 或 `gemini.custom_http` + `http.gemini_native`。generic 文本转发面支持 Messages、Chat Completions、Responses、Gemini。未列出的自定义协议组合、Web Session、Coding Plan、OAuth、媒体、内置付费工具、未知模型／tier 不在金额模式可用范围；发网后的重试同样不覆盖（唯一例外见 §3 的连接失败重试）。仅凭兼容 ProviderType 不足以放行；自定义 Claude 的实际兼容类型可为 `claude_auth`。客户端自定义 function tool 文本允许；Server 不执行工具。
+4. Share 所有已启用绑定必须通过同一个 profile／driver 能力函数。原生三种 API-key 路径保留；`claude.custom_http`、`gemini.custom_http` 分别支持 Anthropic／Chat／Responses／Gemini 四种已实现的 HTTP driver，`codex.custom_http` 支持 Anthropic／Chat／Responses 三种 driver（共 11 对、14 个下游入口组合）。另精确支持三 App 的 `*.workbuddy_oauth + special.workbuddy_oauth`，见 §14。CodeBuddy、其他 OAuth、Web Session、Coding Plan、媒体、内置付费工具仍不在金额模式可用范围。不凭兼容 ProviderType 放行；没有新增协议转换。客户端 function tool、thinking、cache 文本允许；Server 不执行工具。重试仅允许已证明免费且同步结算的前一 attempt。
 5. 已启用且通过上述能力检查的 Single 绑定，其实际 upstream model 必须在当前 active 快照中具备 standard tier 价格。预览输出 `model_price_coverage`（模型／App／修订／排期时间），主动保存 USD 策略再次检查；只在排期快照有价时提示等待生效。Passthrough 输出 `scope=request_time`，不承诺所有调用方模型均有价，每次准入仍核实实际模型和 tier。后台保存已有授权不因该覆盖检查中断，也不清空历史。
 
 灰度部署还必须独立核对每个启用转发面 7 个自然日、至少 100 条真实完成文本请求。缺样本的面维持 Token；本地单测通过不等于 `live_verified`。
@@ -52,7 +52,7 @@ Server-owned `valueMetering` 保存 `quotaPolicyEpoch/valueMeteredFromMs/effecti
 
 文本判定是协议感知的：只拒绝明确识别的独立计费内容——图片／音频／视频／文件／文档 part（`image`、`image_url`、`input_image`、`input_audio`、`input_file`、`document`、`file`，Gemini `inlineData/fileData`，非 TEXT 输出模态、`audio`/`speechConfig`）和服务端付费／内置工具（`web_search*`、`web_fetch*`、`file_search`、`code_interpreter`、`code_execution*`、`computer*`、`image_generation`、`mcp*`、`bash_*`、`text_editor_*`、Gemini `googleSearch*/codeExecution/urlContext/retrieval`、`cachedContent`）。cache_control、thinking／redacted_thinking、tool_choice、response_format／text.format、Responses reasoning／message／function_call(_output)／custom_tool_call(_output)、function／custom 工具、tool_use／tool_result 等均为文本。JSON schema、工具参数、签名等调用方数据子树不解释。
 
-服务 tier 只在金额模式处理：上下文没有 tier 时记录 body 的**原始值**，不再用规范值覆盖导出日志；准入与结算共用 `canonical_service_tier`：缺省／`auto`／`default`／`standard` → standard，`priority`、`flex` 原样，其他（如 `scale`）无价。上游响应实际 tier 当前未被捕获（见 §10）。
+服务 tier 准入与结算共用 `canonical_service_tier`：缺省／`auto`／`default`／`standard` → standard，`priority`、`flex` 原样，其他（如 `scale`）无价。请求 tier 的原始事实保持不变；转换前捕获的上游实际 tier 单独保存在可选本地字段 `reportedServiceTier/reportedServiceTierConflict`。上下游 tier 不同按较高价格保守结算；未知／冲突不视为精确用量。旧日志、Router 线格式与账本 schema 不变。
 
 ### 结果分类结算
 
@@ -175,7 +175,7 @@ schema v3 表结构不变（大规模 ledger 简化／schema v4 延后）。每�
 
 本节对应上文 §2–§6 的新语义：有界预占与每用户并发、结果分类结算与终结守卫、清扫器、作用域阻断与 `set` 对账、取消 shadow 计量与新的生效规则、类型化错误码、规范签名 payload 与 `knownRevision` 拉取。schema 与迁移校验和未改动。
 
-已知限制：上游响应中实际服务的 tier（例如 OpenAI `auto` 被提升为 priority）目前未被任何管道捕获，结算只能使用请求 tier；若需按响应 tier 计价，需要单独增加响应 tier 证据字段。SQLite 连接仍按调用打开（未做连接池，以免备份恢复替换数据库文件后复用旧句柄）。本轮只做 `cargo check`／格式检查，未运行测试。
+当时已知限制：响应 tier 证据缺口已由 §14 的增量字段与转换前观察补齐。SQLite 连接仍按调用打开（未做连接池，以免备份恢复替换数据库文件后复用旧句柄）。本节当时只做 `cargo check`／格式检查，未运行测试。
 
 ## 11. 第三轮修正（2026-10-31）
 
@@ -222,3 +222,42 @@ Router 用户编辑弹窗和 Server 原生 Bundle 用户编辑器在 USD 模式�
 - Rust `cargo check --locked --tests`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo fmt --check` 与全体独立 Rust 源文件格式检查通过；Provider writer 证据已由官方脚本生成并校验，完整 `scripts/audit/*.test.mjs` 通过。SQLite 权威存储、Provider coverage／UI matrix、文档索引、Web i18n／运行时契约及产物体积审计通过。
 
 整体 review 重点为事务边界、可信 actor、旧 wire 指纹、草稿取消／重试、市场只读和跨周期／跨账号隔离，未发现未解决的阻断项。未截图、未运行浏览器或 UI 自动化、未操作远程系统，也未把本地夹具结果作为真实上游或生产验收；未提交、推送或部署。
+
+## 14. WorkBuddy 与已实现跨协议路径（2026-11-04）
+
+本轮扩展的是 USD 等值**用量额度**，不是让 Server 向用户扣钱包。原有 Token 配额、Share Market 租金／补偿、试用合同与历史 ledger 不重写，不增加 schema 迁移。
+
+### 14.1 支持范围与模型身份
+
+- 自定义 HTTP：Claude／Gemini 各四种、Codex 三种现有上游 driver，共 11 对 profile／driver；Codex 的 Responses／Chat 两个入口分别验证，合计 14 个自定义下游入口组合。只复用现有转换，不宣称支持 Registry 尚未实现的 Codex→Gemini。
+- WorkBuddy：精确允许三 App 的 `*.workbuddy_oauth + special.workbuddy_oauth`，覆盖 Messages、Responses、Chat、Gemini 四个文本入口及流式／非流式。CodeBuddy 即使共用转发实现仍不因此获得金额能力。
+- 固定 WorkBuddy 模型按真实 resolver 的规范化标识验价；`auto` 若能在准备阶段解析到具体模型，按该模型准入。最终仍为 `auto/default/default-model` 时，在生成前返回 `price_unavailable`／`model_unresolved`，不能猜测执行模型或把积分当美元。Passthrough 的价格覆盖仅承诺逐请求检查。
+- 原始请求和转换后最终 payload 都必须是可计量文本；媒体、服务端付费工具、其他 OAuth、Web Session、Coding Plan 继续拒绝。普通客户端 function tool 和缓存文本沿用原有语义。
+
+### 14.2 准入与结算边界
+
+WorkBuddy 专用 early-return 分支已接入同一个 SQLite admission：完成认证／目录准备、最终模型／tier／payload 确定后，先持久化 attempt，才发送生成请求。目录查询不等于生成，也不制造使用金额。
+
+每次认证恢复使用独立 attempt；只有明确无用量的失败可自动重试，且须同步结算旧 attempt，之后重新核验模型、价格、授权及预算。已有输出或用量后不自动重放。发送后无响应、超时、流截断、取消或下游转换失败不能靠 HTTP 错误码冒充免费请求。终结守卫跟随实际 response body，即使 body 从未被消费便丢弃，预占也会收敛；重启仍由既有清扫器兜底。
+
+在上游响应转换／模型补写前收集独立 model、tier、usage 证据，错误 HTTP body 也观察；同一网络分片先产生输出、后出现错误时，不丢弃先前用量。WorkBuddy 的响应模型缺失或冲突不能把合成模型当精确证据。反复发送的累计 usage 不做加总；缓存规范化只执行一次，显式零不被估算覆盖，未知写缓存 TTL 使用既有保守价。上报 tier 与请求 tier 分开保存，不覆盖原始请求事实。
+
+这些路径复用普通授权与 Market entitlement 的 ledger／预占／试用预算，不另建并行账本。错误但含不完整用量仍保守计价；模型／tier 证据不可靠时标记 conservative，不能报告为精确 observed。
+
+### 14.3 两端诊断与更新
+
+`text_surface`／`model_price_coverage` 诊断携带 App、Provider、profile、driver 及适用的模型。Router 市场就绪接口只透传有界字段白名单，核验配置 revision、必要能力及每项检查；不暴露凭据、任意上游正文或把失败检查当成功。
+
+两端配额编辑器与 Router 市场车位编辑器可展开查看具体阻塞路径；不透明模型提示选择具体模型，缺价才提示配置对应价格。旧无 `checks` 的 Router 就绪响应继续兼容，旧 Server 缺能力声明时仍不能出售 USD 车位。
+
+先更新 Router，再更新承载 Share 的 Server，等待已有价格快照就绪后重新检查；无需删除或重建授权、用量和租用合同。若 WorkBuddy 当前使用不透明默认模型，应由管理员显式选择并定价具体模型，本轮不自动改生产 Provider 配置。回滚仍须先切回 Token 并完成双端确认。
+
+### 14.4 本轮验证与整体 review
+
+- Server 金额相关 `value_` 回归 90 项通过；显式 opt-in 的十万请求容量测试保持未运行。WorkBuddy／CodeBuddy 完整 HTTP 回归 46/46、流用量解析 138/138、Usage Store 33/33、流日志更新 5/5 通过；严格 Clippy（all targets、warnings as errors）通过。原生／自定义 18 个下游入口组合覆盖流式／非流式与正常／异常模型。WorkBuddy 四入口另覆盖实际发网前持久准入、缓存显式零、累计用量、模型／tier 证据、试用预算、认证重试及中断／取消。
+- 完整后端 Node 审计 2128/2128，Web 四个纯 Node 环境文件 41/41 通过。全体独立 Rust 源文件（含 `include!`）格式检查、Provider writer 证据、Provider coverage／UI matrix、文档索引、SQLite 权威／Web 边界、i18n／运行时契约、转换覆盖及产物体积审计通过。Web 类型检查与 Vite 生产构建通过，内嵌产物已更新。
+- Router 金额回归 31/31、市场 543/543，前端金额与传输 34/34、Share Market 85/85 通过；编译（含测试代码）、格式、类型检查及有关静态审计通过。Webpack 生产构建通过；默认 Turbopack 曾因 Google Fonts 下载连接失败，不计为通过。
+
+Review 修正了四类容易混淆的边界：① 未读与部分读取后取消都触发对应 pending 日志的异步终结；② 过滤掉的模型／tier 预告帧、错误 HTTP body、同分片输出后报错仍保留原始证据；③ 不完整用量及传输结果未知不得变成零费用或触发重放；④ 明确无生成／用量的上游拒绝仍可按零结算，不把它误认作超时。另复核独立 retry attempt、未知 tier 的保守价、缓存计数守恒、Market entitlement／试用 scope 隔离及其他 OAuth 继续拒绝。
+
+Review 后未发现尚未解决的阻断性代码问题。过滤套件有重叠，以上不是全部 Rust 测试或真实上游验收。离线 release-readiness 的 `failures=0` 仅表示该次离线审计无失败；因显式跳过聚合全量测试及缺少真实凭据／部署输入，结果仍为 `blocked_inputs`。未运行本地启动 smoke、容量压测、截图或浏览器／UI 自动化，未做生产迁移、部署、提交或推送；真实验收保持 `live_pending`。

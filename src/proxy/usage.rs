@@ -442,6 +442,10 @@ fn apply_stream_usage_fields(
         };
         log.failure_kind = if log.outcome == UsageOutcome::Success {
             None
+        } else if log.failure_kind.as_deref() == Some("upstream_outcome_unknown") {
+            // A response-body timeout, cancellation or protocol failure must
+            // not turn a sent WorkBuddy attempt with missing usage into $0.
+            log.failure_kind.clone()
         } else {
             stream_status.map(str::to_string)
         };
@@ -709,6 +713,41 @@ mod tests {
             ..UsageLogContext::default()
         });
         log
+    }
+
+    #[test]
+    fn value_quota_stream_failure_keeps_unknown_until_a_successful_terminal() {
+        let mut log = pending_usage_log();
+        log.failure_kind = Some("upstream_outcome_unknown".into());
+        apply_stream_usage_fields(
+            &mut log,
+            504,
+            10,
+            None,
+            TokenUsage::default(),
+            false,
+            false,
+            Some("upstream_error"),
+        );
+        assert_eq!(
+            log.failure_kind.as_deref(),
+            Some("upstream_outcome_unknown")
+        );
+        apply_stream_usage_fields(
+            &mut log,
+            200,
+            20,
+            None,
+            TokenUsage {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                ..TokenUsage::default()
+            },
+            false,
+            false,
+            Some("completed"),
+        );
+        assert!(log.failure_kind.is_none());
     }
 
     #[test]

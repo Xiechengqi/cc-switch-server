@@ -290,6 +290,11 @@ pub struct UsageLog {
     pub reported_model_mismatch: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_model_conflict: Option<bool>,
+    /// Raw upstream evidence, separate from the requested/effective tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_service_tier_conflict: Option<bool>,
     #[serde(default)]
     pub requested_reasoning_effort: Option<String>,
     #[serde(default)]
@@ -442,9 +447,38 @@ impl UsageLog {
 pub struct ResponseModelEvidence {
     pub model: Option<String>,
     pub conflict: bool,
+    pub service_tier: Option<String>,
+    pub service_tier_conflict: bool,
 }
 impl ResponseModelEvidence {
     pub fn observe(&mut self, value: &serde_json::Value) {
+        for pointer in [
+            "/service_tier",
+            "/response/service_tier",
+            "/message/service_tier",
+        ] {
+            let Some(tier) = value.pointer(pointer).filter(|v| !v.is_null()) else {
+                continue;
+            };
+            let Some(tier) = tier.as_str().filter(|tier| {
+                !tier.is_empty()
+                    && tier.len() <= 64
+                    && tier.trim() == *tier
+                    && !tier.chars().any(char::is_control)
+            }) else {
+                self.service_tier_conflict = true;
+                continue;
+            };
+            if self
+                .service_tier
+                .as_deref()
+                .is_some_and(|previous| previous != tier)
+            {
+                self.service_tier_conflict = true;
+            } else if self.service_tier.is_none() {
+                self.service_tier = Some(tier.into());
+            }
+        }
         for pointer in [
             "/model",
             "/modelVersion",
@@ -486,6 +520,9 @@ impl ResponseModelEvidence {
                     | "claude.custom_http"
                     | "codex.custom_http"
                     | "gemini.custom_http"
+                    | "claude.workbuddy_oauth"
+                    | "codex.workbuddy_oauth"
+                    | "gemini.workbuddy_oauth"
             ),
             None => matches!(
                 log.provider_type,
@@ -494,6 +531,19 @@ impl ResponseModelEvidence {
         };
         if !native {
             return;
+        }
+        if let Some(tier) = &self.service_tier {
+            if log
+                .reported_service_tier
+                .as_ref()
+                .is_some_and(|previous| previous != tier)
+            {
+                log.reported_service_tier_conflict = Some(true);
+            }
+            log.reported_service_tier = Some(tier.clone());
+        }
+        if self.service_tier_conflict {
+            log.reported_service_tier_conflict = Some(true);
         }
         // A usage-only frame is not evidence that an earlier model vanished.
         // In particular, HTTP fallback may finish a WebSocket-owned turn log.
@@ -517,6 +567,10 @@ impl ResponseModelEvidence {
 #[derive(Debug, Clone, Default)]
 pub struct UsageLogContext {
     pub response_model: Option<ResponseModelEvidence>,
+    pub value_streamed_text_bytes: Option<u64>,
+    /// Buffered WorkBuddy generation already observed before a downstream
+    /// transform. Preserve it if the transform/response commit fails.
+    pub value_observed_usage: Option<TokenUsage>,
     pub request_id: Option<String>,
     pub quota_attribution: Option<super::quota_ledger::QuotaAttribution>,
     pub record_kind: UsageRecordKind,
@@ -1075,6 +1129,8 @@ impl UsageLog {
             reported_model_source: None,
             reported_model_mismatch: None,
             reported_model_conflict: None,
+            reported_service_tier: None,
+            reported_service_tier_conflict: None,
             requested_reasoning_effort: None,
             effective_reasoning_effort: None,
             client_service_tier: None,
@@ -1142,6 +1198,7 @@ impl UsageLog {
     }
 
     pub fn apply_context(&mut self, context: UsageLogContext) {
+        self.value_streamed_text_bytes = context.value_streamed_text_bytes;
         if let Some(evidence) = context.response_model {
             evidence.apply(self);
         }
@@ -1984,6 +2041,9 @@ mod tests {
             "claude.custom_http",
             "codex.custom_http",
             "gemini.custom_http",
+            "claude.workbuddy_oauth",
+            "codex.workbuddy_oauth",
+            "gemini.workbuddy_oauth",
         ] {
             let mut custom = persisted_test_log("custom-model-evidence", 1);
             custom.profile_id = Some(profile.into());
@@ -1998,6 +2058,35 @@ mod tests {
             changed.apply(&mut custom);
             assert_eq!(custom.reported_model_conflict, Some(true), "{profile}");
         }
+    }
+
+    #[test]
+    fn value_quota_response_tier_keeps_request_facts_and_sticky_conflicts_separate() {
+        let mut log = persisted_test_log("tier-evidence", 1);
+        log.profile_id = Some("codex.workbuddy_oauth".into());
+        log.effective_service_tier = Some("auto".into());
+        let mut evidence = ResponseModelEvidence::default();
+        evidence.observe(&json!({"response":{"service_tier":"priority"}}));
+        evidence.apply(&mut log);
+        assert_eq!(log.effective_service_tier.as_deref(), Some("auto"));
+        assert_eq!(log.reported_service_tier.as_deref(), Some("priority"));
+        evidence.observe(&json!({"service_tier":"flex"}));
+        evidence.observe(&json!({"service_tier":"priority"}));
+        evidence.apply(&mut log);
+        ResponseModelEvidence::default().apply(&mut log);
+        assert_eq!(log.reported_service_tier_conflict, Some(true));
+        for invalid in [json!(12), json!("bad\ntier"), json!("x".repeat(65))] {
+            let mut evidence = ResponseModelEvidence::default();
+            evidence.observe(&json!({"service_tier":invalid}));
+            assert!(evidence.service_tier_conflict);
+        }
+        log.profile_id = Some("codex.codebuddy_oauth".into());
+        log.reported_service_tier = None;
+        evidence.apply(&mut log);
+        assert!(
+            log.reported_service_tier.is_none(),
+            "evidence capture must not promote other OAuth profiles"
+        );
     }
 
     fn persisted_test_log(request_id: impl Into<String>, created_at_ms: u128) -> UsageLog {

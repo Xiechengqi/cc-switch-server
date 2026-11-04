@@ -517,6 +517,11 @@ impl StreamUsageAccumulator {
                 .model
                 .as_ref()
                 .map_or(0, String::capacity)
+            + self
+                .response_model
+                .service_tier
+                .as_ref()
+                .map_or(0, String::capacity)
     }
 
     pub fn finish(self) -> TokenUsage {
@@ -525,6 +530,53 @@ impl StreamUsageAccumulator {
 
     pub fn mark_estimated(&mut self) {
         self.usage_estimated = true;
+    }
+    pub fn mark_parse_error(&mut self) {
+        self.parse_error = true;
+    }
+    pub fn snapshot(&self) -> StreamUsageResult {
+        StreamUsageResult {
+            usage: self.usage,
+            parse_error: self.parse_error,
+            usage_estimated: self.usage_estimated,
+            response_model: self.response_model.clone(),
+            streamed_text_bytes: self.streamed_text_bytes,
+        }
+    }
+
+    /// Replace sanitized stream observations with the raw upstream facts.
+    /// Keep local parse failures sticky, but do not add text or cumulative
+    /// counters a second time when both representations saw the same frame.
+    pub fn replace_observation(&mut self, observed: StreamUsageResult) {
+        self.usage = observed.usage;
+        self.response_model = observed.response_model;
+        self.streamed_text_bytes = observed.streamed_text_bytes;
+        self.parse_error |= observed.parse_error;
+        self.usage_estimated |= observed.usage_estimated;
+    }
+
+    /// An authentication rejection is retryable for USD only before any
+    /// observable generation/usage. Model-only prelude frames are harmless.
+    pub fn has_billable_evidence(&self) -> bool {
+        self.parse_error
+            || self.streamed_text_bytes > 0
+            || self.usage.raw_input_tokens.unwrap_or(0) > 0
+            || self.usage.input_tokens.unwrap_or(0) > 0
+            || self.usage.output_tokens.unwrap_or(0) > 0
+            || self.usage.cache_read_tokens.unwrap_or(0) > 0
+            || self.usage.cache_creation_tokens.unwrap_or(0) > 0
+    }
+
+    pub fn observe_json(&mut self, value: &Value) {
+        self.streamed_text_bytes = self
+            .streamed_text_bytes
+            .saturating_add(generated_text_bytes(value));
+        self.response_model.observe(value);
+        merge_usage(
+            &mut self.usage,
+            usage_from_json_with_semantics(value, self.input_semantics),
+            self.input_semantics,
+        );
     }
 
     pub fn finish_with_status(mut self) -> StreamUsageResult {
@@ -546,15 +598,7 @@ impl StreamUsageAccumulator {
 
     fn merge_events(&mut self, events: Vec<JsonStreamEvent>) {
         for event in events {
-            self.streamed_text_bytes = self
-                .streamed_text_bytes
-                .saturating_add(generated_text_bytes(&event.value));
-            self.response_model.observe(&event.value);
-            merge_usage(
-                &mut self.usage,
-                usage_from_json_with_semantics(&event.value, self.input_semantics),
-                self.input_semantics,
-            );
+            self.observe_json(&event.value);
         }
     }
 }
@@ -1061,8 +1105,13 @@ fn generated_text_bytes(event: &Value) -> u64 {
         total = total.saturating_add(len(event.get("delta")));
     }
     if let Some(choices) = event.get("choices").and_then(Value::as_array) {
-        for delta in choices.iter().filter_map(|choice| choice.get("delta")) {
-            for key in ["content", "reasoning_content", "reasoning"] {
+        for delta in choices
+            .iter()
+            .filter_map(|choice| choice.get("delta").or_else(|| choice.get("message")))
+        {
+            // Error HTTP bodies can carry a complete Chat message rather
+            // than a delta. It still proves generation and forbids replay.
+            for key in ["content", "reasoning_content", "reasoning", "refusal"] {
                 total = total.saturating_add(len(delta.get(key)));
             }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
