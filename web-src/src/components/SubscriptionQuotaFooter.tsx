@@ -45,6 +45,7 @@ interface SubscriptionQuotaViewProps {
   appIdForExpiredHint: string;
   inline?: boolean;
   visibleTierNames?: string[];
+  buddyUsageSummary?: React.ReactNode;
 }
 
 /** 已知 tier 名称的显示映射（官方订阅 + Token Plan 共用） */
@@ -411,11 +412,14 @@ export function formatCompactTier(
     (t && TIER_I18N_KEYS[tier.name] ? t(TIER_I18N_KEYS[tier.name]) : tier.name);
   const buddyPackage = /^codebuddy_package_[1-9]\d*$/.test(tier.name);
   const amount = formatCompactTierAmount(tier);
-  if (buddyPackage && amount) return `${label} ${amount}`;
+  const countdown = countdownStr(
+    buddyPackage ? tier.resetsAt || tier.expiresAt || null : tier.resetsAt,
+    nowMs,
+  );
+  if (buddyPackage && amount) return [label, amount, countdown].filter(Boolean).join(" ");
   const utilization = buddyPackage && tier.utilization > 0 && tier.utilization < 0.1
     ? "<0.1%"
     : `${buddyPackage ? Math.round(tier.utilization * 10) / 10 : Math.round(tier.utilization)}%`;
-  const countdown = buddyPackage ? null : countdownStr(tier.resetsAt, nowMs);
   return [label, amount, utilization, countdown].filter(Boolean).join(" ");
 }
 
@@ -484,6 +488,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   appIdForExpiredHint,
   inline = false,
   visibleTierNames,
+  buddyUsageSummary,
 }) => {
   const { t } = useTranslation();
   const refreshTitle = t(PROVIDER_REFRESH_TITLE_KEY, {
@@ -526,7 +531,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
     if (
       !displayQueriedAt &&
       !quota?.subscription?.expiresAt &&
-      !quota?.tiers?.some((tier) => tier.resetsAt) &&
+      !quota?.tiers?.some((tier) => tier.resetsAt || tier.expiresAt) &&
       !quota?.nextRefreshAt
     ) {
       return;
@@ -735,6 +740,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
       <div className="flex min-w-0 items-start justify-between gap-2 text-xs">
         <span className="min-w-0 break-words">
           {t("provider.buddyPackageHeading")} {summaryText}
+          {buddyUsageSummary ? <> · {buddyUsageSummary}</> : null}
         </span>
         <button
           type="button"

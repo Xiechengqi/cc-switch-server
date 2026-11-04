@@ -75,6 +75,11 @@ const CodeBuddyOauthQuotaFooter: React.FC<CodeBuddyOauthQuotaFooterProps> = ({
             defaultValue: "官方用量暂不可用",
           })
         : null;
+  const usageSummary = usageText ? (
+    <span className="text-xs text-muted-foreground" title={usage?.error}>
+      {usageText}
+    </span>
+  ) : null;
 
   return (
     <div className="space-y-1">
@@ -84,12 +89,9 @@ const CodeBuddyOauthQuotaFooter: React.FC<CodeBuddyOauthQuotaFooterProps> = ({
         refetch={handleRefresh}
         appIdForExpiredHint={product}
         inline={inline}
+        buddyUsageSummary={usageSummary}
       />
-      {usageText ? (
-        <div className="text-xs text-muted-foreground" title={usage?.error}>
-          {usageText}
-        </div>
-      ) : null}
+      {!quota?.success ? usageSummary : null}
     </div>
   );
 };

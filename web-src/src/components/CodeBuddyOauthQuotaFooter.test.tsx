@@ -1,6 +1,6 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import type { SubscriptionQuota } from "@/types/subscription";
 import CodeBuddyOauthQuotaFooter from "./CodeBuddyOauthQuotaFooter";
@@ -14,13 +14,14 @@ vi.mock("@/lib/api/subscription", () => ({ subscriptionApi: { refreshOauthQuota:
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
 beforeEach(async () => {
+  vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-11-04T00:00:00Z"));
   await i18n.changeLanguage("en");
   mocks.refresh.mockReset().mockResolvedValue({});
   mocks.refetch.mockReset().mockResolvedValue({});
   mocks.quota = {
     tool: "workbuddy_oauth", credentialStatus: "valid", credentialMessage: "Buddy",
     success: true, tiers: [{ name: "codebuddy_package_2", label: "CodeBuddy个人体验版",
-      utilization: 0.1, used: 0.5, limit: 500, unit: "credits", resetsAt: "2035-02-01T00:00:00Z",
+      utilization: 0.1, used: 0.5, limit: 500, unit: "credits", resetsAt: "2026-11-24T12:00:00Z",
       expiresAt: "2035-03-01T00:00:00Z" }], extraUsage: null, error: null,
     queriedAt: 1793706177823,
     providerUsage: { status: "complete", scope: "account", source: "buddy_official_request_usage", timezone: "Asia/Shanghai",
@@ -28,6 +29,8 @@ beforeEach(async () => {
       usageToday: 0.45, usage7Days: 0.45, usageThisMonth: 0.45, usageTotal: 0.45 },
   };
 });
+
+afterEach(() => vi.restoreAllMocks());
 
 async function render(product: "workbuddy_oauth" | "codebuddy_oauth", inline = true) {
   const container = document.createElement("div"); document.body.appendChild(container);
@@ -38,13 +41,13 @@ async function render(product: "workbuddy_oauth" | "codebuddy_oauth", inline = t
 }
 
 describe.each(["workbuddy_oauth", "codebuddy_oauth"] as const)("%s quota", (product) => {
-  it.each([true, false])("shows package amounts and today's/monthly usage without duplicate details (inline=%s)", async (inline) => {
+  it.each([true, false])("shows cycle countdowns and official usage in the same summary (inline=%s)", async (inline) => {
     const view = await render(product, inline);
     try {
       const text = view.container.textContent!;
       expect(text).toContain("CodeBuddy个人体验版");
-      expect(text).toContain("Resource packages: CodeBuddy个人体验版 0.5/500 credits");
-      expect(text).toContain("Official usage (account): today 0.45 · this month 0.45 credits");
+      expect(text).toContain("Resource packages: CodeBuddy个人体验版 0.5/500 credits 20d12h · Official usage (account): today 0.45 · this month 0.45 credits");
+      expect(view.container.querySelector("button")?.parentElement?.textContent).toContain("Official usage (account)");
       expect(text.match(/CodeBuddy个人体验版/g)).toHaveLength(1);
       expect(text).not.toMatch(/%|cycle ends|expires|7 days|requests|collected|2026-|UTC|including other shares/);
     } finally { await view.close(); }
@@ -82,10 +85,11 @@ describe.each(["workbuddy_oauth", "codebuddy_oauth"] as const)("%s quota", (prod
 
   it("labels the core accounting values in Chinese", async () => {
     await i18n.changeLanguage("zh");
+    mocks.quota!.tiers[0].resetsAt = null;
+    mocks.quota!.tiers[0].expiresAt = "2026-11-24T12:00:00Z";
     const view = await render(product);
     try {
-      expect(view.container.textContent).toContain("资源包： CodeBuddy个人体验版 0.5/500 credits");
-      expect(view.container.textContent).toContain("官方用量（账号）：今日 0.45 · 本月 0.45 credits");
+      expect(view.container.textContent).toContain("资源包： CodeBuddy个人体验版 0.5/500 credits 20d12h · 官方用量（账号）：今日 0.45 · 本月 0.45 credits");
       expect(view.container.textContent).not.toMatch(/采集|请求数|7 日|到期|周期结束|2026-|132 次/);
     } finally { await view.close(); }
   });
