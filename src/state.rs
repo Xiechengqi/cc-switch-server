@@ -167,7 +167,10 @@ use crate::logging::{
 };
 use crate::proxy::cursor::session::CursorSessionManager;
 
+mod account_checkin;
 mod account_reset;
+pub use account_checkin::spawn_account_checkin;
+pub(crate) use account_checkin::CheckinControlError;
 mod background;
 mod codex_quota;
 mod grok_media_resident;
@@ -1096,6 +1099,7 @@ pub struct ServerStateInner {
     pub account_refresh_locks: AccountRefreshLocks,
     gemini_project_locks: AccountRefreshLocks,
     codex_banked_reset_locks: AccountRefreshLocks,
+    buddy_checkin_locks: AccountRefreshLocks,
     native_refresh_receipt_journal: Mutex<NativeRefreshReceiptJournal>,
     pub account_in_flight: Arc<AccountInFlightTracker>,
     pub share_in_flight: Arc<ShareInFlightTracker>,
@@ -7362,6 +7366,7 @@ impl ServerStateInner {
             account_refresh_locks: AccountRefreshLocks::default(),
             gemini_project_locks: AccountRefreshLocks::default(),
             codex_banked_reset_locks: AccountRefreshLocks::default(),
+            buddy_checkin_locks: AccountRefreshLocks::default(),
             native_refresh_receipt_journal: Mutex::new(NativeRefreshReceiptJournal::default()),
             account_in_flight: Arc::new(AccountInFlightTracker::default()),
             share_in_flight: Arc::new(ShareInFlightTracker::default()),
@@ -14794,9 +14799,27 @@ impl ServerStateInner {
             if !quota_refresh_snapshot_matches(&current, &expected) {
                 return Err(AccountQuotaCommitSkip::Stale(Box::new(current)));
             }
-            accounts
+            let resources_refreshed =
+                expected.provider_type == ProviderType::WorkBuddyOAuth && update.quota.is_some();
+            let updated = accounts
                 .mark_refresh_success(&expected.id, update)
-                .ok_or(AccountQuotaCommitSkip::NotFound)
+                .ok_or(AccountQuotaCommitSkip::NotFound)?;
+            if resources_refreshed {
+                if let Some(record) = accounts.buddy_checkins.get_mut(&expected.id) {
+                    if record.matches(&updated)
+                        && record.last_result.as_ref().is_some_and(|result| {
+                            result.status.confirmed()
+                                && updated
+                                    .quota_refreshed_at
+                                    .is_some_and(|at| at >= result.at_ms)
+                        })
+                    {
+                        record.quota_pending = false;
+                        record.quota_retry_at = None;
+                    }
+                }
+            }
+            Ok(updated)
         })
         .await
     }

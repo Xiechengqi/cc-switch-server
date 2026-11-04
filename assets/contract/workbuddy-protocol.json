@@ -117,5 +117,11 @@
     "harnessRevision": 3,
     "evidenceState": "fixture_verified",
     "liveState": "live_pending"
+  },
+  "dailyCheckinExtension": {
+    "referenceContract": "assets/contract/codebuddy-reference-delta.json#workBuddyCheckinExtension",
+    "scope": "cn_personal_account_opt_in",
+    "defaultEnabled": false,
+    "liveState": "live_pending"
   }
 }

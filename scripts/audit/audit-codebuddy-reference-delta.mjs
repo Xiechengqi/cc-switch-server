@@ -1115,6 +1115,49 @@ assert(workbuddyImage?.referenceContract === "assets/contract/codebuddy-referenc
   workbuddyImage.evidenceState === "fixture_verified" && workbuddyImage.liveState === "live_pending",
   "WorkBuddy image-input contract must retain independent live acceptance");
 
+// Explicit user-authorized account maintenance is recorded separately from
+// immutable CB-R2 and every historical observation above.
+const checkin = contract.workBuddyCheckinExtension;
+assert(checkin?.id === "WORKBUDDY-CN-CHECKIN-01" &&
+  checkin.authorization === "explicit_user_requested_implementation_2026-11-04" &&
+  checkin.historicalRejection?.includes("CB-R2 remains immutable") &&
+  checkin.evidenceState === "fixture_verified" && checkin.liveState === "live_pending",
+  "WorkBuddy check-in authorization/evidence boundary changed");
+assert(checkin.scope?.providerType === "workbuddy_oauth" && checkin.scope.site === "cn" &&
+  checkin.scope.account === "personal" && checkin.scope.ownership === "account" &&
+  checkin.scope.defaultEnabled === false && checkin.scope.defaultTime === "09:00" &&
+  checkin.scope.timezone === "Asia/Shanghai" && checkin.scope.inferencePath === false &&
+  checkin.scope.routerActions === false && checkin.scope.poolOrRotation === false && checkin.scope.fixedReward === false,
+  "WorkBuddy check-in scope expanded");
+assert(checkin.protocol?.origin === "https://www.codebuddy.cn" && checkin.protocol.method === "POST" &&
+  checkin.protocol.statusFallback === "HTTP_404_only" && checkin.protocol.submitRequires === "explicit_unchecked_status" &&
+  checkin.protocol.unknownRecovery === "query_status_first" && checkin.protocol.alreadyHTTP400 === true,
+  "WorkBuddy check-in recovery protocol changed");
+assert(checkin.sources?.length === 2 && checkin.localEvidence?.length === 2, "WorkBuddy check-in evidence is incomplete");
+for (const source of checkin.sources) {
+  assert(commitPattern.test(source.commit) && commitPattern.test(source.tree) && source.files?.length > 0,
+    "WorkBuddy check-in source is not a frozen committed object");
+  for (const file of source.files) {
+    safeRelative(file.path, "WorkBuddy check-in source path");
+    assert(digestPattern.test(file.sha256), "WorkBuddy check-in source digest is invalid");
+    if (checkSources) {
+      assert(gitTree(source.rootHint, source.commit) === source.tree &&
+        sha256(gitFile(source.rootHint, source.commit, file.path, null)) === file.sha256,
+        "WorkBuddy check-in optional source verification failed");
+    }
+  }
+}
+for (const evidence of checkin.localEvidence) {
+  safeRelative(evidence.path, "WorkBuddy check-in local path");
+  const local = fs.readFileSync(path.join(repoRoot, evidence.path), "utf8");
+  assert(evidence.anchors?.length > 0 && evidence.anchors.every((anchor) => local.includes(anchor)),
+    `WorkBuddy check-in local evidence missing in ${evidence.path}`);
+}
+const checkinPolicy = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/contract/workbuddy-protocol.json"), "utf8")).dailyCheckinExtension;
+assert(checkinPolicy?.referenceContract === "assets/contract/codebuddy-reference-delta.json#workBuddyCheckinExtension" &&
+  checkinPolicy.scope === "cn_personal_account_opt_in" && checkinPolicy.defaultEnabled === false && checkinPolicy.liveState === "live_pending",
+  "WorkBuddy protocol lost account-maintenance scope");
+
 console.log(
   `codebuddy reference delta audit ok (${expectedLegacyFields.length} legacy fields, ${sourceSnapshotById.size} dirty-worktree-excluded snapshots, ${observationIds.size} immutable observations, ${reviewedRejections.size} rejection boundaries, ${capabilities.size} capabilities, ${enhancements.size + contract.incrementalEnhancementExtensions.length} enhancements, ${acceptance.requiredChecks.length} real checks, receipt v${acceptance.receiptSchemaVersion}${
     checkSources ? ", external objects verified" : ", external check optional"

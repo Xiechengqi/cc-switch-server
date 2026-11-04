@@ -13,6 +13,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use url::Url;
 
+mod checkin;
+pub(crate) use checkin::{query_checkin_status, submit_checkin, CheckinFailure};
+
 use crate::domain::accounts::oauth::{merge_account_refresh_raw, OAuthErrorKind};
 use crate::domain::accounts::store::{Account, AccountRefreshUpdate, UpsertAccountInput};
 use crate::domain::codebuddy::{

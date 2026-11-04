@@ -324,6 +324,36 @@ pub async fn refresh_account_quota(
     })
 }
 
+/// Refresh actual resource packages after account maintenance without scanning
+/// historical requests or changing their cached collection timestamp.
+pub(crate) async fn refresh_buddy_resources_only(
+    http: &reqwest::Client,
+    account: &Account,
+    now_ms: i64,
+    request_timeout: Duration,
+) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
+    let body =
+        crate::clients::oauth::codebuddy::fetch_billing_resources(http, account, request_timeout)
+            .await
+            .map_err(|error| codebuddy_quota_failure(error, now_ms))?;
+    let mut update = parse_codebuddy_quota_update(account, &body, now_ms, 60_000)?;
+    if let (Some(usage), Some(extra)) = (
+        account
+            .quota
+            .as_ref()
+            .and_then(|q| q.extra_usage.as_ref())
+            .and_then(|e| e.get("codeBuddyOfficialUsage")),
+        update
+            .quota
+            .as_mut()
+            .and_then(|q| q.extra_usage.as_mut())
+            .and_then(Value::as_object_mut),
+    ) {
+        extra.insert("codeBuddyOfficialUsage".into(), usage.clone());
+    }
+    Ok(update)
+}
+
 async fn refresh_codebuddy_quota(
     http: &reqwest::Client,
     account: &Account,

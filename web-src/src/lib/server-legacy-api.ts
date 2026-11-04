@@ -193,6 +193,7 @@ export interface AccountManagerCapability {
   supportsRefreshPlan: boolean;
   supportsCachedQuota: boolean;
   supportsLiveQuotaRefresh: boolean;
+  supportsCheckin?: boolean;
   refreshCapability: AccountRefreshCapability;
   quotaCapability: AccountQuotaCapability;
   inferenceBindingSupported: boolean;

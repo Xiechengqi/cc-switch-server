@@ -169,3 +169,6 @@ Router 主调度 UTC 半小时槽，Server 本地 scheduler 兜底：同一 App/
 - 用量计量：[`usage-accounting.md`](usage-accounting.md)
 - Share 访问模型：[`../share/access-policy.md`](../share/access-policy.md)
 - 文档索引：[`../README.md`](../README.md)
+
+
+WorkBuddy 中国站个人账号可选每日签到由账号控制面持有，默认关闭。账号存储中的 `buddyCheckins` 随 JSON / SQLite 原子持久化；`state/account_checkin.rs` 封装身份/生命周期围栏、状态先查、持久化意图、单账号任务和重试调度，外部签到 HTTP 仅在 `clients/oauth/codebuddy/checkin.rs`。所有 App / Provider / Share 共用账号结果，推理路径和 Router 不执行签到。确认后仅更新实际资源包并复用现有账号 metadata / Router 同步，不更改官方用量、分享额度和推理冷却。具体合同见 [WorkBuddy OAuth](../provider/workbuddy-oauth.md#中国站个人账号每日签到)。

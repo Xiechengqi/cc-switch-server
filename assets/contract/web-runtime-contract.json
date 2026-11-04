@@ -12,7 +12,16 @@
         "status": "known_gap",
         "reason": "Pre-existing missing AuthCenter entry; the Provider editor is available. Tracked separately from CodeBuddy/WorkBuddy integration."
       }
-    ]
+    ],
+    "workBuddyCheckin": {
+      "scope": "account",
+      "supported": "workbuddy_oauth_cn_personal",
+      "defaultEnabled": false,
+      "timezone": "Asia/Shanghai",
+      "defaultTime": "09:00",
+      "providerView": "cached_read_only",
+      "routerActions": false
+    }
   },
   "shareUserTokenPeriods": {
     "wireValues": [
@@ -501,6 +510,30 @@
       "implemented": true,
       "feature": "accounts",
       "notes": "Selects a Codex ChatGPT Account-ID only from organizations verified in the account token claims. Accounts reserved by a Share require a paused Share plus shareId and expectedConfigRevision so Account, Provider binding generation, and Share history advance together."
+    },
+    {
+      "name": "auth_get_checkin",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "GET /api/accounts/:id/checkin",
+      "notes": "Cached state only; no upstream requests."
+    },
+    {
+      "name": "auth_set_checkin_policy",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "PUT /api/accounts/:id/checkin",
+      "notes": "Admin-only, account identity generation and policy revision required; opt-in China personal WorkBuddy only."
+    },
+    {
+      "name": "auth_checkin",
+      "support": "native",
+      "implemented": true,
+      "feature": "accounts",
+      "endpoint": "POST /api/accounts/:id/checkin",
+      "notes": "Admin-only, identity-fenced, owned account task; status first and durable uncertain recovery; refresh resource packages only."
     },
     {
       "name": "auth_import_buddy",

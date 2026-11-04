@@ -47,6 +47,7 @@ interface DeviceCodeManagedAccountSectionProps extends KimiOAuthSectionProps {
   authStatusLabel: string;
   loginLabel: string;
   renderAccountMetadata?: (account: ManagedAuthAccount) => React.ReactNode;
+  renderAccountDetails?: (account: ManagedAuthAccount) => React.ReactNode;
   loginDisabled?: boolean;
   onLoginBusyChange?: (busy: boolean, site?: CodeBuddySite | null) => void;
   userCodeHint?: string;
@@ -71,6 +72,7 @@ export const DeviceCodeManagedAccountSection: React.FC<
   authStatusLabel,
   loginLabel,
   renderAccountMetadata,
+  renderAccountDetails,
   loginDisabled = false,
   onLoginBusyChange,
   userCodeHint,
@@ -274,6 +276,7 @@ export const DeviceCodeManagedAccountSection: React.FC<
                     <X className="h-4 w-4" />
                   </Button>
                 </div>
+                {renderAccountDetails ? <div className="basis-full">{renderAccountDetails(account)}</div> : null}
               </div>
             ))}
           </div>

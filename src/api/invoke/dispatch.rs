@@ -1163,6 +1163,26 @@ async fn web_invoke_dispatch(
                 .collect::<Vec<_>>();
             Ok(json!(mapped))
         }
+        "auth_get_checkin" | "auth_set_checkin_policy" | "auth_checkin" => {
+            let id = web_arg_string(&args, "accountId")?;
+            let mut input = args.clone();
+            if let Some(object) = input.as_object_mut() { object.remove("accountId"); }
+            let response = match command {
+                "auth_get_checkin" => {
+                    let input = serde_json::from_value(input).map_err(ApiError::bad_request)?;
+                    account_checkin(State(state.clone()), headers.clone(), Path(id), Query(input)).await?.0
+                }
+                "auth_set_checkin_policy" => {
+                    let input = serde_json::from_value(input).map_err(ApiError::bad_request)?;
+                    set_account_checkin_policy(State(state.clone()), headers.clone(), Path(id), Json(input)).await?.0
+                }
+                _ => {
+                    let input = serde_json::from_value(input).map_err(ApiError::bad_request)?;
+                    run_account_checkin(State(state.clone()), headers.clone(), Path(id), Json(input)).await?.0
+                }
+            };
+            Ok(json!(response))
+        }
         "auth_import_buddy" => {
             let input = serde_json::from_value(args.clone()).map_err(ApiError::bad_request)?;
             let response = import_buddy_credentials(State(state.clone()), headers.clone(), Json(input)).await?.0;

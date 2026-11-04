@@ -595,6 +595,12 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/accounts/:id/refresh", post(refresh_account))
         .route("/api/accounts/:id/refresh-plan", get(account_refresh_plan))
         .route("/api/accounts/:id/quota", get(account_quota))
+        .route(
+            "/api/accounts/:id/checkin",
+            get(account_checkin)
+                .put(set_account_checkin_policy)
+                .post(run_account_checkin),
+        )
         .route("/api/provider-limits", get(provider_limits))
         .route(
             "/api/providers/:id/limits",

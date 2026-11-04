@@ -2,6 +2,7 @@
 // Extracted from src/api/mod.rs as part of R3.6/R3.7.
 
 include!("api_contract/buddy_login_site.rs");
+include!("api_contract/workbuddy_checkin.rs");
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;

@@ -1,6 +1,7 @@
 pub mod buddy_import;
 pub mod buddy_quota;
 pub mod capability_evidence;
+pub mod checkin;
 pub mod claude_quota;
 pub mod claude_subscription;
 pub mod codex_quota;

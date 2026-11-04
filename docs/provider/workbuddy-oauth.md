@@ -2,7 +2,7 @@
 
 > 状态：权威实现合同。本地 `fixture_verified` 与真实 `live_pending` 分开管理；没有真实账号回执时不宣称厂商接受性。
 
-WorkBuddy 是腾讯办公 Agent 产品，与编程产品 CodeBuddy 分开注册。`workbuddy_oauth` 使用 `family.workbuddy_oauth`、`claude.workbuddy_oauth` / `codex.workbuddy_oauth` / `gemini.workbuddy_oauth` 和 `special.workbuddy_oauth`。固定绑定一个个人 Account，站点仅 `cn` / `intl`；不引入账号池、站点切换、跨 Provider/Account fallback、签到或桌面任务编排。
+WorkBuddy 是腾讯办公 Agent 产品，与编程产品 CodeBuddy 分开注册。`workbuddy_oauth` 使用 `family.workbuddy_oauth`、`claude.workbuddy_oauth` / `codex.workbuddy_oauth` / `gemini.workbuddy_oauth` 和 `special.workbuddy_oauth`。固定绑定一个个人 Account，站点仅 `cn` / `intl`；不引入账号池、站点切换、跨 Provider/Account fallback 或桌面任务编排。每日签到是下述显式授权的中国站个人账号控制面扩展，独立于推理。
 
 连接探针维持 1 token 输出上限。Codex 的预期输出上限终态仅在本次探针设置了上限、`response.incomplete` 的状态/原因为 incomplete / max_output_tokens 且 usage 证明达到该上限时视为健康；其他 incomplete、错误或真实断流仍失败。此检查不改生产推理的 partial-response 语义，详见 [CodeBuddy 测试合同](codebuddy-oauth.md#2026-11-02-自动模型测试与账号展示)。
 
@@ -103,3 +103,18 @@ Claude Code 身份句。CN 同账号对照证实保留该 billing 元数据仍�
 优先周期倒计时。归一后的数据沿既有配额快照同步给 Router，不新增 Router 侧码表。
 真实只读对照确认同一 Intl 账号可取回 `Bonus Pack` / `Free Plan Subscription` 和各自
 期限；这不等同于完整反代调用或远程部署验收，详见 `PROTOCOL_EVIDENCE.md`。
+
+
+## 中国站个人账号每日签到
+
+认证中心按 WorkBuddy Account 保存自动签到开关和 `HH:mm` 时间，默认关闭、09:00、`Asia/Shanghai`，另有“立即签到”。同账号绑定多个 Claude/Codex/Gemini Provider 或 Share 仍只有一个任务和结果；Provider 编辑页只读复用缓存，Router 无新增签到操作。国际站、CodeBuddy、企业账号均不支持，不向签到接口试探。
+
+固定 `https://www.codebuddy.cn`，POST `{}` 到 `/v2/billing/meter/checkin-activity-status`；仅 HTTP 404 回退 `checkin-status`。只有显式布尔“未签到”才提交 `daily-checkin`。缺字段、非法类型或矛盾状态不得视为未签到；HTTP 400 的明确“已签到”单独归一化。结果区分 success、already、inactive、authentication_required、retryable_error、error、unknown，不记录上游原文或凭据。上游活动不可用与 token 过期分别分类。
+
+启动补跑当天到期任务，按稳定账号 ID 抖动 0–59 秒。签到前先持久化意图，账号操作锁、文件锁、身份 generation、进程内 incarnation 和站点/domain 保护并发、删除重建及过期回写；客户端断连不取消拥有者任务。超时、5xx 或不明确的提交响应记录 unknown，下次仍先查状态；尊重 Retry-After，按 5/15/60 分钟退避，每账号每天最多 6 次。自动关闭或时刻未到不启动新的自动签到；关闭后不撤销已发出的请求，结果仍记录，待确认意图仍可后台只读查询，明确未签到时不补发提交。跨北京时间午夜的响应不能确认新一天签到。
+
+确认成功或已签到后，只刷新真实资源包，保留官方请求用量及其采集时间，不扫描历史请求；资源刷新失败单独标记待更新，最多 6 次、间隔 15 分钟。签到不凭空增加额度、不清除推理冷却、不重置分享额度，也不计入请求消耗。策略、待确认意图及最近结果随既有账号存储在 JSON / SQLite 中持久化，最近日志限制 30 天 / 100 条。
+
+管理员 REST 为 `GET /api/accounts/:id/checkin?authIdentityGeneration=N`、同路径 `PUT` 策略（`authIdentityGeneration/revision/enabled/time`）及 `POST` 手动执行（`authIdentityGeneration`）。Web invoke `auth_get_checkin` / `auth_set_checkin_policy` / `auth_checkin` 使用相同编排与管理员鉴权，额外携带 `accountId`；GET 只读缓存，不触发网络。账号变化或旧 revision 写入返回冲突。
+
+协议证据为 `workbuddy-switch@22b318c1f44b335c2222e444abcc2d0f74e160f7` 与 `cli2api@28ddb2fb8f0fa3c3563105130bab6c330ff551e1`，完整固定来源见本仓 `workBuddyCheckinExtension`。历史 CB-R2 拒绝记录保持；本次授权只扩展上述窄范围，不引入账号池或运营轮换。国际区参考策略有冲突，不能据此宣称支持。真实账号签到、奖励额度和期限验收均为 `live_pending`，本地 fixture 不替代真实回执。

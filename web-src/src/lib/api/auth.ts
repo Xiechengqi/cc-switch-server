@@ -19,6 +19,30 @@ export type ManagedAuthProvider =
 
 export type QoderSite = "global" | "cn";
 export type CodeBuddySite = "intl" | "cn";
+
+export type WorkBuddyCheckinStatus = "success" | "already" | "inactive" | "authentication_required" | "retryable_error" | "error" | "unknown";
+export interface WorkBuddyCheckinView {
+  supported: boolean;
+  reason: string | null;
+  enabled: boolean;
+  time: string;
+  timezone: string;
+  revision: number;
+  todayCheckedIn: boolean;
+  pending: boolean;
+  lastResult: { status: WorkBuddyCheckinStatus; atMs: number; message: string } | null;
+  nextRetryAt: number | null;
+  quotaPending: boolean;
+}
+export function authGetCheckin(accountId: string, authIdentityGeneration: number) {
+  return invokeCommand<WorkBuddyCheckinView>("auth_get_checkin", { accountId, authIdentityGeneration });
+}
+export function authSetCheckinPolicy(accountId: string, authIdentityGeneration: number, revision: number, enabled: boolean, time: string) {
+  return invokeCommand<WorkBuddyCheckinView>("auth_set_checkin_policy", { accountId, authIdentityGeneration, revision, enabled, time });
+}
+export function authCheckin(accountId: string, authIdentityGeneration: number) {
+  return invokeCommand<WorkBuddyCheckinView>("auth_checkin", { accountId, authIdentityGeneration });
+}
 export type QoderCredentialRail = "global_oauth" | "cn_oauth" | "pat_job_token";
 
 export interface DeepSeekAccount {

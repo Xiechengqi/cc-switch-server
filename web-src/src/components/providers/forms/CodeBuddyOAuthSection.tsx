@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/select";
 import type { CodeBuddySite } from "@/lib/api";
 import { DeviceCodeManagedAccountSection } from "./KimiOAuthSection";
+import { WorkBuddyCheckinControl } from "./WorkBuddyCheckinControl";
 
 interface CodeBuddyOAuthSectionProps {
   authProvider?: "codebuddy_oauth" | "workbuddy_oauth";
@@ -124,6 +125,7 @@ export const CodeBuddyOAuthSection: React.FC<CodeBuddyOAuthSectionProps> = ({
         await Promise.all([
           queryClient.invalidateQueries({ queryKey: ["managed-auth-status", authProvider] }),
           queryClient.invalidateQueries({ queryKey: ["managed-auth-accounts"] }),
+          queryClient.invalidateQueries({ queryKey: ["account-checkin"] }),
           queryClient.invalidateQueries({ queryKey: ["subscription"] }),
           queryClient.invalidateQueries({ queryKey: oauthQuotaRootKey(authProvider) }),
           queryClient.invalidateQueries({ queryKey: ["providers"] }),
@@ -158,6 +160,9 @@ export const CodeBuddyOAuthSection: React.FC<CodeBuddyOAuthSectionProps> = ({
             site: t(`${locale}.${boundSite ? `${boundSite}Site` : "unknownSite"}`),
           })}
         </p>
+      ) : null}
+      {context === "provider" && authProvider === "workbuddy_oauth" && account ? (
+        <WorkBuddyCheckinControl key={`${account.id}:${account.authIdentityGeneration}`} account={account} />
       ) : null}
       <div className="space-y-2">
         <Label htmlFor={`${authProvider}-login-site`}>
@@ -228,6 +233,9 @@ export const CodeBuddyOAuthSection: React.FC<CodeBuddyOAuthSectionProps> = ({
         loginOptions={{ codeBuddySite: site }}
         loginDisabled={importBusy}
         onLoginBusyChange={onLoginBusyChange}
+        renderAccountDetails={context === "auth-center" && authProvider === "workbuddy_oauth"
+          ? (account) => <WorkBuddyCheckinControl key={`${account.id}:${account.authIdentityGeneration}`} account={account} editable />
+          : undefined}
         renderAccountMetadata={(account) => {
           const actualSite = account.buddy?.site;
           return (

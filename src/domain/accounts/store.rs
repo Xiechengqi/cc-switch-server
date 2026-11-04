@@ -44,6 +44,8 @@ fn next_account_incarnation() -> u64 {
 pub struct AccountStore {
     #[serde(default)]
     pub accounts: Vec<Account>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) buddy_checkins: BTreeMap<String, super::checkin::AccountCheckin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_codex_oauth_account_id: Option<String>,
     // Stable across restarts for the SQLite-backed Kiro/Amazon Q local prompt
@@ -924,6 +926,13 @@ impl AccountStore {
             .iter()
             .map(|account| (account.id.clone(), next_account_incarnation()))
             .collect();
+        store.buddy_checkins.retain(|id, record| {
+            super::checkin::valid_time(&record.time)
+                && store
+                    .accounts
+                    .iter()
+                    .any(|account| account.id == *id && record.matches(account))
+        });
         store.kiro_prompt_cache_owner_ids.retain(|id, owner| {
             valid_kiro_prompt_cache_owner_id(owner)
                 && store.accounts.iter().any(|account| {
@@ -1061,6 +1070,16 @@ impl AccountStore {
             self.accounts.push(account.clone());
         }
 
+        if self
+            .buddy_checkins
+            .get(&account.id)
+            .is_some_and(|r| !r.matches(&account))
+        {
+            self.buddy_checkins.remove(&account.id);
+        }
+        if let Some(record) = self.buddy_checkins.get_mut(&account.id) {
+            record.authentication_recovered();
+        }
         account
     }
 
@@ -1301,6 +1320,7 @@ impl AccountStore {
         if deleted {
             self.account_incarnations.remove(account_id);
             self.kiro_prompt_cache_owner_ids.remove(account_id);
+            self.buddy_checkins.remove(account_id);
         }
         if deleted && self.active_codex_oauth_account_id.as_deref() == Some(account_id) {
             self.active_codex_oauth_account_id = None;
@@ -1425,7 +1445,15 @@ impl AccountStore {
         account.last_refresh_error = update.last_refresh_error;
         advance_account_generations(&previous, account);
         record_observation_drafts(account, update.capability_observations);
-        Some(account.clone())
+        let account = account.clone();
+        if self
+            .buddy_checkins
+            .get(account_id)
+            .is_some_and(|r| !r.matches(&account))
+        {
+            self.buddy_checkins.remove(account_id);
+        }
+        Some(account)
     }
 
     pub fn mark_rate_limited_until(
@@ -1731,7 +1759,11 @@ impl AccountStore {
             .find(|item| item.id == account_id)?;
         account.refresh_consecutive_failures = 0;
         account.needs_relogin = false;
-        Some(account.clone())
+        let account = account.clone();
+        if let Some(record) = self.buddy_checkins.get_mut(account_id) {
+            record.authentication_recovered();
+        }
+        Some(account)
     }
 
     pub fn mark_native_refresh_failure(

@@ -1673,5 +1673,34 @@
       "parse_error": "Parse error",
       "interrupted": "Interrupted"
     }
+  },
+  "workBuddyCheckin": {
+    "title": "Daily check-in",
+    "loading": "Loading check-in status…",
+    "loadError": "Could not load check-in status",
+    "reload": "Retry",
+    "unsupported": "Daily check-in is available for personal WorkBuddy China accounts only",
+    "auto": "Automatic check-in",
+    "time": "Check-in time",
+    "timezone": "China time",
+    "save": "Save time",
+    "now": "Check in now",
+    "hint": "Off by default. Runs once per account each day, shared by all providers and shares. Rewards follow actual resource packages.",
+    "actionError": "The operation did not complete. Reload status and retry. Account or policy changes and retry delays prevent repeated operations.",
+    "quotaPending": "Quota refresh pending",
+    "scheduled": "Daily at {{time}} China time",
+    "disabled": "Automatic check-in off",
+    "status": {
+      "checked": "Checked in today",
+      "success": "Check-in succeeded",
+      "already": "Checked in today",
+      "inactive": "Check-in activity unavailable",
+      "authentication_required": "Sign in to the account again",
+      "retryable_error": "Temporarily unavailable; retry pending",
+      "error": "Check-in did not complete",
+      "unknown": "Result unconfirmed",
+      "pending": "Processing; awaiting confirmation",
+      "unconfirmed": "Today’s status unconfirmed"
+    }
   }
 }

@@ -64,6 +64,8 @@ pub struct AccountManagerCapability {
     pub supports_refresh_plan: bool,
     pub supports_cached_quota: bool,
     pub supports_live_quota_refresh: bool,
+    /// Site/account eligibility is checked by the account-maintenance service.
+    pub supports_checkin: bool,
     pub refresh_capability: OAuthRefreshCapability,
     pub quota_capability: OAuthQuotaCapability,
     pub inference_binding_supported: bool,
@@ -1132,6 +1134,7 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
         supports_refresh_plan,
         supports_cached_quota,
         supports_live_quota_refresh,
+        supports_checkin: provider_type == ProviderType::WorkBuddyOAuth,
         refresh_capability,
         quota_capability,
         inference_binding_supported,

@@ -2277,5 +2277,104 @@
       }
     ],
     "acceptanceBoundary": "Catalog-gated image input is implemented and fixture-tested independently of image generation and unreviewed multimodal models. No product, site or exact model has a live image receipt from this change; existing text receipts do not establish image acceptance."
+  },
+  "workBuddyCheckinExtension": {
+    "id": "WORKBUDDY-CN-CHECKIN-01",
+    "authorization": "explicit_user_requested_implementation_2026-11-04",
+    "historicalRejection": "CB-R2 remains immutable; this explicit account-maintenance extension supersedes daily-checkin exclusion only for the scope below",
+    "scope": {
+      "providerType": "workbuddy_oauth",
+      "site": "cn",
+      "account": "personal",
+      "ownership": "account",
+      "defaultEnabled": false,
+      "defaultTime": "09:00",
+      "timezone": "Asia/Shanghai",
+      "inferencePath": false,
+      "routerActions": false,
+      "poolOrRotation": false,
+      "fixedReward": false
+    },
+    "protocol": {
+      "origin": "https://www.codebuddy.cn",
+      "method": "POST",
+      "paths": [
+        "/v2/billing/meter/checkin-activity-status",
+        "/v2/billing/meter/checkin-status",
+        "/v2/billing/meter/daily-checkin"
+      ],
+      "body": {},
+      "statusFallback": "HTTP_404_only",
+      "submitRequires": "explicit_unchecked_status",
+      "unknownRecovery": "query_status_first",
+      "alreadyHTTP400": true
+    },
+    "sources": [
+      {
+        "repository": "workbuddy-switch",
+        "rootHint": "/data/projects/proxy/CodeBuddy/workbuddy-switch",
+        "commit": "22b318c1f44b335c2222e444abcc2d0f74e160f7",
+        "tree": "aaca14e3f9e01e9495b9f7ae0e40d185fb93dbcf",
+        "files": [
+          {
+            "path": "crates/wb-switch-core/src/modules/checkin.rs",
+            "sha256": "0ca06018b0cf49db8893794f747388e56304512a07c4d657a3ce561d41e64cbc"
+          },
+          {
+            "path": "crates/wb-switch-core/src/modules/variant.rs",
+            "sha256": "1697a0a80ed3cac877fb2e683418ebefa0f7114017799d02daaec7162d952ec3"
+          },
+          {
+            "path": "crates/wb-switch-core/src/modules/config.rs",
+            "sha256": "c2a561d8d952dcbf26ee4609606f6629441bb3cf4e8ab46eb57a0769c6ac01ae"
+          }
+        ]
+      },
+      {
+        "repository": "cli2api",
+        "rootHint": "/data/projects/proxy/cli2api",
+        "commit": "28ddb2fb8f0fa3c3563105130bab6c330ff551e1",
+        "tree": "65bd2f3864fea300506c73f56db9c6aeedf37ee5",
+        "files": [
+          {
+            "path": "internal/providers/workbuddy/client.go",
+            "sha256": "a5896ad5f25cfc498236d10fb242dc6a7ec34c26fa02af1db52b7528c1facd35"
+          },
+          {
+            "path": "internal/providers/workbuddy/checkin.go",
+            "sha256": "eb6ccb5732cb5b42e7013fc0262433984f0c9fb201942d1e7cb508c62698b609"
+          },
+          {
+            "path": "internal/providers/workbuddy/headers.go",
+            "sha256": "13c9a213d92e1b336d2a87f85fbd9f12a81521cd1e3e38010528a6ea3f34f4dc"
+          },
+          {
+            "path": "internal/runtime/manager_maintenance.go",
+            "sha256": "4b084a1fbcac8e59d76fd8cb41c8ad77ad2cbfa97b017e39031d9b54682cf40b"
+          }
+        ]
+      }
+    ],
+    "localEvidence": [
+      {
+        "path": "src/state/account_checkin/tests.rs",
+        "anchors": [
+          "checkin_unknown_recovers_via_status_without_duplicate_post",
+          "checkin_concurrent_clicks_and_disconnected_callers_keep_one_owned_task",
+          "checkin_records_survive_json_and_sqlite_with_pending_recovery",
+          "checkin_resource_refresh_preserves_official_usage_and_cooldown"
+        ]
+      },
+      {
+        "path": "web-src/src/components/providers/forms/WorkBuddyCheckinControl.test.tsx",
+        "anchors": [
+          "loads cached state once",
+          "saves an explicit opt-in",
+          "manual completion updates both views"
+        ]
+      }
+    ],
+    "evidenceState": "fixture_verified",
+    "liveState": "live_pending"
   }
 }

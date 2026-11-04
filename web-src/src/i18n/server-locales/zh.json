@@ -1673,5 +1673,34 @@
       "parse_error": "用量解析失败",
       "interrupted": "请求已中断"
     }
+  },
+  "workBuddyCheckin": {
+    "title": "每日签到",
+    "loading": "正在读取签到状态…",
+    "loadError": "签到状态读取失败",
+    "reload": "重试",
+    "unsupported": "每日签到仅支持中国站个人 WorkBuddy 账号",
+    "auto": "自动签到",
+    "time": "签到时间",
+    "timezone": "北京时间",
+    "save": "保存时间",
+    "now": "立即签到",
+    "hint": "默认关闭；按账号每日执行一次，同账号的所有供应商和分享共用。奖励以实际资源包为准。",
+    "actionError": "操作未完成，请刷新状态后重试。账号或策略变更、重试等待期间会拒绝重复操作。",
+    "quotaPending": "额度待刷新",
+    "scheduled": "每日 {{time}} 北京时间",
+    "disabled": "自动签到已关闭",
+    "status": {
+      "checked": "今日已签到",
+      "success": "签到成功",
+      "already": "今日已签到",
+      "inactive": "签到活动未开放",
+      "authentication_required": "请重新登录账号",
+      "retryable_error": "暂时失败，等待重试",
+      "error": "签到未完成",
+      "unknown": "结果待确认",
+      "pending": "处理中，等待确认",
+      "unconfirmed": "今日状态待确认"
+    }
   }
 }

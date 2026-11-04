@@ -1673,5 +1673,34 @@
       "parse_error": "用量解析失敗",
       "interrupted": "請求已中斷"
     }
+  },
+  "workBuddyCheckin": {
+    "title": "每日簽到",
+    "loading": "正在讀取簽到狀態…",
+    "loadError": "簽到狀態讀取失敗",
+    "reload": "重試",
+    "unsupported": "每日簽到僅支援中國站個人 WorkBuddy 帳號",
+    "auto": "自動簽到",
+    "time": "簽到時間",
+    "timezone": "北京時間",
+    "save": "儲存時間",
+    "now": "立即簽到",
+    "hint": "預設關閉；按帳號每日執行一次，同帳號的所有供應商和分享共用。獎勵以實際資源包為準。",
+    "actionError": "操作未完成，請重新整理狀態後重試。帳號或策略變更、重試等待期間會拒絕重複操作。",
+    "quotaPending": "額度待更新",
+    "scheduled": "每日 {{time}} 北京時間",
+    "disabled": "自動簽到已關閉",
+    "status": {
+      "checked": "今日已簽到",
+      "success": "簽到成功",
+      "already": "今日已簽到",
+      "inactive": "簽到活動未開放",
+      "authentication_required": "請重新登入帳號",
+      "retryable_error": "暫時失敗，等待重試",
+      "error": "簽到未完成",
+      "unknown": "結果待確認",
+      "pending": "處理中，等待確認",
+      "unconfirmed": "今日狀態待確認"
+    }
   }
 }

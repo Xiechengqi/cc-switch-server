@@ -63,6 +63,7 @@ export function useManagedAuth(
       Promise.all([
         queryClient.invalidateQueries({ queryKey }),
         queryClient.invalidateQueries({ queryKey: ["managed-auth-accounts"] }),
+        queryClient.invalidateQueries({ queryKey: ["account-checkin"] }),
         queryClient.invalidateQueries({ queryKey: ["subscription"] }),
         queryClient.invalidateQueries({
           queryKey: oauthQuotaRootKey(authProvider),

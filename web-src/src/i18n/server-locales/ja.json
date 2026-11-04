@@ -1673,5 +1673,34 @@
       "parse_error": "使用量の解析失敗",
       "interrupted": "中断済み"
     }
+  },
+  "workBuddyCheckin": {
+    "title": "毎日チェックイン",
+    "loading": "状態を読み込み中…",
+    "loadError": "状態を取得できませんでした",
+    "reload": "再試行",
+    "unsupported": "中国サイトの個人 WorkBuddy アカウントのみ対応しています",
+    "auto": "自動チェックイン",
+    "time": "実行時刻",
+    "timezone": "中国時間",
+    "save": "時刻を保存",
+    "now": "今すぐ実行",
+    "hint": "初期設定はオフです。同じアカウントのすべてのプロバイダーと共有で毎日1回実行します。報酬は実際のリソース枠に従います。",
+    "actionError": "操作が完了しませんでした。状態を更新して再試行してください。アカウントや設定の変更、再試行の待機中は重複操作を拒否します。",
+    "quotaPending": "枠の更新待ち",
+    "scheduled": "毎日 {{time}} 中国時間",
+    "disabled": "自動チェックインはオフ",
+    "status": {
+      "checked": "本日実行済み",
+      "success": "実行に成功",
+      "already": "本日実行済み",
+      "inactive": "キャンペーンは利用できません",
+      "authentication_required": "再ログインが必要です",
+      "retryable_error": "一時的な失敗、再試行待ち",
+      "error": "完了しませんでした",
+      "unknown": "結果を確認待ち",
+      "pending": "処理中、確認待ち",
+      "unconfirmed": "本日の状態は未確認"
+    }
   }
 }

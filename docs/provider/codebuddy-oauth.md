@@ -912,3 +912,8 @@ Router 私有账号卡片第二行复用既有 `accountLabel`，与 Server 的 O
 
 本轮仅使用本地代码、合成夹具和此前只读远程快照结论，未修改上游 host、账号绑定或
 产品/站点身份；未部署，双端真实页面及账单联合验收仍待执行。
+
+
+## WorkBuddy 签到范围说明
+
+本文件中“不实现签到”的历史决策继续适用于 `codebuddy_oauth`。2026-11-04 用户明确授权的每日签到仅是中国站个人 `workbuddy_oauth` Account 的可选控制面维护，默认关闭，独立于推理；详见 [WorkBuddy 每日签到合同](workbuddy-oauth.md#中国站个人账号每日签到)。旧 CB-R2 和冻结审计记录不改写，不扩展到 CodeBuddy、国际站、企业账号、账号池或积分轮换。

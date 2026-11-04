@@ -3,6 +3,89 @@ use axum::response::Html;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(in crate::api) struct CheckinAccountRequest {
+    pub auth_identity_generation: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(in crate::api) struct CheckinPolicyRequest {
+    pub auth_identity_generation: u64,
+    pub revision: u64,
+    pub enabled: bool,
+    pub time: String,
+}
+
+fn checkin_control_error(error: anyhow::Error) -> ApiError {
+    use crate::state::CheckinControlError;
+    match error.downcast_ref::<CheckinControlError>() {
+        Some(CheckinControlError::NotFound) => ApiError::not_found(error.to_string()),
+        Some(CheckinControlError::Conflict | CheckinControlError::Busy) => {
+            ApiError::conflict(error.to_string())
+        }
+        Some(CheckinControlError::Unsupported) => ApiError::bad_request(error),
+        Some(CheckinControlError::Unavailable) => {
+            ApiError::service_unavailable_code("account_checkin_unavailable", error.to_string())
+        }
+        None => ApiError::internal(error),
+    }
+}
+
+pub(in crate::api) async fn account_checkin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(input): Query<CheckinAccountRequest>,
+) -> Result<Json<crate::domain::accounts::checkin::CheckinView>, ApiError> {
+    require_web_admin_session(&state, &headers).await?;
+    state
+        .account_checkin_view(&id, input.auth_identity_generation)
+        .await
+        .map(Json)
+        .map_err(checkin_control_error)
+}
+
+pub(in crate::api) async fn set_account_checkin_policy(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<CheckinPolicyRequest>,
+) -> Result<Json<crate::domain::accounts::checkin::CheckinView>, ApiError> {
+    require_web_admin_session(&state, &headers).await?;
+    if !crate::domain::accounts::checkin::valid_time(&input.time) {
+        return Err(ApiError::bad_request(
+            "check-in time must be HH:mm (Asia/Shanghai)",
+        ));
+    }
+    state
+        .set_account_checkin_policy(
+            &id,
+            input.auth_identity_generation,
+            input.revision,
+            input.enabled,
+            &input.time,
+        )
+        .await
+        .map(Json)
+        .map_err(checkin_control_error)
+}
+
+pub(in crate::api) async fn run_account_checkin(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<CheckinAccountRequest>,
+) -> Result<Json<crate::domain::accounts::checkin::CheckinView>, ApiError> {
+    require_web_admin_session(&state, &headers).await?;
+    state
+        .run_account_checkin(id, input.auth_identity_generation)
+        .await
+        .map(Json)
+        .map_err(checkin_control_error)
+}
+
 pub(in crate::api) async fn list_accounts(
     State(state): State<ServerState>,
     headers: HeaderMap,

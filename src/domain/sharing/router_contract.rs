@@ -3526,7 +3526,9 @@ mod tests {
                 .unwrap()
                 .healthy
         );
-        assert_eq!(first.model_health.codex[0].status, "success");
+        // Scheduling tolerates the first transient failure, while model
+        // observations retain the raw failed result.
+        assert_eq!(first.model_health.codex[0].status, "failed");
 
         record_health_snapshot_at(
             &mut usage,

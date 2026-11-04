@@ -1,5 +1,40 @@
 # Protocol evidence policy
 
+## 2026-11-04 WorkBuddy CN 账号级每日签到
+
+用户明确授权新增中国区个人 WorkBuddy 的可选签到控制面。只读证据为
+`workbuddy-switch@22b318c1f44b335c2222e444abcc2d0f74e160f7` 的
+`crates/wb-switch-core/src/modules/{checkin,variant,config}.rs`，以及
+`cli2api@28ddb2fb8f0fa3c3563105130bab6c330ff551e1` 的
+`internal/providers/workbuddy/{client,checkin,headers}.go`、
+`internal/runtime/manager_maintenance.go`。中国区固定签到 origin 为
+`https://www.codebuddy.cn`，三个 POST 路径为 `/v2/billing/meter/` 下的
+`checkin-activity-status`、`checkin-status`、`daily-checkin`，body 为 `{}`。
+状态字段可为 `today_checked_in` / `todayCheckedIn`；HTTP 400 也可能返回今日已签到。
+
+两参考的国际区策略冲突：cli2api 注册双站，workbuddy-switch 在入口明确跳过国际区。
+本次仅开放 WorkBuddy CN 个人账号；CodeBuddy 与 Intl 不据共享协议自动取得签到能力。
+新增能力独立于推理，默认关闭，按账号去重；状态未知、活动失效、认证失败和已签到分别建模。
+不复制本地时区、缺字段默认未签、宽泛 token 关键词、全账号冷却清除或忽略持久化错误。
+历史 CB-R2 与冻结 observation 保留原样；本次显式的窄范围扩展不覆盖其他历史拒绝项。
+奖励金额和有效期没有固定保证，资源包重新查询才是额度权威。参考代码、目标 fixture、
+真实签到和发布验收分别记录；本次真实状态保持 `live_pending`。
+
+实现与整体 review 已核对默认关闭、产品/站点/个人账号限制、身份与删除重建围栏、并发去重、
+断连和不确定结果恢复、认证恢复后的再次查询、每日重试上限及资源包独立重试。状态写入均经
+ServerState 域事务；签到不进入推理路径，不重置分享额度或清除推理冷却。验证中补齐了认证
+恢复测试夹具的会话心跳，并修正一处既有健康测试的过期断言，未调整对应生产调度逻辑。
+
+工作区全量 Rust 测试 4,276 项通过、0 失败、3 项既有忽略；cargo fmt/check/build、完整
+静态检查（含 include! 源格式、严格全目标 Clippy、Node 审计 2,128 项、smoke 单测 13 项、
+Web 单测 372 项、类型与契约/文档/依赖边界检查）及生产前端构建通过。本地启动 smoke 的
+十个阶段通过。最终 Rust 源摘要与验证输入一致；工作区原有改动保留，提取的提交快照另经
+Provider Phase 0、覆盖矩阵、UI 矩阵、Buddy 参考合同和文档索引审计，确认无需原有改动。
+
+离线 readiness 为 failures=0、decision=blocked / blocked_inputs；RUN_TESTS=0 明确跳过
+脚本内本地套件，真实验收输入和部署检查仍未满足。上述独立本地验证不能代替发布门禁或
+真实签到及奖励到账回执；本轮实现和验证未进行真实账号签到或部署。
+
 ## 2026-11-04 WorkBuddy Intl 目录与套餐字段兼容
 
 只读核查远程 share 的精确绑定：WorkBuddy、Intl、同一个个人 Account，Claude / Codex /
