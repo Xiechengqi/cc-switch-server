@@ -89,3 +89,17 @@ Claude Code 身份句。CN 同账号对照证实保留该 billing 元数据仍�
 正文、工具数据、非开头或不符合元数据格式的同名文本保持。不因 11128 刷新或重试。
 完整合同见 [CodeBuddy §5.6](codebuddy-oauth.md)，
 目录/最小对照证据见 `PROTOCOL_EVIDENCE.md`。
+
+## 2026-11-04 国际站目录与套餐兼容
+
+实时目录中 `onlyReasoning=true` 优先于同时出现的 `reasoning.canDisableThinking=true`：
+有效的关闭推理能力固定为 false，继续使用目录声明的默认档位。此组合不再导致整份目录失败；
+非法类型、明确非推理却携带推理配置、none 与强制推理冲突、默认不在允许档位内仍失败关闭。
+既有受审模型范围、精确产品/账号/站点绑定、CLI 身份和终态合同保持。
+
+现代套餐查询的 paid/free 码表补齐受审国际商品码，恢复原被漏掉的官方名称与周期信息。
+真实 PackageName 优先；summary 缺少名称或名称等于编码时，006 / 035 分别回退到受审的
+“CodeBuddy 个人体验版” / “版本基础用量”，未知码不猜名称。金额和期限只用上游证据，继续
+优先周期倒计时。归一后的数据沿既有配额快照同步给 Router，不新增 Router 侧码表。
+真实只读对照确认同一 Intl 账号可取回 `Bonus Pack` / `Free Plan Subscription` 和各自
+期限；这不等同于完整反代调用或远程部署验收，详见 `PROTOCOL_EVIDENCE.md`。

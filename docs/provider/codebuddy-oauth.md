@@ -1,5 +1,13 @@
 # CodeBuddy OAuth 单账号反代（实现合同）
 
+2026-11-04 目录/套餐兼容增量与 WorkBuddy 共用：`onlyReasoning=true` 优先于嵌套
+`canDisableThinking=true`，有效关闭能力仍为 false，其他目录校验及默认推理策略保持；
+paid/free 查询补齐受审国际商品码，优先采用官方明细名称和周期，006 / 035 在无真实名称时
+才使用受审的友好回退。未知码、未知能力、期限与金额不推测，不扩张模型准入。真实只读对照
+覆盖 WorkBuddy Intl 的目录与套餐，不代表 CodeBuddy 的新增真实接受性证据。
+详见 [WorkBuddy 兼容合同](workbuddy-oauth.md#2026-11-04-国际站目录与套餐兼容) 与
+`PROTOCOL_EVIDENCE.md`。
+
 > **状态：本地实现完成，`fixture_verified / live_pending`。** 当前实现包含 `codebuddy_oauth` ProviderType、双站点账号域模型、OAuth/refresh、三 Surface driver、严格流终态、同账号恢复、目录、额度、管理 API 与 Web 入口。本文是这些本地实现的权威合同；后文保留的“新增/实现时”措辞记录设计落点，不表示对应代码仍缺失。仓库尚无 Intl/CN 两站真实订阅的脱敏 receipt，因此不得写成 `live_verified` 或发布级真站兼容。
 >
 > 本文只写**已证实**的部分。所有未决项、以及它们各自的判定标准与抓包方法，见 workbuddy-cliproxy 仓库的 `codebuddy-open-questions.md`，编号 `U1`–`U15` 在两份文档间通用。

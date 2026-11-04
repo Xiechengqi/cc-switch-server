@@ -566,16 +566,14 @@ fn codebuddy_model_capability(
     let reasoning_capability_known =
         advertised_reasoning.is_some() || only_reasoning || reasoning.is_some();
     let supports_reasoning = advertised_reasoning.unwrap_or(only_reasoning || reasoning.is_some());
+    // Live Intl catalogs may carry both flags. The model-level lock wins
+    // over the nested toggle; it never authorizes disabling reasoning.
     let can_disable_thinking = reasoning
         .map(|reasoning| bool_field(reasoning, "canDisableThinking"))
         .transpose()?
         .flatten()
-        .unwrap_or(false);
-    if only_reasoning && can_disable_thinking {
-        return Err(format!(
-            "CodeBuddy model {id} has contradictory reasoning capabilities"
-        ));
-    }
+        .unwrap_or(false)
+        && !only_reasoning;
     let parse_effort = |value: &Value| -> Result<Option<String>, String> {
         match value {
             Value::Null => Ok(None),

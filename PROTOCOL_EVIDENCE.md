@@ -1,5 +1,50 @@
 # Protocol evidence policy
 
+## 2026-11-04 WorkBuddy Intl 目录与套餐字段兼容
+
+只读核查远程 share 的精确绑定：WorkBuddy、Intl、同一个个人 Account，Claude / Codex /
+Gemini 均固定上游 `auto`，运行提交为 `a56b1355b67e`。未改远程配置、账号或运行进程。
+同账号、受审 CLI/2.142.0 身份的 `/v3/config` 返回 HTTP 200 / code=0，CLI 允许的
+`glm-5.3` 同时声明 `onlyReasoning=true`、`supportsReasoning=true`、
+`reasoning.canDisableThinking=true`、默认 high、允许 low/high/max。原解析器把强制推理与关闭
+推理的开关判为矛盾，并中断整份目录；模型发现和生成准备因此一起失败，502 发生在聊天出站前。
+
+本轮只读参考 `cli2api@28ddb2fb8f0fa3c3563105130bab6c330ff551e1` 的
+`internal/providers/workbuddy/catalog.go`：`onlyReasoning` 优先于 canDisableThinking，
+有效禁用能力取后者与 `!onlyReasoning` 的交集。该规则不授权 none、不推测默认档位，也不
+放宽其他非法类型、非推理声明冲突或默认不在菜单内的错误。新出现但未受审的模型仍不启用。
+
+远程已保存的套餐快照仅包含 006 / 035 商品码、250 / 100 credits，没有包名或期限。
+Server 的 paid/free 查询码表遗漏国际码，summary 缺名时又直接把码写作 PackageName。
+参考 `workbuddy-switch@22b318c1f44b335c2222e444abcc2d0f74e160f7` 的
+`crates/wb-switch-core/src/modules/credits.rs` 与 `src/lib/credit-package-names.ts`，
+国际付费码补充 003/036，免费码补充 001/006/035/037/039/040；已知商品码在没有真实
+PackageName（或名称就是商品码）时可映射受审名称：006 为 CodeBuddy 个人体验版、035
+为版本基础用量。真实上游包名优先，未知码保留现有回退，不推断额度或周期。
+
+本轮使用精确绑定 Account 的既有解密格式，仅在远程诊断进程内读取凭据；不输出或落盘明文。
+同账号、同站点、同身份/窗口，summary 返回 HTTP 200 / code=0，包含上述两码但没有名称或
+期限；free 查询原码表返回 HTTP 200 / 空 Accounts，补全国际码后返回两个完整资源包：
+006 名为 `Bonus Pack`，CycleEndTime 为 `2026-11-18 17:36:54`；035 名为
+`Free Plan Subscription`，CycleEndTime 为 `2026-11-30 23:59:59`，长期权益到期另在
+2035 年。保留既有 UTC+8 账单时间解析、周期/权益到期区分与优先周期倒计时，不混淆期限。
+初期误用存储密文的 401 不作为上游认证异常证据。未执行刷新或重登录，未跨产品/站点尝试。
+协议修正、本地 fixture、真实上游生成、远程部署和端到端验收分别记录；本次只读目录/套餐
+成功不能当作完整生成或已部署的证据。
+
+验证与整体 review：三项针对旧行为的反例先失败，修复后通过；另补充真实 Intl 套餐字段
+回归，覆盖官方名称优先、零基础容量/精确周期容量、单位、UTC+8 周期与长期权益到期。
+完整 Rust 为 4,250 通过、0 失败、3 项既有忽略；cargo fmt/check/build 与完整
+`scripts/static-checks.sh` 通过，包含全部 include! 源格式、严格全目标 Clippy、Node 审计
+2,128 项、smoke 脚本单测 13 项、Web 单测 367 项及类型/文档/Provider/状态与依赖边界审计。
+本地启动 smoke 的十个阶段通过。双产品/双站目录、固定模型/auto、非法开关与 none 拒绝、
+官方名称/额度/周期归一化和既有 Router 投影经 review 未发现新增阻断项；最终 Rust 源摘要
+与完整验证开始时一致。无需修改 Router，线上需更新 Server 后刷新账号额度与模型目录。
+
+离线 readiness 为 failures=0、decision=blocked / blocked_inputs；RUN_TESTS=0 显式跳过
+该脚本内本地测试，且真实验收输入、部署检查未齐备。上述独立测试及只读上游对照不能替代
+发布门禁或真实反代验收。本轮验证阶段未部署、更改远程配置或新增真实生成调用。
+
 ## 2026-11-04 Claude CLI billing 元数据导致 Buddy 11128
 
 线上只读核对确认 Server 已运行 `02bb7571e806`，不是缺少上一轮推理策略修复。两个

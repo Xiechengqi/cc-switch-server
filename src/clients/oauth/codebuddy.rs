@@ -42,6 +42,8 @@ const CODEBUDDY_USAGE_PAGE_SIZE: usize = 3_000;
 const CODEBUDDY_USAGE_MAX_PAGES: usize = 100;
 const CODEBUDDY_USAGE_DETAIL_LIMIT: usize = 100;
 const CODEBUDDY_PRODUCT_CODE: &str = "p_tcaca";
+// Reviewed CN + Intl billing codes. A CN-only filter silently drops Intl
+// package names and deadlines even when summary still reports their balances.
 const CODEBUDDY_PAID_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_002_AkiJS3ZHF5",
     "TCACA_code_023_4xbGhMrE6q",
@@ -49,6 +51,8 @@ const CODEBUDDY_PAID_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_027_0FCGVA6vSa",
     "TCACA_code_009_0XmEQc2xOf",
     "TCACA_code_038_OhvqZtiPKr",
+    "TCACA_code_003_FAnt7lcmRT",
+    "TCACA_code_036_lupO5WgNdG",
 ];
 const CODEBUDDY_FREE_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_008_cfWoLwvjU4",
@@ -56,6 +60,12 @@ const CODEBUDDY_FREE_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_028_NtpWi0jzXs",
     "TCACA_code_029_6wCGEWquYy",
     "TCACA_code_030_BjSt89qTvr",
+    "TCACA_code_001_PqouKr6QWV",
+    "TCACA_code_006_DbXS0lrypC",
+    "TCACA_code_035_ArVxJcGDsm",
+    "TCACA_code_037_WxOD3MpI2o",
+    "TCACA_code_039_KRcQj7wUat",
+    "TCACA_code_040_mi9rCYg46x",
 ];
 
 #[derive(Debug, Clone)]
@@ -3312,6 +3322,74 @@ mod tests {
                 .host_str(),
             Some("copilot.tencent.com")
         );
+    }
+
+    #[tokio::test]
+    async fn buddy_billing_requests_include_intl_codes_and_recover_detail_names_and_deadlines() {
+        use axum::{extract::Json, http::Uri, routing::post, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().fallback(post(|uri: Uri, Json(body): Json<Value>| async move {
+            if uri.path() == CODEBUDDY_RESOURCE_SUMMARY_PATH {
+                return Json(json!({"data":{"Packages":[
+                    {"PackageCode":"TCACA_code_006_DbXS0lrypC","CycleTotalCapacity":250,"CycleRemainCapacity":250},
+                    {"PackageCode":"TCACA_code_035_ArVxJcGDsm","CycleTotalCapacity":100,"CycleRemainCapacity":90}
+                ]}}));
+            }
+            assert_eq!(body["PageNumber"], 1);
+            assert_eq!(body["PageSize"], CODEBUDDY_BILLING_PAGE_SIZE);
+            assert_eq!(body["Status"], json!([0, 3]));
+            let codes = body["PackageCodes"].as_array().unwrap();
+            if uri.path() == CODEBUDDY_RESOURCE_PAID_PACKAGES_PATH {
+                assert!(codes.contains(&json!("TCACA_code_003_FAnt7lcmRT")));
+                assert!(codes.contains(&json!("TCACA_code_036_lupO5WgNdG")));
+                assert!(codes.contains(&json!("TCACA_code_002_AkiJS3ZHF5")));
+                return Json(json!({"data":{"Accounts":[],"TotalCount":0}}));
+            }
+            assert_eq!(uri.path(), CODEBUDDY_RESOURCE_FREE_PACKAGES_PATH);
+            let packages = [
+                json!({"PackageCode":"TCACA_code_006_DbXS0lrypC","PackageName":"Official Trial",
+                    "CapacitySize":250,"CapacityRemain":250,"DeductionEndTime":"2026-11-18T00:00:00Z"}),
+                json!({"PackageCode":"TCACA_code_035_ArVxJcGDsm","PackageName":"Official Base Usage",
+                    "CapacitySize":100,"CapacityRemain":90,"CycleEndTime":"2026-11-30T16:00:00Z"}),
+            ]
+            .into_iter()
+            .filter(|row| codes.contains(&row["PackageCode"]))
+            .collect::<Vec<_>>();
+            Json(json!({"data":{"TotalCount":packages.len(),"Accounts":packages}}))
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            let mut account = refresh_account("http://127.0.0.1:1", "uid-1");
+            account.provider_type = product;
+            account.profile.as_mut().unwrap()["enterpriseId"] = json!("");
+            account.profile.as_mut().unwrap()["productPlatform"] = json!(
+                buddy_product_policy(product, CodeBuddySite::Intl)
+                    .unwrap()
+                    .auth_platform
+            );
+            account.raw.as_mut().unwrap()["testCodeBuddyBillingBaseUrl"] =
+                json!(format!("http://{address}"));
+            let CodeBuddyBillingResources::Modern {
+                free,
+                details_complete,
+                ..
+            } = fetch_billing_resources(&reqwest::Client::new(), &account, Duration::from_secs(2))
+                .await
+                .unwrap()
+            else {
+                panic!("expected modern billing");
+            };
+            assert!(details_complete);
+            let free = free.unwrap();
+            let packages = free["data"]["Accounts"].as_array().unwrap();
+            assert_eq!(packages.len(), 2);
+            assert_eq!(packages[0]["PackageName"], "Official Trial");
+            assert_eq!(packages[0]["DeductionEndTime"], "2026-11-18T00:00:00Z");
+            assert_eq!(packages[1]["CycleEndTime"], "2026-11-30T16:00:00Z");
+        }
+        server.abort();
     }
 
     #[tokio::test]

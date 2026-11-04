@@ -529,6 +529,16 @@ fn parse_codebuddy_quota_update(
                 now_ms,
             ));
         }
+        // Summary can omit names, and its normalization can supply the code
+        // as the name. Prefer a vendor label and map only reviewed fallbacks.
+        let package_name = match sub_product_code.as_deref() {
+            Some(code) if package_name.as_deref().is_none_or(|name| name == code) => match code {
+                "TCACA_code_006_DbXS0lrypC" => Some("CodeBuddy 个人体验版".to_string()),
+                "TCACA_code_035_ArVxJcGDsm" => Some("版本基础用量".to_string()),
+                _ => package_name,
+            },
+            _ => package_name,
+        };
         let capacity_size =
             codebuddy_required_nonnegative_number(package.get("CapacitySize"), "CapacitySize")
                 .map_err(|message| {
@@ -8049,6 +8059,150 @@ mod tests {
             "ResourceId",
         ] {
             assert!(!projection.contains(forbidden), "{forbidden}: {projection}");
+        }
+    }
+
+    #[test]
+    fn buddy_intl_package_names_use_known_fallbacks_and_preserve_vendor_names_and_amounts() {
+        use crate::clients::oauth::codebuddy::CodeBuddyBillingResources;
+
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            let account = imported_account(product, json!({}));
+            for (name, expected) in [
+                (Value::Null, "CodeBuddy 个人体验版"),
+                (json!("TCACA_code_006_DbXS0lrypC"), "CodeBuddy 个人体验版"),
+                (
+                    json!("Official International Trial"),
+                    "Official International Trial",
+                ),
+            ] {
+                let quota = parse_codebuddy_quota_update(
+                    &account,
+                    &CodeBuddyBillingResources::Modern {
+                        summary: Some(json!({"data":{"Packages":[
+                            {"PackageCode":"TCACA_code_006_DbXS0lrypC","PackageName":name,
+                                "CycleTotalCapacity":250,"CycleRemainCapacity":250},
+                            {"PackageCode":"TCACA_code_035_ArVxJcGDsm",
+                                "CycleTotalCapacity":100,"CycleRemainCapacity":90},
+                            {"PackageCode":"future-code","CycleTotalCapacity":20,"CycleRemainCapacity":15}
+                        ]}})),
+                        paid: None,
+                        free: None,
+                        details_complete: false,
+                    },
+                    1_700_000_000_000,
+                    300_000,
+                )
+                .unwrap()
+                .quota
+                .unwrap();
+                let tier = quota
+                    .tiers
+                    .iter()
+                    .find(|tier| tier.limit == Some(250.0))
+                    .unwrap();
+                assert_eq!(tier.label.as_deref(), Some(expected));
+                assert_eq!(tier.used, Some(0.0));
+                assert!(tier.resets_at.is_none());
+                let base = quota
+                    .tiers
+                    .iter()
+                    .find(|tier| tier.limit == Some(100.0))
+                    .unwrap();
+                assert_eq!(base.label.as_deref(), Some("版本基础用量"));
+                assert_eq!(base.used, Some(10.0));
+                assert!(quota
+                    .tiers
+                    .iter()
+                    .any(|tier| tier.label.as_deref() == Some("future-code")));
+                let projection = quota.extra_usage.unwrap();
+                let packages = projection["codeBuddyBilling"]["packages"]
+                    .as_array()
+                    .unwrap();
+                let trial = packages
+                    .iter()
+                    .find(|package| package["capacitySize"].as_f64() == Some(250.0))
+                    .unwrap();
+                assert_eq!(trial["packageName"], expected);
+                assert_eq!(trial["subProductCode"], "TCACA_code_006_DbXS0lrypC");
+                assert_eq!(trial["expiresAt"], Value::Null);
+                assert_eq!(projection["codeBuddyBilling"]["totalDosage"], 15.0);
+            }
+            let quota = parse_codebuddy_quota_update(
+                &account,
+                &CodeBuddyBillingResources::Legacy(json!({"data":{"Response":{"Data":{
+                    "TotalCount":1,"TotalDosage":20,"Accounts":[{
+                    "SubProductCode":"TCACA_code_035_ArVxJcGDsm","CapacitySize":100,
+                    "CapacityRemain":80,"CapacityUnit":"credits"
+                }]}}}})),
+                1_700_000_000_000,
+                300_000,
+            )
+            .unwrap()
+            .quota
+            .unwrap();
+            assert_eq!(quota.tiers[0].label.as_deref(), Some("版本基础用量"));
+            assert_eq!(quota.tiers[0].used, Some(20.0));
+        }
+    }
+
+    #[test]
+    fn buddy_intl_details_preserve_official_names_and_real_cycle_deadlines() {
+        use crate::clients::oauth::codebuddy::CodeBuddyBillingResources;
+
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            let account = imported_account(product, json!({}));
+            let quota = parse_codebuddy_quota_update(
+                &account,
+                &CodeBuddyBillingResources::Modern {
+                    summary: Some(json!({"data":{"Packages":[
+                        {"PackageCode":"TCACA_code_006_DbXS0lrypC","CycleTotalCapacity":"250","CycleRemainCapacity":"250"},
+                        {"PackageCode":"TCACA_code_035_ArVxJcGDsm","CycleTotalCapacity":"100","CycleRemainCapacity":"100"}
+                    ]}})),
+                    paid: Some(json!({"data":{"Accounts":[],"TotalCount":0}})),
+                    free: Some(json!({"data":{"Accounts":[
+                        {"PackageCode":"TCACA_code_006_DbXS0lrypC","SubProductCode":"sp_tcaca_codebuddyide_bonus_pack",
+                            "PackageName":"Bonus Pack","CapacitySize":0,"CapacityRemain":0,
+                            "CycleCapacitySizePrecise":"250","CycleCapacityRemainPrecise":"250","CapacityUnit":"credit",
+                            "CycleEndTime":"2026-11-18 17:36:54","DeductionEndTime":1794994614000i64},
+                        {"PackageCode":"TCACA_code_035_ArVxJcGDsm","SubProductCode":"sp_tcaca_codebuddy_ide",
+                            "PackageName":"Free Plan Subscription","CapacitySize":0,"CapacityRemain":0,
+                            "CycleCapacitySizePrecise":"100","CycleCapacityRemainPrecise":"100","CapacityUnit":"credits",
+                            "CycleEndTime":"2026-11-30 23:59:59","DeductionEndTime":2054194615000i64}
+                    ],"TotalCount":2}})),
+                    details_complete: true,
+                },
+                1_793_788_800_000,
+                300_000,
+            )
+            .unwrap()
+            .quota
+            .unwrap();
+            assert_eq!(quota.tiers.len(), 2);
+            for (label, limit, end) in [
+                ("Bonus Pack", 250.0, "2026-11-18T09:36:54Z"),
+                ("Free Plan Subscription", 100.0, "2026-11-30T15:59:59Z"),
+            ] {
+                let tier = quota
+                    .tiers
+                    .iter()
+                    .find(|tier| tier.label.as_deref() == Some(label))
+                    .unwrap();
+                assert_eq!(tier.limit, Some(limit));
+                assert_eq!(tier.used, Some(0.0));
+                assert_eq!(tier.unit.as_deref(), Some("credits"));
+                assert_eq!(tier.resets_at, codebuddy_billing_timestamp_ms(end));
+            }
+            let projection = quota.extra_usage.unwrap();
+            let packages = projection["codeBuddyBilling"]["packages"]
+                .as_array()
+                .unwrap();
+            let subscription = packages
+                .iter()
+                .find(|package| package["packageName"] == "Free Plan Subscription")
+                .unwrap();
+            assert_eq!(subscription["expiresAt"], 2054194615000i64);
+            assert_eq!(subscription["subProductCode"], "TCACA_code_035_ArVxJcGDsm");
         }
     }
 

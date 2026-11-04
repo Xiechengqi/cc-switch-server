@@ -238,7 +238,8 @@ mod tests {
     use super::*;
     use crate::domain::codebuddy::CodeBuddySite;
     use crate::proxy::codebuddy_runtime::{
-        build_codebuddy_payload, parse_codebuddy_model_catalog, resolve_codebuddy_model_id,
+        build_codebuddy_payload, parse_buddy_model_catalog, parse_codebuddy_model_catalog,
+        resolve_codebuddy_model_id,
     };
     use serde_json::json;
 
@@ -318,10 +319,62 @@ mod tests {
     }
 
     #[test]
+    fn buddy_only_reasoning_overrides_the_upstream_disable_flag_without_losing_defaults() {
+        use crate::domain::providers::model::ProviderType;
+
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for site in [CodeBuddySite::Intl, CodeBuddySite::Cn] {
+                let id = if site == CodeBuddySite::Intl {
+                    "glm-5.3"
+                } else {
+                    "glm-5.2"
+                };
+                let catalog = parse_buddy_model_catalog(
+                    &json!({"data":{
+                        "agents":[{"name":"cli","models":[id]}],
+                        "models":[{"id":id,"onlyReasoning":true,"supportsReasoning":true,
+                            "supportsToolCall":true,"supportsImages":true,
+                            "reasoning":{"canDisableThinking":true,"defaultEffort":"high",
+                                "supportedEfforts":["low","high","max"]}}]
+                    }}),
+                    product,
+                    site,
+                )
+                .unwrap();
+                assert_eq!(catalog.enabled_models, [id]);
+                let capability = &catalog.capabilities[id];
+                assert!(capability.only_reasoning);
+                assert!(!capability.can_disable_thinking);
+                assert_eq!(capability.reasoning_efforts, ["low", "high", "max"]);
+                assert_eq!(
+                    capability.reasoning_default_source,
+                    Some(BuddyReasoningDefaultSource::DeclaredDefault)
+                );
+                for effort in ["none", "low", "medium", "high", "max", "xhigh"] {
+                    let request = json!({"messages":[{"role":"system","content":"Keep this instruction."},{"role":"user","content":"ping"}],
+                        "reasoning_effort":effort});
+                    assert_eq!(
+                        resolve_codebuddy_model_id(site, "auto", &catalog, &request).unwrap(),
+                        id
+                    );
+                    assert_eq!(
+                        resolve_codebuddy_model_id(site, id, &catalog, &request).unwrap(),
+                        id
+                    );
+                    let payload = build_codebuddy_payload(&request, id, capability).unwrap();
+                    assert_eq!(payload["reasoning_effort"], "high");
+                    assert_eq!(payload["messages"], request["messages"]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn buddy_catalog_rejects_invalid_and_contradictory_defaults() {
         for extra in [
             json!({"supportsReasoning":false,"onlyReasoning":true}),
-            json!({"onlyReasoning":true,"reasoning":{"canDisableThinking":true,"effort":"high"}}),
+            json!({"supportsReasoning":false,"onlyReasoning":true,"reasoning":{"canDisableThinking":true,"effort":"high"}}),
+            json!({"onlyReasoning":true,"reasoning":{"canDisableThinking":true,"defaultEffort":"none","supportedEfforts":["none","high"]}}),
             json!({"onlyReasoning":true,"reasoning":{"canDisableThinking":"false","effort":"high"}}),
             json!({"supportsReasoning":false,"reasoning":{"effort":"high"}}),
             json!({"reasoning":{"defaultEffort":"max","supportedEfforts":["low","high"]}}),
