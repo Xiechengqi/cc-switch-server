@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { CodeBuddySite, ManagedAuthAccount } from "@/lib/api/auth";
+import type { CodeBuddySite, ManagedAuthAccount, WorkBuddyCheckinView } from "@/lib/api/auth";
 import type { BuddyProviderType, ProviderBundleView } from "@/lib/api/providers";
 import { familyById } from "@/server/providerRegistry";
 import { HttpResponseError } from "@/lib/runtime";
@@ -14,6 +14,7 @@ import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccou
 const mocks = vi.hoisted(() => ({
   upsert: vi.fn(), get: vi.fn(), saved: vi.fn(), error: vi.fn(), start: vi.fn(),
   cancel: vi.fn(), importCredentials: vi.fn(),
+  getCheckin: vi.fn(), setCheckinPolicy: vi.fn(), runCheckin: vi.fn(),
   accounts: [] as ManagedAuthAccount[],
 }));
 vi.mock("sonner", () => ({ toast: { error: mocks.error, success: vi.fn() } }));
@@ -30,7 +31,10 @@ vi.mock("@/lib/api", async (original) => ({ ...await original<object>(), authApi
   authGetStatus: async (provider: string) => ({ provider, accounts: mocks.accounts, authenticated: true, default_account_id: null }),
   authStartLogin: mocks.start, authCancelLogin: mocks.cancel, authPollForAccount: async () => null,
 } }));
-vi.mock("@/lib/api/auth", async (original) => ({ ...await original<object>(), authImportBuddyCredentials: mocks.importCredentials }));
+vi.mock("@/lib/api/auth", async (original) => ({
+  ...await original<object>(), authImportBuddyCredentials: mocks.importCredentials,
+  authGetCheckin: mocks.getCheckin, authSetCheckinPolicy: mocks.setCheckinPolicy, authCheckin: mocks.runCheckin,
+}));
 vi.mock("@/lib/query/accounts", async (original) => ({
   ...await original<object>(), useManagedAccountsQuery: () => ({ data: mocks.accounts }),
 }));
@@ -122,7 +126,81 @@ async function choose(select: HTMLSelectElement, value: CodeBuddySite) {
   await act(async () => { select.value = value; select.dispatchEvent(new Event("change", { bubbles: true })); });
 }
 
-beforeEach(() => { vi.resetAllMocks(); mocks.accounts = []; mocks.cancel.mockResolvedValue(undefined); });
+const initialCheckin: WorkBuddyCheckinView = {
+  supported: true, reason: null, enabled: false, time: "09:00", timezone: "Asia/Shanghai", revision: 0,
+  todayCheckedIn: false, pending: false, lastResult: null, nextRetryAt: null, quotaPending: false,
+};
+
+beforeEach(() => {
+  vi.resetAllMocks(); mocks.accounts = []; mocks.cancel.mockResolvedValue(undefined);
+  mocks.getCheckin.mockResolvedValue(initialCheckin);
+  mocks.setCheckinPolicy.mockImplementation(async (_id, _generation, revision, enabled, time) => ({
+    ...initialCheckin, revision: revision + 1, enabled, time,
+  }));
+  mocks.runCheckin.mockResolvedValue({ ...initialCheckin, todayCheckedIn: true,
+    lastResult: { status: "success", atMs: Date.now(), message: "checked_in" } });
+});
+
+describe("Buddy provider check-in entry", () => {
+  it("lets the bound WorkBuddy account opt in and check in without saving the provider", async () => {
+    mocks.accounts = [account("workbuddy_oauth", "cn")];
+    const view = await mount(fixture("workbuddy_oauth"));
+    try {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(mocks.getCheckin).toHaveBeenCalledWith("buddy-account", 1);
+      expect(mocks.setCheckinPolicy).not.toHaveBeenCalled();
+      expect(mocks.runCheckin).not.toHaveBeenCalled();
+      const toggle = view.container.querySelector<HTMLButtonElement>(`[role="switch"][aria-label="${i18n.t("workBuddyCheckin.auto")}"]`)!;
+      expect(toggle).not.toBeNull();
+      await act(async () => toggle.click());
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(mocks.setCheckinPolicy).toHaveBeenCalledWith("buddy-account", 1, 0, true, "09:00");
+      const run = Array.from(view.container.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent === i18n.t("workBuddyCheckin.now"))!;
+      expect(run).toBeDefined();
+      await act(async () => run.click());
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(mocks.runCheckin).toHaveBeenCalledWith("buddy-account", 1);
+      expect(run.disabled).toBe(true);
+      expect(view.save().disabled).toBe(true);
+      expect(mocks.upsert).not.toHaveBeenCalled();
+    } finally { await view.close(); }
+  });
+
+  it("explains the unsupported CodeBuddy product without querying or signing in", async () => {
+    mocks.accounts = [account("codebuddy_oauth", "cn")];
+    const view = await mount(fixture("codebuddy_oauth"));
+    try {
+      expect(view.container.textContent).toContain(i18n.t("workBuddyCheckin.unsupportedProvider"));
+      expect(mocks.getCheckin).not.toHaveBeenCalled();
+      expect(mocks.runCheckin).not.toHaveBeenCalled();
+    } finally { await view.close(); }
+  });
+
+  it("keeps international accounts unsupported even when the new-login preference is China", async () => {
+    mocks.accounts = [account("workbuddy_oauth", "intl")];
+    mocks.getCheckin.mockResolvedValue({ ...initialCheckin, supported: false, reason: "unsupported_site" });
+    const view = await mount(fixture("workbuddy_oauth", "cn"));
+    try {
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      expect(view.container.textContent).toContain(i18n.t("workBuddyCheckin.unsupported"));
+      expect(Array.from(view.container.querySelectorAll("button"))
+        .some((button) => button.textContent === i18n.t("workBuddyCheckin.now"))).toBe(false);
+      expect(mocks.runCheckin).not.toHaveBeenCalled();
+      expect(mocks.setCheckinPolicy).not.toHaveBeenCalled();
+    } finally { await view.close(); }
+  });
+
+  it("explains a stale account binding without operating on its replacement", async () => {
+    mocks.accounts = [{ ...account("workbuddy_oauth", "cn"), authIdentityGeneration: 2 }];
+    const view = await mount(fixture("workbuddy_oauth"));
+    try {
+      expect(view.container.textContent).toContain(i18n.t("workBuddyCheckin.bindingUnavailable"));
+      expect(mocks.getCheckin).not.toHaveBeenCalled();
+      expect(mocks.runCheckin).not.toHaveBeenCalled();
+    } finally { await view.close(); }
+  });
+});
 
 describe.each(["workbuddy_oauth", "codebuddy_oauth"] as const)("%s login site", (product) => {
   it("marks site-only edits dirty, retains a failed save, then saves and reopens the selected site", async () => {

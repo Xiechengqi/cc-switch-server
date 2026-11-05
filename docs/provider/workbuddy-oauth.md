@@ -107,7 +107,7 @@ Claude Code 身份句。CN 同账号对照证实保留该 billing 元数据仍�
 
 ## 中国站个人账号每日签到
 
-认证中心按 WorkBuddy Account 保存自动签到开关和 `HH:mm` 时间，默认关闭、09:00、`Asia/Shanghai`，另有“立即签到”。同账号绑定多个 Claude/Codex/Gemini Provider 或 Share 仍只有一个任务和结果；Provider 编辑页只读复用缓存，Router 无新增签到操作。国际站、CodeBuddy、企业账号均不支持，不向签到接口试探。
+认证中心和 Provider 编辑页的“上游连接”均提供 WorkBuddy Account 的自动签到开关、`HH:mm` 时间和“立即签到”，默认关闭、09:00、`Asia/Shanghai`。签到设置按账号独立保存，无需保存 Provider；同账号绑定多个 Claude/Codex/Gemini Provider 或 Share 仍只有一个策略、任务和结果，两个入口共享状态。未选账号、绑定失效或状态读取失败时显示说明，不对替换账号操作；新登录站点偏好不改变绑定账号的签到资格。国际站、CodeBuddy、企业账号显示不支持，不向签到接口试探；Router 无新增签到操作。
 
 固定 `https://www.codebuddy.cn`，POST `{}` 到 `/v2/billing/meter/checkin-activity-status`；仅 HTTP 404 回退 `checkin-status`。只有显式布尔“未签到”才提交 `daily-checkin`。缺字段、非法类型或矛盾状态不得视为未签到；HTTP 400 的明确“已签到”单独归一化。结果区分 success、already、inactive、authentication_required、retryable_error、error、unknown，不记录上游原文或凭据。上游活动不可用与 token 过期分别分类。
 

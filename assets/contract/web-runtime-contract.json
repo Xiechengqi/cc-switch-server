@@ -19,7 +19,7 @@
       "defaultEnabled": false,
       "timezone": "Asia/Shanghai",
       "defaultTime": "09:00",
-      "providerView": "cached_read_only",
+      "providerView": "shared_account_controls",
       "routerActions": false
     }
   },

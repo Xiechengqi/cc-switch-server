@@ -57,6 +57,15 @@ export const CodeBuddyOAuthSection: React.FC<CodeBuddyOAuthSectionProps> = ({
   const accountSite = account?.buddy?.site;
   const boundSite =
     accountSite === "cn" || accountSite === "intl" ? accountSite : undefined;
+  const checkinNotice = authProvider !== "workbuddy_oauth"
+    ? "unsupportedProvider"
+    : !props.selectedAccountId
+      ? "selectAccount"
+      : accountsQuery.isPending
+        ? "loading"
+        : accountsQuery.isError
+          ? "loadError"
+          : "bindingUnavailable";
   const [localSite, setLocalSite] = React.useState<{
     product: string;
     site: CodeBuddySite;
@@ -161,8 +170,19 @@ export const CodeBuddyOAuthSection: React.FC<CodeBuddyOAuthSectionProps> = ({
           })}
         </p>
       ) : null}
-      {context === "provider" && authProvider === "workbuddy_oauth" && account ? (
-        <WorkBuddyCheckinControl key={`${account.id}:${account.authIdentityGeneration}`} account={account} />
+      {context === "provider" ? (
+        authProvider === "workbuddy_oauth" && account ? (
+          <WorkBuddyCheckinControl key={`${account.id}:${account.authIdentityGeneration}`} account={account} editable />
+        ) : (
+          <p className="text-xs text-muted-foreground" role="status">
+            {t(`workBuddyCheckin.${checkinNotice}`)}
+            {authProvider === "workbuddy_oauth" && props.selectedAccountId && accountsQuery.isError ? (
+              <Button type="button" size="sm" variant="ghost" onClick={() => void accountsQuery.refetch()}>
+                {t("workBuddyCheckin.reload")}
+              </Button>
+            ) : null}
+          </p>
+        )
       ) : null}
       <div className="space-y-2">
         <Label htmlFor={`${authProvider}-login-site`}>

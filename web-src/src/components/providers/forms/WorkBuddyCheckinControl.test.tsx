@@ -56,7 +56,7 @@ describe("WorkBuddy account check-in", () => {
     expect(button.disabled).toBe(true);
     expect(Array.from(container.querySelectorAll('[role="status"]')).every((p) => p.textContent?.includes(i18n.t("workBuddyCheckin.status.checked")))).toBe(true);
   });
-  it("provider and unsupported-site views have no check-in actions", async () => {
+  it("read-only and unsupported-site views have no check-in actions", async () => {
     await mount(false);
     expect(container.querySelector("button, input")).toBeNull();
     mocks.get.mockResolvedValue({ ...initial, supported: false, reason: "unsupported_site" });
