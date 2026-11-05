@@ -19817,7 +19817,7 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                     "auth",
                     "codebuddy_generation_unauthorized",
                 ) {
-                    return Err(error.into_proxy_error());
+                    return Err(error.into_proxy_error_for_provider(stored.provider_type));
                 }
                 let previous_timing = timing.get();
                 if let Some(previous) = &previous_timing {
@@ -19849,7 +19849,7 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                 continue;
             }
             Err(CodeBuddyForwardAttemptError::Upstream(error)) => {
-                let error = error.into_proxy_error();
+                let error = error.into_proxy_error_for_provider(stored.provider_type);
                 record_codebuddy_metered_failure(
                     &state,
                     &stored,
@@ -19981,7 +19981,7 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                     "auth",
                     "codebuddy_stream_unauthorized",
                 ) {
-                    return Err(error.into_proxy_error());
+                    return Err(error.into_proxy_error_for_provider(stored.provider_type));
                 }
                 let previous_timing = timing.get();
                 if let Some(previous) = &previous_timing {
@@ -20013,7 +20013,7 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                 continue;
             }
             Err(CodeBuddyForwardAttemptError::Upstream(error)) => {
-                let error = error.into_proxy_error();
+                let error = error.into_proxy_error_for_provider(stored.provider_type);
                 record_codebuddy_metered_failure(
                     &state,
                     &stored,
@@ -20742,7 +20742,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                             if matches!(&error, super::codebuddy::CodeBuddySseDecodeError::Upstream(_)) {
                                 mark_codebuddy_declared_stream_rejection(&interrupt_guard, value_body_guard.as_ref()).await;
                             }
-                            let error = error.into_proxy_error();
+                            let error = error.into_proxy_error_for_provider(stored.provider_type);
                             if let Some(frame) = finish_qoder_observed_stream_failure(
                                 &mut interrupt_guard,
                                 timing.as_ref(),
@@ -20826,7 +20826,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                     return;
                 }
                 Err(CodeBuddyForwardAttemptError::Upstream(error)) => {
-                    let error = error.into_proxy_error();
+                    let error = error.into_proxy_error_for_provider(stored.provider_type);
                     if let Some(frame) = finish_qoder_observed_stream_failure(
                         &mut interrupt_guard,
                         timing.as_ref(),
@@ -20843,7 +20843,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                 Err(super::codebuddy::CodeBuddySseDecodeError::Upstream(error)) => {
                     if let Some(usage) = wire.decoder.take_value_usage() { interrupt_guard.usage = usage; }
                     mark_codebuddy_declared_stream_rejection(&interrupt_guard, value_body_guard.as_ref()).await;
-                    let error = error.into_proxy_error();
+                    let error = error.into_proxy_error_for_provider(stored.provider_type);
                     if let Some(frame) = finish_qoder_observed_stream_failure(
                         &mut interrupt_guard,
                         timing.as_ref(),

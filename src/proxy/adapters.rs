@@ -1226,6 +1226,9 @@ fn transform_body_for_upstream(
             if input.get("messages").is_some() {
                 Ok(input)
             } else {
+                if stored.provider_type.is_buddy_oauth() {
+                    super::codebuddy_runtime::normalize_buddy_codex_instructions(&mut input);
+                }
                 transforms::openai_responses_to_chat_with_reasoning_effort(
                     &input,
                     chat_reasoning_effort_mode(stored),
@@ -4706,6 +4709,64 @@ mod tests {
             provider_type,
             provider_type_id: provider_type.as_str().to_string(),
             resource: Default::default(),
+        }
+    }
+
+    #[test]
+    fn buddy_codex_preamble_exception_is_scoped_to_responses_instructions() {
+        use crate::domain::codebuddy::BUDDY_CODEX_CLI_PREAMBLE;
+        for product in [
+            ProviderType::CodeBuddyOAuth,
+            ProviderType::WorkBuddyOAuth,
+            ProviderType::Nvidia,
+        ] {
+            let stored = stored_provider(AppKind::Codex, product, json!({}));
+            let body =
+                json!({"instructions":BUDDY_CODEX_CLI_PREAMBLE,"input":"ping","stream":true});
+            let output = transform_body_for_upstream(
+                Bytes::from(body.to_string()),
+                &stored,
+                Some(ProxyRoute::CodexResponses),
+            )
+            .unwrap();
+            let output: Value = serde_json::from_slice(&output).unwrap();
+            if product.is_buddy_oauth() {
+                assert_eq!(output["messages"][0]["content"], "You are a helpful coding assistant. You are expected to be precise, safe, and helpful.");
+            } else {
+                assert_eq!(output["messages"][0]["content"], BUDDY_CODEX_CLI_PREAMBLE);
+            }
+            let chat = json!({"model":"auto","messages":[{"role":"system","content":BUDDY_CODEX_CLI_PREAMBLE},{"role":"user","content":"ping"}]});
+            let output = transform_body_for_upstream(
+                Bytes::from(chat.to_string()),
+                &stored,
+                Some(ProxyRoute::CodexChatCompletions),
+            )
+            .unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&output).unwrap(), chat);
+        }
+        for app in [AppKind::Claude, AppKind::Gemini] {
+            for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+                let (body, route) = if app == AppKind::Claude {
+                    (
+                        json!({"system":BUDDY_CODEX_CLI_PREAMBLE,"messages":[{"role":"user","content":"ping"}]}),
+                        ProxyRoute::ClaudeMessages,
+                    )
+                } else {
+                    (
+                        json!({"systemInstruction":{"parts":[{"text":BUDDY_CODEX_CLI_PREAMBLE}]},"contents":[{"role":"user","parts":[{"text":"ping"}]}]}),
+                        ProxyRoute::Gemini,
+                    )
+                };
+                let stored = stored_provider(app, product, json!({}));
+                let output = transform_body_for_upstream(
+                    Bytes::from(body.to_string()),
+                    &stored,
+                    Some(route),
+                )
+                .unwrap();
+                let output: Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(output["messages"][0]["content"], BUDDY_CODEX_CLI_PREAMBLE);
+            }
         }
     }
 

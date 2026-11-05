@@ -340,7 +340,7 @@ POST {endpoint}/v2/chat/completions
 
 随后对 Claude CLI 2.1.305 在隔离空仓库生成的请求做同账号对照：上述身份句已规范后，首条 system 开头保留 `x-anthropic-billing-header:` 仍使 Kimi/DeepSeek 返回 400/11128；只删除该前置元数据块即获 HTTP 200，工具、其余指令和用户上下文均保持。改变内容数组形式、移除工具或只精简 user 不能消除错误；单独 SDK 身份句或 Git 主分支提示没有复现，不能据此扩大 WAF 改写。
 
-因此 Claude→Buddy 还会清理首条 system 开头的合法 CLI billing 元数据行/块：精确前缀 `x-anthropic-billing-header:`、分号分隔的非空 `key=value` 字段，须同时含 `cc_version` 和 `cc_entrypoint`；字段名限 ASCII 字母/数字/下划线，值限非空 ASCII 可见字符。兼容字符串、独立 text 块及块内前缀行，连续前置元数据一次线性清理。非开头或畸形同名文本、其余 system、用户/工具/历史正文、缓存标记及原生 OpenAI/Gemini 请求保持。此为客户端传输元数据与固定身份句的窄范围例外，不采纳全局品牌、WAF 关键词或任意正文改写；11128 不刷新、重试、换模型或换账号。该 CN 对照不代表双产品双站完整验收。
+因此 Claude→Buddy 还会清理首条 system 开头的合法 CLI billing 元数据行/块：精确前缀 `x-anthropic-billing-header:`、分号分隔的非空 `key=value` 字段，须同时含 `cc_version` 和 `cc_entrypoint`；字段名限 ASCII 字母/数字/下划线，值限非空 ASCII 可见字符。兼容字符串、独立 text 块及块内前缀行，连续前置元数据一次线性清理。非开头或畸形同名文本、其余 system、用户/工具/历史正文和缓存标记保持。该 Claude 处理不作用于原生 OpenAI/Gemini；Codex Responses 的独立兼容例外见 §5.11。此为客户端传输元数据与固定身份句的窄范围例外，不采纳全局品牌、WAF 关键词或任意正文改写；11128 不刷新、重试、换模型或换账号。该 CN 对照不代表双产品双站完整验收。
 
 **响应 SSE**：`object: "chat.completion.chunk"`，delta 为**稠密**结构，每帧都带全部键 `content` / `reasoning_content` / `function_call` / `refusal` / `tool_calls` / `extra_fields`。
 
@@ -416,6 +416,31 @@ CORE-N2 只对精确的 `codebuddy_oauth` Provider 启用；普通 `claude`、`c
 reference delta 现在保留原 15 条 observation 并追加 `CB-OBS-0016`、CB-N6 enhancement 与独立 second-round review；默认 audit 不读取外部仓库，`--check-sources` 才验证新旧 committed objects。该结果不提升 Intl/CN receipt，也不开放 CB-N4、企业或多模态能力。
 
 ---
+
+### 5.11 Codex CLI 固定开场段落兼容与探针边界
+
+2026-11-05 的精确 WorkBuddy CN 对照确认：Codex CLI 0.161.0 新会话的默认开头段落
+单独就能触发 `11128 / Illegal API invocation from an unapproved channel`，裸 ping
+则被接受。仅将该段落中的两句产品身份换为中性 coding 身份、保持完整基础指令的其余部分，
+得到正常 `response.completed`。这不证明其中任何单词是独立触发器，也不证明所有站点接受性。
+
+按本次明确授权，Buddy Codex Responses→Chat 在角色转换前增加固定前缀兼容例外：
+仅字符串 `instructions` 开头的完整 `BUDDY_CODEX_CLI_PREAMBLE`，后接字符串结束或
+LF/CRLF 空行时适用。保留 precise/safe/helpful 的行为约束、所有后续文本及原始段落分隔符。
+不匹配旧 GPT 身份句、部分句子或近似段落，不遍历 input 的 system/developer、Chat 的
+system、项目指令、用户文本、assistant 历史、工具说明/参数/结果；其他 Provider/App 不变。
+这是提示词兼容例外，独立于既有协议规范化，不能据此引入全局品牌替换或 WAF 正则。
+
+两个 Buddy 产品的 Codex `modelProbe` 携带同一已知开场段落，仍使用 ping 和原输出上限。
+Server 与 Router 都消费该权威 body；instructions 已属于现有 wire，保持 payload revision 2
+以兼容现有 Router，仅在内部策略指纹中加入前缀探针版本，使旧 Buddy Codex 健康证据失效。
+其他探针与生成 runtime 指纹不变。探针未模拟完整客户端的
+developer/AGENTS、工具声明或多轮历史，成功不等于完整 CLI 会话通过。
+
+11128 在 HTTP、SSE 及已提交流错误中按精确绑定产品标注 CodeBuddy/WorkBuddy，并提示
+通道兼容性及连接测试范围；继续返回客户端错误，不刷新、重试或更换账号/模型/站点。
+本地双产品/双站夹具与真实 WorkBuddy CN 候选请求分开记录，部署及其他组合保持待验收。
+详见 `PROTOCOL_EVIDENCE.md`。
 
 ## 6. 模型目录
 

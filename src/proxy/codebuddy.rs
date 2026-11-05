@@ -136,19 +136,45 @@ impl CodeBuddyUpstreamError {
     }
 
     pub fn into_proxy_error(self) -> ProxyError {
+        self.into_proxy_error_for_product("CodeBuddy")
+    }
+
+    pub(crate) fn into_proxy_error_for_provider(
+        self,
+        provider_type: crate::domain::providers::model::ProviderType,
+    ) -> ProxyError {
+        self.into_proxy_error_for_product(crate::domain::codebuddy::buddy_product_label(
+            provider_type,
+        ))
+    }
+
+    fn into_proxy_error_for_product(self, product: &str) -> ProxyError {
         let status = self.downstream_status();
         let retry = self.retry_after_seconds.or_else(|| {
             (self.code == Some(6_004))
                 .then(|| quota_reset_seconds(&self.message, chrono::Utc::now()))
                 .flatten()
         });
-        let message = match self
+        let detail = if self
+            .message
+            .starts_with("CodeBuddy upstream returned HTTP ")
+            || self.message == "CodeBuddy stream returned an upstream error"
+        {
+            // These are our own fallback diagnostics, not vendor prompt text.
+            format!("{product}{}", &self.message["CodeBuddy".len()..])
+        } else {
+            self.message
+        };
+        let mut message = match self
             .code
             .filter(|code| status_for_code(*code) != axum::http::StatusCode::BAD_GATEWAY)
         {
-            Some(code) => format!("CodeBuddy upstream error {code}: {}", self.message),
-            None => self.message,
+            Some(code) => format!("{product} upstream error {code}: {detail}"),
+            None => detail,
         };
+        if self.code == Some(11_128) {
+            message.push_str(" (channel-policy rejection; verify client/channel compatibility; connection tests cover only the probe request)");
+        }
         if status == axum::http::StatusCode::TOO_MANY_REQUESTS {
             if let Some(seconds) = retry {
                 return ProxyError::rate_limited(message, seconds);
@@ -223,6 +249,16 @@ impl CodeBuddySseDecodeError {
     pub fn into_proxy_error(self) -> ProxyError {
         match self {
             Self::Upstream(error) => error.into_proxy_error(),
+            Self::Protocol(error) => error,
+        }
+    }
+
+    pub(crate) fn into_proxy_error_for_provider(
+        self,
+        provider_type: crate::domain::providers::model::ProviderType,
+    ) -> ProxyError {
+        match self {
+            Self::Upstream(error) => error.into_proxy_error_for_provider(provider_type),
             Self::Protocol(error) => error,
         }
     }
@@ -1691,6 +1727,38 @@ mod tests {
                 axum::http::StatusCode::UNAUTHORIZED
             );
             assert!(!error.is_authentication_failure(), "stream code {code}");
+        }
+    }
+
+    #[test]
+    fn channel_rejection_uses_bound_product_and_preserves_nonretryable_classification() {
+        use crate::domain::providers::model::ProviderType;
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for error in [
+                CodeBuddyUpstreamError::from_status_body(
+                    400,
+                    br#"{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}"#,
+                ),
+                CodeBuddyUpstreamError::from_status_body(
+                    401,
+                    br#"{"code":11128,"msg":"Authorization: Bearer private-fixture"}"#,
+                ),
+                CodeBuddyUpstreamError::from_event(
+                    &json!({"code":11128,"msg":"unapproved channel"}),
+                )
+                .unwrap(),
+            ] {
+                assert!(!error.is_authentication_failure());
+                let error = error.into_proxy_error_for_provider(product);
+                assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+                assert_eq!(error.retry_after_seconds(), None);
+                assert!(error.message.starts_with(&format!(
+                    "{} upstream error 11128:",
+                    crate::domain::codebuddy::buddy_product_label(product)
+                )));
+                assert!(error.message.contains("channel-policy rejection"));
+                assert!(!error.message.contains("private-fixture"));
+            }
         }
     }
 

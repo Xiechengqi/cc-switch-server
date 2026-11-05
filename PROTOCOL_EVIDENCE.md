@@ -1,5 +1,58 @@
 # Protocol evidence policy
 
+## 2026-11-05 Codex CLI 开场声明导致 Buddy 11128
+
+原故障 `59b7d437-dbba-4543-bd13-84b56417c8fc` 对应 Codex CLI 0.161.0 的新会话，
+不是旧 assistant 历史。精确绑定为 WorkBuddy CN 个人账号、受审 CLI 2.142.0 出站身份、
+固定 `deepseek-v4-pro`。用户已确认随后成功请求来自 curl；不把它推断为完整 CLI 请求。
+原 CLI 基础指令开头是本仓 `BUDDY_CODEX_CLI_PREAMBLE` 的完整段落，而非
+`You are Codex, an agent based on GPT-5…`。
+
+同 Share、账号、模型、Codex 请求头和 8-token 上限的真实对照：裸 ping
+`aae40d5d-3438-48fa-a1fd-b233d53f8e59` 被接受后以输出上限结束；完整基础指令
+`2303148f-6b4c-4699-b1c7-773b579c4222`、仅该开头段落
+`a24ccaf8-1b60-4cb1-8e93-f24980498b3d` 均为 400/11128。无 tools 也能复现，
+因此工具、旧会话或入站 User-Agent 不是此次拒绝的必要条件；不推断具体哪个单词触发。
+
+用户本轮明确授权按建议修复，允许以下已论证的固定前缀兼容例外。它属于提示词兼容处理，
+不能冒称纯协议规范化，也不扩展为参考项目的 WAF/品牌正则。处理仅在 Buddy 的 Codex
+Responses→Chat Adapter 中、角色转换之前执行：字符串 `instructions` 必须从完整的
+已知段落开始，后接字符串结束或 LF/CRLF 空行；将两句客户端身份改为中性 coding 身份，
+保留 `You are expected to be precise, safe, and helpful.` 及段落后每个字节。
+非开头、部分匹配、同段续写、数组、input 中的 system/developer、Chat 请求、用户/历史/
+工具说明/参数/结果均不扫描。其他 Provider、Claude/Gemini、出站头和绑定不受影响。
+
+候选 wire 请求真实对照保留原会话全部 20,751 字符基础指令的其余部分，仅替换上述前缀，
+得到 HTTP 200 / response.completed。增加原 developer/user 上下文的对照亦通过通道检查，
+256-token 样本以 response.incomplete/max_output_tokens 结束，不能计作完整回答。
+将诊断输出上限改为 1024 后，同一完整上下文得到 response.completed，output_tokens=462。
+携带同一上下文及无副作用 echo 工具的真实对照，工具调用
+`a7a8c8b9-34fb-4331-bf64-b251e4cd36bf` 与结果回填续轮
+`174f1891-40e3-4571-8e59-554ef0bc3a58` 均为 HTTP 200 / response.completed；
+工具只在诊断内存中返回固定值，没有执行 shell、读文件或访问外部服务。这里的输出上限仅用于
+人工候选请求验证，产品连接探针仍保持原值。这些候选请求经过现有远程版本，
+并不代表新实现已经部署或实际 CLI 二进制端到端验收，也不能外推 CodeBuddy 或国际站接受性。
+
+Buddy Codex 连接探针增加同一固定开场段落，仍用 ping、原输出上限和严格终态判断。
+Router 继续消费 Server 提供的 modelProbe，无需独立改写正文。instructions 已属于现有
+revision-2 wire；保持该版本以兼容严格校验 revision 的现有 Router，只将内部前缀探针
+策略版本纳入指纹，使旧 Buddy Codex 健康证据失效；其他探针、生成身份和目录缓存指纹保持。
+探针成功只证明该请求，不能宣称验证过完整 CLI 指令、工具和长会话。
+
+11128 按绑定产品显示 CodeBuddy/WorkBuddy，附带通道策略拒绝及探针范围说明。
+HTTP/SSE、提交前后共用该解释；保留 400、非重试分类，不刷新 OAuth、重放、换模型、
+轮换账号或切站。完整正文、凭据与工具参数不进入诊断日志或提交证据。
+
+本地验证：新增 8 项回归，覆盖双产品/双站、流/非流、完整前缀和拒绝边界、上下文/工具
+保真、产品化错误及提交前后不重放。Rust 全量 4,284 项通过、3 项既有忽略；后端审计
+2,128 项、smoke 单测 13 项、Web 376 项通过。cargo check、两类格式检查、严格 Clippy、
+Provider/UI 矩阵、参考合同、文档索引、依赖方向和状态写入审计均通过。启动 smoke 首轮
+未在 30 秒窗口连上服务，单独完成二进制构建后复核通过。兼容 reader 的源证据通过原生成器
+更新并检查，没有手工改哈希。离线 readiness 的 failures=0，但缺真实发布输入及部署验证时
+仍为 blocked；不宣称发布就绪。整体 review 核对 Adapter 范围、内存/取消/终态、固定绑定、
+不重放与 Router revision-2 兼容，未发现遗留阻断项；原有四处工作区改动完整保留。
+实现与验证阶段未部署；提交与推送按用户后续指令执行。
+
 ## 2026-11-05 WorkBuddy 供应商编辑页签到入口
 
 远程只读核对 `sgptokenswitch`：Server `/version` 已运行 `2dc1fa5bd855a23111bdc3c528bff7550671aa6a`，

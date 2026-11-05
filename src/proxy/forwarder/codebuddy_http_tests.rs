@@ -21,6 +21,7 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 
 include!("workbuddy_value_tests.rs");
 include!("buddy_reasoning_tests.rs");
+include!("buddy_codex_tests.rs");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodeBuddyGenerationReply {
@@ -32,6 +33,8 @@ enum CodeBuddyGenerationReply {
     HttpUnauthorizedWithTerminalCode(i64),
     OversizedHttpUnauthorized,
     LateLicenseRejected,
+    ChannelRejected,
+    LateChannelRejected,
     LargeAggregate,
     LargeToolStream,
     MixedSseLineEndings,
@@ -474,6 +477,13 @@ async fn codebuddy_generation(
         CodeBuddyGenerationReply::LateLicenseRejected => sse_response(vec![
             chat_chunk("discard-me", None),
             Bytes::from_static(b"data: {\"code\":12005,\"message\":\"expired\"}\n\n"),
+        ]),
+        CodeBuddyGenerationReply::ChannelRejected => sse_response(vec![Bytes::from_static(
+            b"data: {\"code\":11128,\"message\":\"Illegal API invocation from an unapproved channel\"}\n\n",
+        )]),
+        CodeBuddyGenerationReply::LateChannelRejected => sse_response(vec![
+            chat_chunk("partial-output", None),
+            Bytes::from_static(b"data: {\"code\":11128,\"message\":\"Illegal API invocation from an unapproved channel\"}\n\n"),
         ]),
         CodeBuddyGenerationReply::LargeAggregate => large_memory_response(true),
         CodeBuddyGenerationReply::LargeToolStream => large_memory_response(false),

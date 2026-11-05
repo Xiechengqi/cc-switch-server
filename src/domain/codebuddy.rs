@@ -9,6 +9,10 @@ use crate::domain::providers::model::ProviderType;
 
 pub const CODEBUDDY_CLIENT_VERSION: &str = "2.142.0";
 pub const CODEBUDDY_PLATFORM: &str = "CLI";
+/// Codex CLI 0.161.0's generated opening paragraph. Shared with the Buddy
+/// connection probe so it exercises the same narrowly supported compatibility
+/// case as Responses requests. This is not a general prompt rewrite rule.
+pub const BUDDY_CODEX_CLI_PREAMBLE: &str = "You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful.";
 pub const CODEBUDDY_AUTH_STATE_PATH: &str = "/v2/plugin/auth/state?platform=CLI";
 pub const CODEBUDDY_AUTH_TOKEN_PATH: &str = "/v2/plugin/auth/token";
 pub const CODEBUDDY_LOGIN_ACCOUNT_PATH: &str = "/v2/plugin/login/account";

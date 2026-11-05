@@ -28,6 +28,9 @@ pub const MAX_PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS: u64 = 600;
 pub const MAX_PROVIDER_IDLE_TIMEOUT_SECONDS: u64 = 3_600;
 pub const PROVIDER_MODEL_PROBE_PROMPT: &str = "ping";
 pub const PROVIDER_MODEL_PROBE_PAYLOAD_REVISION: u32 = 2;
+// Instructions already belong to the revision-2 wire schema. Version only the
+// Buddy Codex probe policy so existing Routers can consume the enhanced body.
+const BUDDY_CODEX_PREAMBLE_PROBE_REVISION: u32 = 1;
 
 /// Public, credential-free description of the exact model request used to
 /// probe a Provider runtime.  The Router renders connection examples from this
@@ -106,6 +109,11 @@ pub fn build_provider_model_probe(
                 body["instructions"] = json!("");
                 body["tools"] = json!([]);
                 body["parallel_tool_calls"] = json!(false);
+            } else if provider_type.is_buddy_oauth() {
+                // Exercise the known CLI preamble through the real adapter,
+                // rather than treating a bare ping as proof of CLI acceptance.
+                // This remains a bounded connection probe, not a full session.
+                body["instructions"] = json!(crate::domain::codebuddy::BUDDY_CODEX_CLI_PREAMBLE);
             }
             (
                 "openai",
@@ -767,6 +775,15 @@ pub fn compile_runtime_plan_with_defaults(
     if let Some(policy) = driver.reasoning_policy {
         fingerprint_input["reasoningPolicy"] = serde_json::to_value(policy)?;
     }
+    let probe_policy_fingerprint =
+        if stored.app == AppKind::Codex && stored.provider_type.is_buddy_oauth() {
+            runtime_fingerprint(&json!({
+                "basePolicyFingerprint": defaults.probe_policy_fingerprint,
+                "buddyCodexPreambleRevision": BUDDY_CODEX_PREAMBLE_PROBE_REVISION,
+            }))?
+        } else {
+            defaults.probe_policy_fingerprint.clone()
+        };
     let runtime_fingerprint = runtime_fingerprint(&fingerprint_input)?;
 
     Ok(ProviderRuntimePlan {
@@ -784,7 +801,7 @@ pub fn compile_runtime_plan_with_defaults(
         model_policy,
         coding_plan,
         test_model,
-        probe_policy_fingerprint: defaults.probe_policy_fingerprint.clone(),
+        probe_policy_fingerprint,
         aws_region,
         media_policy,
         transport_policy,
@@ -1793,6 +1810,88 @@ mod tests {
             gemini.payload_revision,
             PROVIDER_MODEL_PROBE_PAYLOAD_REVISION
         );
+    }
+
+    #[test]
+    fn buddy_codex_probes_include_the_reviewed_cli_preamble_without_expanding_token_budget() {
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for stream in [false, true] {
+                let probe = build_provider_model_probe(
+                    AppKind::Codex,
+                    product,
+                    "auto",
+                    "ping",
+                    stream,
+                    "fingerprint",
+                );
+                assert_eq!(
+                    probe.body["instructions"],
+                    crate::domain::codebuddy::BUDDY_CODEX_CLI_PREAMBLE
+                );
+                assert_eq!(
+                    probe.body["input"],
+                    json!([{"role":"user","content":"ping"}])
+                );
+                assert_eq!(probe.body["max_output_tokens"], 1);
+                assert_eq!(probe.body["stream"], stream);
+                assert!(probe.body.get("tools").is_none());
+                assert_eq!(
+                    probe.payload_revision,
+                    PROVIDER_MODEL_PROBE_PAYLOAD_REVISION
+                );
+            }
+            for app in [AppKind::Claude, AppKind::Gemini] {
+                let probe =
+                    build_provider_model_probe(app, product, "auto", "ping", true, "fingerprint");
+                assert!(probe.body.get("instructions").is_none());
+                assert_eq!(
+                    probe.payload_revision,
+                    PROVIDER_MODEL_PROBE_PAYLOAD_REVISION
+                );
+            }
+        }
+        let probe = build_provider_model_probe(
+            AppKind::Codex,
+            ProviderType::Codex,
+            "test",
+            "ping",
+            true,
+            "fingerprint",
+        );
+        assert!(probe.body.get("instructions").is_none());
+        assert_eq!(
+            probe.payload_revision,
+            PROVIDER_MODEL_PROBE_PAYLOAD_REVISION
+        );
+    }
+
+    #[test]
+    fn buddy_codex_probe_revision_invalidates_only_its_health_evidence() {
+        let defaults = ProviderRuntimeDefaults::default();
+        let accounts = AccountStore::default();
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                let mut stored =
+                    provider(&format!("{}.{}", app.as_str(), product.as_str()), product);
+                stored.app = app;
+                let plan =
+                    compile_runtime_plan_with_defaults(&stored, &accounts, &defaults).unwrap();
+                let mut old_probe_plan = plan.clone();
+                old_probe_plan.probe_policy_fingerprint = defaults.probe_policy_fingerprint.clone();
+                assert_eq!(plan.runtime_fingerprint, old_probe_plan.runtime_fingerprint);
+                if app == AppKind::Codex {
+                    assert_ne!(
+                        plan.health_fingerprint(),
+                        old_probe_plan.health_fingerprint()
+                    );
+                } else {
+                    assert_eq!(
+                        plan.health_fingerprint(),
+                        old_probe_plan.health_fingerprint()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

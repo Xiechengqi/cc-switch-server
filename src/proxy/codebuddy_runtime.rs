@@ -10,11 +10,13 @@ use crate::domain::providers::model::ProviderType;
 use crate::infra::resident_memory::ResidentMemoryBudget;
 
 mod claude;
+mod codex;
 mod images;
 mod reasoning;
 mod resident;
 
 pub(crate) use claude::transform_buddy_claude_request;
+pub(crate) use codex::normalize_buddy_codex_instructions;
 pub(crate) use images::{has_image_input, validate_buddy_source_images};
 pub use reasoning::BuddyReasoningDefaultSource;
 pub(crate) use reasoning::{clear_buddy_reasoning_controls, requested_buddy_reasoning_effort};
