@@ -2,7 +2,7 @@
 
 本文定义 cc-switch-server 的 `qoder_cosy` Provider 边界。一个 Qoder Provider 固定绑定一个 Qoder Account；Server 不实现账号池、轮询、权重、按配额/并发选号、自动切站，或 OAuth/PAT/其他 Provider 之间的 fallback。
 
-当前 `special.qoder_cosy` Driver contract revision 为 **2**。`assets/contract/qoder-reference-delta.json` 把该 revision 与三个 Registry Profile、生产入口、官方 CLI oracle、生成 coverage、三 rail conformance 和真实验收状态映射在一起；`scripts/audit/audit-qoder-reference-delta.mjs` 对这些来源做交叉校验。`supported` 只表示实现入口存在，`fixture_verified` 与 `live_pending` 仍分别表达离线合同证据和缺失的真实证据，三者不得互相替代。
+当前 `special.qoder_cosy` Driver contract revision 为 **3**。`assets/contract/qoder-reference-delta.json` 把该 revision 与三个 Registry Profile、生产入口、官方 CLI oracle、生成 coverage、三 rail conformance 和真实验收状态映射在一起；`scripts/audit/audit-qoder-reference-delta.mjs` 对这些来源做交叉校验。新增图片/历史 reasoning/采样证据另存 `assets/contract/qoder-capability-extension.json`，不重写原 oracle。`supported` 只表示实现入口存在，`fixture_verified` 与 `live_pending` 仍分别表达离线合同证据和缺失的真实证据，三者不得互相替代。
 
 Provider 生命周期边界已收敛到 `src/proxy/providers/qoder/`：它持有精确 `qoder_cosy` Account 绑定、Share/用户/session conversation scope、live catalog model、payload preparation、generation fence 与 Qoder throttle 分类。COSY codec/terminal 仍由 `proxy::qoder` 持有，runtime cache/payload primitive 仍由 `proxy::qoder_runtime` 持有；Share/Account lease、usage、共享 attempt budget、终态和是否执行同账号 pre-commit 401 replay 继续由 forwarder 持有。该结构迁移不改变 endpoint、header、签名、wire、恢复次数或跨边界 fail-closed 规则。
 
@@ -30,11 +30,25 @@ COSY model list 是当前绑定账号的权威 entitlement。成功空目录保�
 Global/CN alias 表集中维护，但只有对应 live-enabled route 才会发布公开 alias。若上游同时给出与 alias 同名的原始 key，该原始条目不能冒充 alias 的 route/capability；未启用 alias route 时公开目录也不发布这个不可请求的 ID。上游出现未知 live route 时保留其 exact id，便于观察新 entitlement，同时不猜测 reasoning、context、图片或其他能力。`/v1/models` 可返回：
 
 - `reasoningEfforts`：按 site × route 的 reviewed matrix，仅发布 `none`/`low`/`high`/`max` 中已证明的组合；
-- `contextWindow`：只在 route 有明确协议证据时发布；
-- `inputModalities: ["text"]` 与 `supportsTools: true`；图片能力保持不发布；
+- `contextWindow`：优先使用精确 live 目录的默认 context 档位、可选窗口与输入上限，缺失时才使用已审 route 矩阵；
+- `maxOutputTokens`：仅在精确 live 目录明确提供正整数输出上限时发布，并裁剪实际请求；
+- `inputModalities` 默认只有 `text`，精确 live 模型显式 `is_vl: true` 才增加 `image`；`supportsTools: true`；
 - `source: qoder_live_model_catalog`、fresh `fetchedAtMs`，以及权威空结果。
 
-推理 payload 与目录使用同一 capability resolver。fixed-context route 只写 `model_config.max_input_tokens`；runtime-selectable route 还同时写 `parameters.context_length` 和 `chat_context.extra.ideModelConfigOverride.max_input_tokens`。未知 route 不注入 context，未知 effort 不注入 reasoning 字段。
+推理 payload 与目录使用同一 capability resolver。fixed-context route 只写 `model_config.max_input_tokens`；runtime-selectable route 还同时写 `parameters.context_length` 和 `chat_context.extra.ideModelConfigOverride.max_input_tokens`。请求 `context_length` 必须命中 live 可选档位，未给菜单时不能超过已审上限；坏菜单、默认值不在菜单及窗口超过 live 上限均拒绝。没有默认值时使用菜单最大合法档位。未知 route 不猜测 context，未知 effort 不注入 reasoning 字段。
+
+## Revision 3 单账号增强
+
+- 四种入口（Claude Messages、OpenAI Responses、OpenAI Chat、Gemini）的 user/tool 图片在协议转换前验证结构，之后按同一 canonical validator 验证；原始图文顺序与 URI 转发到 COSY `content/contents`，Server 不下载、OCR 或生成图片。HTTPS URL 禁止 userinfo/fragment，最长 16 KiB；inline 图片使用共享 MIME/signature/base64 校验，最多 16 张、单张 20 MiB、合计 32 MiB，另受请求共享内存预算限制。没有精确 `is_vl: true` 的模型发网前拒绝图片。
+- 支持并验证 `temperature`（0～2）、`top_p`（0～1）、正整数 `top_k`、`max_tokens/max_completion_tokens/max_output_tokens`、布尔 `preserve_thinking`。Gemini generationConfig 的对应字段在转换前捕获。显式 `stop/stop_sequences`、penalties、seed、logprobs、response_format、`n>1` 或 `parallel_tool_calls=false` 不在已证实 wire 内，返回本地 400，不静默忽略。默认输出预算沿用原行为：使用 live 输出上限，缺失时为 32768；显式请求受该上限裁剪。
+- Canonical assistant 历史保留 `reasoning_content`、`reasoning_content_signature`、`reasoning_item`，Claude/Gemini 桥保留思考文本、签名及 reasoning-only turn。Server reasoning envelope 必须认证成功，不能把伪造 envelope 当原生签名。`preserve_thinking=false` 明确移除三个历史 reasoning 字段。此项不承诺任意 opaque reasoning 在所有跨协议转换中无损往返；Responses 仍沿共享 bridge 的已审语义边界。
+- 流与非流共用请求级工具结果合同：完整且稳定的 ID、精确声明名称、唯一调用身份、合法 JSON 参数以及 none/named/required 都须通过，才能在 EOF 后成功。晚到 ID/分片名称在授权前暂存，名称前缀多义延迟到结束，不修原生参数或补原生 ID/name。原生工具显式 `input:{}` 且无后续参数片段可作为合法零参数调用；纯缺参仍失败。所有状态、迟延输出与解析临时内存计入共享预算。
+- 请求扩展 `qoder_text_tool_recovery: true` 显式开启严格文本工具回读，默认关闭，且须存在可调用声明。只接受整段回答为 `[assistant 请求调用工具]` JSON 数组、`<tool_call>` 或 ASCII/全角 DSML 包裹，最多 128 KiB/128 调用；只执行精确声明工具，对象参数必须是完整 JSON，重复键/多余字段/混合原生工具/截断/夹带正文拒绝。不修引号、不补括号、不从普通文字或代码示例抽取调用；DSML 参数保留字符串，不猜类型。
+- 已提交流每 15 秒可发送 SSE 注释心跳；心跳不满足首语义输出、不重置上游 idle deadline、不计业务 token、不触发成功或重试。首语义输出从发送开始共用绝对 deadline，覆盖响应头、非成功 HTTP 响应体及 SSE prelude；慢头、注释和分片均不能重获完整预算，错误体停滞也会超时。图片转换 timeout 只在已审状态范围归为 504/专门指标，绝不扩大认证恢复资格；112/115 保持原分类。错误中的 URL 与 inline 图片先脱敏再截断。
+
+新增官方观测来自固定 Global/CN 1.1.32 归档，仅隔离运行选取的纯映射函数，不运行 CLI bootstrap/postinstall。独立 Node 摘要及 mutation 测试冻结 package/function 与观测，Rust 测试对照最终生产 payload；构建、测试和运行时不读取外仓或 npm bundle。本轮未扩展凭据 rail，CN PAT 继续受本文末尾 R4-QD-02 门禁约束。
+
+2026-11-06 整体 review 已复核工具身份/授权与迟延输出、媒体和原生控制转换、reasoning envelope、continuation、内存预约/释放、心跳和终态/EOF。发现的重复名称片段、原生空对象参数、文本回读歧义、迟延工具内存及跨响应阶段超时问题均已修复并加入回归，未发现本轮范围内遗留阻断项。独立基线加本轮 Qoder 增量的 Rust 全量为 4,309 项通过、3 项既有忽略，严格 Clippy、cargo check、两类格式检查及本地 HTTP 启动 smoke 通过；主工作区 Node 审计 2,135 项、smoke 单测 13 项及合同/文档检查通过。隔离构建不包含并行 Trae 增量，不能据此宣称整个并行工作区已通过 Rust 回归。未运行 UI 自动化、真实 Qoder 请求或部署；离线 readiness 为 failures=0、blocked/blocked_inputs，不能替代发布批准或真实 receipt。
 
 ## COSY 签名、session 与流
 

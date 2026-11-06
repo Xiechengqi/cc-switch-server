@@ -3,7 +3,13 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
-  "updatedAt": "2026-10-14T00:00:00Z",
+  "updatedAt": "2026-11-06T00:00:00Z",
+  "capabilityExtension": {
+    "path": "assets/contract/qoder-capability-extension.json",
+    "driverContractRevision": 3,
+    "offlineState": "fixture_verified",
+    "liveState": "live_pending"
+  },
   "observationPolicy": {
     "history": "append_only; every schema v1 content field is immutable",
     "sourceReadMode": "read_only_committed_git_objects",

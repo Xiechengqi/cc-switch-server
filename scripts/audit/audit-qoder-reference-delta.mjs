@@ -5,6 +5,10 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import {
+  auditQoderCapabilityExtension,
+  loadQoderCapabilityExtension,
+} from "./audit-qoder-capability-extension.mjs";
 
 const repoRoot = path.resolve(new URL("../..", import.meta.url).pathname);
 const contractPath = path.join(
@@ -811,22 +815,39 @@ for (const id of ["QD-01", "QD-02", "QD-03"]) {
   assert(Array.isArray(capability.evidence) && capability.evidence.length > 0, `${id} lacks evidence`);
   for (const evidence of capability.evidence) {
     safeRelative(evidence.path, `${id} local path`);
-    const source = fs.readFileSync(path.join(repoRoot, evidence.path), "utf8");
+    // The immutable QD-01 Registry anchor describes revision 2. Verify that
+    // historical anchor against its frozen target, and validate the current
+    // Registry separately against the additive revision-3 evidence below.
+    const source = id === "QD-01" && evidence.path === "assets/contract/provider-registry.json"
+      ? gitFile(repoRoot, legacy.targetCommit, evidence.path)
+      : fs.readFileSync(path.join(repoRoot, evidence.path), "utf8");
     for (const anchor of evidence.anchors ?? []) {
       assert(source.includes(anchor), `${id} is missing ${evidence.path} anchor ${anchor}`);
     }
   }
 }
 
-const truth = contract.contractMap;
+exact(contract.capabilityExtension, {
+  path: "assets/contract/qoder-capability-extension.json",
+  driverContractRevision: 3,
+  offlineState: "fixture_verified",
+  liveState: "live_pending",
+}, "Qoder additive capability binding");
+const truth = {
+  ...contract.contractMap,
+  driverContractRevision: contract.capabilityExtension.driverContractRevision,
+};
 const registry = readJson(registryPath);
 const driver = registry.drivers?.find((candidate) => candidate.driverId === truth.driverId);
 assert(driver, "special.qoder_cosy is absent from the Provider registry");
 assert(
   driver.driverContractRevision === truth.driverContractRevision &&
-    truth.driverContractRevision === 2,
-  "Qoder driver contract revision must be 2",
+    truth.driverContractRevision === 3,
+  "Qoder driver contract revision must be 3",
 );
+const extension = auditQoderCapabilityExtension(loadQoderCapabilityExtension());
+assert(extension.revision === driver.driverContractRevision, "Qoder capability extension revision drifted");
+assert(driver.capabilities?.images === true, "Qoder exact-live-model image gate is not advertised");
 assert(driver.optionSchemaId === truth.optionSchemaId, "Qoder option schema drifted");
 exact(driver.operations, truth.operations, "Qoder supported operations");
 const conformance = registry.conformance?.find(

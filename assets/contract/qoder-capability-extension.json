@@ -1,0 +1,226 @@
+{
+  "format": "cc-switch-qoder-capability-extension",
+  "schemaVersion": 1,
+  "capturedAt": "2026-11-06",
+  "driverContractRevision": 3,
+  "liveState": "live_pending",
+  "sourcePolicy": "pinned official archives inspected read-only; no CLI bootstrap, installation or external runtime/test dependency",
+  "officialPackages": [
+    {
+      "site": "global",
+      "version": "1.1.32",
+      "bundleSha256": "24de5b12520cbe49c0027b53654eaee02bddd857e3d9f19a6198824e365d89bf",
+      "functions": [
+        {
+          "name": "D7a",
+          "next": "Azi",
+          "sha256": "edf6e1caa3acdced4b4ac15a978d2880fb8c3f4d00ab5e91879bb25d204ac5e9"
+        },
+        {
+          "name": "Azi",
+          "next": "R5t",
+          "sha256": "10d6c5cd3839ab4ed378d97b2c1d19cf8481ab965ec1de28ae4eaed5a6a656f6"
+        },
+        {
+          "name": "R5t",
+          "next": "S7a",
+          "sha256": "59fee36af33370e2cb83a50242f324785b71029ac5678d4a99fbdad7266a2ef3"
+        },
+        {
+          "name": "S7a",
+          "next": "P7a",
+          "sha256": "b4ee3f38c8facf6d6c9cb1582e5fa1c8b1acfe58b8b4978c99ab1401dfada52a"
+        },
+        {
+          "name": "P7a",
+          "next": "y7a",
+          "sha256": "c36286b5177c5c2742273bc9d251ccf62d4e527fe00b5d91b169839edb88f336"
+        },
+        {
+          "name": "y7a",
+          "next": "pm",
+          "sha256": "e59786d7a6221045493d7b1cc2e4ba5c7032ea46849f1f8387b02f05e6eb55df"
+        },
+        {
+          "name": "Zlr",
+          "next": "Eje",
+          "sha256": "4e14e80a8db3acbc0e22c1a77d96918f395314a74660b14c3356273b7b776137"
+        },
+        {
+          "name": "zN",
+          "next": "dje",
+          "sha256": "22e23c85853979620ed460295f59a67993a9318266efedd3623d40a84b53c8c9"
+        },
+        {
+          "name": "gUA",
+          "next": "Shl",
+          "sha256": "87d45d73af22f28aa87539f6b156db34d637e823816f8cf1418ebafb9fd47226"
+        },
+        {
+          "name": "NW",
+          "next": "MxA",
+          "sha256": "337f45e0c9b994ddf5940342628335c5893db2bac31b9212e8b86a040e7558db"
+        }
+      ]
+    },
+    {
+      "site": "cn",
+      "version": "1.1.32",
+      "bundleSha256": "5a82eeffbeb015d78c4945b7f4ed989494d2ea8cc7fdf2dbfc6ad04c17418f8b",
+      "functions": [
+        {
+          "name": "D7a",
+          "next": "Azi",
+          "sha256": "edf6e1caa3acdced4b4ac15a978d2880fb8c3f4d00ab5e91879bb25d204ac5e9"
+        },
+        {
+          "name": "Azi",
+          "next": "R5t",
+          "sha256": "10d6c5cd3839ab4ed378d97b2c1d19cf8481ab965ec1de28ae4eaed5a6a656f6"
+        },
+        {
+          "name": "R5t",
+          "next": "S7a",
+          "sha256": "59fee36af33370e2cb83a50242f324785b71029ac5678d4a99fbdad7266a2ef3"
+        },
+        {
+          "name": "S7a",
+          "next": "P7a",
+          "sha256": "b4ee3f38c8facf6d6c9cb1582e5fa1c8b1acfe58b8b4978c99ab1401dfada52a"
+        },
+        {
+          "name": "P7a",
+          "next": "y7a",
+          "sha256": "c36286b5177c5c2742273bc9d251ccf62d4e527fe00b5d91b169839edb88f336"
+        },
+        {
+          "name": "y7a",
+          "next": "pm",
+          "sha256": "e59786d7a6221045493d7b1cc2e4ba5c7032ea46849f1f8387b02f05e6eb55df"
+        },
+        {
+          "name": "Zlr",
+          "next": "Eje",
+          "sha256": "4e14e80a8db3acbc0e22c1a77d96918f395314a74660b14c3356273b7b776137"
+        },
+        {
+          "name": "zN",
+          "next": "dje",
+          "sha256": "22e23c85853979620ed460295f59a67993a9318266efedd3623d40a84b53c8c9"
+        },
+        {
+          "name": "gUA",
+          "next": "Shl",
+          "sha256": "95105535f1d5bf80013aaa8ec5bb306a0c703b5fab9b132103f83b6ca82cbc25"
+        },
+        {
+          "name": "NW",
+          "next": "MxA",
+          "sha256": "337f45e0c9b994ddf5940342628335c5893db2bac31b9212e8b86a040e7558db"
+        }
+      ]
+    }
+  ],
+  "observations": {
+    "image": {
+      "input": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "describe"
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "url",
+              "url": "https://images.example.invalid/fixture.png"
+            }
+          }
+        ]
+      },
+      "output": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "describe"
+            },
+            {
+              "type": "image_url",
+              "image_url": {
+                "url": "https://images.example.invalid/fixture.png"
+              }
+            }
+          ],
+          "contents": [
+            {
+              "type": "text",
+              "text": "describe"
+            },
+            {
+              "type": "image_url",
+              "image_url": {
+                "url": "https://images.example.invalid/fixture.png"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "reasoning": {
+      "input": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "answer"
+          },
+          {
+            "type": "thinking",
+            "thinking": "fixture thought",
+            "signature": "fixture-signature"
+          }
+        ]
+      },
+      "output": [
+        {
+          "role": "assistant",
+          "content": "answer",
+          "contents": [
+            {
+              "type": "text",
+              "text": "answer"
+            }
+          ],
+          "reasoning_content": "fixture thought",
+          "reasoning_content_signature": "fixture-signature",
+          "reasoning_item": {
+            "type": "reasoning",
+            "summary": [
+              {
+                "text": "fixture thought",
+                "type": "summary_text"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "sampling": {
+      "input": {
+        "temperature": 0.25,
+        "topP": 0.75,
+        "topK": 32,
+        "maxTokens": 512
+      },
+      "output": {
+        "temperature": 0.25,
+        "top_p": 0.75,
+        "top_k": 32,
+        "max_tokens": 512
+      }
+    }
+  }
+}

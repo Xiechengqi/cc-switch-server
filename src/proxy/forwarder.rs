@@ -22520,25 +22520,26 @@ async fn send_qoder_generation(
     if let Some(timing) = &timing {
         timing.mark(Milestone::SendStarted);
     }
+    // One absolute budget spans headers, error bodies and the first semantic
+    // output. Starting a fresh timer after headers grants slow headers a second
+    // full first-event budget; comments and partial frames must not do that.
+    let qoder_first_timeout = execution
+        .stream_first_byte_timeout()
+        .unwrap_or(execution.request_timeout());
+    let qoder_prelude_deadline = tokio::time::Instant::now() + qoder_first_timeout;
     let headers_wait = timing.as_ref().map(|timing| timing.wait(WaitKind::Headers));
-    let response = match execution.stream_first_byte_timeout() {
-        Some(timeout) => tokio::time::timeout(timeout, request.send())
-            .await
-            .map_err(|_| {
-                QoderForwardAttemptError::Proxy(ProxyError {
-                    status: StatusCode::GATEWAY_TIMEOUT,
-                    message: format!(
-                        "Qoder generation response-header timeout after {}ms",
-                        timeout.as_millis()
-                    ),
-                })
-            })?
-            .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
-        None => request
-            .send()
-            .await
-            .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
-    };
+    let response = tokio::time::timeout_at(qoder_prelude_deadline, request.send())
+        .await
+        .map_err(|_| {
+            QoderForwardAttemptError::Proxy(ProxyError {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message: format!(
+                    "Qoder generation response-header timeout after {}ms",
+                    qoder_first_timeout.as_millis()
+                ),
+            })
+        })?
+        .map_err(|error| QoderForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
     drop(headers_wait);
     if let Some(timing) = &timing {
         timing.mark(Milestone::Headers);
@@ -22552,12 +22553,21 @@ async fn send_qoder_generation(
     let status = response.status();
     if !status.is_success() {
         let response_headers = response.headers().clone();
-        let (body, _body_memory) = read_response_body_limited_with_memory(
-            &mut response,
-            PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
-            request_memory,
+        let (body, _body_memory) = tokio::time::timeout_at(
+            qoder_prelude_deadline,
+            read_response_body_limited_with_memory(
+                &mut response,
+                PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                request_memory,
+            ),
         )
         .await
+        .map_err(|_| {
+            QoderForwardAttemptError::Proxy(ProxyError {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message: "Qoder generation error-body timeout before response commit".into(),
+            })
+        })?
         .map_err(|error| QoderForwardAttemptError::Proxy(error.into_proxy_error()))?;
         let _error_parse_memory = request_memory
             .map(|budget| {
@@ -22580,6 +22590,9 @@ async fn send_qoder_generation(
     let mut inner = response.bytes_stream().boxed();
     let mut decoder = super::qoder::QoderSseDecoder::with_request_memory(request_memory.cloned())
         .map_err(QoderForwardAttemptError::Proxy)?;
+    decoder
+        .set_output_contract(&payload.output_contract)
+        .map_err(QoderForwardAttemptError::Proxy)?;
     if let Some(id) = responses_chat_id {
         decoder
             .set_canonical_chat_id(id.to_string())
@@ -22592,6 +22605,9 @@ async fn send_qoder_generation(
         } else {
             execution.stream_first_byte_timeout()
         };
+        let remaining =
+            qoder_prelude_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let timeout = Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)));
         let next = qoder_next_wire_chunk(&mut inner, timeout, timing.as_ref()).await?;
         let Some(chunk) = next else {
             let tail = decoder.finish_classified().map_err(|error| match error {
@@ -23375,8 +23391,28 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
             }
             return;
         }
+        let mut qoder_keepalive = super::downstream_keepalive::DownstreamKeepalive::new(Duration::from_secs(15))
+            .expect("Qoder keepalive interval is nonzero");
+        qoder_keepalive.commit(tokio::time::Instant::now());
         loop {
-            let chunk = match qoder_next_wire_chunk(&mut wire.inner, execution.stream_idle_timeout(), timing.as_ref()).await {
+            // Keep the SAME read/timeout future alive across heartbeats. A
+            // downstream comment must not restart an upstream idle deadline.
+            let next = {
+                let read = qoder_next_wire_chunk(&mut wire.inner, execution.stream_idle_timeout(), timing.as_ref());
+                tokio::pin!(read);
+                loop {
+                    let deadline = qoder_keepalive.deadline().expect("committed Qoder stream");
+                    tokio::select! {
+                        biased;
+                        next = &mut read => break next,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            qoder_keepalive.emitted(tokio::time::Instant::now());
+                            yield Ok(Bytes::from_static(b": keep-alive\n\n"));
+                        }
+                    }
+                }
+            };
+            let chunk = match next {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => {
                     let canonical = match wire.decoder.finish_classified() {
@@ -23658,6 +23694,7 @@ async fn forward_qoder_stream(options: QoderStreamOptions) -> Result<Response, P
                         Some("streaming"),
                     ).await;
                 }
+                qoder_keepalive.emitted(tokio::time::Instant::now());
                 yield Ok(transformed);
             }
             if wire.decoder.is_terminal() {

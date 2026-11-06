@@ -9,6 +9,14 @@ use super::request_memory::{
 };
 use super::ProxyError;
 
+mod text_tools;
+mod tool_state;
+pub(crate) use tool_state::QoderOutputContract;
+
+#[cfg(test)]
+#[path = "qoder/enhancement_tests.rs"]
+mod enhancement_tests;
+
 const MAX_QODER_SSE_EVENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_QODER_ERROR_MESSAGE_BYTES: usize = 2048;
 const MAX_QODER_CHAT_TOOL_CALLS: usize = 128;
@@ -57,7 +65,9 @@ impl QoderUpstreamError {
             agent_limit_reset_at_ms,
             retry_after_ms: None,
         };
-        crate::metrics::record_qoder_error(if error.is_agent_limited() {
+        crate::metrics::record_qoder_error(if error.is_image_conversion_timeout() {
+            "image_conversion_timeout"
+        } else if error.is_agent_limited() {
             "rate_limited"
         } else if error.is_entitlement_denied() {
             "permission"
@@ -78,6 +88,9 @@ impl QoderUpstreamError {
     }
 
     pub fn downstream_status(&self) -> axum::http::StatusCode {
+        if self.is_image_conversion_timeout() {
+            return axum::http::StatusCode::GATEWAY_TIMEOUT;
+        }
         match self.code.as_deref() {
             Some("112") => axum::http::StatusCode::FORBIDDEN,
             Some("115") => axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -91,6 +104,24 @@ impl QoderUpstreamError {
 
     pub fn is_authentication_failure(&self) -> bool {
         self.status == 401 && !matches!(self.code.as_deref(), Some("112" | "115"))
+    }
+
+    pub fn is_image_conversion_timeout(&self) -> bool {
+        if !matches!(self.status, 408 | 500 | 502 | 504)
+            || self.is_entitlement_denied()
+            || self.is_agent_limited()
+        {
+            return false;
+        }
+        let message = self.message.to_ascii_lowercase();
+        [
+            "image conversion timeout",
+            "image convert timeout",
+            "convert image timeout",
+            "images timeout",
+        ]
+        .iter()
+        .any(|pattern| message.contains(pattern))
     }
 
     pub fn is_entitlement_denied(&self) -> bool {
@@ -188,9 +219,26 @@ pub struct QoderSseDecoder {
     buffer_memory: Option<RequestMemoryReservation>,
     canonical_chat_id: Option<String>,
     _canonical_chat_id_memory: Option<RequestMemoryReservation>,
+    tool_state: tool_state::QoderToolState,
+    text_tools: text_tools::TextTools,
 }
 
 impl QoderSseDecoder {
+    pub(crate) fn set_output_contract(
+        &mut self,
+        contract: &QoderOutputContract,
+    ) -> Result<(), ProxyError> {
+        if let Some(memory) = self.buffer_memory.as_ref() {
+            memory
+                .resize(
+                    self.retained_bytes()
+                        .saturating_add(contract.retained_bytes()),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        self.tool_state.set_contract(contract.clone());
+        Ok(())
+    }
     pub(crate) fn set_canonical_chat_id(&mut self, id: String) -> Result<(), ProxyError> {
         let memory = self
             .request_memory
@@ -220,7 +268,10 @@ impl QoderSseDecoder {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.buffer.capacity()
+        self.buffer
+            .capacity()
+            .saturating_add(self.tool_state.retained_bytes())
+            .saturating_add(self.text_tools.retained_bytes())
     }
 
     /// True only after upstream EOF validates the single authoritative
@@ -326,6 +377,7 @@ impl QoderSseDecoder {
                 "Qoder SSE ended without meaningful output and an authoritative finish reason",
             )));
         }
+        self.tool_state.validate(self.request_memory.as_ref())?;
         self.complete = true;
         if let Some(timing) = self
             .request_memory
@@ -501,6 +553,37 @@ impl QoderSseDecoder {
             self.saw_meaningful = true;
             self.saw_finish_reason |= finish_reason;
             self.saw_tool_calls |= tool_calls;
+            if self
+                .tool_state
+                .contract()
+                .is_some_and(|contract| contract.recover_text_tools)
+            {
+                if let Some(memory) = self.buffer_memory.as_ref() {
+                    memory
+                        .resize(
+                            self.retained_bytes()
+                                .saturating_add(self.text_tools.projected_bytes(&canonical)),
+                        )
+                        .map_err(|error| QoderSseDecodeError::Protocol(error.into_proxy_error()))?;
+                }
+                self.text_tools
+                    .observe(&mut canonical, self.tool_state.contract())?;
+            }
+            if let Some(memory) = self.buffer_memory.as_ref() {
+                memory
+                    .resize(
+                        self.buffer
+                            .capacity()
+                            .saturating_add(self.tool_state.projected_bytes(&canonical))
+                            .saturating_add(self.text_tools.retained_bytes()),
+                    )
+                    .map_err(|error| QoderSseDecodeError::Protocol(error.into_proxy_error()))?;
+            }
+            self.tool_state.observe(&mut canonical)?;
+            self.saw_tool_calls |= qoder_canonical_semantics(&canonical).2;
+            if !qoder_canonical_semantics(&canonical).0 {
+                continue;
+            }
             if let Some(id) = self.canonical_chat_id.as_ref() {
                 canonical["id"] = Value::String(id.clone());
             }
@@ -535,11 +618,11 @@ impl QoderSseDecoder {
     fn reserve_buffer_append(&self, additional: usize) -> Result<(), QoderSseDecodeError> {
         if let Some(memory) = self.buffer_memory.as_ref() {
             memory
-                .resize(projected_vec_capacity(
-                    self.buffer.capacity(),
-                    self.buffer.len(),
-                    additional,
-                ))
+                .resize(
+                    projected_vec_capacity(self.buffer.capacity(), self.buffer.len(), additional)
+                        .saturating_add(self.tool_state.retained_bytes())
+                        .saturating_add(self.text_tools.retained_bytes()),
+                )
                 .map_err(|error| QoderSseDecodeError::Protocol(error.into_proxy_error()))?;
         }
         Ok(())
@@ -954,6 +1037,11 @@ fn canonical_qoder_tool_call(value: &Value, index: usize) -> Result<Option<Value
     });
     if let Some(id) = id {
         call["id"] = Value::String(id.to_string());
+    }
+    if empty_tool_use_start {
+        // Server-owned evidence of an explicit native input:{} placeholder.
+        // Never copied from a raw Chat tool call or forwarded downstream.
+        call["_qoder_empty_object_input"] = Value::Bool(true);
     }
     Ok(Some(call))
 }
@@ -1799,6 +1887,15 @@ fn sanitize_error_message(value: &str) -> String {
         }
     });
     let message = structured.unwrap_or_else(|| value.to_string());
+    // Image conversion failures can echo signed URLs or entire inline images.
+    // Redact before truncating so neither a signature nor a base64 prefix leaks.
+    static MEDIA: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let message = MEDIA
+        .get_or_init(|| {
+            regex::Regex::new(r#"(?i)data:image/[^\s<>\"']+|https?://[^\s<>\"']+"#)
+                .expect("constant Qoder error media regex")
+        })
+        .replace_all(&message, "[REDACTED_MEDIA]");
     crate::logging::redact_sensitive_text(&message)
         .chars()
         .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
@@ -2700,12 +2797,12 @@ mod tests {
         let first = decoder
             .push(wrapped_qoder_event(200, &padded_fragment.to_string()))
             .unwrap();
-        let second = decoder
-            .push(wrapped_qoder_event(200, &unpadded.to_string()))
-            .unwrap();
         let mut aggregator = QoderChatSseAggregator::default();
         aggregator.push(first).unwrap();
-        assert!(aggregator.push(second).is_err());
+        // Streaming now enforces the same opaque identity as aggregation.
+        assert!(decoder
+            .push(wrapped_qoder_event(200, &unpadded.to_string()))
+            .is_err());
     }
 
     #[test]

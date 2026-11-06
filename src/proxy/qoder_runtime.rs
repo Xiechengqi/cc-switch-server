@@ -7,8 +7,16 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::domain::qoder::{QoderCosySession, QoderCredentialRail, QoderSite};
 
+mod canonical;
+mod media;
+mod parameters;
 mod resident;
 use crate::infra::resident_memory::{ResidentMemoryBudget, ResidentMemoryReservation};
+pub(crate) use canonical::claude_to_chat;
+#[cfg(test)]
+mod enhancement_tests;
+pub(crate) use media::validate_source_images;
+pub(crate) use parameters::source_controls;
 pub use resident::QoderResidentSession;
 use resident::{QoderResidentCatalog, ResidentSessionEntry, RuntimeFlights};
 
@@ -191,6 +199,7 @@ pub struct QoderModelCapability {
     pub display_name: Option<String>,
     pub reasoning_efforts: Vec<String>,
     pub max_input_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
     pub runtime_context_selectable: bool,
     pub input_modalities: Vec<String>,
     pub supports_tools: bool,
@@ -562,6 +571,7 @@ pub fn parse_qoder_model_catalog(
                 ))
             }
         };
+        parameters::validate_catalog(object)?;
         if enabled {
             enabled_models.push(key.to_string());
             capabilities.insert(key.to_string(), qoder_model_capability(site, key, object));
@@ -606,7 +616,7 @@ fn qoder_model_capability(
     model_key: &str,
     config: &Map<String, Value>,
 ) -> QoderModelCapability {
-    let context = qoder_context_capability(site, model_key);
+    let context = parameters::context_capability(site, model_key, config);
     QoderModelCapability {
         model_key: model_key.to_string(),
         display_name: config
@@ -618,8 +628,13 @@ fn qoder_model_capability(
             .map(str::to_string),
         reasoning_efforts: qoder_reasoning_efforts(site, model_key),
         max_input_tokens: context.map(|context| context.max_input_tokens),
+        max_output_tokens: config.get("max_output_tokens").and_then(Value::as_u64),
         runtime_context_selectable: context.is_some_and(|context| context.runtime_selectable),
-        input_modalities: vec!["text".to_string()],
+        input_modalities: if config.get("is_vl").and_then(Value::as_bool) == Some(true) {
+            vec!["text".to_string(), "image".to_string()]
+        } else {
+            vec!["text".to_string()]
+        },
         supports_tools: true,
     }
 }
@@ -662,6 +677,8 @@ pub struct PreparedQoderPayload {
     pub request_id: String,
     pub session_id: String,
     pub model_key: String,
+    /// Server-owned response constraints; never serialized into COSY JSON.
+    pub(crate) output_contract: super::qoder::QoderOutputContract,
 }
 
 impl PreparedQoderPayload {
@@ -670,6 +687,7 @@ impl PreparedQoderPayload {
             .saturating_add(self.request_id.capacity())
             .saturating_add(self.session_id.capacity())
             .saturating_add(self.model_key.capacity())
+            .saturating_add(self.output_contract.retained_bytes())
     }
 }
 
@@ -730,8 +748,45 @@ pub(crate) fn build_qoder_payload_with_continuation(
         ));
     }
 
+    parameters::validate_catalog(&model_config)?;
+    media::validate_canonical(
+        canonical_chat_request,
+        model_config.get("is_vl").and_then(Value::as_bool) == Some(true),
+    )?;
+    let generation_parameters = parameters::generation_parameters(request)?;
+
     let declared_tools = declared_tools(request)?;
     let tools = tools_for_choice(request, declared_tools.to_vec())?;
+    let mut allowed_names = tools
+        .iter()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    // Omitted continuation declarations inherit only the previous identities.
+    // Explicit none/empty declarations must never be expanded by history.
+    if !request.contains_key("tools") && !request.contains_key("tool_choice") {
+        if let Some(previous) = continuation {
+            allowed_names.extend(previous.tool_names.iter().cloned());
+        }
+    }
+    let choice = request.get("tool_choice");
+    let require_tool = choice.and_then(Value::as_str) == Some("required")
+        || choice
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "required" | "function"));
+    let output_contract = super::qoder::QoderOutputContract {
+        allowed_names,
+        require_tool,
+        recover_text_tools: match request.get("qoder_text_tool_recovery") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err("Qoder qoder_text_tool_recovery must be boolean".into()),
+        },
+    };
+    if output_contract.recover_text_tools && output_contract.allowed_names.is_empty() {
+        return Err("Qoder text tool recovery requires explicit callable tools".into());
+    }
     // Tool choice limits the next call, not the identity of completed history.
     // Unknown/retired declarations still follow the separate acceptance gate.
     let normalized_history = normalize_tool_history_with_continuation(
@@ -743,6 +798,19 @@ pub(crate) fn build_qoder_payload_with_continuation(
     let normalized_history = Value::Array(normalized_history);
     let (system, mut messages, last_user_text) =
         normalize_chat_messages(Some(&normalized_history))?;
+    if generation_parameters["preserve_thinking"] == false {
+        for message in &mut messages {
+            if let Some(object) = message.as_object_mut() {
+                for field in [
+                    "reasoning_content",
+                    "reasoning_content_signature",
+                    "reasoning_item",
+                ] {
+                    object.remove(field);
+                }
+            }
+        }
+    }
     if !system.is_empty() {
         messages.insert(0, qoder_message("system", &system, None, None));
     }
@@ -750,7 +818,11 @@ pub(crate) fn build_qoder_payload_with_continuation(
     let max_tokens = qoder_max_tokens(request, &model_config);
     let reasoning = qoder_reasoning_directive(request);
     apply_reasoning_directive(site, model_key, reasoning, &mut model_config);
-    let context_capability = qoder_context_capability(site, model_key);
+    let context_capability = parameters::select_context(
+        request,
+        &model_config,
+        parameters::context_capability(site, model_key, &model_config),
+    )?;
     if let Some(context) = context_capability {
         model_config.insert(
             "max_input_tokens".to_string(),
@@ -797,7 +869,7 @@ pub(crate) fn build_qoder_payload_with_continuation(
         "source": 1,
         "version": "3",
         "chat_prompt": "",
-        "parameters": {"max_tokens": max_tokens},
+        "parameters": generation_parameters,
         "aliyun_user_type": effective_user_type,
         "session_type": "qodercli",
         "agent_id": "agent_common",
@@ -826,6 +898,7 @@ pub(crate) fn build_qoder_payload_with_continuation(
             "begin_at": now_ms
         }
     });
+    body["parameters"]["max_tokens"] = Value::Number(max_tokens.into());
     if context_capability.is_some_and(|context| context.runtime_selectable) {
         let max_input_tokens = context_capability
             .expect("runtime-selectable context is present")
@@ -840,6 +913,7 @@ pub(crate) fn build_qoder_payload_with_continuation(
         request_id,
         session_id: session_id.to_string(),
         model_key: model_key.to_string(),
+        output_contract,
     })
 }
 
@@ -1090,7 +1164,8 @@ fn normalize_chat_messages(value: Option<&Value>) -> Result<(String, Vec<Value>,
             .and_then(Value::as_str)
             .map(str::trim)
             .unwrap_or("user");
-        let text = chat_content_text(object.get("content"))?;
+        let (text, image_parts) =
+            chat_content_parts(object.get("content"), matches!(role, "user" | "tool"))?;
         match role {
             "system" | "developer" => {
                 if !text.trim().is_empty() {
@@ -1099,16 +1174,23 @@ fn normalize_chat_messages(value: Option<&Value>) -> Result<(String, Vec<Value>,
             }
             "user" => {
                 last_user_text = text.clone();
-                output.push(qoder_message("user", &text, None, None));
+                let mut message = qoder_message("user", &text, None, None);
+                if let Some(parts) = image_parts {
+                    message["content"] = Value::Array(parts.clone());
+                    message["contents"] = Value::Array(parts);
+                }
+                output.push(message);
             }
             "assistant" => {
                 let tool_calls = normalized_tool_calls(object.get("tool_calls"))?;
-                output.push(qoder_message(
+                let mut message = qoder_message(
                     "assistant",
                     &text,
                     (!tool_calls.is_empty()).then_some(tool_calls),
                     None,
-                ));
+                );
+                parameters::preserve_history_reasoning(object, &mut message)?;
+                output.push(message);
             }
             "tool" => {
                 let call_id = object
@@ -1118,6 +1200,10 @@ fn normalize_chat_messages(value: Option<&Value>) -> Result<(String, Vec<Value>,
                     .ok_or_else(|| "Qoder tool message is missing tool_call_id".to_string())?;
                 let mut message =
                     qoder_message("tool", empty_placeholder(&text), None, Some(call_id));
+                if let Some(parts) = image_parts {
+                    message["content"] = Value::Array(parts.clone());
+                    message["contents"] = Value::Array(parts);
+                }
                 if let Some(name) = object
                     .get("name")
                     .and_then(Value::as_str)
@@ -1152,11 +1238,20 @@ fn normalize_chat_messages(value: Option<&Value>) -> Result<(String, Vec<Value>,
 }
 
 fn chat_content_text(value: Option<&Value>) -> Result<String, String> {
+    chat_content_parts(value, false).map(|(text, _)| text)
+}
+
+fn chat_content_parts(
+    value: Option<&Value>,
+    allow_images: bool,
+) -> Result<(String, Option<Vec<Value>>), String> {
     match value.unwrap_or(&Value::Null) {
-        Value::Null => Ok(String::new()),
-        Value::String(value) => Ok(value.clone()),
+        Value::Null => Ok((String::new(), None)),
+        Value::String(value) => Ok((value.clone(), None)),
         Value::Array(parts) => {
             let mut output = Vec::new();
+            let mut contents = Vec::new();
+            let mut has_images = false;
             for part in parts {
                 let object = part
                     .as_object()
@@ -1169,14 +1264,19 @@ fn chat_content_text(value: Option<&Value>) -> Result<String, String> {
                     "text" | "input_text" | "output_text" => {
                         if let Some(text) = object.get("text").and_then(Value::as_str) {
                             output.push(text.to_string());
+                            contents.push(json!({"type":"text", "text":text}));
+                        } else {
+                            return Err("Qoder text content part requires a string".into());
                         }
                     }
-                    "image" | "image_url" | "input_image" => {
-                        return Err(
-                            "Qoder image input is not supported by the verified COSY wire contract"
-                                .to_string(),
-                        )
+                    "image_url" if allow_images => {
+                        has_images = true;
+                        contents.push(part.clone());
                     }
+                    "image" | "image_url" | "input_image" => return Err(
+                        "Qoder images require a vision-enabled user/tool image_url content part"
+                            .to_string(),
+                    ),
                     other => {
                         return Err(format!(
                             "unsupported Qoder Chat content part type {other:?}"
@@ -1184,7 +1284,7 @@ fn chat_content_text(value: Option<&Value>) -> Result<String, String> {
                     }
                 }
             }
-            Ok(output.join("\n"))
+            Ok((output.join("\n"), has_images.then_some(contents)))
         }
         _ => Err("Qoder Chat content must be text, an array, or null".to_string()),
     }
@@ -1284,11 +1384,21 @@ fn normalized_tools(request: &Map<String, Value>) -> Result<Vec<Value>, String> 
 }
 
 fn declared_tools(request: &Map<String, Value>) -> Result<&[Value], String> {
+    if request
+        .get("tools")
+        .is_some_and(|tools| !tools.is_null() && !tools.is_array())
+    {
+        return Err("Qoder tools must be an array or null".into());
+    }
     let tools = request
         .get("tools")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
+    if tools.len() > 128 {
+        return Err("Qoder tools exceed the 128 declaration limit".into());
+    }
+    let mut names = BTreeSet::new();
     for tool in tools {
         let function = tool
             .get("function")
@@ -1301,6 +1411,13 @@ fn declared_tools(request: &Map<String, Value>) -> Result<&[Value], String> {
             .is_none_or(str::is_empty)
         {
             return Err("Qoder tool function is missing name".to_string());
+        }
+        let name = function["name"].as_str().expect("validated tool name");
+        if name.trim() != name
+            || !names.insert(name)
+            || tool.get("type").is_some_and(|kind| kind != "function")
+        {
+            return Err("Qoder tools require unique exact names and function type".into());
         }
     }
     Ok(tools)
@@ -1357,7 +1474,7 @@ fn qoder_max_tokens(request: &Map<String, Value>, config: &Map<String, Value>) -
         .get("max_output_tokens")
         .and_then(positive_u64)
         .unwrap_or(32_768);
-    ["max_completion_tokens", "max_tokens"]
+    ["max_completion_tokens", "max_tokens", "max_output_tokens"]
         .into_iter()
         .find_map(|field| request.get(field).and_then(positive_u64))
         .map(|requested| requested.min(configured))

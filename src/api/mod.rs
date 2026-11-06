@@ -1916,7 +1916,7 @@ async fn append_qoder_models(
                 input_modalities: Some(model.route.input_modalities),
                 context_window: model.route.max_input_tokens,
                 supports_tools: Some(model.route.supports_tools),
-                max_output_tokens: None,
+                max_output_tokens: model.route.max_output_tokens,
             }),
     );
     data.sort_by(|left, right| left.id.cmp(&right.id));

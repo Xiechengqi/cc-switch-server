@@ -1,5 +1,27 @@
 # Protocol evidence policy
 
+## 2026-11-06 Qoder 单账号 capability revision 3
+
+本轮仅增强 `cc-switch-server` 的单绑定 Qoder 反代，不新增账号池、自动切站、跨账号/Provider fallback 或额外重试。Global OAuth、Global PAT job-token、CN OAuth 三 rail 及 Account/Provider/Share/generation fencing、同绑定账号唯一一次 eligible pre-business 401 恢复、唯一终态与 EOF 合同均保持。CN PAT 仍是 R4-QD-02 独立候选门禁，未以 Global PAT 冒充实现。
+
+主证据为原已冻结官方 `@qoder-ai/qodercli@1.1.32` / `@qodercn-ai/qoderclicn@1.1.32` 归档。本轮重新校验 npm integrity，仅提取 package metadata 与 bundle，Global bundle SHA-256 为 `24de5b12520cbe49c0027b53654eaee02bddd857e3d9f19a6198824e365d89bf`、CN 为 `5a82eeffbeb015d78c4945b7f4ed989494d2ea8cc7fdf2dbfc6ad04c17418f8b`。只读核对 D7a/Azi/R5t/S7a/P7a/y7a 的图片与历史映射、Zlr/zN/gUA 的参数和最终 COSY builder、NW 的 context 菜单；在无 process/fs/network 的隔离 Node vm 中只运行选取的纯图片/reasoning/采样映射，不执行 CLI bootstrap、postinstall 或外仓测试。新观测和所选函数摘要单独存入 `qoder-capability-extension.json`，Node 独立摘要/变异检查防止 fixture 与生产投影同时漂移，Rust 对照最终生产 payload。原 `qoder-cli-oracle.json`、65/9/7 历史验证元数据及 reference-delta 的 schema-v1 内容全部保留；revision 3 绑定是新增 extension，不改历史 revision 2。
+
+次级只读比较为 `qoder2api-hub@cdd95ef6ce2d49a553267360a7aba42fbe31dfe6` 的 `qoder_proxy.py` 文本工具 marker/DSML 及 issue 135/137 测试。它只提供可选兼容方向，不成为构建、测试、运行时或发布输入。未迁移宽松引号修复、截断伪成功、任意正文抽取及账号池行为；历史 TokenRouter 来源和审查状态不改写。
+
+本轮实现：
+
+- 请求级原生工具状态在流/非流统一校验完整 ID/name、精确授权、跨 index 唯一性、参数 JSON 与 none/named/required。晚到身份和名称前缀歧义延迟输出，不修原生 JSON 或补原生 ID/name；显式原生 `input:{}` 无后续片段时保留为零参数调用。工具状态、迟延输出、解析和回读临时内存先预约、统一释放。
+- 四种入口在转换前拒绝会被共享 bridge 静默丢弃的错误图片形状，再按精确 live `is_vl:true` 授权并验证 canonical user/tool 图片。保留原图 URI/顺序，不在 Server 下载；沿共享图片 MIME/signature/base64、单张/总量/数量上限，HTTPS 禁止 userinfo/fragment。上游错误中的 URL/data-image 先脱敏再截断。
+- 采样、token 上限、preserve_thinking 与 context_length 明确支持/校验；不在已审 wire 中的 stop/penalties/seed/logprobs/response_format、多选项或禁用并行工具显式拒绝。live 输出上限对外发布并约束实际请求，context 菜单/默认值/上限一致。canonical 历史保留 reasoning 文本/签名/item，Claude/Gemini 桥保留 reasoning-only turn 并认证 Server envelope；不声明任意 opaque item 在所有协议间无损。
+- 文本工具回读默认关闭，仅显式 `qoder_text_tool_recovery:true` 且有授权声明时接受有界整段 JSON/XML/DSML；不修引号、不部分执行、不提取普通正文，重复 JSON 键、额外歧义字段、截断与原生工具混合均拒绝。DSML 参数保持字符串。
+- 已提交流 15 秒注释心跳不重启上游 idle timeout、不计业务 token、不发布成功或重放。首语义输出从发送开始共用绝对 deadline，覆盖响应头、HTTP 错误响应体和 SSE prelude，慢头/注释不重新计时，停滞错误体也受限。三 rail 的流/非流回环覆盖慢头加注释及 401 错误体停滞，超时不刷新或重放。图片转换 timeout 单独映射 504/有限指标，112/115 与原认证恢复资格不变。
+
+整体 review 复核工具授权与分片/前缀歧义、原生空对象参数、整段文本工具回读及重复 JSON 键、四入口媒体与控制转换、reasoning envelope、continuation、共享内存预约/释放、心跳和终态/EOF。修复 review 中发现的重复片段误判、迟延工具输出内存漏计、canonical 多余深拷贝及跨响应阶段超时问题，均补回归，未发现本轮范围内遗留阻断项。
+
+验证采用 `54f389a` 独立基线叠加本轮 Qoder 增量，避免混入并行 Trae 开发。该快照 Rust 全量 4,309 项通过、0 失败、3 项既有忽略；cargo check、全目标严格 Clippy、cargo fmt 与 include! 独立源格式检查、本地 loopback HTTP 启动 smoke 通过。验证前后 448 个 src/tests/assets 与 Cargo/build 输入按路径及文件 SHA-256 汇总的摘要同为 `78b464dd4aadc779e9c4d6f8b4000ec51f5e8b4316e0c8676a18b550d9951d57`；Qoder 专属文件及共享 Adapter/API/forwarder/Registry 的对应 Qoder 片段与主工作区一致。主工作区 Node 后端审计 2,135/2,135、smoke 单测 13/13、两类 Rust 格式、Qoder oracle/extension/reference-delta、Phase 0、coding-plan、coverage、静态 UI Provider 矩阵、文档索引和 diff 检查通过。此范围不等于整个并行工作区的 Rust 验证；未执行 UI 自动化。离线 readiness 为 failures=0、decision=blocked / blocked_inputs，缺真实输入、部署验证且脚本内本地套件显式跳过，不能宣称发布就绪。
+
+本轮实现与验证未发起真实凭据请求或部署，也不代表发布批准。三条 rail 及新增图片/参数接受性均保持 `live_pending`，离线验证不能提升真实状态。
+
 ## 2026-11-06 积分获取范围收敛：只借鉴国内自动签到
 
 用户明确决定：cc-switch-server 的外部积分获取自动化只借鉴已实现的 WorkBuddy CN

@@ -42,6 +42,7 @@ for (const file of [
   'assets/contract/web-session-registry-manifest.json',
   'assets/contract/provider-coverage.json',
   'assets/contract/qoder-cli-oracle.json',
+  'assets/contract/qoder-capability-extension.json',
   'assets/contract/router-provider-channel-baseline.json',
   'assets/contract/web-runtime-contract.json',
   'SOURCE_PROVENANCE.json',
@@ -72,6 +73,7 @@ node scripts/audit/audit-provider-phase0-contracts.mjs --check
 node --test scripts/audit/*.test.mjs
 node --test scripts/smoke/*.test.mjs
 node scripts/audit/audit-qoder-cli-oracle.mjs
+node scripts/audit/audit-qoder-capability-extension.mjs
 node scripts/audit/audit-antigravity-reference-delta.mjs
 node scripts/audit/audit-codebuddy-reference-delta.mjs
 node scripts/audit/audit-provider-conformance-evidence.mjs

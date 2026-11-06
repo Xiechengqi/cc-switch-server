@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "qoder_enhancement_http_tests.rs"]
+mod enhancement;
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -61,6 +64,14 @@ impl QoderFixtureRail {
 enum QoderGenerationReply {
     Success,
     ToolCall,
+    WriteToolCall,
+    TextToolEcho,
+    InvalidToolArguments,
+    MissingToolName,
+    UndeclaredToolName,
+    IdleAfterContent,
+    DelayedHeadersAndSemantic,
+    UnauthorizedStalledBody,
     TerminalThenUnauthorized,
     UsageThenReadFailure,
     LargeAggregate,
@@ -95,6 +106,7 @@ struct QoderFixtureState {
     pat_exchanges: Arc<AtomicUsize>,
     refresh_requests: Arc<AtomicUsize>,
     observations: Arc<Mutex<Vec<QoderRequestObservation>>>,
+    catalog_config: Arc<Mutex<Value>>,
 }
 
 impl QoderFixtureState {
@@ -107,6 +119,7 @@ impl QoderFixtureState {
             pat_exchanges: Default::default(),
             refresh_requests: Default::default(),
             observations: Default::default(),
+            catalog_config: Arc::new(Mutex::new(model_config())),
         }
     }
 
@@ -181,7 +194,7 @@ async fn qoder_model_list(
 ) -> Response {
     state.model_requests.fetch_add(1, Ordering::SeqCst);
     record_observation(&state, uri, &headers, None);
-    wrapped_json(json!({"chat": [model_config()]}))
+    wrapped_json(json!({"chat": [state.catalog_config.lock().unwrap().clone()]}))
 }
 
 async fn qoder_pat_exchange(State(state): State<QoderFixtureState>) -> Response {
@@ -300,7 +313,7 @@ fn success_stream() -> Response {
         .unwrap()
 }
 
-fn tool_call_stream() -> Response {
+fn tool_call_stream(name: &str) -> Response {
     let call = json!({
         "id": "chat-qoder-fixture",
         "object": "chat.completion.chunk",
@@ -312,7 +325,7 @@ fn tool_call_stream() -> Response {
                 "index": 0,
                 "id": "call_lookup",
                 "type": "function",
-                "function": {"name": "lookup", "arguments": "{\"key\":\"one\"}"}
+                "function": {"name": name, "arguments": "{\"key\":\"one\"}"}
             }]},
             "finish_reason": "tool_calls"
         }]
@@ -485,7 +498,33 @@ async fn qoder_generation(
         .unwrap_or(QoderGenerationReply::Success);
     match reply {
         QoderGenerationReply::Success => success_stream(),
-        QoderGenerationReply::ToolCall => tool_call_stream(),
+        QoderGenerationReply::ToolCall => tool_call_stream("lookup"),
+        QoderGenerationReply::WriteToolCall => tool_call_stream("write"),
+        QoderGenerationReply::TextToolEcho => Response::builder()
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(qoder_wrapper(json!("OK"), inner_success_chunk(
+                Some(r#"<tool_call>lookup {"key":"one"}</tool_call>"#), true))))
+            .unwrap(),
+        QoderGenerationReply::InvalidToolArguments | QoderGenerationReply::MissingToolName | QoderGenerationReply::UndeclaredToolName => {
+            let name = if reply == QoderGenerationReply::MissingToolName { "" } else if reply == QoderGenerationReply::UndeclaredToolName { "undeclared" } else { "lookup" };
+            let arguments = if reply == QoderGenerationReply::InvalidToolArguments { "{" } else { "{}" };
+            Response::builder().header(CONTENT_TYPE,"text/event-stream").body(Body::from(qoder_wrapper(json!("OK"),json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"bad-call","type":"function","function":{"name":name,"arguments":arguments}}]},"finish_reason":"tool_calls"}]})))).unwrap()
+        }
+        QoderGenerationReply::IdleAfterContent => Response::builder().header(CONTENT_TYPE,"text/event-stream").body(Body::from_stream(futures_util::stream::once(async { Ok::<_,std::convert::Infallible>(qoder_wrapper(json!("OK"),inner_success_chunk(Some("ready"),false))) }).chain(futures_util::stream::pending()))).unwrap(),
+        QoderGenerationReply::DelayedHeadersAndSemantic => {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let comments = futures_util::stream::iter(0..10).then(|_| async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok::<_, std::convert::Infallible>(Bytes::from_static(b": upstream heartbeat\n\n"))
+            });
+            let ready = futures_util::stream::once(async { Ok::<_, std::convert::Infallible>(qoder_wrapper(json!("OK"),inner_success_chunk(Some("too late"),true))) });
+            Response::builder().header(CONTENT_TYPE,"text/event-stream").body(Body::from_stream(comments.chain(ready))).unwrap()
+        }
+        QoderGenerationReply::UnauthorizedStalledBody => Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(CONTENT_TYPE,"application/json")
+            .body(Body::from_stream(futures_util::stream::pending::<Result<Bytes,std::convert::Infallible>>()))
+            .unwrap(),
         QoderGenerationReply::TerminalThenUnauthorized => terminal_then_unauthorized_stream(),
         QoderGenerationReply::UsageThenReadFailure => usage_then_read_failure_stream(),
         QoderGenerationReply::LargeAggregate => large_aggregate_stream(),
@@ -2272,14 +2311,17 @@ fn qoder_stream_tool_state_exhaustion_emits_one_redacted_terminal() {
         )
         .await;
 
-        let response = forward_qoder_surface(
+        let (route, gemini_path, body) = surface_request(AppKind::Codex, true);
+        let mut request: Value = serde_json::from_slice(&body).unwrap();
+        request["tools"] =
+            json!([{"type":"function","name":"bounded_tool","parameters":{"type":"object"}}]);
+        let response = super::forward_for_test_surface(
             state.clone(),
-            AppKind::Codex,
+            route,
             provider_id,
-            &share_id,
-            "owner@example.com",
-            "memory-stream-tools",
-            true,
+            gemini_path,
+            qoder_headers(&share_id, "owner@example.com", "memory-stream-tools"),
+            Bytes::from(request.to_string()),
         )
         .await
         .unwrap();
@@ -2730,8 +2772,16 @@ fn qoder_r4_declared_history_survives_choice_on_every_rail_and_surface() {
         ] {
             for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
                 let name = format!("qoder-r4-history-{}-{app:?}", rail.label());
-                let (address, fixture, server) =
-                    spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+                let (address, fixture, server) = spawn_qoder_upstream(
+                    rail,
+                    vec![
+                        QoderGenerationReply::Success,
+                        QoderGenerationReply::WriteToolCall,
+                        QoderGenerationReply::Success,
+                        QoderGenerationReply::WriteToolCall,
+                    ],
+                )
+                .await;
                 let state = qoder_test_state(&name);
                 let (provider_id, _) =
                     install_qoder_provider(&state, &name, app, rail, &format!("http://{address}"))

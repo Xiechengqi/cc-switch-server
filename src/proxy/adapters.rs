@@ -1177,6 +1177,16 @@ fn transform_body_for_upstream(
     } else {
         None
     };
+    let qoder_controls = if stored.provider_type == ProviderType::QoderCosy {
+        super::qoder_runtime::validate_source_images(stored.app, &input)
+            .map_err(ProxyError::bad_request)?;
+        Some(
+            super::qoder_runtime::source_controls(stored.app, &input)
+                .map_err(ProxyError::bad_request)?,
+        )
+    } else {
+        None
+    };
     if stored.provider_type == ProviderType::QoderCosy
         && stored.app == AppKind::Codex
         && route == Some(ProxyRoute::CodexResponses)
@@ -1205,6 +1215,8 @@ fn transform_body_for_upstream(
         (AppKind::Claude, UpstreamFormat::OpenAiChat) => {
             if stored.provider_type.is_buddy_oauth() {
                 super::codebuddy_runtime::transform_buddy_claude_request(&input)
+            } else if stored.provider_type == ProviderType::QoderCosy {
+                super::qoder_runtime::claude_to_chat(&input)
             } else {
                 transforms::anthropic_to_openai_chat(&input)
             }
@@ -1265,12 +1277,22 @@ fn transform_body_for_upstream(
             })
         }
         (AppKind::Gemini, UpstreamFormat::OpenAiChat) => {
-            transforms::gemini_native_to_anthropic(&input)
-                .and_then(|value| transforms::anthropic_to_openai_chat(&value))
+            transforms::gemini_native_to_anthropic(&input).and_then(|value| {
+                if stored.provider_type == ProviderType::QoderCosy {
+                    super::qoder_runtime::claude_to_chat(&value)
+                } else {
+                    transforms::anthropic_to_openai_chat(&value)
+                }
+            })
         }
         _ => Ok(input),
     }
     .map_err(|error| ProxyError::bad_request(format!("request transform failed: {error}")))?;
+    if let Some(controls) = qoder_controls {
+        for (field, value) in controls {
+            output[field] = value;
+        }
+    }
 
     if let Some(effort) = buddy_requested_effort {
         // Diagnostic only. Model selection and final serialization always use
