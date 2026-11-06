@@ -1462,6 +1462,17 @@
     "unreachableHint": "无法建立连接（DNS / 连接 / TLS / 超时）。请检查 base_url 与网络。"
   },
   "subscription": {
+    "buddyRegistrationCredits": "注册积分奖励",
+    "buddyCheckinCredits": "签到",
+    "buddyBaseCredits": "基础积分",
+    "buddyAmountHelp": "金额为已用 / 总额；签到汇总保留各批次独立有效期。",
+    "buddyRemaining": "剩余 {{amount}} {{unit}}",
+    "buddyExpiryDetail": "积分到期：{{time}}",
+    "buddyResetDetail": "周期重置：{{time}}",
+    "buddyExpiryUnknown": "到期时间未知",
+    "buddyNextExpiry": "最近到期 {{time}}",
+    "buddyNextKnownExpiry": "最近已知到期 {{time}}",
+    "buddyExpiryPending": "到期状态待刷新",
     "awaitingObservation": "待观测",
     "copilotPremium": "高级请求",
     "credentialParseFailed": "凭据数据解析失败",

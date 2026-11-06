@@ -34,9 +34,11 @@ Claude Messages、OpenAI Chat / Responses、Gemini stream/nonstream 使用共同
 
 官方 credit 用量与本地 token 计量分开。按站点时区扫描近 31 个自然日，pageNum 固定 1，满 3000 条用最大时间推进 inclusive startTime，以归一时间与 requestId 去重；同秒饱和、窗口停滞、坏行和安全上限均不报 complete。套餐成功而官方明细失败时保留套餐并显示 unavailable。原始 prompt、账号私密字段和凭据不能进入日志或回执。
 
-Server / Router 同时展示资源包额度与官方请求汇总，保留上游官方包名（可含 CodeBuddy）、
-各包已用/总额、`20d12h` 形式的倒计时及今日/本月官方 credits，正常摘要接在同一段文字中，
-不固定换行。倒计时优先取周期结束，缺失时才取权益到期，无有效未来时间则省略。卡片省略
+Server / Router 同时展示资源包额度与官方请求汇总，原始数据保留上游官方包名（可含 CodeBuddy），
+各包使用已用/总额。Server Web 摘要按 [CodeBuddy 展示合同](codebuddy-oauth.md#2026-11-03-资源包与官方请求用量展示)
+简化已知包名、汇总签到 credits，并仅显示仍有余额批次的最近失效倒计时。周期重置不替代积分失效；
+未知期限、过期待刷新和部分数据分别提示。悬浮明细保留原名与各批次金额、期限。今日/本月官方 credits
+接在同一段摘要中，自然折行；卡片省略
 重复百分比、完整期限、采集时间、请求范围和说明文字；缺少金额时仍可显示已知使用率。
 完整数据与原有校验保留。两者都是账号账本，
 不与 Share 本地 Token/USD 配额混用，也不强行对齐不同采集时间的金额。
@@ -99,8 +101,8 @@ Claude Code 身份句。CN 同账号对照证实保留该 billing 元数据仍�
 
 现代套餐查询的 paid/free 码表补齐受审国际商品码，恢复原被漏掉的官方名称与周期信息。
 真实 PackageName 优先；summary 缺少名称或名称等于编码时，006 / 035 分别回退到受审的
-“CodeBuddy 个人体验版” / “版本基础用量”，未知码不猜名称。金额和期限只用上游证据，继续
-优先周期倒计时。归一后的数据沿既有配额快照同步给 Router，不新增 Router 侧码表。
+“CodeBuddy 个人体验版” / “版本基础用量”，未知码不猜名称。金额和期限只用上游证据；Server Web 现采用最近积分失效提示，
+周期重置独立保留在明细中。归一后的数据沿既有配额快照同步给 Router，不新增 Router 侧码表。
 真实只读对照确认同一 Intl 账号可取回 `Bonus Pack` / `Free Plan Subscription` 和各自
 期限；这不等同于完整反代调用或远程部署验收，详见 `PROTOCOL_EVIDENCE.md`。
 

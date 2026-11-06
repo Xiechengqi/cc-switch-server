@@ -1462,6 +1462,17 @@
     "unreachableHint": "無法建立連線（DNS / 連線 / TLS / 逾時）。請檢查 base_url 與網路。"
   },
   "subscription": {
+    "buddyRegistrationCredits": "註冊積分獎勵",
+    "buddyCheckinCredits": "簽到",
+    "buddyBaseCredits": "基礎積分",
+    "buddyAmountHelp": "金額為已用 / 總額；簽到彙總保留各批次獨立有效期。",
+    "buddyRemaining": "剩餘 {{amount}} {{unit}}",
+    "buddyExpiryDetail": "積分到期：{{time}}",
+    "buddyResetDetail": "週期重設：{{time}}",
+    "buddyExpiryUnknown": "到期時間未知",
+    "buddyNextExpiry": "最近到期 {{time}}",
+    "buddyNextKnownExpiry": "最近已知到期 {{time}}",
+    "buddyExpiryPending": "到期狀態待更新",
     "awaitingObservation": "待觀測",
     "copilotPremium": "進階請求",
     "credentialParseFailed": "憑據資料解析失敗",

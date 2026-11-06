@@ -1462,6 +1462,17 @@
     "unreachableHint": "接続を確立できませんでした（DNS / 接続 / TLS / タイムアウト）。base_url とネットワークを確認してください。"
   },
   "subscription": {
+    "buddyRegistrationCredits": "登録ボーナス",
+    "buddyCheckinCredits": "チェックイン",
+    "buddyBaseCredits": "基本クレジット",
+    "buddyAmountHelp": "使用済み / 合計。チェックイン分はそれぞれの有効期限を保持します。",
+    "buddyRemaining": "残り {{amount}} {{unit}}",
+    "buddyExpiryDetail": "クレジット有効期限：{{time}}",
+    "buddyResetDetail": "周期リセット：{{time}}",
+    "buddyExpiryUnknown": "有効期限不明",
+    "buddyNextExpiry": "次の有効期限 {{time}}",
+    "buddyNextKnownExpiry": "確認済みの次の有効期限 {{time}}",
+    "buddyExpiryPending": "期限状態の更新待ち",
     "awaitingObservation": "観測待ち",
     "copilotPremium": "プレミアム",
     "credentialParseFailed": "認証情報を解析できませんでした",

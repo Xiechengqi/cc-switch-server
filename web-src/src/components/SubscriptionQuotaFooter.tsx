@@ -17,6 +17,7 @@ import type {
   SubscriptionQuota,
 } from "@/types/subscription";
 import { cn } from "@/lib/utils";
+import { buildBuddyQuotaSummary } from "@/utils/buddyQuotaSummary";
 import {
   PROVIDER_REFRESH_TITLE_KEY,
   resolveQuotaQueriedAt,
@@ -720,9 +721,12 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   const summaryUnobservedTiers = inline
     ? unobservedTiers.filter((tier) => !HIDDEN_INLINE_TIERS.has(tier.name))
     : unobservedTiers;
+  const buddySummary = buddy ? buildBuddyQuotaSummary(summaryTiers, t, now,
+    quota.quotaStatus === "partial" || summaryUnobservedTiers.length > 0
+      || (quota.staleTierNames?.length ?? 0) > 0) : null;
   const summaryText = buddy
     ? [
-        ...summaryTiers.map((tier) => formatCompactTier(tier, t, now)),
+        buddySummary?.text,
         ...summaryUnobservedTiers.map((tier) => formatUnobservedQuotaTier(tier, t)),
         quota.quotaStatus === "partial" ? t("subscription.quotaPartial") : null,
       ].filter(Boolean).join(" · ") || t("subscription.numericQuotaNotExposed")
@@ -738,7 +742,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   if (buddy) {
     return (
       <div className="flex min-w-0 items-start justify-between gap-2 text-xs">
-        <span className="min-w-0 break-words">
+        <span className="min-w-0 break-words" title={buddySummary?.details}>
           {summaryText}
           {buddyUsageSummary ? <> · {buddyUsageSummary}</> : null}
         </span>

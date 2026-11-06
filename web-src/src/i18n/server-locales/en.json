@@ -1462,6 +1462,17 @@
     "unreachableHint": "Could not establish a connection (DNS / connect / TLS / timeout). Check the base_url and your network."
   },
   "subscription": {
+    "buddyRegistrationCredits": "Registration reward",
+    "buddyCheckinCredits": "Check-in",
+    "buddyBaseCredits": "Base credits",
+    "buddyAmountHelp": "Amounts are used / total; check-in batches retain separate expiry dates.",
+    "buddyRemaining": "Remaining {{amount}} {{unit}}",
+    "buddyExpiryDetail": "Credits expire: {{time}}",
+    "buddyResetDetail": "Cycle resets: {{time}}",
+    "buddyExpiryUnknown": "Expiry unknown",
+    "buddyNextExpiry": "Next expiry {{time}}",
+    "buddyNextKnownExpiry": "Next known expiry {{time}}",
+    "buddyExpiryPending": "Expiry status awaiting refresh",
     "awaitingObservation": "awaiting observation",
     "copilotPremium": "Premium",
     "credentialParseFailed": "Credential data could not be parsed",
