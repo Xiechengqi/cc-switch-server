@@ -2711,7 +2711,9 @@ pub(in crate::api) fn managed_auth_provider_label(provider_type: ProviderType) -
         ProviderType::QoderCosy => "qoder_cosy",
         ProviderType::CodeBuddyOAuth => "codebuddy_oauth",
         ProviderType::WorkBuddyOAuth => "workbuddy_oauth",
-        ProviderType::TraeSolo => "trae_solo",
+        ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl => {
+            provider_type.as_str()
+        }
         ProviderType::DeepSeekAccount => "deepseek_account",
         _ => "unknown",
     }
@@ -3304,11 +3306,12 @@ pub(in crate::api) async fn web_managed_auth_start_login(
                 "site": response.login.site,
             }))
         }
-        ProviderType::TraeSolo => {
+        ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl => {
             let response = start_trae_login(
                 State(state),
                 headers,
                 Json(StartTraeLoginRequest {
+                    provider_type: Some(provider_type),
                     account_id: web_optional_string_any(args, &["accountId", "account_id"]),
                 }),
             )
@@ -3520,7 +3523,7 @@ pub(in crate::api) async fn web_managed_auth_poll_for_account(
                 })?;
             web_managed_auth_account_by_id(&state, account_id, provider_label).await
         }
-        ProviderType::TraeSolo => {
+        ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl => {
             let response = trae_login_status(
                 State(state.clone()),
                 headers,
@@ -3676,7 +3679,7 @@ pub(in crate::api) async fn web_managed_auth_cancel_login(
         .0;
         return Ok(json!(response));
     }
-    if provider_type == ProviderType::TraeSolo {
+    if provider_type.is_trae() {
         let response = cancel_trae_login(
             State(state),
             headers,

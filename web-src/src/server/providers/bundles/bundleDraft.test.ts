@@ -1106,3 +1106,38 @@ describe("Provider Bundle drafts", () => {
     });
   });
 });
+
+describe("Trae raw channel configuration", () => {
+  it.each(["trae_raw_chat", "trae_raw_chat_intl"])("keeps %s tool simulation opt-in and requires an exact probe model", (providerType) => {
+    const family = familyById(`family.${providerType}`)!;
+    const draft = createProviderBundleDraft(family);
+    expect(draft.modelPolicy).toBe("passthrough");
+    expect(draft.upstreamModel).toBe("");
+    for (const app of ["claude", "codex", "gemini"] as const) {
+      expect(bundleProbeModel(draft, app, "unrelated-global-model").effectiveModel).toBeUndefined();
+    }
+    const initial = toProviderBundleWriteDraft(draft);
+    expect(initial.surfaces.every(surface => surface.driverOptions?.traeToolSimulationEnabled === false)).toBe(true);
+    draft.testModel = "Exact-Name";
+    draft.surfaces.forEach(surface => { surface.driverOptions.traeToolSimulationEnabled = true; });
+    const enabled = toProviderBundleWriteDraft(draft);
+    expect(enabled.surfaces.every(surface => surface.driverOptions?.traeToolSimulationEnabled === true)).toBe(true);
+    expect(bundleProbeModel(draft, "codex", "unrelated-global-model").effectiveModel).toBe("Exact-Name");
+    draft.surfaceTestModels.codex = "Codex-Exact-Name";
+    expect(bundleProbeModel(draft, "codex").effectiveModel).toBe("Codex-Exact-Name");
+    const surfaces = Object.fromEntries(family.surfaces.map(surface => [surface.app, {
+      app: surface.app,
+      provider: { id: draft.id, name: draft.name, settingsConfig: {}, meta: { providerType, traeToolSimulationEnabled: true } },
+      providerType, providerTypeId: providerType, revision: 1, profileId: surface.profileId,
+      identity: { status: "bound" }, credentialConfigured: false, credentialSlots: [],
+    }])) as ProviderBundleView["surfaces"];
+    const view: ProviderBundleView = {
+      id: draft.id, familyId: family.familyId, revision: 1, name: draft.name,
+      modelPolicyScope: "global", testApp: "codex", surfaceTestModels: {}, transport: {},
+      supportedApps: family.surfaces.map(surface => surface.app), enabledApps: family.surfaces.map(surface => surface.app),
+      credentialConfigured: false, credentialSlots: [], surfaces,
+    };
+    const edited = editProviderBundleDraft(view);
+    expect(edited.surfaces.every(surface => surface.driverOptions.traeToolSimulationEnabled === true)).toBe(true);
+  });
+});

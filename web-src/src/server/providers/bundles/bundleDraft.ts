@@ -109,6 +109,7 @@ export interface BundleSurfaceEditorDraft {
     codexWebsocketEnabled?: boolean;
     codexResponsesKeepaliveIntervalMs?: number;
     codexRoutingHintEnabled?: boolean;
+    traeToolSimulationEnabled?: boolean;
   };
   customBinding?: ProviderCustomBinding;
   // Editing intent only. Persisted bindings stay concrete and pinned on reload.
@@ -156,10 +157,11 @@ export function bundleProbeModel(
   const surface = draft.surfaces.find((item) => item.app === app);
   const providerType = surface && profileById(surface.profileId)?.compatibilityProviderType;
   const buddy = providerType === "workbuddy_oauth" || providerType === "codebuddy_oauth";
+  const traeRaw = providerType === "trae_raw_chat" || providerType === "trae_raw_chat_intl";
   const policy = draft.modelPolicyScope === "per_app" ? surface : draft;
   const fixedModel = buddy && policy?.modelPolicy === "single"
     ? policy.upstreamModel.trim() || undefined : undefined;
-  const defaultModel = buddy ? "auto" : globalDefault;
+  const defaultModel = buddy ? "auto" : traeRaw ? undefined : globalDefault;
   const inheritedModel = fixedModel || draft.testModel.trim() || defaultModel;
   return {
     fixedModel,
@@ -569,6 +571,10 @@ function surfaceFromResource(
       codexResponsesKeepaliveIntervalMs:
         numberOption(runtimeOptions.codexResponsesKeepaliveIntervalMs) ??
         configuredMeta.codexResponsesKeepaliveIntervalMs,
+      traeToolSimulationEnabled:
+        booleanOption(runtimeOptions.traeToolSimulationEnabled) ??
+        configuredMeta.traeToolSimulationEnabled ??
+        false,
       codexRoutingHintEnabled:
         booleanOption(runtimeOptions.codexRoutingHintEnabled) ??
         configuredMeta.codexRoutingHintEnabled,
@@ -999,6 +1005,9 @@ function typedDriverOptions(surface: BundleSurfaceEditorDraft) {
       "codexResponsesKeepaliveIntervalMs",
     )
       ? surface.driverOptions.codexResponsesKeepaliveIntervalMs
+      : undefined,
+    traeToolSimulationEnabled: fields.has("traeToolSimulationEnabled")
+      ? surface.driverOptions.traeToolSimulationEnabled
       : undefined,
     codexRoutingHintEnabled: fields.has("codexRoutingHintEnabled")
       ? surface.driverOptions.codexRoutingHintEnabled

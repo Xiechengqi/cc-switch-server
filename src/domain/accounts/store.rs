@@ -1873,6 +1873,7 @@ struct CodeBuddyIdentityEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TraeIdentityEvidence {
+    device_proof_key_fingerprint: Option<[u8; 32]>,
     uid: String,
     enterprise_id: String,
     machine_id: String,
@@ -1944,7 +1945,7 @@ fn account_auth_identity_snapshot(account: &Account) -> AccountAuthIdentitySnaps
             .is_buddy_oauth()
             .then(|| codebuddy_identity_evidence(account))
             .flatten(),
-        trae_identity: (account.provider_type == ProviderType::TraeSolo)
+        trae_identity: (account.provider_type.is_trae())
             .then(|| trae_identity_evidence(account))
             .flatten(),
         fallback_email: normalized_identity_email(account.email.as_deref()),
@@ -1993,7 +1994,7 @@ fn account_auth_identity_changed(
             &current.fallback_email,
         );
     }
-    if previous.provider_type == ProviderType::TraeSolo {
+    if previous.provider_type.is_trae() {
         return managed_profile_identity_changed(
             &previous.trae_identity,
             &current.trae_identity,
@@ -2059,7 +2060,7 @@ pub fn account_refresh_replaces_auth_identity(
             &candidate.fallback_email,
         );
     }
-    if previous.provider_type == ProviderType::TraeSolo {
+    if previous.provider_type.is_trae() {
         return managed_refresh_profile_identity_replaced(
             &previous.trae_identity,
             &candidate.trae_identity,
@@ -2242,6 +2243,15 @@ fn trae_identity_evidence(account: &Account) -> Option<TraeIdentityEvidence> {
     let profile = crate::domain::trae::TraeAccountProfile::parse(account.profile.as_ref()).ok()?;
     let [uid, enterprise_id, machine_id, device_id] = profile.stable_identity_components();
     Some(TraeIdentityEvidence {
+        device_proof_key_fingerprint: account
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("devicePrivateKeyPem"))
+            .and_then(Value::as_str)
+            .map(|key| {
+                use sha2::Digest;
+                sha2::Sha256::digest(key.as_bytes()).into()
+            }),
         uid: uid.to_string(),
         enterprise_id: enterprise_id.to_string(),
         machine_id: machine_id.to_string(),
@@ -2854,6 +2864,7 @@ fn account_secret_field(field: &str) -> bool {
         "kiroapikey",
         "secretaccesskey",
         "privatekey",
+        "privatekeypem",
         "signingkey",
     ]
     .iter()
@@ -5659,6 +5670,7 @@ mod tests {
                 "githubToken": "github-token-secret",
                 "copilotToken": {"token": "copilot-token-secret"},
                 "qoderSecrets": {"machineToken": "qoder-machine-token-secret"},
+                "devicePrivateKeyPem": "trae-device-private-key-secret",
                 "entry": {"key": "grok-key-secret"},
                 "extra_headers": {"x-private": "extra-header-secret"}
             })),
@@ -5684,6 +5696,7 @@ mod tests {
         assert!(!content.contains("github-token-secret"));
         assert!(!content.contains("copilot-token-secret"));
         assert!(!content.contains("qoder-machine-token-secret"));
+        assert!(!content.contains("trae-device-private-key-secret"));
         assert!(!content.contains("grok-key-secret"));
         assert!(!content.contains("extra-header-secret"));
         assert!(content.contains(ENCRYPTED_V2_PREFIX));
@@ -5698,6 +5711,10 @@ mod tests {
         assert_eq!(account.refresh_token.as_deref(), Some("refresh-secret"));
         assert_eq!(account.id_token.as_deref(), Some("id-secret"));
         assert_eq!(account.api_key.as_deref(), Some("api-secret"));
+        assert_eq!(
+            account.raw.as_ref().unwrap()["devicePrivateKeyPem"],
+            "trae-device-private-key-secret"
+        );
         assert_eq!(
             account
                 .raw

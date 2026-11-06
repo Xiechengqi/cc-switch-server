@@ -191,6 +191,20 @@ export const serverProviderPresets: Readonly<
     },
     "category": "official"
   },
+  "claude.trae_raw_chat": {
+    "name": "Trae CN raw_chat",
+    "websiteUrl": "https://www.trae.cn",
+    "notes": "Tool calls require optional prompt simulation. Select an explicit upstream model.",
+    "settingsConfig": { "modelMapping": { "mode": "passthrough" } },
+    "category": "official"
+  },
+  "claude.trae_raw_chat_intl": {
+    "name": "Trae Intl raw_chat",
+    "websiteUrl": "https://www.trae.ai",
+    "notes": "Tool calls require optional prompt simulation. Select an explicit upstream model.",
+    "settingsConfig": { "modelMapping": { "mode": "passthrough" } },
+    "category": "official"
+  },
   "claude.kiro_oauth": {
     "name": "Kiro OAuth",
     "websiteUrl": "https://kiro.dev",
@@ -711,6 +725,20 @@ export const serverProviderPresets: Readonly<
         "OPENAI_MODEL": "glm-5.2"
       }
     },
+    "category": "official"
+  },
+  "codex.trae_raw_chat": {
+    "name": "Trae CN raw_chat",
+    "websiteUrl": "https://www.trae.cn",
+    "notes": "Tool calls require optional prompt simulation. Select an explicit upstream model.",
+    "settingsConfig": { "modelMapping": { "mode": "passthrough" } },
+    "category": "official"
+  },
+  "codex.trae_raw_chat_intl": {
+    "name": "Trae Intl raw_chat",
+    "websiteUrl": "https://www.trae.ai",
+    "notes": "Tool calls require optional prompt simulation. Select an explicit upstream model.",
+    "settingsConfig": { "modelMapping": { "mode": "passthrough" } },
     "category": "official"
   },
   "codex.kiro_oauth": {
@@ -1235,6 +1263,20 @@ export const serverProviderPresets: Readonly<
         "upstreamModel": "glm-5.2"
       }
     },
+    "category": "official"
+  },
+  "gemini.trae_raw_chat": {
+    "name": "Trae CN raw_chat",
+    "websiteUrl": "https://www.trae.cn",
+    "notes": "Tool calls require optional prompt simulation. Select an explicit upstream model.",
+    "settingsConfig": { "modelMapping": { "mode": "passthrough" } },
+    "category": "official"
+  },
+  "gemini.trae_raw_chat_intl": {
+    "name": "Trae Intl raw_chat",
+    "websiteUrl": "https://www.trae.ai",
+    "notes": "Tool calls require optional prompt simulation. Select an explicit upstream model.",
+    "settingsConfig": { "modelMapping": { "mode": "passthrough" } },
     "category": "official"
   },
   "gemini.cursor_api_key": {

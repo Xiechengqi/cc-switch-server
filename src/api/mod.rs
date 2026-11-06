@@ -2652,7 +2652,7 @@ fn resolve_trae_catalog_provider<'a>(
 ) -> Option<&'a StoredProvider> {
     let provider_id = provider_id.map(str::trim).filter(|id| !id.is_empty())?;
     let mut matches = providers.providers.iter().filter(|provider| {
-        provider.provider_type == ProviderType::TraeSolo
+        provider.provider_type.is_trae()
             && provider.provider.id == provider_id
             && app.is_none_or(|app| provider.app == app)
     });

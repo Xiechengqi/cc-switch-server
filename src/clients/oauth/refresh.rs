@@ -187,6 +187,8 @@ pub fn provider_native_refresh_available(provider_type: ProviderType) -> bool {
             | ProviderType::CodeBuddyOAuth
             | ProviderType::WorkBuddyOAuth
             | ProviderType::TraeSolo
+            | ProviderType::TraeRaw
+            | ProviderType::TraeIntl
     ) {
         return true;
     }
@@ -425,7 +427,7 @@ where
         )
         .await;
     }
-    if account.provider_type == ProviderType::TraeSolo {
+    if account.provider_type.is_trae() {
         return crate::clients::oauth::trae::refresh_trae_account(
             http,
             account,

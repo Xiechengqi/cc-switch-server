@@ -335,6 +335,13 @@ fn account_secret_values(account: &Account) -> Vec<&str> {
         .chain(account.api_key.iter())
         .map(String::as_str)
         .chain(account.extra_headers.values().map(String::as_str))
+        .chain(
+            account
+                .raw
+                .as_ref()
+                .and_then(|raw| raw.get("devicePrivateKeyPem"))
+                .and_then(Value::as_str),
+        )
         .filter(|value| !value.is_empty())
         .collect()
 }
@@ -426,6 +433,7 @@ fn account_public_key_is_sensitive(key: &str) -> bool {
         "apikey",
         "clientsecret",
         "privatekey",
+        "privatekeypem",
         "signingkey",
         "sessioncookie",
         "machinetoken",
@@ -845,6 +853,8 @@ pub(in crate::api) struct CancelCodeBuddyLoginResponse {
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct StartTraeLoginRequest {
     #[serde(default)]
+    pub(in crate::api) provider_type: Option<ProviderType>,
+    #[serde(default)]
     pub(in crate::api) account_id: Option<String>,
 }
 
@@ -1123,6 +1133,7 @@ mod tests {
             "idToken": "id-secret-value",
             "apiKey": "api-secret-value",
             "extraHeaders": {"x-session": "header-secret-value"},
+            "raw": {"devicePrivateKeyPem": "trae-private-key-secret"},
             "quota": {
                 "success": true,
                 "credentialMessage": "plan access-secret-value\napi_key=unknown-credential-secret",
@@ -1137,6 +1148,8 @@ mod tests {
                         },
                         "encoded": "{\"refresh_token\":\"unknown-refresh-secret\",\"usage\":42}",
                         "reflected": "prefix header-secret-value suffix",
+                        "reflectedDeviceProofKey": "prefix trae-private-key-secret suffix",
+                        "devicePrivateKeyPem": "unknown-device-private-key",
                         "tokenLimit": 8192
                     }
                 }
@@ -1155,6 +1168,8 @@ mod tests {
             "unknown-client-secret",
             "unknown-refresh-secret",
             "unknown-credential-secret",
+            "trae-private-key-secret",
+            "unknown-device-private-key",
         ] {
             assert!(!serialized.contains(secret), "leaked secret: {secret}");
         }

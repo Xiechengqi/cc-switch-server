@@ -12,11 +12,11 @@ const variantToId = new Map([...model.matchAll(/Self::([A-Za-z0-9]+)\s*=>\s*"([^
 const knownEntryGaps = JSON.parse(read("assets/contract/web-runtime-contract.json")).authCenter.knownEntryGaps;
 const audit = (overrides = {}) => auditAuthCenterCoverage({ accountManagers, variantToId, registry, knownEntryGaps, ...overrides });
 
-test("AuthCenter covers Rust managed accounts with an explicit pre-existing Trae gap", () => {
-  assert.deepEqual(audit(), { errors: [], entryCount: 15, knownEntryGaps: ["trae_solo"] });
+test("AuthCenter covers all Rust managed accounts including the three Trae channels", () => {
+  assert.deepEqual(audit(), { errors: [], entryCount: 18, knownEntryGaps: [] });
 });
 
-for (const product of ["codebuddy_oauth", "workbuddy_oauth"]) {
+for (const product of ["codebuddy_oauth", "workbuddy_oauth", "trae_solo", "trae_raw_chat", "trae_raw_chat_intl"]) {
   test(`AuthCenter rejects a missing ${product} entry`, () => {
     const result = audit({ registry: registry.replace(`providerType: "${product}"`, "removed: true") });
     assert.ok(result.errors.includes(`AuthCenter is missing managed-account entry ${product}`));
@@ -42,6 +42,6 @@ test("AuthCenter rejects duplicates and Provider-owned static credentials", () =
 test("known gaps need a reason and must be removed when implemented", () => {
   assert.ok(audit({ knownEntryGaps: [{ providerType: "trae_solo", status: "known_gap", reason: "" }] })
     .errors.includes("AuthCenter has invalid known entry gap trae_solo"));
-  assert.ok(audit({ registry: `${registry}\n{providerType: "trae_solo"}` })
+  assert.ok(audit({ knownEntryGaps: [{ providerType: "trae_solo", status: "known_gap", reason: "fixture gap already closed" }] })
     .errors.includes("AuthCenter known entry gap trae_solo is already implemented"));
 });

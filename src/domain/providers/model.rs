@@ -57,6 +57,10 @@ pub enum ProviderType {
     WorkBuddyOAuth,
     #[serde(rename = "trae_solo")]
     TraeSolo,
+    #[serde(rename = "trae_raw_chat")]
+    TraeRaw,
+    #[serde(rename = "trae_raw_chat_intl")]
+    TraeIntl,
     #[serde(rename = "cursor_oauth")]
     CursorOAuth,
     #[serde(rename = "cursor_apikey")]
@@ -78,6 +82,18 @@ pub enum ProviderType {
 }
 
 impl ProviderType {
+    pub const fn is_trae(self) -> bool {
+        matches!(self, Self::TraeSolo | Self::TraeRaw | Self::TraeIntl)
+    }
+    pub const fn trae_driver_id(self) -> Option<&'static str> {
+        match self {
+            Self::TraeSolo => Some("special.trae_solo"),
+            Self::TraeRaw => Some("special.trae_raw_chat"),
+            Self::TraeIntl => Some("special.trae_raw_chat_intl"),
+            _ => None,
+        }
+    }
+
     pub const fn is_buddy_oauth(self) -> bool {
         matches!(self, Self::CodeBuddyOAuth | Self::WorkBuddyOAuth)
     }
@@ -109,6 +125,8 @@ impl ProviderType {
             Self::CodeBuddyOAuth => "codebuddy_oauth",
             Self::WorkBuddyOAuth => "workbuddy_oauth",
             Self::TraeSolo => "trae_solo",
+            Self::TraeRaw => "trae_raw_chat",
+            Self::TraeIntl => "trae_raw_chat_intl",
             Self::CursorOAuth => "cursor_oauth",
             Self::CursorApiKey => "cursor_apikey",
             Self::AntigravityOAuth => "antigravity_oauth",
@@ -189,6 +207,8 @@ pub struct ProviderMeta {
     pub codex_image_tool_strip_policy: Option<CodexImageToolStripPolicy>,
     #[serde(default)]
     pub codex_websocket_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trae_tool_simulation_enabled: Option<bool>,
     #[serde(default)]
     pub codex_responses_keepalive_interval_ms: Option<u64>,
     #[serde(default)]
@@ -294,6 +314,8 @@ fn classify_claude_provider(provider: &Provider) -> ProviderType {
         Some("codebuddy_oauth") => return ProviderType::CodeBuddyOAuth,
         Some("workbuddy_oauth") => return ProviderType::WorkBuddyOAuth,
         Some("trae_solo") => return ProviderType::TraeSolo,
+        Some("trae_raw_chat") => return ProviderType::TraeRaw,
+        Some("trae_raw_chat_intl") => return ProviderType::TraeIntl,
         Some("cursor_oauth") => return ProviderType::CursorOAuth,
         Some("cursor_apikey") => return ProviderType::CursorApiKey,
         _ => {}
@@ -345,6 +367,8 @@ fn classify_codex_provider(provider: &Provider) -> ProviderType {
         Some("codebuddy_oauth") => ProviderType::CodeBuddyOAuth,
         Some("workbuddy_oauth") => ProviderType::WorkBuddyOAuth,
         Some("trae_solo") => ProviderType::TraeSolo,
+        Some("trae_raw_chat") => ProviderType::TraeRaw,
+        Some("trae_raw_chat_intl") => ProviderType::TraeIntl,
         Some("kiro_oauth") => ProviderType::KiroOAuth,
         Some("amazon_q_oauth") | Some("amazon_q") | Some("amazon-q") => ProviderType::AmazonQOAuth,
         _ => {
@@ -388,6 +412,8 @@ fn classify_gemini_provider(provider: &Provider) -> ProviderType {
         Some("codebuddy_oauth") => return ProviderType::CodeBuddyOAuth,
         Some("workbuddy_oauth") => return ProviderType::WorkBuddyOAuth,
         Some("trae_solo") => return ProviderType::TraeSolo,
+        Some("trae_raw_chat") => return ProviderType::TraeRaw,
+        Some("trae_raw_chat_intl") => return ProviderType::TraeIntl,
         Some("amazon_q_oauth") | Some("amazon_q") | Some("amazon-q") => {
             return ProviderType::AmazonQOAuth
         }

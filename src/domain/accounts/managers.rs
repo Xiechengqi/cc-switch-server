@@ -713,6 +713,8 @@ fn account_manager_kind_for(provider_type: ProviderType) -> AccountManagerKind {
         | ProviderType::CodeBuddyOAuth
         | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo
+        | ProviderType::TraeRaw
+        | ProviderType::TraeIntl
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth => AccountManagerKind::NativeOAuth,
@@ -742,7 +744,7 @@ fn validate_required_account_credential(
     if input.provider_type.is_buddy_oauth() {
         validate_codebuddy_account_input(input)?;
     }
-    if input.provider_type == ProviderType::TraeSolo {
+    if input.provider_type.is_trae() {
         validate_trae_account_input(input)?;
     }
     Ok(())
@@ -1021,7 +1023,7 @@ pub fn account_import_templates() -> Vec<AccountImportTemplate> {
         .collect()
 }
 
-fn account_provider_types() -> [ProviderType; 21] {
+fn account_provider_types() -> [ProviderType; 23] {
     [
         ProviderType::ClaudeOAuth,
         ProviderType::CodexOAuth,
@@ -1036,6 +1038,8 @@ fn account_provider_types() -> [ProviderType; 21] {
         ProviderType::CodeBuddyOAuth,
         ProviderType::WorkBuddyOAuth,
         ProviderType::TraeSolo,
+        ProviderType::TraeRaw,
+        ProviderType::TraeIntl,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
@@ -1086,6 +1090,8 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
             | ProviderType::CodeBuddyOAuth
             | ProviderType::WorkBuddyOAuth
             | ProviderType::TraeSolo
+            | ProviderType::TraeRaw
+            | ProviderType::TraeIntl
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth
@@ -1167,6 +1173,8 @@ pub(crate) fn account_credential_ownership(
         | ProviderType::CodeBuddyOAuth
         | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo
+        | ProviderType::TraeRaw
+        | ProviderType::TraeIntl
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth => AccountCredentialOwnership::ManagedAccount,
@@ -1193,7 +1201,7 @@ fn login_flows_for(provider_type: ProviderType) -> Vec<AccountLoginFlowCapabilit
             supports_cancel: true,
         });
     }
-    if provider_type == ProviderType::TraeSolo {
+    if provider_type.is_trae() {
         flows.push(AccountLoginFlowCapability {
             kind: AccountLoginFlowKind::BrowserOAuth,
             supports_callback: true,
@@ -1842,6 +1850,18 @@ mod tests {
                 true,
             ),
             (
+                ProviderType::TraeRaw,
+                OAuthRefreshCapability::ProviderDynamic,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
+                ProviderType::TraeIntl,
+                OAuthRefreshCapability::ProviderDynamic,
+                OAuthQuotaCapability::LiveRefresh,
+                true,
+            ),
+            (
                 ProviderType::CursorOAuth,
                 OAuthRefreshCapability::OAuthRequest,
                 OAuthQuotaCapability::ImportedSnapshot,
@@ -1961,7 +1981,7 @@ mod tests {
                 .iter()
                 .filter(|item| item.kind == AccountManagerKind::NativeOAuth)
                 .count(),
-            15
+            17
         );
         assert_eq!(
             registrations

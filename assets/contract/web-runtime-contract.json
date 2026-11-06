@@ -6,13 +6,7 @@
     "capabilityEndpoint": "GET /api/accounts/capabilities",
     "buddyLoginSiteScope": "page",
     "buddyAccountSiteField": "buddy.site",
-    "knownEntryGaps": [
-      {
-        "providerType": "trae_solo",
-        "status": "known_gap",
-        "reason": "Pre-existing missing AuthCenter entry; the Provider editor is available. Tracked separately from CodeBuddy/WorkBuddy integration."
-      }
-    ],
+    "knownEntryGaps": [],
     "workBuddyCheckin": {
       "scope": "account",
       "supported": "workbuddy_oauth_cn_personal",

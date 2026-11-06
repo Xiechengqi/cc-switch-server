@@ -151,6 +151,8 @@ pub fn subscription_expiry_capability(provider_type: ProviderType) -> Subscripti
         | ProviderType::CodeBuddyOAuth
         | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo
+        | ProviderType::TraeRaw
+        | ProviderType::TraeIntl
         | ProviderType::CursorOAuth => SubscriptionExpiryCapability::ResearchPending,
         ProviderType::Claude
         | ProviderType::ClaudeAuth

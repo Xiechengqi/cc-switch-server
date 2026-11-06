@@ -620,12 +620,14 @@
     "patRail": "PAT"
   },
   "traeOauth": {
+    "signIn": "登录",
+    "toolSimulation": "启用工具提示词模拟（由模型遵从提示词生成调用）",
     "authStatus": "Trae 中国区 Solo 认证",
     "callbackHint": "若浏览器无法访问 Server 的 localhost 回调，请从地址栏复制完整回调 URL 并粘贴到此处。",
     "callbackPlaceholder": "http://localhost:15721/api/accounts/trae/login/callback?...",
     "callbackRequired": "请粘贴完整的 Trae 回调 URL。",
     "callbackUrl": "回调 URL",
-    "loginSuccess": "Trae 中国区 Solo 账号已登录。",
+    "loginSuccess": "Trae 账号已登录。",
     "loginWithTrae": "使用 Trae 中国区 Solo 登录",
     "submitCallback": "完成登录"
   },

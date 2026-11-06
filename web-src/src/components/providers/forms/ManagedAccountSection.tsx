@@ -39,6 +39,8 @@ export const MANAGED_ACCOUNT_SECTION_PROVIDER_TYPES = [
   "codebuddy_oauth",
   "workbuddy_oauth",
   "trae_solo",
+  "trae_raw_chat",
+  "trae_raw_chat_intl",
   "deepseek_account",
 ] as const;
 
@@ -182,7 +184,9 @@ export function ManagedAccountSection({
         />
       );
     case "trae_solo":
-      return <TraeOAuthSection {...common} />;
+    case "trae_raw_chat":
+    case "trae_raw_chat_intl":
+      return <TraeOAuthSection {...common} authProvider={sectionProviderType} />;
     case "deepseek_account":
       return <DeepSeekAccountSection {...common} />;
   }

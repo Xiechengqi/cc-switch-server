@@ -265,6 +265,7 @@ function buildFieldConsumption(inventory) {
     persistedField("provider.meta.codexWebsocketEnabled", "runtime"),
     persistedField("provider.meta.codexResponsesKeepaliveIntervalMs", "runtime"),
     persistedField("provider.meta.codexRoutingHintEnabled", "runtime"),
+    persistedField("provider.meta.traeToolSimulationEnabled", "runtime"),
     persistedField("provider.meta.codexChatReasoning", "runtime"),
     persistedField("provider.meta.localProxyRequestOverrides", "runtime", {
       disposition: "retire_unless_consumer_is_allowlisted",

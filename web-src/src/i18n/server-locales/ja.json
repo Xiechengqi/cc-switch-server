@@ -620,12 +620,14 @@
     "patRail": "PAT"
   },
   "traeOauth": {
+    "signIn": "ログイン",
+    "toolSimulation": "ツールのプロンプト模擬を有効化（モデルによる指示への追従が必要）",
     "authStatus": "Trae CN Solo 認証",
     "callbackHint": "ブラウザーが Server の localhost コールバックに到達できない場合は、アドレスバーの完全なコールバック URL をここに貼り付けてください。",
     "callbackPlaceholder": "http://localhost:15721/api/accounts/trae/login/callback?...",
     "callbackRequired": "Trae の完全なコールバック URL を貼り付けてください。",
     "callbackUrl": "コールバック URL",
-    "loginSuccess": "Trae CN Solo アカウントでログインしました。",
+    "loginSuccess": "Trae アカウントでログインしました。",
     "loginWithTrae": "Trae CN Solo でログイン",
     "submitCallback": "ログインを完了"
   },

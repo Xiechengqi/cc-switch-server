@@ -15,6 +15,7 @@ import { GeminiOAuthSection } from "@/components/providers/forms/GeminiOAuthSect
 import { GrokOAuthSection } from "@/components/providers/forms/GrokOAuthSection";
 import { KiroOAuthSection } from "@/components/providers/forms/KiroOAuthSection";
 import { KimiOAuthSection } from "@/components/providers/forms/KimiOAuthSection";
+import { TraeOAuthSection } from "@/components/providers/forms/TraeOAuthSection";
 import { QoderOAuthSection } from "@/components/providers/forms/QoderOAuthSection";
 import type { ManagedAccountSectionProviderType } from "@/components/providers/forms/ManagedAccountSection";
 import type { CodeBuddySite } from "@/lib/api/auth";
@@ -136,6 +137,24 @@ export function getAuthCenterProviders(
           onLoginSiteChange={(site) => buddy.onSiteChange("workbuddy_oauth", site)}
         />
       ),
+    },
+    {
+      providerType: "trae_solo", value: "trae_solo",
+      icon: <Sparkles className="h-5 w-5" />, title: "Trae CN Solo",
+      description: t("settings.authCenter.trae_solo", { defaultValue: "国内 SOLO 账号，支持原生工具调用。" }),
+      content: <TraeOAuthSection authProvider="trae_solo" showLoggedInAccounts />,
+    },
+    {
+      providerType: "trae_raw_chat", value: "trae_raw_chat",
+      icon: <Sparkles className="h-5 w-5" />, title: "Trae CN raw_chat",
+      description: t("settings.authCenter.trae_raw_chat", { defaultValue: "国内聊天账号，支持图片输入，可选工具提示词模拟。" }),
+      content: <TraeOAuthSection authProvider="trae_raw_chat" showLoggedInAccounts />,
+    },
+    {
+      providerType: "trae_raw_chat_intl", value: "trae_raw_chat_intl",
+      icon: <Sparkles className="h-5 w-5" />, title: "Trae Intl raw_chat",
+      description: t("settings.authCenter.trae_raw_chat_intl", { defaultValue: "国际站聊天账号，使用独立凭据并指定上游模型。" }),
+      content: <TraeOAuthSection authProvider="trae_raw_chat_intl" showLoggedInAccounts />,
     },
     {
       providerType: "cursor_oauth",

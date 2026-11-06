@@ -3259,6 +3259,16 @@ impl AnthropicGeminiState {
         for (key, value) in object {
             if value.is_number() {
                 self.usage.insert(key.clone(), value.clone());
+            } else if key == "output_tokens_details" {
+                let mut details = serde_json::Map::new();
+                for field in ["thinking_tokens", "reasoning_tokens"] {
+                    if let Some(count) = value.get(field).and_then(Value::as_u64) {
+                        details.insert(field.into(), json!(count));
+                    }
+                }
+                if !details.is_empty() {
+                    self.usage.insert(key.clone(), Value::Object(details));
+                }
             }
         }
     }
@@ -3311,12 +3321,26 @@ fn gemini_usage_from_anthropic_stream_usage(usage: &BTreeMap<String, Value>) -> 
         .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    json!({
+    let mut result = json!({
         "promptTokenCount": input,
         "candidatesTokenCount": output,
         "totalTokenCount": input.saturating_add(output),
         "cachedContentTokenCount": cache_read
-    })
+    });
+    if let Some(thinking) = usage
+        .get("output_tokens_details")
+        .and_then(|details| {
+            details
+                .get("thinking_tokens")
+                .or_else(|| details.get("reasoning_tokens"))
+        })
+        .and_then(Value::as_u64)
+        .filter(|thinking| *thinking <= output)
+    {
+        result["candidatesTokenCount"] = json!(output.saturating_sub(thinking));
+        result["thoughtsTokenCount"] = json!(thinking);
+    }
+    result
 }
 
 fn bridge_thought_signature(value: &Value) -> Option<&str> {

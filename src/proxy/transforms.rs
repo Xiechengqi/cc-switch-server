@@ -7159,6 +7159,20 @@ pub(super) fn anthropic_usage_from_openai_usage(usage: Option<&Value>) -> Value 
             json!(cache_creation),
         );
     }
+    if let Some(thinking) = nonnegative_integer_usage_number(
+        usage,
+        &[
+            &["completion_tokens_details", "reasoning_tokens"],
+            &["output_tokens_details", "reasoning_tokens"],
+        ],
+    )
+    .filter(|thinking| *thinking <= output_tokens)
+    {
+        output.insert(
+            "output_tokens_details".into(),
+            json!({"thinking_tokens":thinking}),
+        );
+    }
     copy_provider_metering(usage, &mut output);
     Value::Object(output)
 }
@@ -7424,12 +7438,25 @@ fn gemini_usage_from_anthropic_usage(usage: Option<&Value>) -> Value {
     let input_tokens = fresh_input_tokens
         .saturating_add(cache_read.unwrap_or(0))
         .saturating_add(cache_creation.unwrap_or(0));
-    json!({
+    let mut result = json!({
         "promptTokenCount": input_tokens,
         "candidatesTokenCount": output_tokens,
         "totalTokenCount": input_tokens + output_tokens,
         "cachedContentTokenCount": cache_read.unwrap_or(0)
-    })
+    });
+    if let Some(thinking) = nonnegative_integer_usage_number(
+        usage,
+        &[
+            &["output_tokens_details", "thinking_tokens"],
+            &["output_tokens_details", "reasoning_tokens"],
+        ],
+    )
+    .filter(|thinking| *thinking <= output_tokens)
+    {
+        result["candidatesTokenCount"] = json!(output_tokens.saturating_sub(thinking));
+        result["thoughtsTokenCount"] = json!(thinking);
+    }
+    result
 }
 
 fn gemini_usage_from_openai_usage(usage: Option<&Value>) -> Value {

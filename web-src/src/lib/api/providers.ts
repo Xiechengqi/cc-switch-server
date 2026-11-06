@@ -361,6 +361,7 @@ export interface ProviderBundleSurfaceWriteDraft {
     codexWebsocketEnabled?: boolean;
     codexResponsesKeepaliveIntervalMs?: number;
     codexRoutingHintEnabled?: boolean;
+    traeToolSimulationEnabled?: boolean;
   };
   extraHeaders?: string[];
   customBinding?: ProviderCustomBinding;

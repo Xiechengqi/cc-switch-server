@@ -250,6 +250,8 @@ pub struct ProviderDriverOptionsWriteDraft {
     pub codex_responses_keepalive_interval_ms: Option<u64>,
     #[serde(default)]
     pub codex_routing_hint_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trae_tool_simulation_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,6 +470,7 @@ impl ProviderBundleWriteDraft {
                 .driver_options
                 .codex_responses_keepalive_interval_ms,
             codex_routing_hint_enabled: surface.driver_options.codex_routing_hint_enabled,
+            trae_tool_simulation_enabled: surface.driver_options.trae_tool_simulation_enabled,
             ..ProviderMeta::default()
         };
         if let Some(account) = self.managed_account.as_ref() {
@@ -836,6 +839,9 @@ fn validate_model_policy_fields(
 impl ProviderDriverOptionsWriteDraft {
     fn configured_fields(&self) -> BTreeSet<&'static str> {
         let mut fields = BTreeSet::new();
+        if self.trae_tool_simulation_enabled.is_some() {
+            fields.insert("traeToolSimulationEnabled");
+        }
         if self.api_key_field.is_some() {
             fields.insert("apiKeyField");
         }

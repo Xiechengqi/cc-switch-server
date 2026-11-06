@@ -2954,7 +2954,10 @@ export function ProviderBundleEditor({
               </div>
             </ConfigCard>
 
-            {codexDriverOptions || grokDriverOptions ? (
+            {codexDriverOptions ||
+            grokDriverOptions ||
+            draft.familyId === "family.trae_raw_chat" ||
+            draft.familyId === "family.trae_raw_chat_intl" ? (
               <ConfigCard
                 id="bundle-card-features"
                 title={t("providerBundle.cardFeatures", {
@@ -2968,6 +2971,33 @@ export function ProviderBundleEditor({
                 onOpenChange={(open) => setCardOpen("features", open)}
               >
                 <div className="space-y-5">
+                  {draft.familyId === "family.trae_raw_chat" ||
+                  draft.familyId === "family.trae_raw_chat_intl" ? (
+                    <Label className="flex items-center gap-2">
+                      <Checkbox
+                        checked={draft.surfaces.some(
+                          (surface) =>
+                            surface.driverOptions.traeToolSimulationEnabled === true,
+                        )}
+                        onCheckedChange={(checked) =>
+                          setDraft((current) => ({
+                            ...current,
+                            surfaces: current.surfaces.map((surface) => ({
+                              ...surface,
+                              driverOptions: {
+                                ...surface.driverOptions,
+                                traeToolSimulationEnabled: checked === true,
+                              },
+                            })),
+                          }))
+                        }
+                      />
+                      {t("traeOauth.toolSimulation", {
+                        defaultValue: "启用工具提示词模拟（由模型遵从提示词生成调用）",
+                      })}
+                    </Label>
+                  ) : null}
+
                   {codexDriverOptions ? (
                     <CodexFeatureOptions
                       values={{

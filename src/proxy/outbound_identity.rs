@@ -135,6 +135,8 @@ fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(S
             headers,
             crate::domain::codebuddy::BuddyClientIdentity::WorkBuddyCli.user_agent().to_string(),
         ),
+        ManagedIdentityFamily::TraeRawCn => set_user_agent(headers, "Trae CN/3.4.3".to_string()),
+        ManagedIdentityFamily::TraeRawIntl => set_user_agent(headers, "TraeClient/TTNet".to_string()),
         ManagedIdentityFamily::Trae => set_user_agent(
             headers,
             format!("Trae/{}", crate::domain::trae::TRAE_IDE_VERSION),

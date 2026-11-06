@@ -620,12 +620,14 @@
     "patRail": "PAT"
   },
   "traeOauth": {
+    "signIn": "Sign in",
+    "toolSimulation": "Enable tool prompt simulation (the model must follow the prompt)",
     "authStatus": "Trae CN Solo authentication",
     "callbackHint": "If the browser cannot reach the Server localhost callback, paste the complete callback URL from the address bar here.",
     "callbackPlaceholder": "http://localhost:15721/api/accounts/trae/login/callback?...",
     "callbackRequired": "Paste the complete Trae callback URL.",
     "callbackUrl": "Callback URL",
-    "loginSuccess": "Trae CN Solo account signed in.",
+    "loginSuccess": "Trae account signed in.",
     "loginWithTrae": "Sign in with Trae CN Solo",
     "submitCallback": "Complete sign-in"
   },

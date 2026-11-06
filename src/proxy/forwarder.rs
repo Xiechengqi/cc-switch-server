@@ -2245,6 +2245,9 @@ fn request_memory_enabled_for_provider(app: AppKind, provider_type: Option<Provi
                         | ProviderType::GrokOAuth
                         | ProviderType::KiroOAuth
                         | ProviderType::AmazonQOAuth
+                        | ProviderType::TraeSolo
+                        | ProviderType::TraeRaw
+                        | ProviderType::TraeIntl
                         | ProviderType::QoderCosy
                         | ProviderType::CodeBuddyOAuth
                         | ProviderType::WorkBuddyOAuth
@@ -2615,6 +2618,21 @@ async fn forward_with_attempt_inner(
             route,
             stored.provider_type,
         )?;
+        let (body, trae_continuation) = if execution.stored.provider_type.trae_driver_id()
+            == Some(execution.plan.driver_id.as_str())
+            && route == ProxyRoute::CodexResponses
+        {
+            prepare_trae_continuation(
+                &state,
+                &execution,
+                &request_context,
+                body,
+                attempt_context.request_memory(),
+            )
+            .await?
+        } else {
+            (body, None)
+        };
         let qoder_previous_response_id =
             if execution.driver_is("special.qoder_cosy") && route == ProxyRoute::CodexResponses {
                 let raw = serde_json::from_slice::<Value>(&body).map_err(|error| {
@@ -2786,7 +2804,9 @@ async fn forward_with_attempt_inner(
             }))
             .await;
         }
-        if execution.driver_is("special.trae_solo") {
+        if execution.stored.provider_type.trae_driver_id()
+            == Some(execution.plan.driver_id.as_str())
+        {
             if !matches!(
                 route,
                 ProxyRoute::ClaudeMessages
@@ -2809,6 +2829,8 @@ async fn forward_with_attempt_inner(
                 account_in_flight_guard,
                 share_invocation_guard,
                 started,
+                continuation: trae_continuation,
+                request_memory: attempt_context.request_memory().cloned(),
             })
             .await;
         }
@@ -20902,6 +20924,8 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
     Ok(response)
 }
 
+include!("forwarder/trae_support.rs");
+
 struct TraeForwardOptions {
     state: ServerState,
     execution: ProviderExecution,
@@ -20913,6 +20937,8 @@ struct TraeForwardOptions {
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
+    continuation: Option<TraeContinuation>,
+    request_memory: Option<RequestMemoryBudget>,
 }
 
 struct PreparedTraeWireResponse {
@@ -20938,13 +20964,16 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
         account_in_flight_guard,
         share_invocation_guard,
         started,
+        continuation,
+        request_memory,
     } = options;
-    let (ProviderType::TraeSolo, account_id, expected_identity_generation) =
-        execution.managed_account_identity_target().ok_or_else(|| {
-            ProxyError::bad_request(
-                "Trae Provider must bind one explicit trae_solo managed account",
-            )
-        })?
+    let (
+        provider_type @ (ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl),
+        account_id,
+        expected_identity_generation,
+    ) = execution.managed_account_identity_target().ok_or_else(|| {
+        ProxyError::bad_request("Trae Provider must bind one explicit account for its channel")
+    })?
     else {
         return Err(ProxyError::bad_request(
             "Trae Provider account type does not match its runtime contract",
@@ -20956,6 +20985,11 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
         .or_else(|| adapter_request.model.clone())
         .or_else(|| chat_model_from_canonical(&adapter_request.body))
         .ok_or_else(|| ProxyError::bad_request("Trae request is missing a model"))?;
+    let _canonical_memory = trae_reserve(
+        request_memory.as_ref(),
+        RequestMemoryComponent::NormalizedBody,
+        super::request_memory::json_parse_working_bytes(&adapter_request.body),
+    )?;
     let canonical_chat_request = serde_json::from_slice::<Value>(&adapter_request.body)
         .map_err(|error| ProxyError::bad_request(format!("invalid Trae Chat request: {error}")))?;
 
@@ -20993,20 +21027,34 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
                 return Err(error);
             }
         };
-        let model_id = runtime
-            .catalog
-            .resolve_model(&requested_model)
-            .map_err(ProxyError::bad_request)?;
-        let capability = runtime.catalog.capabilities.get(&model_id).ok_or_else(|| {
-            ProxyError::bad_gateway(format!(
-                "Trae live catalog has no capability record for enabled model {model_id}"
-            ))
-        })?;
+        let model_id = if provider_type == ProviderType::TraeIntl {
+            requested_model.clone()
+        } else if provider_type == ProviderType::TraeRaw {
+            runtime
+                .catalog
+                .resolve_raw_model(&requested_model)
+                .map_err(ProxyError::bad_request)?
+        } else {
+            runtime
+                .catalog
+                .resolve_model(&requested_model)
+                .map_err(ProxyError::bad_request)?
+        };
+        let intl_capability;
+        let capability = if provider_type == ProviderType::TraeIntl {
+            intl_capability = super::trae_runtime::raw_passthrough_capability(&model_id)
+                .map_err(ProxyError::bad_request)?;
+            &intl_capability
+        } else {
+            runtime.catalog.capabilities.get(&model_id).ok_or_else(|| {
+                ProxyError::bad_gateway("Trae live catalog is missing capability record")
+            })?
+        };
         let has_tools = canonical_chat_request
             .get("tools")
             .and_then(Value::as_array)
             .is_some_and(|tools| !tools.is_empty());
-        if has_tools && !capability.supports_tools {
+        if has_tools && provider_type == ProviderType::TraeSolo && !capability.supports_tools {
             return qoder_fail_before_commit(
                 &state,
                 &stored,
@@ -21019,23 +21067,55 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
             )
             .await;
         }
-        let payload =
-            match super::trae::build_trae_payload(&canonical_chat_request, &model_id, capability) {
-                Ok(payload) => payload,
-                Err(error) => {
-                    return qoder_fail_before_commit(
-                        &state,
-                        &stored,
-                        &adapter_request,
-                        &request_context,
-                        started,
-                        ProxyError::bad_request(error),
-                    )
-                    .await;
-                }
-            };
+        let _payload_memory = trae_reserve(
+            request_memory.as_ref(),
+            RequestMemoryComponent::NormalizedBody,
+            retained_json_bytes(&canonical_chat_request)
+                .saturating_mul(4)
+                .saturating_add(8192),
+        )?;
+        let simulate_tools = execution
+            .plan
+            .driver_options
+            .get("traeToolSimulationEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let (payload, tool_contract) = match if provider_type == ProviderType::TraeSolo {
+            super::trae::build_trae_payload(&canonical_chat_request, &model_id, capability)
+                .and_then(|payload| {
+                    let contract = super::trae::TraeToolContract::from_payload(&payload)?;
+                    Ok((payload, contract))
+                })
+        } else {
+            super::trae::build_raw_payload(
+                &canonical_chat_request,
+                &model_id,
+                capability,
+                simulate_tools,
+            )
+        } {
+            Ok(payload) => payload,
+            Err(error) => {
+                return qoder_fail_before_commit(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    ProxyError::bad_request(error),
+                )
+                .await;
+            }
+        };
         adapter_request.actual_model = Some(model_id.clone());
-        adapter_request.actual_model_source = Some("trae_live_catalog".to_string());
+        adapter_request.actual_model_source = Some(
+            if provider_type == ProviderType::TraeIntl {
+                "trae_explicit_passthrough"
+            } else {
+                "trae_live_catalog"
+            }
+            .to_string(),
+        );
         if let Err(error) = ensure_share_model_available(
             &state,
             &execution,
@@ -21055,42 +21135,52 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
             .await;
         }
 
-        let wire =
-            match send_trae_generation(&state, &execution, &runtime, &payload, &model_id).await {
-                Ok(wire) => wire,
-                Err(TraeForwardAttemptError::Upstream(error))
-                    if error.is_authentication_failure() && !auth_recovery_attempted =>
-                {
-                    auth_recovery_attempted = true;
-                    recover_trae_auth(&state, &execution, Some(&runtime)).await?;
-                    continue;
-                }
-                Err(TraeForwardAttemptError::Upstream(error)) => {
-                    let error = error.into_proxy_error();
-                    record_qoder_nonstream_failure(
-                        &state,
-                        &stored,
-                        &adapter_request,
-                        &request_context,
-                        started,
-                        &error,
-                    )
-                    .await;
-                    return Err(error);
-                }
-                Err(TraeForwardAttemptError::Proxy(error)) => {
-                    record_qoder_nonstream_failure(
-                        &state,
-                        &stored,
-                        &adapter_request,
-                        &request_context,
-                        started,
-                        &error,
-                    )
-                    .await;
-                    return Err(error);
-                }
-            };
+        let wire = match send_trae_generation(TraeGenerationOptions {
+            state: &state,
+            execution: &execution,
+            runtime: &runtime,
+            payload: &payload,
+            model_id: &model_id,
+            tool_contract,
+            simulate_tools,
+            request_memory: request_memory.as_ref(),
+        })
+        .await
+        {
+            Ok(wire) => wire,
+            Err(TraeForwardAttemptError::Upstream(error))
+                if error.is_authentication_failure() && !auth_recovery_attempted =>
+            {
+                auth_recovery_attempted = true;
+                recover_trae_auth(&state, &execution, Some(&runtime)).await?;
+                continue;
+            }
+            Err(TraeForwardAttemptError::Upstream(error)) => {
+                let error = error.into_proxy_error();
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+            Err(TraeForwardAttemptError::Proxy(error)) => {
+                record_qoder_nonstream_failure(
+                    &state,
+                    &stored,
+                    &adapter_request,
+                    &request_context,
+                    started,
+                    &error,
+                )
+                .await;
+                return Err(error);
+            }
+        };
 
         if adapter_request.stream_requested {
             let task = tokio::spawn(forward_trae_stream(TraeStreamOptions {
@@ -21105,13 +21195,27 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
                 account_in_flight_guard,
                 share_invocation_guard,
                 started,
+                continuation,
+                request_memory,
             }));
             return await_provider_stream_task(task, "Trae").await;
         }
 
-        match aggregate_trae_nonstream(&state, &execution, &runtime, wire).await {
-            Ok(canonical) => {
-                return finish_qoder_nonstream(QoderNonstreamFinishOptions {
+        match aggregate_trae_nonstream(&state, &execution, &runtime, wire, request_memory.as_ref())
+            .await
+        {
+            Ok((canonical, canonical_memory)) => {
+                let cache_snapshot = if continuation.is_some() {
+                    let reservation = trae_reserve(
+                        request_memory.as_ref(),
+                        RequestMemoryComponent::NormalizedEvent,
+                        retained_json_bytes(&canonical).saturating_mul(2),
+                    )?;
+                    Some((canonical.clone(), reservation))
+                } else {
+                    None
+                };
+                let response = finish_qoder_nonstream(QoderNonstreamFinishOptions {
                     state,
                     stored,
                     adapter,
@@ -21120,13 +21224,19 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
                     request_context,
                     canonical,
                     alias_publication: None,
-                    canonical_memory: None,
+                    canonical_memory,
                     account_in_flight_guard,
                     share_invocation_guard,
                     started,
-                    request_memory: None,
+                    request_memory,
                 })
-                .await;
+                .await?;
+                if let (Some(continuation), Some((canonical, _snapshot_memory))) =
+                    (&continuation, cache_snapshot)
+                {
+                    continuation.store(&canonical)?;
+                }
+                return Ok(response);
             }
             Err(TraeForwardAttemptError::Upstream(error))
                 if error.is_authentication_failure() && !auth_recovery_attempted =>
@@ -21163,100 +21273,78 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
     }
 }
 
+struct TraeGenerationOptions<'a> {
+    state: &'a ServerState,
+    execution: &'a ProviderExecution,
+    runtime: &'a super::trae_runtime::PreparedTraeRuntime,
+    payload: &'a Value,
+    model_id: &'a str,
+    tool_contract: super::trae::TraeToolContract,
+    simulate_tools: bool,
+    request_memory: Option<&'a RequestMemoryBudget>,
+}
+
 async fn send_trae_generation(
-    state: &ServerState,
-    execution: &ProviderExecution,
-    runtime: &super::trae_runtime::PreparedTraeRuntime,
-    payload: &Value,
-    model_id: &str,
+    options: TraeGenerationOptions<'_>,
 ) -> Result<PreparedTraeWireResponse, TraeForwardAttemptError> {
+    let TraeGenerationOptions {
+        state,
+        execution,
+        runtime,
+        payload,
+        model_id,
+        tool_contract,
+        simulate_tools,
+        request_memory,
+    } = options;
+    // One deadline covers response headers, error bodies and all queue/progress
+    // frames before the first semantic output. Transport activity cannot renew it.
+    let prelude_deadline = tokio::time::Instant::now() + execution.request_timeout();
     if !trae_runtime_is_current(state, execution, runtime).await {
         return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
             "Trae Provider or bound account changed before inference",
         )));
     }
+    let _body_memory = trae_reserve(
+        request_memory,
+        RequestMemoryComponent::NormalizedBody,
+        serialized_json_bytes(payload),
+    )
+    .map_err(TraeForwardAttemptError::Proxy)?;
     let body = serde_json::to_vec(payload).map_err(|error| {
         TraeForwardAttemptError::Proxy(ProxyError::bad_gateway(format!(
             "encode Trae generation payload: {error}"
         )))
     })?;
-    let profile = &runtime.profile;
-    let target_headers = vec![
-        ("accept".to_string(), "text/event-stream".to_string()),
-        ("content-type".to_string(), "application/json".to_string()),
-        (
-            "user-agent".to_string(),
-            format!("Trae/{}", crate::domain::trae::TRAE_IDE_VERSION),
-        ),
-        (
-            "authorization".to_string(),
-            format!("Cloud-IDE-JWT {}", runtime.access_token),
-        ),
-        (
-            "x-cloudide-token".to_string(),
-            runtime.access_token.to_string(),
-        ),
-        ("x-ide-token".to_string(), runtime.access_token.to_string()),
-        ("x-uid".to_string(), profile.uid.clone()),
-        (
-            "x-app-id".to_string(),
-            crate::domain::trae::TRAE_APP_ID.to_string(),
-        ),
-        ("x-app-version".to_string(), "default".to_string()),
-        (
-            "x-ide-version".to_string(),
-            crate::domain::trae::TRAE_IDE_VERSION.to_string(),
-        ),
-        (
-            "x-ide-version-code".to_string(),
-            crate::domain::trae::TRAE_IDE_VERSION_CODE.to_string(),
-        ),
-        (
-            "x-app-version-code".to_string(),
-            crate::domain::trae::TRAE_IDE_VERSION_CODE.to_string(),
-        ),
-        ("x-ide-version-type".to_string(), "stable".to_string()),
-        ("x-device-type".to_string(), "windows".to_string()),
-        (
-            "x-os-version".to_string(),
-            crate::domain::trae::TRAE_OS_VERSION.to_string(),
-        ),
-        (
-            "x-device-brand".to_string(),
-            crate::domain::trae::TRAE_DEVICE_BRAND.to_string(),
-        ),
-        ("request-traffic-type".to_string(), "prod".to_string()),
-        ("x-machine-id".to_string(), profile.machine_id.clone()),
-        ("x-device-id".to_string(), profile.device_id.clone()),
-    ];
+    let protocol = crate::domain::trae::TraeProtocol::for_provider(execution.stored.provider_type)
+        .map_err(|error| TraeForwardAttemptError::Proxy(ProxyError::bad_request(error)))?;
+    let target_headers = protocol.headers(&runtime.profile, &runtime.access_token, true);
     let mut headers = HeaderMap::new();
     super::outbound_request::insert_target_headers(&mut headers, &target_headers)
         .map_err(TraeForwardAttemptError::Proxy)?;
-    let url = super::join_url(&runtime.agent_origin, crate::domain::trae::TRAE_CHAT_PATH);
+    let url = super::join_url(&runtime.agent_origin, protocol.chat_path);
     let request = state
         .http_client()
         .await
         .post(url)
         .headers(headers)
         .body(body);
-    let response = match execution.stream_first_byte_timeout() {
-        Some(timeout) => tokio::time::timeout(timeout, request.send())
-            .await
-            .map_err(|_| {
-                TraeForwardAttemptError::Proxy(ProxyError {
-                    status: StatusCode::GATEWAY_TIMEOUT,
-                    message: format!(
-                        "Trae generation response-header timeout after {}ms",
-                        timeout.as_millis()
-                    ),
-                })
-            })?
-            .map_err(|error| TraeForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
-        None => request
-            .send()
-            .await
-            .map_err(|error| TraeForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?,
-    };
+    let remaining = prelude_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let header_timeout = execution
+        .stream_first_byte_timeout()
+        .map_or(remaining, |timeout| timeout.min(remaining));
+    let response = tokio::time::timeout(header_timeout, request.send())
+        .await
+        .map_err(|_| {
+            TraeForwardAttemptError::Proxy(ProxyError {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message: format!(
+                    "Trae generation response-header timeout after {}ms",
+                    header_timeout.as_millis()
+                ),
+            })
+        })?
+        .map_err(|error| TraeForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
     if !trae_runtime_is_current(state, execution, runtime).await {
         return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
             "Trae Provider or bound account changed while inference was starting",
@@ -21265,19 +21353,37 @@ async fn send_trae_generation(
     let mut response = response;
     let status = response.status();
     if !status.is_success() {
-        let body = crate::infra::http::read_response_body_limited(
-            &mut response,
-            PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+        let (body, _error_body_memory) = tokio::time::timeout_at(
+            prelude_deadline,
+            read_response_body_limited_with_memory(
+                &mut response,
+                PROXY_BUFFERED_RESPONSE_BODY_LIMIT_BYTES,
+                request_memory,
+            ),
         )
         .await
-        .map_err(|error| TraeForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
+        .map_err(|_| {
+            TraeForwardAttemptError::Proxy(ProxyError {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message: "Trae generation error-body timeout before response commit".into(),
+            })
+        })?
+        .map_err(|error| TraeForwardAttemptError::Proxy(error.into_proxy_error()))?;
         return Err(TraeForwardAttemptError::Upstream(
             super::trae::TraeUpstreamError::from_status_body(status.as_u16(), &body),
         ));
     }
 
     let mut inner = response.bytes_stream().boxed();
-    let mut decoder = super::trae::TraeSseDecoder::new(model_id);
+    let mut decoder = if protocol.raw {
+        super::trae::TraeSseDecoder::with_raw(model_id, tool_contract, simulate_tools)
+    } else {
+        super::trae::TraeSseDecoder::with_contract(model_id, tool_contract)
+    };
+    decoder
+        .attach_memory(request_memory.cloned())
+        .map_err(TraeForwardAttemptError::Proxy)?;
+    // Transport progress cannot extend the first semantic output deadline.
     let mut received_chunk = false;
     loop {
         let timeout = if received_chunk {
@@ -21285,6 +21391,8 @@ async fn send_trae_generation(
         } else {
             execution.stream_first_byte_timeout()
         };
+        let remaining = prelude_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let timeout = Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)));
         let next = trae_next_wire_chunk(&mut inner, timeout).await?;
         let Some(chunk) = next else {
             let tail = decoder.finish_classified().map_err(map_trae_decode_error)?;
@@ -21362,6 +21470,7 @@ async fn trae_runtime_is_current(
             &runtime.account_id,
             runtime.auth_identity_generation,
             runtime.token_refresh_generation,
+            runtime.account_incarnation,
         )
         .await
 }
@@ -21374,7 +21483,7 @@ async fn recover_trae_auth(
     let (provider_type, account_id, expected_generation) = execution
         .managed_account_identity_target()
         .ok_or_else(|| ProxyError::bad_request("Trae managed account binding is missing"))?;
-    if provider_type != ProviderType::TraeSolo {
+    if !provider_type.is_trae() {
         return Err(ProxyError::bad_request(
             "Trae managed account binding has the wrong provider type",
         ));
@@ -21383,11 +21492,7 @@ async fn recover_trae_auth(
         state.invalidate_trae_runtime_scope(&runtime.scope).await;
     }
     state
-        .refresh_managed_account_now_for_generation(
-            ProviderType::TraeSolo,
-            account_id,
-            expected_generation,
-        )
+        .refresh_managed_account_now_for_generation(provider_type, account_id, expected_generation)
         .await
         .map_err(managed_account_refresh_error_to_proxy_error)
 }
@@ -21427,8 +21532,11 @@ async fn aggregate_trae_nonstream(
     execution: &ProviderExecution,
     runtime: &super::trae_runtime::PreparedTraeRuntime,
     mut wire: PreparedTraeWireResponse,
-) -> Result<Value, TraeForwardAttemptError> {
-    loop {
+    request_memory: Option<&RequestMemoryBudget>,
+) -> Result<(Value, Option<RequestMemoryReservation>), TraeForwardAttemptError> {
+    // The decoder already owns the aggregate; discard its redundant first delta.
+    wire.first_canonical = Bytes::new();
+    while !wire.decoder.is_terminal() {
         let chunk =
             match trae_next_wire_chunk(&mut wire.inner, execution.stream_idle_timeout()).await {
                 Ok(Some(chunk)) => chunk,
@@ -21454,9 +21562,22 @@ async fn aggregate_trae_nonstream(
             "Trae Provider or bound account changed before response commit",
         )));
     }
-    wire.decoder
+    // Reserve before constructing the JSON aggregate and keep the reservation
+    // through downstream conversion and continuation storage.
+    let canonical_memory = trae_reserve(
+        request_memory,
+        RequestMemoryComponent::NormalizedEvent,
+        wire.decoder
+            .retained_bytes()
+            .saturating_mul(8)
+            .saturating_add(8192),
+    )
+    .map_err(TraeForwardAttemptError::Proxy)?;
+    let canonical = wire
+        .decoder
         .into_chat_completion()
-        .map_err(TraeForwardAttemptError::Proxy)
+        .map_err(TraeForwardAttemptError::Proxy)?;
+    Ok((canonical, canonical_memory))
 }
 
 struct TraeStreamOptions {
@@ -21471,6 +21592,8 @@ struct TraeStreamOptions {
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
+    continuation: Option<TraeContinuation>,
+    request_memory: Option<RequestMemoryBudget>,
 }
 
 async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, ProxyError> {
@@ -21486,6 +21609,8 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
         account_in_flight_guard,
         share_invocation_guard,
         started,
+        continuation,
+        request_memory,
     } = options;
     let first_canonical = wire.first_canonical;
     let mut stream_transform =
@@ -21495,36 +21620,24 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
             adapter_request.responses_tool_context.clone(),
             adapter_request.downstream_include_usage,
         );
-    let mut first_transformed = match stream_transform.push(first_canonical.clone()) {
-        Ok(transformed) => transformed,
-        Err(error) => {
-            return qoder_fail_before_commit(
-                &state,
-                &stored,
-                &adapter_request,
-                &request_context,
-                started,
-                error,
-            )
-            .await;
-        }
-    };
+    let transformer_memory = trae_reserve(
+        request_memory.as_ref(),
+        RequestMemoryComponent::StreamRetainedState,
+        stream_transform.retained_bytes(),
+    )?;
+    let first_transformed = trae_transform(
+        &mut stream_transform,
+        first_canonical.clone(),
+        wire.decoder.is_terminal(),
+        request_memory.as_ref(),
+        &transformer_memory,
+    )?;
     if wire.decoder.is_terminal() {
-        let tail = match stream_transform.finish() {
-            Ok(tail) => tail,
-            Err(error) => {
-                return qoder_fail_before_commit(
-                    &state,
-                    &stored,
-                    &adapter_request,
-                    &request_context,
-                    started,
-                    error,
-                )
-                .await;
-            }
-        };
-        first_transformed = join_bytes(first_transformed, tail);
+        trae_store_continuation(
+            continuation.as_ref(),
+            &wire.decoder,
+            request_memory.as_ref(),
+        )?;
     }
     let request_id = log_usage(
         &state,
@@ -21555,11 +21668,17 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
             status_code: StatusCode::OK.as_u16(),
             share_id: share_id.clone(),
             user_email: user_email.clone(),
-                                    quota_started_at_ms,
+            quota_started_at_ms,
             started,
             first_token_ms: None,
             usage: StreamUsageAccumulator::default(),
         };
+        let _continuation = continuation;
+        let mut keepalive = super::downstream_keepalive::DownstreamKeepalive::new(Duration::from_secs(15));
+        if let Some(keepalive) = &mut keepalive {
+            keepalive.commit(tokio::time::Instant::now());
+        }
+        let mut upstream_deadline = execution.stream_idle_timeout().map(|timeout| tokio::time::Instant::now() + timeout);
         let mut first_token_ms = None;
         if !first_canonical.is_empty() {
             interrupt_guard.usage.push(&first_canonical);
@@ -21584,7 +21703,25 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
             return;
         }
         loop {
-            let next = trae_next_wire_chunk(&mut wire.inner, execution.stream_idle_timeout()).await;
+            let remaining = upstream_deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
+            let next = if let Some(deadline) = keepalive.as_ref().and_then(|keepalive| keepalive.deadline()) {
+                tokio::select! {
+                    next = trae_next_wire_chunk(&mut wire.inner, remaining) => next,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        if let Some(keepalive) = &mut keepalive {
+                            keepalive.emitted(tokio::time::Instant::now());
+                        }
+                        yield Ok::<Bytes, std::io::Error>(trae_keepalive_frame(route));
+                        continue;
+                    }
+                }
+            } else {
+                trae_next_wire_chunk(&mut wire.inner, remaining).await
+            };
+            if matches!(&next, Ok(Some(_))) {
+                upstream_deadline = execution.stream_idle_timeout()
+                    .map(|timeout| tokio::time::Instant::now() + timeout);
+            }
             let canonical = match next {
                 Ok(Some(chunk)) => match wire.decoder.push_classified(chunk) {
                     Ok(canonical) => canonical,
@@ -21652,13 +21789,17 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
             if !canonical.is_empty() {
                 interrupt_guard.usage.push(&canonical);
             }
-            let mut transformed = match stream_transform.push(canonical) {
+            let transformed = match trae_transform(
+                &mut stream_transform,
+                canonical,
+                wire.decoder.is_terminal(),
+                request_memory.as_ref(),
+                &transformer_memory,
+            ) {
                 Ok(transformed) => transformed,
                 Err(error) => {
                     if let Some(frame) = finish_qoder_stream_failure(
-                        &mut interrupt_guard,
-                        route,
-                        &error,
+                        &mut interrupt_guard, route, &error,
                     ).await {
                         yield Ok(frame);
                     }
@@ -21666,18 +21807,15 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
                 }
             };
             if wire.decoder.is_terminal() {
-                match stream_transform.finish() {
-                    Ok(tail) => transformed = join_bytes(transformed, tail),
-                    Err(error) => {
-                        if let Some(frame) = finish_qoder_stream_failure(
-                            &mut interrupt_guard,
-                            route,
-                            &error,
-                        ).await {
-                            yield Ok(frame);
-                        }
-                        return;
+                if let Err(error) = trae_store_continuation(
+                    _continuation.as_ref(), &wire.decoder, request_memory.as_ref(),
+                ) {
+                    if let Some(frame) = finish_qoder_stream_failure(
+                        &mut interrupt_guard, route, &error,
+                    ).await {
+                        yield Ok(frame);
                     }
+                    return;
                 }
             }
             if !transformed.is_empty() {
@@ -26929,7 +27067,9 @@ fn auth_header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
         | ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
         | ProviderType::WorkBuddyOAuth
-        | ProviderType::TraeSolo => AppKind::Codex,
+        | ProviderType::TraeSolo
+        | ProviderType::TraeRaw
+        | ProviderType::TraeIntl => AppKind::Codex,
         ProviderType::Gemini | ProviderType::GeminiCli => AppKind::Gemini,
         ProviderType::OpenRouter => {
             if app == AppKind::Gemini {

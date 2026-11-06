@@ -260,7 +260,9 @@ impl ProviderExecution {
                 | "special.qoder_cosy"
                 | "special.codebuddy_oauth"
                 | "special.workbuddy_oauth"
-                | "special.trae_solo" => Some("openai_chat"),
+                | "special.trae_solo"
+                | "special.trae_raw_chat"
+                | "special.trae_raw_chat_intl" => Some("openai_chat"),
                 "special.grok_web_session" | "special.perplexity_web_session" => {
                     Some(match self.plan.provider_key.app {
                         AppKind::Claude => "anthropic",
@@ -1153,6 +1155,8 @@ fn managed_auth_is_protocol_owned(execution: &ProviderExecution) -> bool {
             | "special.codebuddy_oauth"
             | "special.workbuddy_oauth"
             | "special.trae_solo"
+            | "special.trae_raw_chat"
+            | "special.trae_raw_chat_intl"
             | "special.deepseek_account"
             | "special.copilot"
     )

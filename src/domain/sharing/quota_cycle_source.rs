@@ -46,7 +46,9 @@ pub fn provider_capability(provider: ProviderType) -> AccountResetCapability {
         GrokOAuth | KiroOAuth | AmazonQOAuth | CursorOAuth | GitHubCopilot | KimiCode
         | QoderCosy => ("conditional", "quota_boundary_unavailable"),
         AntigravityOAuth | AgyOAuth | GeminiCli => ("conditional", "multiple_quota_scopes"),
-        CodeBuddyOAuth | WorkBuddyOAuth | TraeSolo => ("conditional", "non_recurring_package"),
+        CodeBuddyOAuth | WorkBuddyOAuth | TraeSolo | TraeRaw | TraeIntl => {
+            ("conditional", "non_recurring_package")
+        }
         OllamaCloud => ("unsupported", "quota_boundary_unavailable"),
         CursorApiKey | DeepSeekAccount | Claude | ClaudeAuth | Codex | Gemini | OpenRouter
         | AwsBedrock | Nvidia | DeepSeekApi => ("unsupported", "profile_unsupported"),
@@ -123,7 +125,9 @@ pub fn resolve_share_source_with_coding(
                         | ProviderType::GeminiCli => "multiple_quota_scopes",
                         ProviderType::CodeBuddyOAuth
                         | ProviderType::WorkBuddyOAuth
-                        | ProviderType::TraeSolo => "non_recurring_package",
+                        | ProviderType::TraeSolo
+                        | ProviderType::TraeRaw
+                        | ProviderType::TraeIntl => "non_recurring_package",
                         ProviderType::GrokOAuth | ProviderType::QoderCosy => "quota_scope_unproven",
                         _ => "profile_unsupported",
                     })

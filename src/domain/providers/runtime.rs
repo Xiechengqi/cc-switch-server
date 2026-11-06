@@ -1175,6 +1175,10 @@ fn runtime_driver_options(
     };
     for (name, value) in [
         (
+            "traeToolSimulationEnabled",
+            meta.trae_tool_simulation_enabled.map(|value| json!(value)),
+        ),
+        (
             "apiKeyField",
             meta.api_key_field.as_ref().map(|value| json!(value)),
         ),
@@ -1327,13 +1331,19 @@ fn runtime_test_model(
                 })
                 .flatten()
         })
-        .unwrap_or_else(|| {
-            if stored.provider_type.is_buddy_oauth() {
-                "auto".to_string()
-            } else {
-                defaults.test_models.for_app(stored.app).to_string()
+        .or_else(|| {
+            if matches!(
+                stored.provider_type,
+                ProviderType::TraeRaw | ProviderType::TraeIntl
+            ) {
+                return None;
             }
-        });
+            if stored.provider_type.is_buddy_oauth() {
+                Some("auto".to_string())
+            } else {
+                Some(defaults.test_models.for_app(stored.app).to_string())
+            }
+        })?;
     if stored.app == AppKind::Codex && stored.provider_type == ProviderType::CodexOAuth {
         let model = model.trim();
         if model.contains('@') || model.contains('#') {
@@ -1522,7 +1532,8 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::QoderCosy => Some("https://api1.qoder.sh"),
         ProviderType::CodeBuddyOAuth => Some("https://www.codebuddy.ai"),
         ProviderType::WorkBuddyOAuth => Some("https://www.workbuddy.ai"),
-        ProviderType::TraeSolo => Some("https://trae-api-cn.mchost.guru"),
+        ProviderType::TraeSolo | ProviderType::TraeRaw => Some("https://trae-api-cn.mchost.guru"),
+        ProviderType::TraeIntl => Some("https://core-normal.traeapi.us"),
         ProviderType::CursorOAuth => Some("https://api2.cursor.sh"),
         ProviderType::CursorApiKey => Some("https://api.cursor.com"),
         ProviderType::OllamaCloud => Some("https://ollama.com"),
@@ -1544,6 +1555,8 @@ fn managed_oauth_endpoint_is_fixed(provider_type: ProviderType) -> bool {
             | ProviderType::CodeBuddyOAuth
             | ProviderType::WorkBuddyOAuth
             | ProviderType::TraeSolo
+            | ProviderType::TraeRaw
+            | ProviderType::TraeIntl
             | ProviderType::CursorOAuth
             | ProviderType::CursorApiKey
     )
@@ -1713,6 +1726,8 @@ fn legacy_driver_id(stored: &StoredProvider) -> anyhow::Result<DriverId> {
         ProviderType::CodeBuddyOAuth => "special.codebuddy_oauth",
         ProviderType::WorkBuddyOAuth => "special.workbuddy_oauth",
         ProviderType::TraeSolo => "special.trae_solo",
+        ProviderType::TraeRaw => "special.trae_raw_chat",
+        ProviderType::TraeIntl => "special.trae_raw_chat_intl",
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => "special.cursor",
         ProviderType::AntigravityOAuth => "special.antigravity",
         ProviderType::AgyOAuth => "special.agy",

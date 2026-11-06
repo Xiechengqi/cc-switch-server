@@ -40,6 +40,8 @@
     "family.codebuddy_oauth": { "category": "codebuddy", "icon": "codebuddy" },
     "family.workbuddy_oauth": { "category": "workbuddy", "icon": "workbuddy" },
     "family.trae_solo": { "category": "trae", "icon": "custom" },
+    "family.trae_raw_chat": { "category": "trae", "icon": "custom" },
+    "family.trae_raw_chat_intl": { "category": "trae", "icon": "custom" },
     "family.kiro_oauth": { "category": "kiro", "icon": "kiro" },
     "family.amazon_q_oauth": { "category": "amazon_q", "icon": "aws" },
     "family.ollama_cloud": { "category": "ollama", "icon": "ollama" },

@@ -1336,7 +1336,7 @@ async fn web_invoke_dispatch(
         "auth_submit_oauth_code" => {
             let provider_type = web_auth_provider_type(&args)?;
             let provider_label = managed_auth_provider_label(provider_type);
-            if provider_type == ProviderType::TraeSolo {
+            if provider_type.is_trae() {
                 let callback_url = web_arg_string_any(
                     &args,
                     &["callbackUrl", "callback_url", "code"],

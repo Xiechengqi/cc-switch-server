@@ -1,12 +1,12 @@
-# Trae CN Solo 单账号反代
+# Trae SOLO / raw_chat 单账号反代
 
-> **状态：本地实现完成，`fixture_verified / live_pending`。** 当前实现包含独立 `trae_solo` ProviderType、固定端点 OAuth/refresh、一次性 callback capability、三 Surface driver、严格 `done`、同账号恢复、目录、额度、管理 API 与 Web 入口。本文是 Server-native Trae CN Solo 上游 bridge 的权威合同；仓库尚无真实 CN Solo 脱敏 receipt，不能据本地 fixture 声称 `live_verified`。仍不实现 IDE MITM、插件注入、桌面流量劫持、账号池或跨账号回退。
+> **状态：本地实现，`fixture_verified / live_pending`。** 本文是 CN SOLO、CN raw_chat、Intl raw_chat 三条单账号通道的权威合同，覆盖固定端点 OAuth/refresh、四协议入口、流式、工具、推理、图片边界、续接与资源预算。第 1–6 节描述 SOLO 基线，第 7 节补充本次三通道增强。仓库尚无真实 Trae 脱敏 receipt，不能据本地 fixture 声称 `live_verified`。不实现 IDE MITM、插件注入、桌面流量劫持、账号池或跨账号回退。
 
-一个 Trae Provider Bundle 固定绑定一个 `trae_solo` Account。初始请求、refresh、首次 eligible 401 恢复、目录与额度查询始终停留在该账号及其 auth/token generation；任何错误都不能改选账号、Provider 或 host。
+一个 Trae Provider Bundle 固定绑定一个同 ProviderType 的 Account：`trae_solo`、`trae_raw_chat` 或 `trae_raw_chat_intl`。初始请求、refresh、首次 eligible 401 恢复、目录与额度查询始终停留在该账号及其 auth/token generation；任何错误都不能改选账号、Provider 或 host。
 
 ## 1. 身份与固定端点
 
-新增独立 `ProviderType::TraeSolo`（wire id `trae_solo`），不复用 Qoder 或 CodeBuddy 的凭据类型。当前只允许中国 Solo 站点，四个目的地逐字节固定：
+新增独立 `ProviderType::TraeSolo`（wire id `trae_solo`），不复用 Qoder 或 CodeBuddy 的凭据类型。SOLO 固定中国站点，四个目的地逐字节固定：
 
 | Plane | Origin | Path |
 | --- | --- | --- |
@@ -25,7 +25,7 @@ Credential/import payload 中的 `api_host`、URL 或 Origin 不参与目的地�
 
 浏览器授权 URL 必须携带至少 128 bit、一次性、10 分钟 TTL 的 callback capability。Server 只接受与 exact flow、预期回调字段和发起管理员会话绑定的 capability；未知、过期、已消费或并发消费均拒绝。禁止遍历 pending map 或消费“任意一个”登录。
 
-回调取得 authorization code 后，仅向固定 OAuth origin 调用 `ExchangeToken`，再调用 `GetUserInfo` 确认稳定 UID。access token、refresh token 与 UID 三者缺一不落库；敏感字段只经加密 Account store 持久化。
+回调取得 refresh token 后，仅向固定 OAuth origin 调用 `ExchangeToken`，再调用 `GetUserInfo` 确认稳定 UID。access token、refresh token 与 UID 三者缺一不落库；敏感字段只经加密 Account store 持久化。
 
 Refresh 复用现有 managed-account singleflight、durable receipt、CAS 与 generation fencing。旋转 refresh token 必须先形成 receipt，再原子写回同一账号。只有明确的 invalid/expired grant 将账号标为 `needs_relogin`；network、408、429 与 5xx 是瞬时错误，不改变登录状态。新 token 对应 UID 改变时 fail closed。
 
@@ -53,7 +53,7 @@ Claude Messages、OpenAI Chat/Responses 与 Gemini 输入先进入本仓库 cano
 
 ## 5. Registry 与代码落点
 
-Registry 新增一个 family/driver/空 option schema/conformance，以及 Claude、Codex、Gemini 三个 managed-account profile：
+SOLO 基线包含一个 family/driver/空 option schema/conformance，以及 Claude、Codex、Gemini 三个 managed-account profile；raw_chat 的独立注册项见第 7 节：
 
 - family `family.trae_solo`，driver `special.trae_solo`；
 - profiles `claude.trae_solo`、`codex.trae_solo`、`gemini.trae_solo`；
@@ -70,3 +70,50 @@ Registry 新增一个 family/driver/空 option schema/conformance，以及 Claud
 离线验收覆盖：callback capability 精确绑定/TTL/一次性/并发；固定 host 与恶意 `api_host`；refresh rotating token/receipt/CAS/身份冲突；三 Surface payload；tool/reasoning；严格 `done`；EOF/error/重复 terminal；同账号单次 401；全部 generation drift；目录空/stale/fail-closed；额度脱敏。
 
 真实验收需一份 CN Solo 脱敏 receipt，覆盖登录、refresh 轮换、model detail、quota、三 Surface 流/非流、tools、reasoning、首次与二次 401、五类业务码、截断流，以及日志、API 和持久化文件不泄露凭据。
+
+
+## 7. 2026-11-06 单账号增强合同
+
+外部协议证据冻结为 trae2api-hub `5ed619f`（1.4.3），只用于一次性源码审计。构建、测试和运行时均不读取该仓库。下列能力经 Server 独立实现，真实上游仍待验收。
+
+| 通道 | ProviderType / Driver 后缀 | 鉴权与目录 | 工具 / 图片 |
+| --- | --- | --- | --- |
+| CN SOLO | `trae_solo` | 原冻结协议身份；`get_detail_param` 实时目录 | 原生结构化工具；图片明确拒绝 |
+| CN raw_chat | `trae_raw_chat` | `Cloud-IDE-JWT`，UA `Trae CN/3.4.3`，版本码 `20260212`；独立 `model_list` | 可选提示词模拟；保留 image_url |
+| Intl raw_chat | `trae_raw_chat_intl` | Agent `https://core-normal.traeapi.us`；Bearer、UA `TraeClient/TTNet`、版本 `3.6.2` / `20260924`、country `us` | 可选提示词模拟；保留 image_url |
+
+raw_chat 独立 family / driver / 三 App profile，使用 `/api/ide/v1/llm_raw_chat`，模型写 `model_name`，生成参数写 `parameters`。CN / Intl 使用不同 ProviderType 与账号 ID 域隔离，既不能替换账号站点，也不能自动从 SOLO 回退 raw_chat。两条 raw 通道采用 passthrough 模型策略，客户端必须提交精确上游模型名；CN 仍必须在该账号的 raw 目录内，精确匹配且不接受 SOLO 的 auto/模糊别名。raw 健康测试也必须在请求或 Provider 中显式配置模型名，不继承 Claude/Codex/Gemini 的全局默认测试模型。Intl 暂无经过审查的可用实时目录接口，Discovery 明确 unsupported，不采用 CN 目录或静态表冒充可用权限。
+
+raw OAuth client id 为 `ono9krqynydwx5`。CN OAuth 固定 `https://api.trae.com.cn`，Intl OAuth 固定 `https://grow-normal.trae.ai`，浏览器分别固定 `www.trae.cn` / `www.trae.ai`。Intl refresh 可通过账号 raw 的 `devicePrivateKeyPem` 选择性提供 P-256 SEC1/PKCS8 PEM 设备私钥；配置后必须正确签名，否则拒绝，不降级重试。签名为 ECDSA-SHA256 DER/base64，覆盖 METHOD、固定 PATH、client id、refresh token、毫秒整数 timestamp、随机 nonce；设备信息取同一账号的持久化 profile。设备证明 key 的变动推进身份代次；私钥按敏感字段加密落盘，公开 Account 视图同时移除敏感键并清除反射到其他文本中的原值。同 UID/enterprise/machine/device 的重新登录保留已有私钥，换设备不继承。轮换 receipt 仍先于 GetUserInfo 身份闭合持久化，单次恢复只限同账号认证失败。raw 浏览器 `auth_from=trae` 是本仓库的接入选择，参考 Hub 未提供对应浏览器登录闭环证据；真实浏览器授权接受性仍待验收。
+
+raw 工具模拟默认关闭。显式 `driverOptions.traeToolSimulationEnabled=true`（或 Provider meta 同名字段）才会注入工具提示，并解析跨分片 `<|FunctionCallBegin|>…<|FunctionCallEnd|>`。Registry 的 native tools 保持 false。完整工具历史包含所有 system/developer、call ID、参数和工具结果，不自动裁剪。缺尾标记、无效 JSON、非对象参数、未知/错误工具名、必需字段缺失、required 无调用、禁止并行却返回多个调用、异常 finish 都失败；这些检查不是完整 JSON Schema validator，也不保证模型会遵从工具提示。
+
+SOLO 和 raw 共用以下语义：
+
+- 支持 LF/CRLF/CR、多行 data、传输控制字段、碎片化 UTF-8；SOLO 接受受限的 `Processing_*` 排队通知和空工具身份占位，已确认的非空身份禁止变化。
+- 历史工具结果按精确 call ID 回填 name；孤立结果、重复 ID、缺失回执或冲突名称拒绝。空结果保持为空。缺参数仅在明确空 properties 且无额外约束的零参 Schema 下补 `{}`。
+- 工具调用成功终态统一为 `tool_calls`，严格等待唯一 done 后的 EOF 校验；拒绝 EOF 假成功和重复 finalize。raw 也接受显式 `data: [DONE]`，不把无终态 EOF 合成成功。
+- `max_tokens` / `max_completion_tokens` / `max_output_tokens` 统一映射，冲突、非正数或超过目录上限拒绝；temperature、top_p、stop 有明确验证；n 只允许 1。四入口在通用转换前验证源控制，保留显式别名并删除桥接推导的默认上限/思考档位。不支持的 reasoning 档位、max 模式与 seed（包括 0）拒绝。精确 thinking token budget 没有已审上游语义，Anthropic `thinking.budget_tokens`、正数 Gemini `thinkingBudget` 与 `reasoning_budget_tokens` 明确拒绝，调用方应改用 effort/level。`none` / disabled / Gemini budget=0 只省略档位，不能解释为保证关闭模型推理。
+- 结构化输出没有经过审查的上游证据；显式 `json_object` / `json_schema` 请求返回参数错误。仅支持普通 text；不静默丢弃结构化约束。
+- Anthropic 工具选择必须为 auto/any/none/tool；Gemini 支持 AUTO/ANY/NONE，显式 allowedFunctionNames 必须为非空、唯一且已声明的精确名称。未知模式、缺名称、非法并行开关、冲突别名与不能保证的 VALIDATED 模式返回 400，不降为 auto。
+- raw 图片保留 HTTP(S) URL 或合法 image MIME/base64 data URI，URL 不允许嵌入凭据，Server 不主动下载媒体。四入口的消息图片与工具回执显式图片块均在转换前验证，base64 使用固定大小缓冲验证；SOLO 图片、文件 ID、非图片媒体明确拒绝。任意工具 JSON/字符串保持不透明，不递归当作媒体解释。
+- Responses 在通用转换前恢复 `previous_response_id`，缓存保留完整输入消息、成功正文、工具调用及可重放推理摘要，当前 instructions 只作用于本次请求；按调用者/Share、Provider revision/runtime、账号实例和身份代次隔离。使用现有 10 分钟 TTL、2000 项/64 MiB、单项 8 MiB/200 items 上限。Share 需开启 previous-response cache；未知、过期、错作用域、被禁用的引用返回明确冲突。只在严格终态且下游协议转换成功后写缓存，不缓存中断/失败；合法 token 刷新保持同一已确认对话身份。
+- 响应头、错误响应体和排队等待共用首段语义输出总期限，Transport 心跳不延长该期限。提交后每 15 秒发协议兼容心跳；心跳不推进上游 idle deadline。取消下游会释放上游响应、内存预算和在途 guard。缓存、解析、聚合、工具参数及协议转换纳入同一个 RequestMemoryBudget，耗尽返回稳定容量错误，不刷新重试。
+- usage 检查非负整数和 details 范围，归一 prompt/completion/total、cached tokens、reasoning tokens，保留 cache creation 口径。Gemini 将 inclusive output 拆为 candidates 与 thoughts，二者不重复计数；额度、风控、模型错误均不消耗认证刷新预算。
+
+管理入口同时覆盖 SOLO、CN raw_chat、Intl raw_chat，账号不能跨类型绑定；Web 功能开关说明工具模拟的性质。离线验收矩阵包括三通道 × Chat/Responses/Messages/Gemini × 流/非流 × 连续两轮工具调用/回执，另验证源控制拒绝路径、工具回执图片、完整文本续接、账号删除重建隔离、国际目录不发网、慢响应头/错误体/组合排队期限、15 秒心跳与 idle、取消释放、失败不缓存、刷新设备签名与私钥加密脱敏。真实模型权限、图片理解、国际设备注册状态和真实 token 轮换仍须凭据与上游 receipt 验收，不能由 fixture 推导。
+
+## 8. 实施与整体 review 验收（2026-11-06）
+
+规划内的单账号增强已实施并完成整体 review。Review 修复了普通正文续接被工具专用缓存过滤、Gemini 路径与 stream query 解析、跨协议推理 usage 丢失、源参数/媒体在通用转换时被静默丢弃、错误响应体未受首段总期限约束、设备私钥未纳入加密/脱敏规则等问题；同时补齐新增 Registry 类型对应的契约测试清单。最终 Trae 发送上下文使用结构体显式传递，Clippy 无警告。
+
+本地验证结果如下，数量为整个 Server 仓库套件的计数，不作为外部项目或真实上游的质量评分：
+
+- `RUST_MIN_STACK=67108864 cargo test --offline`：库测试 **4195 通过、0 失败、3 忽略**；API 集成测试 **138 通过**，Cursor fixture 与 lease payload 集成测试各 **1 通过**；binary/doc test target 均通过。另对最终发送上下文重构执行 Trae 专项，**44 通过**。
+- `cargo check --offline`、`cargo clippy --offline --all-targets -- -D warnings`、`cargo build --offline` 通过；`cargo fmt --check` 和逐个列举全部 `src/**/*.rs`（含 `include!` 源文件）的 rustfmt 检查通过。
+- 全部 Node 审计测试 **2135 通过**，smoke 脚本测试 **13 通过**，Phase 0 writer 证据检查及其 **6 项测试通过**；生成资产、覆盖矩阵、文档索引、依赖方向、状态写入纪律、出站 HTTP 规则与 diff whitespace 检查通过。
+- Web 全套 **56 文件 / 391 测试通过**；locale 更新后的相关 **79 测试复验通过**，typecheck、build、i18n 与 dist 体积/引用审计通过。
+- 本地服务 smoke 通过 health、version、Web、setup/login、API token 轮换及登录、Provider/Share 创建；使用独立临时配置，结束后清理测试进程和配置。
+- `RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0 scripts/release-readiness.sh` 已执行，**failures=0**，按脚本合同返回 `blocked`：其内部全套测试被显式跳过，且缺少真实 Router/Provider 输入与部署验收。本节单独记录的本地测试已通过；不将该离线检查描述为发布就绪。
+
+没有执行真实 Trae 上游请求或部署；三通道真实接受性继续为 `live_pending`。

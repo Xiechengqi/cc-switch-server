@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { DeviceCodeManagedAccountSection } from "./KimiOAuthSection";
 
 interface TraeOAuthSectionProps {
+  authProvider?: "trae_solo" | "trae_raw_chat" | "trae_raw_chat_intl";
   className?: string;
   selectedAccountId?: string | null;
   onAccountSelect?: (accountId: string | null) => void;
@@ -13,16 +14,20 @@ interface TraeOAuthSectionProps {
 export const TraeOAuthSection: React.FC<TraeOAuthSectionProps> = (props) => {
   const { t } = useTranslation();
 
+  const { authProvider = "trae_solo", ...common } = props;
+  const label =
+    authProvider === "trae_solo"
+      ? "Trae CN Solo"
+      : authProvider === "trae_raw_chat"
+        ? "Trae CN raw_chat"
+        : "Trae Intl raw_chat";
+
   return (
     <DeviceCodeManagedAccountSection
-      {...props}
-      authProvider="trae_solo"
-      authStatusLabel={t("traeOauth.authStatus", {
-        defaultValue: "Trae CN Solo authentication",
-      })}
-      loginLabel={t("traeOauth.loginWithTrae", {
-        defaultValue: "Sign in with Trae CN Solo",
-      })}
+      {...common}
+      authProvider={authProvider}
+      authStatusLabel={label}
+      loginLabel={`${t("traeOauth.signIn", { defaultValue: "Sign in" })} · ${label}`}
       manualCallback={{
         label: t("traeOauth.callbackUrl", {
           defaultValue: "Callback URL",
@@ -42,7 +47,7 @@ export const TraeOAuthSection: React.FC<TraeOAuthSectionProps> = (props) => {
           defaultValue: "Paste the complete Trae callback URL.",
         }),
         successMessage: t("traeOauth.loginSuccess", {
-          defaultValue: "Trae CN Solo account signed in.",
+          defaultValue: "Trae account signed in.",
         }),
       }}
     />

@@ -1885,6 +1885,10 @@ Server 独立扩展 `PreviousResponseCacheScope`：加入 Provider ID/revision�
 
 ## 2026-09-01 Trae CN Solo evidence freeze
 
+2026-11-06 单账号增强研究固定参考 `trae2api-hub@5ed619f`（1.4.3），仅作一次性只读协议证据。采纳 SOLO `progress_notice` 字符串通知、工具增量的空身份占位、工具回执按精确调用 ID 回填名称、完整对象参数及异常终止拒绝；补齐 Server 自身四入口参数一致性、严格终态、Responses 续接与资源预算。raw_chat 使用独立 Driver，与 CN SOLO 显式分开；CN/Intl 的固定 origin、鉴权/客户端版本、model_list、ExchangeToken 来自该快照的 `trae_client.py`。不移植账号池、自动跨通道回退、导入 host、静默裁剪历史、EOF 合成成功或 SOLO 聚合后伪流式。新增能力均以本仓离线合同验证，真实账号接受性继续独立 `live_pending`，外部仓库不进入构建、测试或运行时依赖。
+
+本轮整体 review 进一步收紧 Server 自身的转换边界：四入口先验证源控制，再恢复显式 max/reasoning/tool-choice；无法兑现的精确 thinking token budget、结构化输出和 Gemini VALIDATED 工具模式明确拒绝。CN raw 模型只接受 live model_list 中的精确名称，不复用 SOLO 的 auto/模糊别名；Intl discovery 为 unsupported 且不访问 CN。Gemini 模型路径兼容 models/ 与 /v1[beta]/models/ 前缀，stream 动作识别剥离查询参数。消息与工具回执的显式图片块先验证再桥接，base64 用固定大小缓冲检查，工具任意 JSON 不作递归媒体解释。Responses 续接保存完整消息与成功输出，沿用有界缓存且按 Share/principal、Provider revision/runtime、Account incarnation/identity 隔离，只有严格 done+EOF 和下游转换成功后才写入；instructions 不跨请求继承。响应头、错误体和排队共用首段语义输出期限，提交后心跳不重置上游 idle。usage 保留 cache/reasoning details，Gemini candidates/thoughts 不重复计数。可选设备私钥加密落盘、公开视图脱敏，同稳定设备重新登录保留，私钥变动推进身份代次。这些均为本仓独立实现和本地 fixture 事实，不扩张参考 Hub 的协议保证；raw 浏览器 auth_from=trae 是未有 Hub 浏览器闭环证据的实现选择，真实登录、设备注册、模型权限和 token 轮换继续 live_pending。
+
 `trae_solo` 的 wire 来自对 `cli2api` commit `9b18f2d` 中 `internal/providers/trae/` 的一次性只读审计。采纳的事实仅限固定端点、Cloud-IDE 身份头、Solo payload、模型详情、订阅额度与 `metadata/output/token_usage/done/error` 事件结构；实现由本仓库独立完成，外部源码不是同步源或依赖。
 
 固定出站 origin 为 OAuth `https://api.trae.com.cn`、Agent `https://trae-api-cn.mchost.guru`、Billing `https://api.trae.cn`、浏览器授权 `https://www.trae.cn`。明确拒绝参考实现中的三类行为：callback 消费任意 pending flow、导入的 `api_host` 控制凭据目的地、以及 EOF/error 后合成成功终态。Server-native Solo bridge 不等于 Trae IDE MITM、插件注入或桌面流量劫持。

@@ -15998,7 +15998,7 @@ impl ServerStateInner {
             ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth => {
                 self.cancel_codebuddy_login_flow(device_code).await;
             }
-            ProviderType::TraeSolo => {
+            ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl => {
                 self.cancel_trae_login_flow(device_code).await;
             }
             _ => {}
@@ -16042,7 +16042,7 @@ impl ServerStateInner {
                 ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth => {
                     self.cancel_codebuddy_login_flow(device_code).await;
                 }
-                ProviderType::TraeSolo => {
+                ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl => {
                     self.cancel_trae_login_flow(device_code).await;
                 }
                 _ => {}
@@ -18353,6 +18353,12 @@ impl ServerStateInner {
             parse_trae_model_catalog, PreparedTraeRuntime, TraeRuntimeScope,
         };
 
+        let provider_type = self
+            .find_account_by_id(account_id)
+            .await
+            .filter(|account| account.provider_type.is_trae())
+            .ok_or(TraeRuntimeError::NotFound)?
+            .provider_type;
         if self.credential_persistence_degraded() {
             return Err(TraeRuntimeError::CredentialPersistenceDegraded);
         }
@@ -18371,14 +18377,14 @@ impl ServerStateInner {
         }
 
         self.refresh_managed_account_if_needed_for_generation(
-            ProviderType::TraeSolo,
+            provider_type,
             account_id,
             expected_auth_identity_generation,
         )
         .await
         .map_err(TraeRuntimeError::Refresh)?;
-        let account = self
-            .find_account_for_provider(ProviderType::TraeSolo, account_id)
+        let (account, account_incarnation) = self
+            .find_account_for_provider_with_incarnation(provider_type, account_id)
             .await
             .ok_or(TraeRuntimeError::NotFound)?;
         if account.auth_identity_generation != expected_auth_identity_generation {
@@ -18415,11 +18421,25 @@ impl ServerStateInner {
             &profile,
             account.auth_identity_generation,
             account.token_refresh_generation,
+            account_incarnation,
         )
         .map_err(TraeRuntimeError::InvalidAccount)?;
 
         let mut now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
-        let catalog = if let Some(catalog) = self.trae_runtime.catalog(&scope, now_ms).await {
+        let catalog = if provider_type == ProviderType::TraeIntl {
+            // No CN/static entitlement fallback for international accounts.
+            self.trae_runtime
+                .insert_catalog(
+                    scope.clone(),
+                    crate::proxy::trae_runtime::FetchedTraeModelCatalog {
+                        enabled_models: Vec::new(),
+                        raw_configs: std::collections::BTreeMap::new(),
+                        capabilities: std::collections::BTreeMap::new(),
+                    },
+                    now_ms,
+                )
+                .await
+        } else if let Some(catalog) = self.trae_runtime.catalog(&scope, now_ms).await {
             catalog
         } else {
             let _catalog_guard = self.trae_runtime.catalog_lock(&scope).await;
@@ -18434,6 +18454,7 @@ impl ServerStateInner {
                         provider_revision,
                         runtime_fingerprint,
                         &account,
+                        account_incarnation,
                     )
                     .await
                 {
@@ -18447,7 +18468,12 @@ impl ServerStateInner {
                 .await;
                 match fetched {
                     Ok(value) => {
-                        let parsed = parse_trae_model_catalog(&value).map_err(|message| {
+                        let parsed = (if provider_type == ProviderType::TraeRaw {
+                            crate::proxy::trae_runtime::parse_trae_raw_catalog(&value)
+                        } else {
+                            parse_trae_model_catalog(&value)
+                        })
+                        .map_err(|message| {
                             TraeRuntimeError::Upstream {
                                 status_code: 502,
                                 message,
@@ -18461,6 +18487,7 @@ impl ServerStateInner {
                                 provider_revision,
                                 runtime_fingerprint,
                                 &account,
+                                account_incarnation,
                             )
                             .await
                         {
@@ -18500,6 +18527,7 @@ impl ServerStateInner {
                 provider_revision,
                 runtime_fingerprint,
                 &account,
+                account_incarnation,
             )
             .await
         {
@@ -18515,6 +18543,7 @@ impl ServerStateInner {
             account_id: account.id,
             auth_identity_generation: account.auth_identity_generation,
             token_refresh_generation: account.token_refresh_generation,
+            account_incarnation,
         })
     }
 
@@ -18532,7 +18561,7 @@ impl ServerStateInner {
         let Some(stored) = providers.providers.iter().find(|stored| {
             stored.app == app
                 && stored.provider.id == provider_id
-                && stored.provider_type == ProviderType::TraeSolo
+                && stored.provider_type.is_trae()
                 && stored.resource.revision == provider_revision
         }) else {
             return false;
@@ -18544,14 +18573,14 @@ impl ServerStateInner {
             && plan.runtime_fingerprint == runtime_fingerprint
             && plan.configuration_state
                 != crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
-            && plan.driver_id.as_str() == "special.trae_solo"
+            && stored.provider_type.trae_driver_id() == Some(plan.driver_id.as_str())
             && matches!(
                 &plan.auth_ref,
                 crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
                     account_id: bound_account_id,
-                    expected_provider_type: ProviderType::TraeSolo,
+                    expected_provider_type,
                     auth_identity_generation,
-                } if bound_account_id == account_id
+                } if *expected_provider_type == stored.provider_type && bound_account_id == account_id
                     && *auth_identity_generation == expected_auth_identity_generation
             )
     }
@@ -18563,6 +18592,7 @@ impl ServerStateInner {
         provider_revision: u64,
         runtime_fingerprint: &str,
         expected: &Account,
+        expected_incarnation: u64,
     ) -> bool {
         if !self
             .trae_runtime_matches(
@@ -18577,10 +18607,11 @@ impl ServerStateInner {
         {
             return false;
         }
-        self.find_account_for_provider(ProviderType::TraeSolo, &expected.id)
+        self.find_account_for_provider_with_incarnation(expected.provider_type, &expected.id)
             .await
-            .is_some_and(|current| {
-                current.auth_identity_generation == expected.auth_identity_generation
+            .is_some_and(|(current, incarnation)| {
+                incarnation == expected_incarnation
+                    && current.auth_identity_generation == expected.auth_identity_generation
                     && current.token_refresh_generation == expected.token_refresh_generation
             })
     }
@@ -18602,6 +18633,7 @@ impl ServerStateInner {
         account_id: &str,
         auth_identity_generation: u64,
         token_refresh_generation: u64,
+        expected_incarnation: u64,
     ) -> bool {
         if !self
             .trae_runtime_matches(
@@ -18616,10 +18648,14 @@ impl ServerStateInner {
         {
             return false;
         }
-        self.find_account_for_provider(ProviderType::TraeSolo, account_id)
+        let Some(account) = self.find_account_by_id(account_id).await else {
+            return false;
+        };
+        self.find_account_for_provider_with_incarnation(account.provider_type, account_id)
             .await
-            .is_some_and(|account| {
-                account.auth_identity_generation == auth_identity_generation
+            .is_some_and(|(account, incarnation)| {
+                incarnation == expected_incarnation
+                    && account.auth_identity_generation == auth_identity_generation
                     && account.token_refresh_generation == token_refresh_generation
             })
     }

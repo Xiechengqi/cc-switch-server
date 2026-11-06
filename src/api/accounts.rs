@@ -1912,6 +1912,9 @@ async fn persist_completed_device_login(
             if provider_type.is_buddy_oauth() {
                 reuse_existing_codebuddy_identity_account(store, &mut account_input);
             }
+            if provider_type == ProviderType::TraeIntl {
+                preserve_trae_login_device_proof(store, &mut account_input);
+            }
             manager_for(provider_type)
                 .finish_login(store, account_input)
                 .map_err(ApiError::bad_request)
@@ -1940,6 +1943,68 @@ async fn persist_completed_device_login(
             .map_err(ApiError::internal)?;
     }
     Ok(account)
+}
+
+fn preserve_trae_login_device_proof(
+    store: &crate::domain::accounts::store::AccountStore,
+    input: &mut UpsertAccountInput,
+) {
+    let Some(existing) = input
+        .id
+        .as_deref()
+        .and_then(|id| store.find_for_provider(ProviderType::TraeIntl, Some(id)))
+    else {
+        return;
+    };
+    let same_device = crate::domain::trae::TraeAccountProfile::parse(existing.profile.as_ref())
+        .ok()
+        .zip(crate::domain::trae::TraeAccountProfile::parse(input.profile.as_ref()).ok())
+        .is_some_and(|(existing, current)| {
+            existing.stable_identity_components() == current.stable_identity_components()
+        });
+    if !same_device {
+        return;
+    }
+    let Some(key) = existing
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("devicePrivateKeyPem"))
+    else {
+        return;
+    };
+    if let Some(raw) = input.raw.as_mut().and_then(Value::as_object_mut) {
+        raw.entry("devicePrivateKeyPem")
+            .or_insert_with(|| key.clone());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn trae_relogin_preserves_device_proof_only_for_the_same_stable_device() {
+    let mut store = crate::domain::accounts::store::AccountStore::default();
+    let original: UpsertAccountInput = serde_json::from_value(json!({"id":"trae-proof-fixture","providerType":"trae_raw_chat_intl","profile":{"uid":"fixture-uid","enterpriseId":"","machineId":"machine","deviceId":"device"},"raw":{"devicePrivateKeyPem":"private-key-fixture"}})).unwrap();
+    store.upsert(original.clone());
+    for changed_device in [false, true] {
+        let mut replacement = original.clone();
+        replacement.raw = Some(json!({"source":"trae_oauth_login"}));
+        if changed_device {
+            replacement.profile.as_mut().unwrap()["deviceId"] = json!("other-device");
+        }
+        preserve_trae_login_device_proof(&store, &mut replacement);
+        assert_eq!(
+            replacement
+                .raw
+                .unwrap()
+                .get("devicePrivateKeyPem")
+                .is_some(),
+            !changed_device
+        );
+    }
+    let before = store.accounts[0].auth_identity_generation;
+    let mut replacement = original;
+    replacement.raw.as_mut().unwrap()["devicePrivateKeyPem"] = json!("replacement-key");
+    let after = store.upsert(replacement).auth_identity_generation;
+    assert!(after > before);
 }
 
 pub(in crate::api) async fn cancel_grok_device_login(
@@ -2612,12 +2677,39 @@ pub(in crate::api) async fn cancel_buddy_login(
     }))
 }
 
+async fn owned_trae_flow_type(
+    state: &ServerState,
+    flow_id: &str,
+    principal: &str,
+    now: i64,
+) -> Result<ProviderType, ApiError> {
+    for provider_type in [
+        ProviderType::TraeSolo,
+        ProviderType::TraeRaw,
+        ProviderType::TraeIntl,
+    ] {
+        if state
+            .device_flow_is_owned_by(provider_type, flow_id, principal, now)
+            .await
+        {
+            return Ok(provider_type);
+        }
+    }
+    Err(ApiError::unauthorized(
+        "Trae login flow is expired, unknown, or owned by another principal",
+    ))
+}
+
 pub(in crate::api) async fn start_trae_login(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(input): Json<StartTraeLoginRequest>,
 ) -> Result<Json<StartTraeLoginResponse>, ApiError> {
     let principal = require_web_admin_session(&state, &headers).await?;
+    let provider_type = input.provider_type.unwrap_or(ProviderType::TraeSolo);
+    if !provider_type.is_trae() {
+        return Err(ApiError::bad_request("expected a Trae providerType"));
+    }
     let expected_account = match input
         .account_id
         .as_deref()
@@ -2626,7 +2718,7 @@ pub(in crate::api) async fn start_trae_login(
     {
         Some(account_id) => Some(
             state
-                .find_account_for_provider(ProviderType::TraeSolo, account_id)
+                .find_account_for_provider(provider_type, account_id)
                 .await
                 .ok_or_else(|| ApiError::not_found("Trae target account was not found"))?,
         ),
@@ -2637,8 +2729,9 @@ pub(in crate::api) async fn start_trae_login(
         state.bind_addr.port()
     );
     let now = now_ms() as i64;
-    let (login, flow) = crate::clients::oauth::trae::start_login(
+    let (login, flow) = crate::clients::oauth::trae::start_login_for_provider(
         &callback_base_url,
+        provider_type,
         expected_account.as_ref(),
         now,
     )
@@ -2649,7 +2742,7 @@ pub(in crate::api) async fn start_trae_login(
         .await;
     state
         .bind_device_flow_principal(
-            ProviderType::TraeSolo,
+            provider_type,
             login.flow_id.clone(),
             principal.oauth_binding_id(),
             login.expires_at,
@@ -2668,9 +2761,10 @@ pub(in crate::api) async fn trae_login_status(
     let principal = require_web_admin_session(&state, &headers).await?;
     let principal_id = principal.oauth_binding_id();
     let now = now_ms() as i64;
+    let provider_type = owned_trae_flow_type(&state, &input.flow_id, &principal_id, now).await?;
     require_device_flow_owner(
         &state,
-        ProviderType::TraeSolo,
+        provider_type,
         &input.flow_id,
         &principal_id,
         now,
@@ -2701,7 +2795,7 @@ pub(in crate::api) async fn trae_login_status(
         crate::clients::oauth::trae::TraeLoginStatus::Completed(account_input) => {
             let account = persist_completed_device_login(
                 &state,
-                ProviderType::TraeSolo,
+                provider_type,
                 &input.flow_id,
                 &principal_id,
                 *account_input,
@@ -2727,9 +2821,10 @@ pub(in crate::api) async fn complete_trae_login(
         .map_err(map_trae_client_error)?;
     let principal_id = principal.oauth_binding_id();
     let now = now_ms() as i64;
+    let provider_type = owned_trae_flow_type(&state, &callback.flow_id, &principal_id, now).await?;
     require_device_flow_owner(
         &state,
-        ProviderType::TraeSolo,
+        provider_type,
         &callback.flow_id,
         &principal_id,
         now,
@@ -2748,7 +2843,7 @@ pub(in crate::api) async fn complete_trae_login(
     };
     let account = persist_completed_device_login(
         &state,
-        ProviderType::TraeSolo,
+        provider_type,
         &callback.flow_id,
         &principal_id,
         *account_input,
@@ -2766,11 +2861,18 @@ pub(in crate::api) async fn cancel_trae_login(
     Json(input): Json<CancelTraeLoginRequest>,
 ) -> Result<Json<CancelTraeLoginResponse>, ApiError> {
     let principal = require_web_admin_session(&state, &headers).await?;
+    let provider_type = owned_trae_flow_type(
+        &state,
+        &input.flow_id,
+        &principal.oauth_binding_id(),
+        now_ms() as i64,
+    )
+    .await?;
     let managed_auth_operation = state.lock_managed_auth_operations().await;
     let cancelled = state
         .remove_device_flow_for_principal_under_managed_auth_guard(
             &managed_auth_operation,
-            ProviderType::TraeSolo,
+            provider_type,
             &input.flow_id,
             &principal.oauth_binding_id(),
             now_ms() as i64,

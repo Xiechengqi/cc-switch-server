@@ -4,7 +4,7 @@
     "legacyCompatibility": "assets/contract/provider-legacy-compatibility.json",
     "serverProviderTypes": {
       "path": "src/domain/providers/model.rs",
-      "sha256": "239fc35b8f1819d7299fe080846bfceb11ec9d229d9ee457685a09a477de313c"
+      "sha256": "f096806a183eb3d208bc44d92c1a0b9f1352b80dba32099e542850c9b2bf2d91"
     },
     "qoderOracle": "assets/contract/qoder-cli-oracle.json"
   },
@@ -228,6 +228,34 @@
       "variant": "TraeSolo",
       "id": "trae_solo",
       "label": "Trae CN Solo",
+      "apps": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "required": false,
+      "coverageClass": "server_extension",
+      "presentInSource": true,
+      "presentInServer": true
+    },
+    {
+      "variant": "TraeRaw",
+      "id": "trae_raw_chat",
+      "label": "Trae CN raw_chat",
+      "apps": [
+        "claude",
+        "codex",
+        "gemini"
+      ],
+      "required": false,
+      "coverageClass": "server_extension",
+      "presentInSource": true,
+      "presentInServer": true
+    },
+    {
+      "variant": "TraeIntl",
+      "id": "trae_raw_chat_intl",
+      "label": "Trae Intl raw_chat",
       "apps": [
         "claude",
         "codex",

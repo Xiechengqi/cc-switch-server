@@ -7756,11 +7756,11 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["optionSchemas"]
             .as_array()
             .map(Vec::len),
-        Some(26)
+        Some(28)
     );
     assert_eq!(
         registry["registry"]["profiles"].as_array().unwrap().len(),
-        85
+        91
     );
     assert!(registry["registry"]["families"]
         .as_array()
@@ -7810,6 +7810,16 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         json!(["single", "passthrough"])
     );
     assert_eq!(configurable["defaultUpstreamModel"], "gpt-5.4");
+    for profile_id in ["codex.trae_raw_chat", "codex.trae_raw_chat_intl"] {
+        let profile = profiles
+            .iter()
+            .find(|profile| profile["profileId"] == profile_id)
+            .unwrap();
+        assert_eq!(profile["modelPolicy"], "passthrough");
+        assert!(profile
+            .get("defaultUpstreamModel")
+            .is_none_or(Value::is_null));
+    }
 
     let presets = app
         .clone()
@@ -7824,7 +7834,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert_eq!(presets.status(), StatusCode::OK);
     let presets = json_body(presets).await;
     let presets = presets["presets"].as_array().unwrap();
-    assert_eq!(presets.len(), 28);
+    assert_eq!(presets.len(), 30);
     assert!(presets
         .iter()
         .all(|preset| preset["profileId"].as_str().is_some()));
@@ -7852,6 +7862,9 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert!(presets
         .iter()
         .any(|preset| preset["profileId"] == "codex.trae_solo"));
+    for profile in ["codex.trae_raw_chat", "codex.trae_raw_chat_intl"] {
+        assert!(presets.iter().any(|preset| preset["profileId"] == profile));
+    }
     assert!(presets
         .iter()
         .any(|preset| preset["profileId"] == "codex.github_copilot"));

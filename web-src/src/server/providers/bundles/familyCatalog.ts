@@ -55,6 +55,8 @@ export const SUBSCRIPTION_FAMILY_IDS = [
   "family.codebuddy_oauth",
   "family.workbuddy_oauth",
   "family.trae_solo",
+  "family.trae_raw_chat",
+  "family.trae_raw_chat_intl",
   "family.kimi_coding_api_key",
   "family.zhipu_glm_cn",
   "family.zhipu_glm_global",
@@ -133,6 +135,8 @@ const FAMILY_SEARCH_ALIASES: Record<string, string[]> = {
   "family.codebuddy_oauth": ["codebuddy"],
   "family.workbuddy_oauth": ["workbuddy", "办公"],
   "family.trae_solo": ["trae", "trae cn solo"],
+  "family.trae_raw_chat": ["trae", "trae cn raw"],
+  "family.trae_raw_chat_intl": ["trae", "trae intl raw"],
   "family.bailian_coding_plan_cn": ["alibaba", "alibaba china"],
   "family.bailian_coding_plan_global": [
     "alibaba",

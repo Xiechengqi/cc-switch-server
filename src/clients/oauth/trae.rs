@@ -17,12 +17,12 @@ use crate::domain::accounts::oauth::{merge_account_refresh_raw, OAuthErrorKind};
 use crate::domain::accounts::store::{Account, AccountRefreshUpdate, UpsertAccountInput};
 use crate::domain::providers::model::ProviderType;
 use crate::domain::trae::{
-    random_trae_identity, trae_account_id, TraeAccountProfile, TRAE_AGENT_ORIGIN, TRAE_APP_ID,
-    TRAE_AUTHORIZATION_PATH, TRAE_BILLING_ORIGIN, TRAE_CLIENT_ID, TRAE_CONSOLE_ORIGIN,
+    random_trae_identity, TraeAccountProfile, TRAE_APP_ID, TRAE_AUTHORIZATION_PATH,
     TRAE_DEVICE_BRAND, TRAE_EXCHANGE_TOKEN_PATH, TRAE_IDE_VERSION, TRAE_IDE_VERSION_CODE,
-    TRAE_MODEL_DETAIL_PATH, TRAE_OAUTH_ORIGIN, TRAE_OS_VERSION, TRAE_PLUGIN_VERSION,
-    TRAE_QUOTA_PATH, TRAE_USER_INFO_PATH,
+    TRAE_OS_VERSION, TRAE_PLUGIN_VERSION, TRAE_QUOTA_PATH, TRAE_USER_INFO_PATH,
 };
+
+mod device_proof;
 
 const FLOW_TTL_SECS: u64 = 10 * 60;
 const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
@@ -32,26 +32,32 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone)]
 struct TraeOAuthEndpoints {
     oauth_origin: Url,
+    protocol: crate::domain::trae::TraeProtocol,
 }
 
 impl TraeOAuthEndpoints {
-    fn production() -> Result<Self, TraeClientError> {
-        let oauth_origin = Url::parse(TRAE_OAUTH_ORIGIN).map_err(|error| {
-            TraeClientError::protocol(format!("invalid reviewed Trae OAuth origin: {error}"))
-        })?;
-        Ok(Self { oauth_origin })
+    fn production_for(provider_type: ProviderType) -> Result<Self, TraeClientError> {
+        let protocol = crate::domain::trae::TraeProtocol::for_provider(provider_type)
+            .map_err(TraeClientError::bad_request)?;
+        Ok(Self {
+            oauth_origin: Url::parse(protocol.oauth_origin)
+                .map_err(|error| TraeClientError::protocol(error.to_string()))?,
+            protocol,
+        })
     }
 
     #[cfg(test)]
     fn for_test(origin: &str) -> Self {
         Self {
             oauth_origin: Url::parse(origin).unwrap(),
+            protocol: crate::domain::trae::TraeProtocol::for_provider(ProviderType::TraeSolo)
+                .unwrap(),
         }
     }
 
     #[cfg(not(test))]
-    fn for_account(_account: &Account) -> Result<Self, TraeClientError> {
-        Self::production()
+    fn for_account(account: &Account) -> Result<Self, TraeClientError> {
+        Self::production_for(account.provider_type)
     }
 
     #[cfg(test)]
@@ -64,9 +70,13 @@ impl TraeOAuthEndpoints {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            return Ok(Self::for_test(origin));
+            let mut endpoints = Self::for_test(origin);
+            endpoints.protocol =
+                crate::domain::trae::TraeProtocol::for_provider(account.provider_type)
+                    .map_err(TraeClientError::bad_request)?;
+            return Ok(endpoints);
         }
-        Self::production()
+        Self::production_for(account.provider_type)
     }
 
     fn url(&self, path: &str) -> Result<Url, TraeClientError> {
@@ -83,27 +93,25 @@ struct TraeRuntimeEndpoints {
 }
 
 impl TraeRuntimeEndpoints {
-    fn production() -> Result<Self, TraeClientError> {
-        let agent_origin = Url::parse(TRAE_AGENT_ORIGIN).map_err(|error| {
-            TraeClientError::protocol(format!("invalid reviewed Trae Agent origin: {error}"))
-        })?;
-        let billing_origin = Url::parse(TRAE_BILLING_ORIGIN).map_err(|error| {
-            TraeClientError::protocol(format!("invalid reviewed Trae Billing origin: {error}"))
-        })?;
+    fn production_for(provider_type: ProviderType) -> Result<Self, TraeClientError> {
+        let protocol = crate::domain::trae::TraeProtocol::for_provider(provider_type)
+            .map_err(TraeClientError::bad_request)?;
         Ok(Self {
-            agent_origin,
-            billing_origin,
+            agent_origin: Url::parse(protocol.agent_origin)
+                .map_err(|error| TraeClientError::protocol(error.to_string()))?,
+            billing_origin: Url::parse(protocol.billing_origin)
+                .map_err(|error| TraeClientError::protocol(error.to_string()))?,
         })
     }
 
     #[cfg(not(test))]
-    fn for_account(_account: &Account) -> Result<Self, TraeClientError> {
-        Self::production()
+    fn for_account(account: &Account) -> Result<Self, TraeClientError> {
+        Self::production_for(account.provider_type)
     }
 
     #[cfg(test)]
     fn for_account(account: &Account) -> Result<Self, TraeClientError> {
-        let mut endpoints = Self::production()?;
+        let mut endpoints = Self::production_for(account.provider_type)?;
         if let Some(origin) = account
             .raw
             .as_ref()
@@ -441,11 +449,29 @@ pub fn start_login(
     expected_account: Option<&Account>,
     now_ms: i64,
 ) -> Result<(TraeLoginStart, PendingTraeLoginFlow), TraeClientError> {
+    start_login_for_provider(
+        callback_base_url,
+        expected_account.map_or(ProviderType::TraeSolo, |account| account.provider_type),
+        expected_account,
+        now_ms,
+    )
+}
+
+pub fn start_login_for_provider(
+    callback_base_url: &str,
+    provider_type: ProviderType,
+    expected_account: Option<&Account>,
+    now_ms: i64,
+) -> Result<(TraeLoginStart, PendingTraeLoginFlow), TraeClientError> {
+    if !provider_type.is_trae() {
+        return Err(TraeClientError::bad_request("expected a Trae ProviderType"));
+    }
     let (machine_id, device_id, expected_account_id, expected_uid) =
         if let Some(account) = expected_account {
-            if account.provider_type != ProviderType::TraeSolo {
+            if account.provider_type != provider_type {
                 return Err(TraeClientError::bad_request(format!(
-                    "expected trae_solo account, got {}",
+                    "expected account type {}, got {}",
+                    provider_type.as_str(),
                     account.provider_type.as_str()
                 )));
             }
@@ -467,7 +493,7 @@ pub fn start_login(
         device_id,
         expected_account_id,
         expected_uid,
-        TraeOAuthEndpoints::production()?,
+        TraeOAuthEndpoints::production_for(provider_type)?,
         now_ms,
     )
 }
@@ -486,7 +512,13 @@ fn start_login_with_endpoints(
     let capability = random_secret();
     let trace = random_hex(16);
     let callback_url = build_callback_url(callback_base_url, &flow_id, &capability)?;
-    let auth_url = build_login_url(&machine_id, &device_id, callback_url.as_str(), &trace)?;
+    let auth_url = build_login_url(
+        &machine_id,
+        &device_id,
+        callback_url.as_str(),
+        &trace,
+        endpoints.protocol,
+    )?;
     let expires_at_ms = now_ms.saturating_add((FLOW_TTL_SECS as i64).saturating_mul(1_000));
     let flow = PendingTraeLoginFlow {
         expires_at_ms,
@@ -578,7 +610,15 @@ pub async fn complete_login(
     callback: &TraeCallbackPayload,
     now_ms: i64,
 ) -> Result<UpsertAccountInput, TraeClientError> {
-    let receipt = exchange_token(http, &flow.endpoints, &callback.refresh_token, now_ms).await?;
+    let receipt = exchange_token(
+        http,
+        &flow.endpoints,
+        &callback.refresh_token,
+        callback.callback_uid.as_deref().unwrap_or_default(),
+        None,
+        now_ms,
+    )
+    .await?;
     let identity = fetch_user_info(http, &flow.endpoints, &receipt.access_token).await?;
     if let Some(callback_uid) = callback.callback_uid.as_deref() {
         if callback_uid != identity.uid {
@@ -601,7 +641,11 @@ pub async fn complete_login(
             ));
         }
     }
-    let account_id = trae_account_id(&identity.uid).map_err(TraeClientError::protocol)?;
+    let account_id = crate::domain::trae::trae_account_id_for(
+        flow.endpoints.protocol.provider_type,
+        &identity.uid,
+    )
+    .map_err(|error| TraeClientError::protocol(error.to_string()))?;
     if flow
         .expected_account_id
         .as_deref()
@@ -617,12 +661,12 @@ pub async fn complete_login(
         .unwrap_or_default();
     Ok(UpsertAccountInput {
         id: Some(account_id),
-        provider_type: ProviderType::TraeSolo,
+        provider_type: flow.endpoints.protocol.provider_type,
         email: None,
         access_token: Some(receipt.access_token),
         refresh_token: Some(receipt.refresh_token),
         id_token: None,
-        token_type: Some("Cloud-IDE-JWT".to_string()),
+        token_type: Some(flow.endpoints.protocol.token_type().to_string()),
         api_key: None,
         extra_headers: None,
         scopes: Vec::new(),
@@ -664,9 +708,9 @@ where
 {
     use crate::clients::oauth::refresh::AccountRefreshFailure;
 
-    if account.provider_type != ProviderType::TraeSolo {
+    if !account.provider_type.is_trae() {
         return Err(AccountRefreshFailure::bad_request(format!(
-            "expected trae_solo account, got {}",
+            "expected a Trae account, got {}",
             account.provider_type.as_str()
         )));
     }
@@ -680,13 +724,21 @@ where
         .ok_or_else(|| AccountRefreshFailure::bad_request("Trae refresh token is required"))?;
     let endpoints =
         TraeOAuthEndpoints::for_account(account).map_err(trae_refresh_client_failure)?;
-    let receipt = exchange_token(http, &endpoints, refresh_token, now_ms)
-        .await
-        .map_err(trae_refresh_exchange_failure)?;
+    let receipt = exchange_token(
+        http,
+        &endpoints,
+        refresh_token,
+        &profile.uid,
+        device_proof::device_proof(account, &profile.uid, refresh_token, now_ms)
+            .map_err(trae_refresh_client_failure)?,
+        now_ms,
+    )
+    .await
+    .map_err(trae_refresh_exchange_failure)?;
     let refresh_update = AccountRefreshUpdate {
         access_token: Some(receipt.access_token.clone()),
         refresh_token: Some(receipt.refresh_token.clone()),
-        token_type: Some("Cloud-IDE-JWT".to_string()),
+        token_type: Some(endpoints.protocol.token_type().to_string()),
         expires_at: Some(receipt.expires_at_ms),
         raw: Some(json!({
             "traeRefreshReceipt": {
@@ -744,7 +796,34 @@ pub(crate) async fn fetch_model_detail(
     let profile = validate_runtime_account(account)?;
     let access_token = required_access_token(account)?;
     let endpoints = TraeRuntimeEndpoints::for_account(account)?;
-    let url = endpoints.agent_url(TRAE_MODEL_DETAIL_PATH)?;
+    let protocol = crate::domain::trae::TraeProtocol::for_provider(account.provider_type)
+        .map_err(TraeClientError::bad_request)?;
+    let path = protocol.catalog_path.ok_or_else(|| {
+        TraeClientError::bad_request(
+            "Trae Intl live model discovery is unavailable; configure an explicit upstream model",
+        )
+    })?;
+    let url = endpoints.agent_url(path)?;
+    if protocol.raw {
+        let mut request = http.post(url).json(&json!({"type":"chat"}));
+        for (key, value) in protocol.headers(&profile, access_token, false) {
+            request = request.header(key, value);
+        }
+        let (status, body) = execute_bounded_with(
+            request,
+            "raw model list",
+            request_timeout,
+            MAX_RUNTIME_RESPONSE_BODY_BYTES,
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(TraeClientError::upstream(status, "raw model list", &body));
+        }
+        let value = serde_json::from_slice(&body)
+            .map_err(|error| TraeClientError::protocol(error.to_string()))?;
+        ensure_success_envelope(&value, "raw model list")?;
+        return Ok(value);
+    }
     let request = solo_request(
         http.request(Method::POST, url).json(&json!({
             "function": crate::domain::trae::TRAE_FUNCTION,
@@ -786,14 +865,31 @@ pub(crate) async fn fetch_entitlement_usage(
     let profile = validate_runtime_account(account)?;
     let access_token = required_access_token(account)?;
     let endpoints = TraeRuntimeEndpoints::for_account(account)?;
-    let url = endpoints.billing_url(TRAE_QUOTA_PATH)?;
+    let protocol = crate::domain::trae::TraeProtocol::for_provider(account.provider_type)
+        .map_err(TraeClientError::bad_request)?;
+    let url = endpoints.billing_url(if protocol.intl {
+        "/trae/api/v1/pay/ide_user_ent_usage"
+    } else {
+        TRAE_QUOTA_PATH
+    })?;
     let request = http
         .request(Method::POST, url)
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, "application/json")
-        .header(USER_AGENT, format!("Trae/{TRAE_IDE_VERSION}"))
+        .header(
+            USER_AGENT,
+            if protocol.raw {
+                if protocol.intl {
+                    format!("Trae/{}", protocol.version)
+                } else {
+                    format!("Trae CN/{}", protocol.version)
+                }
+            } else {
+                format!("Trae/{TRAE_IDE_VERSION}")
+            },
+        )
         .header("Authorization", format!("Cloud-IDE-JWT {access_token}"))
-        .header("X-User-Region", "CN")
+        .header("X-User-Region", if protocol.intl { "US" } else { "CN" })
         .header("X-Device-Id", &profile.device_id)
         .json(&json!({}));
     let (status, body) = execute_bounded_with(
@@ -820,9 +916,9 @@ pub(crate) async fn fetch_entitlement_usage(
 }
 
 fn validate_runtime_account(account: &Account) -> Result<TraeAccountProfile, TraeClientError> {
-    if account.provider_type != ProviderType::TraeSolo {
+    if !account.provider_type.is_trae() {
         return Err(TraeClientError::bad_request(format!(
-            "expected trae_solo account, got {}",
+            "expected a Trae account, got {}",
             account.provider_type.as_str()
         )));
     }
@@ -899,6 +995,8 @@ async fn exchange_token(
     http: &reqwest::Client,
     endpoints: &TraeOAuthEndpoints,
     refresh_token: &str,
+    uid: &str,
+    proof: Option<Value>,
     now_ms: i64,
 ) -> Result<TraeTokenReceipt, TraeClientError> {
     if refresh_token.trim().is_empty() {
@@ -906,17 +1004,17 @@ async fn exchange_token(
             "Trae refresh token is required",
         ));
     }
+    let mut payload = json!({"ClientID": endpoints.protocol.client_id, "RefreshToken": refresh_token, "ClientSecret":"-", "UserID":if endpoints.protocol.raw { uid } else { "" }});
+    if let Some(Value::Object(proof)) = proof {
+        payload.as_object_mut().unwrap().extend(proof);
+    }
     let url = endpoints.url(TRAE_EXCHANGE_TOKEN_PATH)?;
     let request = oauth_request(
         http.request(Method::POST, url)
             .header(CONTENT_TYPE, "application/json")
-            .json(&json!({
-                "ClientID": TRAE_CLIENT_ID,
-                "RefreshToken": refresh_token,
-                "ClientSecret": "-",
-                "UserID": "",
-            })),
+            .json(&payload),
     );
+    let request = request.header(USER_AGENT, format!("Trae/{}", endpoints.protocol.version));
     let (status, body) = execute_bounded(request, "token exchange").await?;
     if !status.is_success() {
         return Err(TraeClientError::upstream(status, "token exchange", &body));
@@ -969,8 +1067,9 @@ async fn fetch_user_info(
         http.request(Method::POST, url)
             .header(CONTENT_TYPE, "application/json")
             .header("X-Cloudide-Token", access_token)
-            .json(&json!({"ReqSource": "IDE", "IDEVersion": TRAE_IDE_VERSION})),
+            .json(&json!({"ReqSource": "IDE", "IDEVersion": endpoints.protocol.version})),
     );
+    let request = request.header(USER_AGENT, format!("Trae/{}", endpoints.protocol.version));
     let (status, body) = execute_bounded(request, "user info").await?;
     if !status.is_success() {
         return Err(TraeClientError::upstream(status, "user info", &body));
@@ -1034,19 +1133,20 @@ fn build_login_url(
     device_id: &str,
     callback_url: &str,
     trace: &str,
+    protocol: crate::domain::trae::TraeProtocol,
 ) -> Result<String, TraeClientError> {
-    let mut url = Url::parse(TRAE_CONSOLE_ORIGIN)
+    let mut url = Url::parse(protocol.console_origin)
         .and_then(|origin| origin.join(TRAE_AUTHORIZATION_PATH))
         .map_err(|error| {
             TraeClientError::protocol(format!("invalid reviewed Trae browser URL: {error}"))
         })?;
     url.query_pairs_mut()
         .append_pair("login_version", "1")
-        .append_pair("auth_from", "solo")
+        .append_pair("auth_from", if protocol.raw { "trae" } else { "solo" })
         .append_pair("login_channel", "native_ide")
         .append_pair("plugin_version", TRAE_PLUGIN_VERSION)
         .append_pair("auth_type", "local")
-        .append_pair("client_id", TRAE_CLIENT_ID)
+        .append_pair("client_id", protocol.client_id)
         .append_pair("redirect", "0")
         .append_pair("login_trace_id", trace)
         .append_pair("auth_callback_url", callback_url)
@@ -1057,7 +1157,7 @@ fn build_login_url(
         .append_pair("x_device_brand", "PC")
         .append_pair("x_device_type", "PC")
         .append_pair("x_os_version", "1.0")
-        .append_pair("x_app_version", TRAE_IDE_VERSION)
+        .append_pair("x_app_version", protocol.version)
         .append_pair("x_app_type", "stable");
     Ok(url.into())
 }
@@ -1311,8 +1411,10 @@ fn trae_refresh_identity_failure(
 
 #[cfg(test)]
 mod tests {
+    include!("trae/enhancement_tests.rs");
     use super::*;
     use crate::domain::accounts::store::AccountStore;
+    use crate::domain::trae::*;
     use axum::body::Body;
     use axum::extract::Request;
     use axum::http::{HeaderMap, Response};

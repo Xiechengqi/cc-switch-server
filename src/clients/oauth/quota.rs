@@ -283,7 +283,7 @@ pub async fn refresh_account_quota(
             )
             .await?
         }
-        ProviderType::TraeSolo => {
+        ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl => {
             refresh_trae_quota(http, account, now_ms, success_cooldown_ms, request_timeout).await?
         }
         ProviderType::CursorOAuth => {

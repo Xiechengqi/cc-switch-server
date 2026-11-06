@@ -129,7 +129,8 @@ export type ProviderDriverOptionField =
   | "grokVideoGenerationEnabled"
   | "codexWebsocketEnabled"
   | "codexResponsesKeepaliveIntervalMs"
-  | "codexRoutingHintEnabled";
+  | "codexRoutingHintEnabled"
+  | "traeToolSimulationEnabled";
 
 export interface ProviderDriverOptionSchema {
   optionSchemaId: string;

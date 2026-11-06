@@ -29,6 +29,8 @@ The Server-owned requirements and Rust Provider Registry are authoritative. Lega
 | `codebuddy_oauth` | claude, codex, gemini | server_extension | yes |
 | `workbuddy_oauth` | claude, codex, gemini | server_extension | yes |
 | `trae_solo` | claude, codex, gemini | server_extension | yes |
+| `trae_raw_chat` | claude, codex, gemini | server_extension | yes |
+| `trae_raw_chat_intl` | claude, codex, gemini | server_extension | yes |
 | `cursor_oauth` | claude, codex, gemini | core | yes |
 | `cursor_apikey` | claude, codex, gemini | core | yes |
 | `antigravity_oauth` | claude, gemini | core | yes |
@@ -134,7 +136,7 @@ The Server-owned requirements and Rust Provider Registry are authoritative. Lega
 
 ### Provider-owned API-key Coding Plans
 
-- The Registry contains 85 Profiles, including 20 typed `codingPlan` Profiles across Claude and Codex. Each contract fixes origin, upstream protocol, credential slot/auth scheme, route, reviewed model catalog, quota adapter, cache-token semantics, stream terminal, error envelope, and same-credential retry policy. These are Provider-owned credentials and never participate in Account pooling, rotation, quota selection, or cross-Provider fallback.
+- The Registry contains 91 Profiles, including 20 typed `codingPlan` Profiles across Claude and Codex. Each contract fixes origin, upstream protocol, credential slot/auth scheme, route, reviewed model catalog, quota adapter, cache-token semantics, stream terminal, error envelope, and same-credential retry policy. These are Provider-owned credentials and never participate in Account pooling, rotation, quota selection, or cross-Provider fallback.
 - `assets/contract/coding-plan-source-baseline.json` pins the reviewed OmniRoute and 9router commits plus every evidence-file SHA-256. `scripts/audit/audit-coding-plan-registry.mjs` derives a checked-in manifest and fails on any unreviewed Family, missing Claude/Codex surface, non-HTTPS/fixed route, credential-policy mismatch, model/quota/terminal drift, retry expansion, or stale generated output. `--check-sources` additionally verifies the available external repositories byte-for-byte. The manifest exposes region, maturity, `fixture_verified`/`live_pending`, model modality/context, and quota provenance; tools remain `not_inferred_without_explicit_model_evidence`.
 - Alibaba Coding Plan is split into China and Global/Singapore Families. Claude uses `x-api-key` against `/apps/anthropic/v1/messages`; Codex uses Bearer against `/v1/chat/completions`. Both regions have fixed DashScope Coding origins and reviewed catalogs. No stable official quota endpoint was evidenced, so the quota adapter is explicitly `unavailable` rather than inferred from console cookies or a different Alibaba Token Plan.
 - Within the Provider-owned Zhipu Coding Plan, `glm-5.3` is advertised only by the China and Global Codex Profiles. The reviewed 9router live receipt covers the OpenAI-compatible Coding endpoint and `reasoning_content`; it does not establish an Anthropic Messages rail, so the two Claude Profiles deliberately stop at their separately evidenced catalogs. Qoder independently maps a same-named model under the separate Qoder entitlement and never supplies Zhipu credentials.

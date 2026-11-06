@@ -123,6 +123,8 @@ pub fn all_provider_types() -> &'static [ProviderType] {
         ProviderType::CodeBuddyOAuth,
         ProviderType::WorkBuddyOAuth,
         ProviderType::TraeSolo,
+        ProviderType::TraeRaw,
+        ProviderType::TraeIntl,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
@@ -153,6 +155,8 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::CodeBuddyOAuth,
             ProviderType::WorkBuddyOAuth,
             ProviderType::TraeSolo,
+            ProviderType::TraeRaw,
+            ProviderType::TraeIntl,
             ProviderType::CursorOAuth,
             ProviderType::CursorApiKey,
             ProviderType::AntigravityOAuth,
@@ -179,6 +183,8 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::CodeBuddyOAuth,
             ProviderType::WorkBuddyOAuth,
             ProviderType::TraeSolo,
+            ProviderType::TraeRaw,
+            ProviderType::TraeIntl,
             ProviderType::KiroOAuth,
             ProviderType::AmazonQOAuth,
             ProviderType::Claude,
@@ -209,6 +215,8 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::CodeBuddyOAuth,
             ProviderType::WorkBuddyOAuth,
             ProviderType::TraeSolo,
+            ProviderType::TraeRaw,
+            ProviderType::TraeIntl,
         ],
     }
 }
@@ -280,6 +288,8 @@ fn provider_api_key_url(provider_type: ProviderType) -> Option<&'static str> {
         | ProviderType::CodeBuddyOAuth
         | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo
+        | ProviderType::TraeRaw
+        | ProviderType::TraeIntl
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth
@@ -305,7 +315,8 @@ fn provider_website_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::QoderCosy => Some("https://qoder.com"),
         ProviderType::CodeBuddyOAuth => Some("https://www.codebuddy.ai"),
         ProviderType::WorkBuddyOAuth => Some("https://www.workbuddy.ai"),
-        ProviderType::TraeSolo => Some("https://www.trae.cn"),
+        ProviderType::TraeSolo | ProviderType::TraeRaw => Some("https://www.trae.cn"),
+        ProviderType::TraeIntl => Some("https://www.trae.ai"),
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => Some("https://cursor.com"),
         ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
             Some("https://antigravity.google")
@@ -336,6 +347,8 @@ fn provider_label(provider_type: ProviderType) -> &'static str {
         ProviderType::CodeBuddyOAuth => "CodeBuddy",
         ProviderType::WorkBuddyOAuth => "WorkBuddy",
         ProviderType::TraeSolo => "Trae CN Solo",
+        ProviderType::TraeRaw => "Trae CN raw_chat",
+        ProviderType::TraeIntl => "Trae Intl raw_chat",
         ProviderType::CursorOAuth => "Cursor OAuth",
         ProviderType::CursorApiKey => "Cursor API Key",
         ProviderType::AntigravityOAuth => "Antigravity OAuth",
@@ -462,13 +475,15 @@ fn provider_defaults(provider_type: ProviderType) -> ProviderDefaults {
             key: "ANTHROPIC_AUTH_TOKEN",
             aws_region: None,
         },
-        ProviderType::TraeSolo => ProviderDefaults {
-            base_url: "https://trae-api-cn.mchost.guru",
-            api_format: "openai_chat",
-            model: "glm-5.2",
-            key: "ANTHROPIC_AUTH_TOKEN",
-            aws_region: None,
-        },
+        ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl => {
+            ProviderDefaults {
+                base_url: "https://trae-api-cn.mchost.guru",
+                api_format: "openai_chat",
+                model: "glm-5.2",
+                key: "ANTHROPIC_AUTH_TOKEN",
+                aws_region: None,
+            }
+        }
         ProviderType::CursorOAuth => ProviderDefaults {
             base_url: "https://api2.cursor.sh",
             api_format: "openai_chat",
@@ -559,7 +574,9 @@ fn provider_template_env(provider_type: ProviderType) -> &'static [&'static str]
         ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
         | ProviderType::WorkBuddyOAuth
-        | ProviderType::TraeSolo => &[],
+        | ProviderType::TraeSolo
+        | ProviderType::TraeRaw
+        | ProviderType::TraeIntl => &[],
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => {
             &["OPENAI_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]
         }
@@ -603,6 +620,8 @@ fn credential_mode(provider_type: ProviderType) -> &'static str {
         | ProviderType::CodeBuddyOAuth
         | ProviderType::WorkBuddyOAuth
         | ProviderType::TraeSolo
+        | ProviderType::TraeRaw
+        | ProviderType::TraeIntl
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth
@@ -625,6 +644,8 @@ fn account_supported(provider_type: ProviderType) -> bool {
             | ProviderType::CodeBuddyOAuth
             | ProviderType::WorkBuddyOAuth
             | ProviderType::TraeSolo
+            | ProviderType::TraeRaw
+            | ProviderType::TraeIntl
             | ProviderType::CursorOAuth
             | ProviderType::CursorApiKey
             | ProviderType::AntigravityOAuth
@@ -656,6 +677,8 @@ fn managed_account_recommended(provider_type: ProviderType) -> bool {
             | ProviderType::CodeBuddyOAuth
             | ProviderType::WorkBuddyOAuth
             | ProviderType::TraeSolo
+            | ProviderType::TraeRaw
+            | ProviderType::TraeIntl
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth
@@ -692,7 +715,7 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
         (_, ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth) => {
             "CodeBuddy uses one explicitly bound managed account and immutable Intl/CN site identity; real-account acceptance remains external"
         }
-        (_, ProviderType::TraeSolo) => {
+        (_, ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl) => {
             "Trae CN Solo uses one explicitly bound managed account and fixed Server-owned OAuth/agent/billing origins; real-account acceptance remains external"
         }
         (AppKind::Gemini, ProviderType::KiroOAuth) => {

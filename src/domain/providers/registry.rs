@@ -155,6 +155,7 @@ pub enum DriverOptionField {
     CodexResponsesKeepaliveIntervalMs,
     CodexRoutingHintEnabled,
     CodexWebsocketEnabled,
+    TraeToolSimulationEnabled,
 }
 
 impl DriverOptionField {
@@ -170,6 +171,7 @@ impl DriverOptionField {
             Self::CodexResponsesKeepaliveIntervalMs => "codexResponsesKeepaliveIntervalMs",
             Self::CodexRoutingHintEnabled => "codexRoutingHintEnabled",
             Self::CodexWebsocketEnabled => "codexWebsocketEnabled",
+            Self::TraeToolSimulationEnabled => "traeToolSimulationEnabled",
         }
     }
 }
@@ -377,6 +379,8 @@ pub enum ManagedIdentityFamily {
     Codebuddy,
     Workbuddy,
     Trae,
+    TraeRawCn,
+    TraeRawIntl,
     Kiro,
     AmazonQCli,
     Cursor,
@@ -1565,7 +1569,7 @@ fn validate_operation_contract(driver: &DriverSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
-const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 48] = [
+const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 54] = [
     "claude.anthropic_api_key",
     "claude.google_oauth",
     "claude.kimi_code",
@@ -1573,6 +1577,8 @@ const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 48] = [
     "claude.codebuddy_oauth",
     "claude.workbuddy_oauth",
     "claude.trae_solo",
+    "claude.trae_raw_chat",
+    "claude.trae_raw_chat_intl",
     "codex.github_copilot",
     "codex.kiro_oauth",
     "codex.kimi_code",
@@ -1580,6 +1586,8 @@ const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 48] = [
     "codex.codebuddy_oauth",
     "codex.workbuddy_oauth",
     "codex.trae_solo",
+    "codex.trae_raw_chat",
+    "codex.trae_raw_chat_intl",
     "codex.openai_api_key",
     "gemini.google_api_key",
     "gemini.github_copilot",
@@ -1588,6 +1596,8 @@ const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 48] = [
     "gemini.codebuddy_oauth",
     "gemini.workbuddy_oauth",
     "gemini.trae_solo",
+    "gemini.trae_raw_chat",
+    "gemini.trae_raw_chat_intl",
     "gemini.cursor_api_key",
     "gemini.cursor_oauth",
     "claude.kimi_coding_api_key",
@@ -1650,8 +1660,8 @@ mod tests {
         let registry = provider_registry();
         validate_registry(registry).unwrap();
 
-        assert_eq!(registry.families.len(), 37);
-        assert_eq!(registry.profiles.len(), 85);
+        assert_eq!(registry.families.len(), 39);
+        assert_eq!(registry.profiles.len(), 91);
         assert_eq!(registry.legacy_preset_mappings.len(), 31);
         assert_eq!(registry.custom_recipes.len(), 1);
         assert_eq!(

@@ -160,3 +160,182 @@ mod tests {
         assert_eq!(profile.stable_identity_components(), ["u1", "", "m1", "d1"]);
     }
 }
+
+/// The ProviderType is an immutable realm/channel selector. Imported hosts and
+/// request headers never select a Trae destination or OAuth client identity.
+#[derive(Debug, Clone, Copy)]
+pub struct TraeProtocol {
+    pub provider_type: crate::domain::providers::model::ProviderType,
+    pub oauth_origin: &'static str,
+    pub agent_origin: &'static str,
+    pub billing_origin: &'static str,
+    pub console_origin: &'static str,
+    pub client_id: &'static str,
+    pub version: &'static str,
+    pub version_code: &'static str,
+    pub chat_path: &'static str,
+    pub catalog_path: Option<&'static str>,
+    pub intl: bool,
+    pub raw: bool,
+}
+impl TraeProtocol {
+    pub fn for_provider(
+        provider_type: crate::domain::providers::model::ProviderType,
+    ) -> Result<Self, String> {
+        use crate::domain::providers::model::ProviderType;
+        if !provider_type.is_trae() {
+            return Err("expected a Trae account".into());
+        }
+        let intl = provider_type == ProviderType::TraeIntl;
+        let raw = provider_type != ProviderType::TraeSolo;
+        Ok(Self {
+            provider_type,
+            oauth_origin: if intl {
+                "https://grow-normal.trae.ai"
+            } else {
+                TRAE_OAUTH_ORIGIN
+            },
+            agent_origin: if intl {
+                "https://core-normal.traeapi.us"
+            } else {
+                TRAE_AGENT_ORIGIN
+            },
+            billing_origin: if intl {
+                "https://grow-normal.traeapi.us"
+            } else if raw {
+                "https://api.trae.com.cn"
+            } else {
+                TRAE_BILLING_ORIGIN
+            },
+            console_origin: if intl {
+                "https://www.trae.ai"
+            } else {
+                TRAE_CONSOLE_ORIGIN
+            },
+            client_id: if raw {
+                "ono9krqynydwx5"
+            } else {
+                TRAE_CLIENT_ID
+            },
+            version: if intl {
+                "3.6.2"
+            } else if raw {
+                "3.4.3"
+            } else {
+                TRAE_IDE_VERSION
+            },
+            version_code: if intl {
+                "20260924"
+            } else if raw {
+                "20260212"
+            } else {
+                TRAE_IDE_VERSION_CODE
+            },
+            chat_path: if raw {
+                "/api/ide/v1/llm_raw_chat"
+            } else {
+                TRAE_CHAT_PATH
+            },
+            catalog_path: if intl {
+                None
+            } else if raw {
+                Some("/api/ide/v1/model_list")
+            } else {
+                Some(TRAE_MODEL_DETAIL_PATH)
+            },
+            intl,
+            raw,
+        })
+    }
+    pub fn token_type(self) -> &'static str {
+        if self.intl {
+            "Bearer"
+        } else {
+            "Cloud-IDE-JWT"
+        }
+    }
+    pub fn headers(
+        self,
+        profile: &TraeAccountProfile,
+        token: &str,
+        stream: bool,
+    ) -> Vec<(String, String)> {
+        let mut headers: Vec<(String, String)> = [
+            (
+                "accept",
+                if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                }
+                .to_string(),
+            ),
+            ("content-type", "application/json".into()),
+            (
+                "user-agent",
+                if self.intl {
+                    "TraeClient/TTNet".into()
+                } else if self.raw {
+                    format!("Trae CN/{}", self.version)
+                } else {
+                    format!("Trae/{}", self.version)
+                },
+            ),
+            ("authorization", format!("{} {token}", self.token_type())),
+            ("x-cloudide-token", token.into()),
+            ("x-ide-token", token.into()),
+            ("x-uid", profile.uid.clone()),
+            ("x-app-id", TRAE_APP_ID.into()),
+            ("x-ide-version", self.version.into()),
+            ("x-ide-version-code", self.version_code.into()),
+            (
+                "x-app-version",
+                if self.intl { self.version } else { "default" }.into(),
+            ),
+            ("x-app-version-code", self.version_code.into()),
+            ("x-ide-version-type", "stable".into()),
+            ("x-device-type", "windows".into()),
+            ("x-os-version", TRAE_OS_VERSION.into()),
+            ("x-device-brand", TRAE_DEVICE_BRAND.into()),
+            ("request-traffic-type", "prod".into()),
+            ("x-machine-id", profile.machine_id.clone()),
+            ("x-device-id", profile.device_id.clone()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
+        if self.intl {
+            headers.push(("store-country-code".into(), "us".into()));
+        } else if self.raw {
+            headers.push(("x-plugin-channel".into(), "icube-ai".into()));
+        }
+        headers
+    }
+}
+
+pub fn trae_account_id_for(
+    provider_type: crate::domain::providers::model::ProviderType,
+    uid: &str,
+) -> Result<String, String> {
+    use crate::domain::providers::model::ProviderType;
+    if provider_type == ProviderType::TraeSolo {
+        return trae_account_id(uid);
+    }
+    if !provider_type.is_trae() || uid.trim().is_empty() {
+        return Err("Trae account id requires a channel and uid".into());
+    }
+    let digest = Sha256::digest(format!(
+        "cc-switch/trae-raw/account-id/v1\0{}\0{}",
+        provider_type.as_str(),
+        uid.trim()
+    ));
+    Ok(format!(
+        "trae-{}-{}",
+        if provider_type == ProviderType::TraeIntl {
+            "intl"
+        } else {
+            "raw-cn"
+        },
+        &hex::encode(digest)[..16]
+    ))
+}

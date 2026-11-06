@@ -620,12 +620,14 @@
     "patRail": "PAT"
   },
   "traeOauth": {
+    "signIn": "登入",
+    "toolSimulation": "啟用工具提示詞模擬（由模型遵從提示詞產生呼叫）",
     "authStatus": "Trae 中國區 Solo 驗證",
     "callbackHint": "若瀏覽器無法存取 Server 的 localhost 回呼，請從網址列複製完整回呼 URL 並貼到此處。",
     "callbackPlaceholder": "http://localhost:15721/api/accounts/trae/login/callback?...",
     "callbackRequired": "請貼上完整的 Trae 回呼 URL。",
     "callbackUrl": "回呼 URL",
-    "loginSuccess": "Trae 中國區 Solo 帳號已登入。",
+    "loginSuccess": "Trae 帳號已登入。",
     "loginWithTrae": "使用 Trae 中國區 Solo 登入",
     "submitCallback": "完成登入"
   },

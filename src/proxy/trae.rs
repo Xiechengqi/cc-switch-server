@@ -1,4 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+mod contract;
+mod controls;
+mod media;
+mod raw;
+pub(super) use contract::TraeToolContract;
+pub(super) use controls::TraeSourceControls;
+pub(super) use raw::build_raw_payload;
 
 use bytes::Bytes;
 use rand::RngCore;
@@ -52,6 +60,8 @@ pub fn build_trae_payload(
     normalize_messages(&mut payload)?;
     normalize_tool_choice(&mut payload)?;
     normalize_tools(&mut payload)?;
+    normalize_generation_controls(&mut payload, capability)?;
+    TraeToolContract::from_payload(&Value::Object(payload.clone()))?;
     apply_reasoning_fields(&mut payload, capability)?;
 
     payload.remove("stream_options");
@@ -104,34 +114,57 @@ fn reject_images(payload: &Map<String, Value>) -> Result<(), String> {
 }
 
 fn normalize_messages(payload: &mut Map<String, Value>) -> Result<(), String> {
+    normalize_messages_with_images(payload, false)
+}
+fn normalize_messages_with_images(
+    payload: &mut Map<String, Value>,
+    images: bool,
+) -> Result<(), String> {
     let messages = payload
         .get_mut("messages")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| "Trae canonical Chat request must contain messages array".to_string())?;
+    if messages.is_empty() {
+        return Err("Trae messages must not be empty".to_string());
+    }
+    let mut pending = BTreeMap::<String, String>::new();
+    let mut seen = BTreeSet::new();
     for (index, message) in messages.iter_mut().enumerate() {
         let message = message
             .as_object_mut()
             .ok_or_else(|| format!("Trae message {index} must be an object"))?;
-        let assistant = message
+        let role = message
             .get("role")
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("Trae message {index} is missing role"))?
-            .eq_ignore_ascii_case("assistant");
-
+            .ok_or_else(|| format!("Trae message {index} is missing role"))?;
+        let role = match role {
+            "developer" => "system",
+            "system" => "system",
+            "user" => "user",
+            "assistant" => "assistant",
+            "tool" => "tool",
+            _ => return Err(format!("Trae message {index} has an unsupported role")),
+        }
+        .to_string();
+        message.insert("role".to_string(), json!(role));
+        if role != "tool" && !pending.is_empty() {
+            return Err(format!(
+                "Trae message {index} precedes outstanding tool results"
+            ));
+        }
         if let Some(content) = message.get_mut("content") {
             match content {
-                Value::String(text) => {
-                    *content = json!([{"type": "text", "text": text}]);
-                }
+                Value::String(text) => *content = json!([{"type":"text","text":text}]),
                 Value::Array(parts) => {
                     for (part_index, part) in parts.iter().enumerate() {
-                        let part = part.as_object().ok_or_else(|| {
-                            format!(
-                                "Trae message {index} content part {part_index} must be an object"
-                            )
-                        })?;
+                        if images && part.get("type").and_then(Value::as_str) == Some("image_url") {
+                            let url = part
+                                .pointer("/image_url/url")
+                                .and_then(Value::as_str)
+                                .ok_or("Trae image_url requires a URL")?;
+                            media::validate_image_url(url)?;
+                            continue;
+                        }
                         if part.get("type").and_then(Value::as_str) != Some("text")
                             || !part.get("text").is_some_and(Value::is_string)
                         {
@@ -141,16 +174,58 @@ fn normalize_messages(payload: &mut Map<String, Value>) -> Result<(), String> {
                         }
                     }
                 }
-                Value::Null => {}
+                Value::Null => *content = json!([]),
                 _ => return Err(format!("Trae message {index} content has an invalid shape")),
             }
+        } else {
+            message.insert("content".to_string(), json!([]));
         }
-
-        if assistant {
+        if role == "assistant" {
             normalize_assistant_tool_calls(message, index)?;
+            if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    let id = exact_tool_id(call.get("id"))?;
+                    if !seen.insert(id.to_string()) {
+                        return Err("Trae history contains a duplicate tool call id".to_string());
+                    }
+                    let name = call
+                        .pointer("/function_call/name")
+                        .and_then(Value::as_str)
+                        .expect("normalized function name");
+                    pending.insert(id.to_string(), name.to_string());
+                }
+            }
+        } else if role == "tool" {
+            let id = exact_tool_id(message.get("tool_call_id"))?;
+            let name = pending
+                .remove(id)
+                .ok_or_else(|| "Trae tool result has no matching outstanding call".to_string())?;
+            if message
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|current| current != name)
+            {
+                return Err("Trae tool result name conflicts with its call".to_string());
+            }
+            message.insert("name".to_string(), json!(name));
         }
     }
+    if !pending.is_empty() {
+        return Err("Trae history is missing tool results".to_string());
+    }
     Ok(())
+}
+
+fn exact_tool_id(value: Option<&Value>) -> Result<&str, String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id.trim() == *id
+                && id.len() <= 512
+                && !id.chars().any(char::is_control)
+        })
+        .ok_or_else(|| "Trae tool call id must be a nonempty exact identifier".to_string())
 }
 
 fn normalize_assistant_tool_calls(
@@ -163,6 +238,9 @@ fn normalize_assistant_tool_calls(
     let calls = calls.as_array_mut().ok_or_else(|| {
         format!("Trae assistant message {message_index} tool_calls must be an array")
     })?;
+    if calls.len() > MAX_TOOL_CALLS {
+        return Err("Trae history has too many tool calls".to_string());
+    }
     for (call_index, call) in calls.iter_mut().enumerate() {
         let call = call.as_object_mut().ok_or_else(|| {
             format!(
@@ -177,9 +255,11 @@ fn normalize_assistant_tool_calls(
             }
             call.insert("function_call".to_string(), function);
         }
+        call.insert("index".to_string(), json!(call_index));
+        call.insert("type".to_string(), json!("function"));
         let function = call
-            .get("function_call")
-            .and_then(Value::as_object)
+            .get_mut("function_call")
+            .and_then(Value::as_object_mut)
             .ok_or_else(|| {
                 format!(
                     "Trae assistant message {message_index} tool call {call_index} is missing function"
@@ -194,6 +274,23 @@ fn normalize_assistant_tool_calls(
                 "Trae assistant message {message_index} tool call {call_index} is missing function name"
             ));
         }
+        let arguments = function
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!("{}"));
+        let parsed = if let Some(text) = arguments.as_str() {
+            serde_json::from_str::<Value>(text)
+                .map_err(|_| "Trae historical tool arguments are not valid JSON".to_string())?
+        } else {
+            arguments
+        };
+        if !parsed.is_object() {
+            return Err("Trae historical tool arguments must be an object".to_string());
+        }
+        function.insert(
+            "arguments".to_string(),
+            json!(serde_json::to_string(&parsed).map_err(|error| error.to_string())?),
+        );
     }
     Ok(())
 }
@@ -254,9 +351,7 @@ fn normalize_tool_choice(payload: &mut Map<String, Value>) -> Result<(), String>
                         })?;
                     payload.insert("tool_choice".to_string(), Value::String(name.to_string()));
                 }
-                _ => {
-                    payload.remove("tool_choice");
-                }
+                _ => return Err("Trae tool_choice has an unsupported type".to_string()),
             }
         }
         Value::Null => {
@@ -280,7 +375,6 @@ fn normalize_tools(payload: &mut Map<String, Value>) -> Result<(), String> {
         .ok_or_else(|| "Trae tools must be an array".to_string())?;
     if tools.is_empty() {
         payload.remove("tools");
-        payload.remove("tool_choice");
         return Ok(());
     }
     if tools.len() > MAX_TOOL_CALLS {
@@ -304,18 +398,134 @@ fn normalize_tools(payload: &mut Map<String, Value>) -> Result<(), String> {
         {
             return Err(format!("Trae tool {index} is missing function name"));
         }
-        if let Some(parameters) = function.get_mut("parameters") {
-            let encoded = if let Value::String(value) = parameters {
-                serde_json::from_str::<Value>(value).map_err(|_| {
-                    format!("Trae tool {index} parameters string is not valid JSON")
-                })?;
-                value.clone()
-            } else {
-                serde_json::to_string(&*parameters)
-                    .map_err(|error| format!("encode Trae tool {index} parameters: {error}"))?
-            };
-            *parameters = Value::String(encoded);
+        let parameters = function
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+        let parameters = if let Some(text) = parameters.as_str() {
+            serde_json::from_str::<Value>(text)
+                .map_err(|_| format!("Trae tool {index} parameters string is not valid JSON"))?
+        } else {
+            parameters
+        };
+        if !parameters.is_object()
+            || parameters
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "object")
+        {
+            return Err(format!(
+                "Trae tool {index} parameters must describe an object"
+            ));
         }
+        function.insert(
+            "parameters".to_string(),
+            json!(serde_json::to_string(&parameters).map_err(|error| error.to_string())?),
+        );
+    }
+    Ok(())
+}
+
+fn normalize_generation_controls(
+    payload: &mut Map<String, Value>,
+    capability: &TraeModelCapability,
+) -> Result<(), String> {
+    normalize_generation_controls_with_limit(payload, capability.max_output_tokens)
+}
+
+fn normalize_generation_controls_with_limit(
+    payload: &mut Map<String, Value>,
+    max_output_tokens: Option<u64>,
+) -> Result<(), String> {
+    let mut maximum = None;
+    for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+        if let Some(value) = payload.remove(key).filter(|value| !value.is_null()) {
+            let value = value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| format!("Trae {key} must be a positive integer"))?;
+            if maximum.is_some_and(|current| current != value) {
+                return Err("Trae output token limits conflict".to_string());
+            }
+            maximum = Some(value);
+        }
+    }
+    if let Some(maximum) = maximum {
+        if max_output_tokens.is_some_and(|limit| maximum > limit) {
+            return Err("Trae output token limit exceeds the model capability".to_string());
+        }
+        payload.insert("max_tokens".to_string(), json!(maximum));
+    }
+    for (key, low, high) in [("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)] {
+        if let Some(value) = payload.get(key).filter(|value| !value.is_null()) {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| format!("Trae {key} must be a number"))?;
+            if !number.is_finite() || number < low || number > high {
+                return Err(format!("Trae {key} is out of range"));
+            }
+        }
+    }
+    if let Some(stop) = payload.get_mut("stop").filter(|value| !value.is_null()) {
+        if let Value::String(text) = stop {
+            *stop = json!([text]);
+        }
+        let values = stop
+            .as_array()
+            .ok_or_else(|| "Trae stop must be text or a text array".to_string())?;
+        if values.len() > 4 || values.iter().any(|value| !value.is_string()) {
+            return Err("Trae stop must contain at most four strings".to_string());
+        }
+    }
+    if payload
+        .get("n")
+        .is_some_and(|value| !value.is_null() && value.as_u64() != Some(1))
+    {
+        return Err("Trae supports one completion per request".to_string());
+    }
+    if payload.get("response_format").is_some_and(|value| {
+        !value.is_null() && value.get("type").and_then(Value::as_str) != Some("text")
+    }) {
+        return Err(
+            "Trae structured output constraints are not supported by the reviewed contract"
+                .to_string(),
+        );
+    }
+    // These controls have no reviewed Solo wire semantics. Never silently claim enforcement.
+    if payload.get("seed").is_some_and(|value| !value.is_null()) {
+        return Err("Trae does not support seed".to_string());
+    }
+    for key in [
+        "logprobs",
+        "top_logprobs",
+        "logit_bias",
+        "frequency_penalty",
+        "presence_penalty",
+        "top_k",
+    ] {
+        if payload
+            .get(key)
+            .is_some_and(|value| !value.is_null() && value != &json!(false) && value != &json!(0))
+        {
+            return Err(format!("Trae does not support {key}"));
+        }
+    }
+    for key in [
+        "n",
+        "response_format",
+        "metadata",
+        "user",
+        "service_tier",
+        "store",
+        "logprobs",
+        "top_logprobs",
+        "logit_bias",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "top_k",
+    ] {
+        payload.remove(key);
     }
     Ok(())
 }
@@ -326,11 +536,15 @@ fn apply_reasoning_fields(
 ) -> Result<(), String> {
     let requested_level = requested_reasoning_level(payload)?;
     let max_requested = requested_max_mode(payload)?;
+    if max_requested && !capability.max_mode {
+        return Err("Trae model does not support SOLO max mode".to_string());
+    }
     for key in [
         "enable_thinking",
         "enable_reasoning",
         "is_reasoning",
         "reasoning_effort",
+        "reasoning",
         "reasoning_budget_tokens",
         "thinking",
         "context_length",
@@ -361,11 +575,9 @@ fn apply_reasoning_fields(
         .iter()
         .find(|candidate| candidate.as_str() == level)
         .cloned()
-        .or_else(|| capability.reasoning_default.clone())
-        .or_else(|| capability.reasoning_efforts.first().cloned())
         .ok_or_else(|| {
             format!(
-                "Trae model {} has an incomplete reasoning capability",
+                "Trae model {} does not support the requested reasoning level",
                 capability.id
             )
         })?;
@@ -377,30 +589,41 @@ fn apply_reasoning_fields(
 }
 
 fn requested_reasoning_level(payload: &Map<String, Value>) -> Result<Option<String>, String> {
-    if let Some(value) = payload.get("reasoning_effort") {
-        let raw = match value {
-            Value::String(value) => Some(value.as_str()),
-            Value::Object(value) => ["effort", "level", "type"]
-                .iter()
-                .find_map(|key| value.get(*key).and_then(Value::as_str)),
-            Value::Null => None,
-            _ => return Err("Trae reasoning_effort has an invalid shape".to_string()),
+    let mut selected = None;
+    for key in ["reasoning_effort", "reasoning", "reasoning_effort_level"] {
+        let Some(value) = payload.get(key).filter(|value| !value.is_null()) else {
+            continue;
         };
-        if let Some(raw) = raw {
-            return normalize_reasoning_level(raw)
-                .map(Some)
-                .ok_or_else(|| format!("unsupported Trae reasoning effort {raw:?}"));
+        let raw = value
+            .as_str()
+            .or_else(|| value.get("effort").and_then(Value::as_str))
+            .or_else(|| value.get("level").and_then(Value::as_str))
+            .ok_or_else(|| format!("Trae {key} has an invalid shape"))?;
+        let level = normalize_reasoning_level(raw)
+            .ok_or_else(|| "unsupported Trae reasoning effort".to_string())?;
+        if selected.as_ref().is_some_and(|current| current != &level) {
+            return Err("Trae reasoning controls conflict".to_string());
         }
+        selected = Some(level);
     }
     for key in ["enable_thinking", "enable_reasoning", "is_reasoning"] {
         if let Some(value) = payload.get(key) {
             let enabled = value
                 .as_bool()
                 .ok_or_else(|| format!("Trae {key} must be a boolean"))?;
-            return Ok(Some(if enabled { "medium" } else { "none" }.to_string()));
+            let level = if enabled { "medium" } else { "none" }.to_string();
+            if selected
+                .as_ref()
+                .is_some_and(|current| (current == "none") == enabled)
+            {
+                return Err("Trae reasoning controls conflict".to_string());
+            }
+            if selected.is_none() {
+                selected = Some(level);
+            }
         }
     }
-    Ok(None)
+    Ok(selected)
 }
 
 fn requested_max_mode(payload: &Map<String, Value>) -> Result<bool, String> {
@@ -501,7 +724,8 @@ fn status_for_code(code: &str) -> axum::http::StatusCode {
     match code.trim() {
         "1001" => axum::http::StatusCode::UNAUTHORIZED,
         "1005" | "4008" | "4011" => axum::http::StatusCode::TOO_MANY_REQUESTS,
-        "4001" => axum::http::StatusCode::BAD_REQUEST,
+        "4001" | "4023" => axum::http::StatusCode::BAD_REQUEST,
+        "4015" | "4019" => axum::http::StatusCode::FORBIDDEN,
         _ => axum::http::StatusCode::BAD_GATEWAY,
     }
 }
@@ -529,8 +753,13 @@ impl From<ProxyError> for TraeSseDecodeError {
 
 #[derive(Debug)]
 pub struct TraeSseDecoder {
-    buffer: Vec<u8>,
+    wire: super::sse_transport::SseEventDecoder,
+    contract: Option<TraeToolContract>,
+    raw: bool,
+    markers: Option<raw::ToolMarkers>,
     aggregate_bytes: usize,
+    memory: Option<super::request_memory::RequestMemoryBudget>,
+    resident: Option<super::request_memory::RequestMemoryReservation>,
     id: String,
     created: i64,
     fallback_model: String,
@@ -555,8 +784,13 @@ struct AggregatedToolCall {
 impl TraeSseDecoder {
     pub fn new(fallback_model: impl Into<String>) -> Self {
         Self {
-            buffer: Vec::new(),
+            wire: super::sse_transport::SseEventDecoder::new(MAX_SSE_EVENT_BYTES),
+            contract: None,
+            raw: false,
+            markers: None,
             aggregate_bytes: 0,
+            memory: None,
+            resident: None,
             id: format!("chatcmpl-trae-{}", random_trae_request_id()),
             created: super::openai_chat_compat::unix_timestamp_seconds(),
             fallback_model: fallback_model.into(),
@@ -569,6 +803,138 @@ impl TraeSseDecoder {
             saw_done: false,
             complete: false,
         }
+    }
+
+    pub(super) fn with_contract(model: impl Into<String>, contract: TraeToolContract) -> Self {
+        let mut decoder = Self::new(model);
+        decoder.contract = Some(contract);
+        decoder
+    }
+
+    pub(super) fn with_raw(model: &str, contract: TraeToolContract, simulation: bool) -> Self {
+        let mut decoder = Self::with_contract(model, contract);
+        decoder.raw = true;
+        decoder.markers = simulation.then(raw::ToolMarkers::default);
+        decoder
+    }
+
+    pub(super) fn attach_memory(
+        &mut self,
+        memory: Option<super::request_memory::RequestMemoryBudget>,
+    ) -> Result<(), ProxyError> {
+        self.resident = memory
+            .as_ref()
+            .map(|budget| {
+                budget.reserve(
+                    super::request_memory::RequestMemoryComponent::StreamRetainedState,
+                    self.retained_bytes(),
+                )
+            })
+            .transpose()
+            .map_err(|error| error.into_proxy_error())?;
+        self.memory = memory;
+        Ok(())
+    }
+
+    fn working_memory(
+        &self,
+        incoming: usize,
+    ) -> Result<Option<super::request_memory::RequestMemoryReservation>, ProxyError> {
+        self.memory
+            .as_ref()
+            .map(|budget| {
+                budget.reserve(
+                    super::request_memory::RequestMemoryComponent::NormalizedEvent,
+                    self.wire
+                        .retained_bytes()
+                        .saturating_add(
+                            self.markers
+                                .as_ref()
+                                .map_or(0, raw::ToolMarkers::retained_bytes),
+                        )
+                        .saturating_add(
+                            self.tool_calls
+                                .values()
+                                .map(|call| call.arguments.capacity())
+                                .sum::<usize>(),
+                        )
+                        .saturating_add(incoming)
+                        .saturating_mul(64)
+                        .saturating_add(self.retained_bytes().saturating_mul(4))
+                        .saturating_add(8192),
+                )
+            })
+            .transpose()
+            .map_err(|error| error.into_proxy_error())
+    }
+
+    fn retain_output(&self, output: Vec<u8>) -> Result<Bytes, ProxyError> {
+        if let Some(resident) = &self.resident {
+            resident
+                .resize(self.retained_bytes())
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        let bytes = Bytes::from(output);
+        self.memory.as_ref().map_or(Ok(bytes.clone()), |budget| {
+            budget
+                .retain_bytes(
+                    super::request_memory::RequestMemoryComponent::NormalizedEvent,
+                    bytes,
+                )
+                .map_err(|error| error.into_proxy_error())
+        })
+    }
+
+    pub(super) fn snapshot_completion(&self) -> Result<Value, ProxyError> {
+        if !self.complete {
+            return Err(ProxyError::bad_gateway("Trae completion is not terminal"));
+        }
+        let mut message = json!({"role":"assistant", "content": self.content});
+        if !self.reasoning_content.is_empty() {
+            message["reasoning_content"] = json!(self.reasoning_content);
+        }
+        if !self.tool_calls.is_empty() {
+            message["tool_calls"] = json!(self.final_tool_calls());
+        }
+        let mut result = json!({"id":self.id,"object":"chat.completion","created":self.created,"model":self.model(),"choices":[{"index":0,"message":message,"finish_reason":self.finish_reason}]});
+        if let Some(usage) = &self.usage {
+            result["usage"] = usage.clone();
+        }
+        Ok(result)
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.wire
+            .retained_bytes()
+            .saturating_add(
+                self.markers
+                    .as_ref()
+                    .map_or(0, raw::ToolMarkers::retained_bytes),
+            )
+            .saturating_add(
+                self.contract
+                    .as_ref()
+                    .map_or(0, TraeToolContract::retained_bytes),
+            )
+            .saturating_add(self.content.capacity())
+            .saturating_add(self.reasoning_content.capacity())
+            .saturating_add(
+                self.tool_calls
+                    .values()
+                    .map(|call| {
+                        call.id.capacity()
+                            + call.name.capacity()
+                            + call.arguments.capacity()
+                            + call.call_type.capacity()
+                            + 128
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.usage
+                    .as_ref()
+                    .map_or(0, super::request_memory::retained_json_bytes),
+            )
     }
 
     /// True only after upstream EOF validated the single previously observed
@@ -588,15 +954,31 @@ impl TraeSseDecoder {
         if self.aggregate_bytes > MAX_AGGREGATE_BYTES {
             return Err(ProxyError::bad_gateway("Trae SSE response exceeds the limit").into());
         }
-        self.buffer.extend_from_slice(&chunk);
-        self.drain(false)
+        let _working = self.working_memory(chunk.len())?;
+        let events = self
+            .wire
+            .push(&chunk)
+            .map_err(|error| ProxyError::bad_gateway(format!("invalid Trae SSE: {error}")))?;
+        let mut output = Vec::new();
+        for event in events {
+            self.decode_event(event, &mut output)?;
+        }
+        self.retain_output(output).map_err(Into::into)
     }
 
     pub fn finish_classified(&mut self) -> Result<Bytes, TraeSseDecodeError> {
         if self.complete {
             return Err(ProxyError::bad_gateway("Trae SSE was finalized more than once").into());
         }
-        let mut output = self.drain(true)?.to_vec();
+        let _working = self.working_memory(0)?;
+        let events = self
+            .wire
+            .finish()
+            .map_err(|error| ProxyError::bad_gateway(format!("invalid Trae SSE: {error}")))?;
+        let mut output = Vec::new();
+        for event in events {
+            self.decode_event(event, &mut output)?;
+        }
         if !self.saw_done {
             return Err(
                 ProxyError::bad_gateway("Trae SSE ended without exactly one done event").into(),
@@ -606,7 +988,7 @@ impl TraeSseDecoder {
         self.complete = true;
         append_sse_json(&mut output, &self.terminal_chunk())?;
         output.extend_from_slice(b"data: [DONE]\n\n");
-        Ok(Bytes::from(output))
+        self.retain_output(output).map_err(Into::into)
     }
 
     pub fn into_chat_completion(self) -> Result<Value, ProxyError> {
@@ -653,72 +1035,20 @@ impl TraeSseDecoder {
         Ok(response)
     }
 
-    fn drain(&mut self, finish: bool) -> Result<Bytes, TraeSseDecodeError> {
-        let mut output = Vec::new();
-        while let Some((end, delimiter)) = next_event_boundary(&self.buffer) {
-            if end > MAX_SSE_EVENT_BYTES {
-                return Err(ProxyError::bad_gateway("Trae SSE event exceeds the limit").into());
-            }
-            let event = self.buffer[..end].to_vec();
-            self.buffer.drain(..end + delimiter);
-            self.decode_event(&event, &mut output)?;
-        }
-        if self.buffer.len() > MAX_SSE_EVENT_BYTES {
-            return Err(ProxyError::bad_gateway("Trae SSE event exceeds the limit").into());
-        }
-        if finish && !self.buffer.is_empty() {
-            let event = std::mem::take(&mut self.buffer);
-            self.decode_event(&event, &mut output)?;
-        }
-        Ok(Bytes::from(output))
-    }
-
     fn decode_event(
         &mut self,
-        event: &[u8],
+        event: super::sse_transport::SseEvent,
         output: &mut Vec<u8>,
     ) -> Result<(), TraeSseDecodeError> {
-        let text = std::str::from_utf8(event)
-            .map_err(|_| ProxyError::bad_gateway("Trae SSE event is not UTF-8"))?;
-        let mut name = None;
-        let mut data = None;
-        for line in text.lines() {
-            let line = line.trim_end_matches('\r');
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
-            if let Some(value) = line.strip_prefix("event:") {
-                if name.is_some() {
-                    return Err(ProxyError::bad_gateway(
-                        "Trae SSE event contains multiple event fields",
-                    )
-                    .into());
-                }
-                name = Some(value.trim());
-            } else if let Some(value) = line.strip_prefix("data:") {
-                if data.is_some() {
-                    return Err(ProxyError::bad_gateway(
-                        "Trae SSE event contains multiple data fields",
-                    )
-                    .into());
-                }
-                data = Some(value.trim_start());
-            } else {
-                return Err(ProxyError::bad_gateway(
-                    "Trae SSE event contains an unsupported field",
-                )
-                .into());
-            }
+        if !event.has_data {
+            return Ok(());
         }
-        let Some(name) = name.filter(|name| !name.is_empty()) else {
-            if data.is_none() {
-                return Ok(());
-            }
-            return Err(ProxyError::bad_gateway("Trae SSE data is missing an event name").into());
-        };
-        let data = data.ok_or_else(|| {
-            ProxyError::bad_gateway(format!("Trae SSE {name} event is missing data"))
-        })?;
+        let name = event
+            .event
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .or(self.raw.then_some("message"))
+            .ok_or_else(|| ProxyError::bad_gateway("Trae SSE data is missing an event name"))?;
         if self.saw_done {
             return Err(ProxyError::bad_gateway(if name == "done" {
                 "Trae SSE emitted duplicate done events"
@@ -727,12 +1057,58 @@ impl TraeSseDecoder {
             })
             .into());
         }
+        let data = std::str::from_utf8(&event.data)
+            .map_err(|_| ProxyError::bad_gateway("Trae SSE event is not UTF-8"))?;
+        if self.raw && data.trim() == "[DONE]" {
+            return self.consume_done(&json!({}), output);
+        }
         let value = serde_json::from_str::<Value>(data).map_err(|error| {
             ProxyError::bad_gateway(format!("invalid Trae SSE {name} event: {error}"))
         })?;
+        if name != "error" && recursive_business_code(&value, 0).is_some() {
+            return Err(TraeSseDecodeError::Upstream(TraeUpstreamError::from_event(
+                &value,
+            )));
+        }
         match name {
+            "progress_notice" => {
+                let notice = value
+                    .as_str()
+                    .filter(|notice| {
+                        notice.starts_with("Processing_") && notice.len() <= MAX_ERROR_MESSAGE_BYTES
+                    })
+                    .ok_or_else(|| ProxyError::bad_gateway("invalid Trae progress notice"))?;
+                let _ = notice;
+                Ok(())
+            }
             "metadata" => self.consume_metadata(&value),
+            "output" | "message" if self.raw => {
+                if value
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+                {
+                    return Err(ProxyError::bad_gateway(
+                        "Trae raw_chat native tools have no reviewed contract",
+                    )
+                    .into());
+                }
+                if let Some(text) = value.get("response").and_then(Value::as_str) {
+                    if let Some(markers) = &mut self.markers {
+                        let deltas = markers.feed(text, false)?;
+                        for delta in deltas {
+                            self.consume_output(&delta, output)?;
+                        }
+                        let mut rest = value.clone();
+                        rest.as_object_mut().unwrap().remove("response");
+                        return self.consume_output(&rest, output);
+                    }
+                }
+                self.consume_output(&value, output)
+            }
             "output" => self.consume_output(&value, output),
+            "usage" if self.raw => self.consume_usage(&value),
+            "notify_usage" if self.raw && value.is_object() => Ok(()),
             "token_usage" => self.consume_usage(&value),
             "done" => self.consume_done(&value, output),
             "error" => Err(TraeSseDecodeError::Upstream(TraeUpstreamError::from_event(
@@ -819,10 +1195,87 @@ impl TraeSseDecoder {
     }
 
     fn consume_usage(&mut self, value: &Value) -> Result<(), TraeSseDecodeError> {
-        if !value.is_object() {
-            return Err(ProxyError::bad_gateway("Trae token_usage must be an object").into());
+        let object = value
+            .as_object()
+            .ok_or_else(|| ProxyError::bad_gateway("Trae token_usage must be an object"))?;
+        let mut usage = self.usage.clone().unwrap_or_else(|| json!({}));
+        for key in [
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "reasoning_tokens",
+        ] {
+            if let Some(value) = object.get(key) {
+                let number = value
+                    .as_u64()
+                    .filter(|number| *number <= i64::MAX as u64)
+                    .ok_or_else(|| {
+                        ProxyError::bad_gateway(format!(
+                            "Trae usage {key} must be a nonnegative integer"
+                        ))
+                    })?;
+                usage[key] = json!(number);
+            }
         }
-        self.usage = Some(value.clone());
+        for (detail, key) in [
+            ("prompt_tokens_details", "cached_tokens"),
+            ("completion_tokens_details", "reasoning_tokens"),
+        ] {
+            if let Some(value) = object.get(detail) {
+                let value = value.as_object().ok_or_else(|| {
+                    ProxyError::bad_gateway("Trae usage details must be an object")
+                })?;
+                if let Some(number) = value.get(key) {
+                    let number = number
+                        .as_u64()
+                        .filter(|number| *number <= i64::MAX as u64)
+                        .ok_or_else(|| {
+                            ProxyError::bad_gateway(
+                                "Trae usage detail must be a nonnegative integer",
+                            )
+                        })?;
+                    usage[detail] = json!({key:number});
+                }
+            }
+        }
+        let prompt = usage["prompt_tokens"].as_u64().unwrap_or(0);
+        let completion = usage["completion_tokens"].as_u64().unwrap_or(0);
+        let sum = prompt
+            .checked_add(completion)
+            .filter(|sum| *sum <= i64::MAX as u64)
+            .ok_or_else(|| ProxyError::bad_gateway("Trae usage total overflows"))?;
+        usage["prompt_tokens"] = json!(prompt);
+        usage["completion_tokens"] = json!(completion);
+        if !object.contains_key("total_tokens") {
+            usage["total_tokens"] = json!(sum);
+        }
+        let cached = usage["cache_read_input_tokens"]
+            .as_u64()
+            .or_else(|| {
+                usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(0);
+        let reasoning = usage["reasoning_tokens"]
+            .as_u64()
+            .or_else(|| {
+                usage
+                    .pointer("/completion_tokens_details/reasoning_tokens")
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(0);
+        if cached > prompt || reasoning > completion {
+            return Err(ProxyError::bad_gateway(
+                "Trae usage detail exceeds its inclusive token count",
+            )
+            .into());
+        }
+        usage["prompt_tokens_details"] = json!({"cached_tokens":cached});
+        usage["completion_tokens_details"] = json!({"reasoning_tokens":reasoning});
+        self.usage = Some(usage);
         Ok(())
     }
 
@@ -831,6 +1284,15 @@ impl TraeSseDecoder {
         value: &Value,
         output: &mut Vec<u8>,
     ) -> Result<(), TraeSseDecodeError> {
+        if self.saw_done {
+            return Err(ProxyError::bad_gateway("Trae emitted duplicate done").into());
+        }
+        if let Some(markers) = &mut self.markers {
+            let deltas = markers.feed("", true)?;
+            for delta in deltas {
+                self.consume_output(&delta, output)?;
+            }
+        }
         let object = value
             .as_object()
             .ok_or_else(|| ProxyError::bad_gateway("Trae done must be an object"))?;
@@ -838,9 +1300,26 @@ impl TraeSseDecoder {
             self.finish_reason =
                 required_nonempty_string(reason, "Trae done finish_reason")?.to_string();
         }
+        if !self.tool_calls.is_empty()
+            && !matches!(self.finish_reason.as_str(), "stop" | "tool_calls")
+        {
+            return Err(ProxyError::bad_gateway(
+                "Trae tool calls ended with an incomplete finish reason",
+            )
+            .into());
+        }
         let mut empty_argument_deltas = Vec::new();
         for (index, call) in &mut self.tool_calls {
             if call.arguments.is_empty() {
+                if !self
+                    .contract
+                    .as_ref()
+                    .is_some_and(|contract| contract.allows_empty_arguments(&call.name))
+                {
+                    return Err(
+                        ProxyError::bad_gateway("Trae tool call is missing arguments").into(),
+                    );
+                }
                 call.arguments = "{}".to_string();
                 empty_argument_deltas.push(json!({
                     "index": index,
@@ -853,6 +1332,10 @@ impl TraeSseDecoder {
                 output,
                 &self.chunk(json!({"tool_calls": empty_argument_deltas}), None),
             )?;
+        }
+        self.validate_tool_calls()?;
+        if !self.tool_calls.is_empty() {
+            self.finish_reason = "tool_calls".to_string();
         }
         self.saw_done = true;
         Ok(())
@@ -886,6 +1369,11 @@ impl TraeSseDecoder {
                 );
             }
             item.insert("index".to_string(), Value::from(index));
+            for field in ["id", "type"] {
+                if item.get(field).and_then(Value::as_str) == Some("") {
+                    item.remove(field);
+                }
+            }
             if !item.contains_key("type") {
                 item.insert("type".to_string(), Value::String("function".to_string()));
             }
@@ -896,6 +1384,9 @@ impl TraeSseDecoder {
             let mut function = function.as_object().cloned().ok_or_else(|| {
                 ProxyError::bad_gateway("Trae tool call function must be an object")
             })?;
+            if function.get("name").and_then(Value::as_str) == Some("") {
+                function.remove("name");
+            }
             function.remove("namespace");
             function.remove("partial_arguments");
             if let Some(arguments) = function.get_mut("arguments") {
@@ -933,19 +1424,37 @@ impl TraeSseDecoder {
     }
 
     fn validate_tool_calls(&self) -> Result<(), TraeSseDecodeError> {
-        for (index, call) in &self.tool_calls {
-            if call.id.trim().is_empty() || call.name.trim().is_empty() {
-                return Err(ProxyError::bad_gateway(format!(
-                    "Trae tool call {index} is missing id or function name"
-                ))
-                .into());
+        let mut ids = BTreeSet::new();
+        for call in self.tool_calls.values() {
+            if exact_tool_id(Some(&json!(call.id))).is_err()
+                || call.name.trim().is_empty()
+                || call.call_type != "function"
+            {
+                return Err(
+                    ProxyError::bad_gateway("Trae tool call has an invalid identity").into(),
+                );
             }
-            if serde_json::from_str::<Value>(&call.arguments).is_err() {
-                return Err(ProxyError::bad_gateway(format!(
-                    "Trae tool call {index} has invalid JSON arguments"
-                ))
-                .into());
+            if !ids.insert(&call.id) {
+                return Err(ProxyError::bad_gateway("Trae tool calls reuse an id").into());
             }
+            let arguments = serde_json::from_str::<Value>(&call.arguments).map_err(|_| {
+                ProxyError::bad_gateway("Trae tool call has invalid JSON arguments")
+            })?;
+            if !arguments.is_object() {
+                return Err(
+                    ProxyError::bad_gateway("Trae tool arguments must be a JSON object").into(),
+                );
+            }
+            if let Some(contract) = &self.contract {
+                contract
+                    .validate_call(&call.name, &arguments)
+                    .map_err(ProxyError::bad_gateway)?;
+            }
+        }
+        if let Some(contract) = &self.contract {
+            contract
+                .validate_count(self.tool_calls.len())
+                .map_err(ProxyError::bad_gateway)?;
         }
         Ok(())
     }
@@ -1058,7 +1567,11 @@ fn recursive_business_code(value: &Value, depth: usize) -> Option<String> {
     if depth > 6 {
         return None;
     }
-    if let Some(code) = value.get("code").and_then(json_scalar_string) {
+    if let Some(code) = value
+        .get("code")
+        .or_else(|| value.get("Code"))
+        .and_then(json_scalar_string)
+    {
         if !code.is_empty() && code != "0" {
             return Some(code);
         }
@@ -1110,18 +1623,6 @@ fn sanitize_error_message(value: &str) -> String {
     output
 }
 
-fn next_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) if lf <= crlf => Some((lf, 2)),
-        (Some(_), Some(crlf)) => Some((crlf, 4)),
-        (Some(lf), None) => Some((lf, 2)),
-        (None, Some(crlf)) => Some((crlf, 4)),
-        (None, None) => None,
-    }
-}
-
 fn integer_value(value: &Value) -> Option<i64> {
     value
         .as_i64()
@@ -1131,6 +1632,7 @@ fn integer_value(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("trae/enhancement_tests.rs");
 
     fn capability() -> TraeModelCapability {
         TraeModelCapability {
@@ -1167,7 +1669,7 @@ mod tests {
                         "type": "function",
                         "function": {"name": "weather", "arguments": "{}"}
                     }]
-                }],
+                }, {"role":"tool","tool_call_id":"call-1","content":"sunny"}],
                 "tools": [{
                     "type": "function",
                     "function": {
@@ -1249,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_rejects_images_and_omits_unsupported_explicit_max_mode() {
+    fn payload_rejects_images_and_unsupported_explicit_max_mode() {
         let error = build_trae_payload(
             &json!({
                 "messages": [{"role": "user", "content": [{
@@ -1264,7 +1766,7 @@ mod tests {
 
         let mut caps = capability();
         caps.max_mode = false;
-        let payload = build_trae_payload(
+        let error = build_trae_payload(
             &json!({
                 "messages": [{"role": "user", "content": "hello"}],
                 "is_max_mode": 1
@@ -1272,8 +1774,8 @@ mod tests {
             "DeepSeek-V4-Pro-Official",
             &caps,
         )
-        .unwrap();
-        assert!(payload.get("is_max_mode").is_none());
+        .unwrap_err();
+        assert!(error.contains("max mode"));
     }
 
     #[test]
@@ -1323,7 +1825,8 @@ mod tests {
 
     #[test]
     fn solo_tool_call_without_arguments_emits_and_aggregates_empty_object() {
-        let mut decoder = TraeSseDecoder::new("glm-5.2");
+        let contract = TraeToolContract::from_payload(&json!({"tools":[{"function":{"name":"NoArgs","parameters":{"type":"object","properties":{}}}}]})).unwrap();
+        let mut decoder = TraeSseDecoder::with_contract("glm-5.2", contract);
         let first = decoder
             .push_classified(Bytes::from_static(concat!(
                 "event: output\n",

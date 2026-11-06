@@ -612,7 +612,12 @@ fn maybe_inject_gemini_cross_protocol_route_model(
 }
 
 fn gemini_model_from_path(gemini_path: Option<&str>) -> Option<String> {
-    let path = gemini_path?.trim();
+    let path = gemini_path?.trim().trim_start_matches('/');
+    let path = path.split('?').next().unwrap_or(path);
+    let path = path
+        .strip_prefix("v1beta/")
+        .or_else(|| path.strip_prefix("v1/"))
+        .unwrap_or(path);
     let after_models = path.strip_prefix("models/").unwrap_or(path);
     let model = after_models
         .split(':')
@@ -660,6 +665,8 @@ fn all_provider_types() -> impl Iterator<Item = ProviderType> {
         ProviderType::CodeBuddyOAuth,
         ProviderType::WorkBuddyOAuth,
         ProviderType::TraeSolo,
+        ProviderType::TraeRaw,
+        ProviderType::TraeIntl,
         ProviderType::CursorOAuth,
         ProviderType::CursorApiKey,
         ProviderType::AntigravityOAuth,
@@ -757,9 +764,10 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Claude, ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth) => {
             ("claude_to_codebuddy_chat", AdapterSupport::Native)
         }
-        (AppKind::Claude, ProviderType::TraeSolo) => {
-            ("claude_to_trae_solo", AdapterSupport::Native)
-        }
+        (
+            AppKind::Claude,
+            ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl,
+        ) => ("claude_to_trae_solo", AdapterSupport::Native),
 
         (AppKind::Codex, ProviderType::Codex) => {
             ("codex_openai_compatible", AdapterSupport::Native)
@@ -813,7 +821,10 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Codex, ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth) => {
             ("codex_to_codebuddy_chat", AdapterSupport::Native)
         }
-        (AppKind::Codex, ProviderType::TraeSolo) => ("codex_to_trae_solo", AdapterSupport::Native),
+        (
+            AppKind::Codex,
+            ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl,
+        ) => ("codex_to_trae_solo", AdapterSupport::Native),
 
         (AppKind::Gemini, ProviderType::Gemini) => ("gemini_api_key", AdapterSupport::Native),
         (AppKind::Gemini, ProviderType::GeminiCli) => {
@@ -863,9 +874,10 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Gemini, ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth) => {
             ("gemini_to_codebuddy_chat", AdapterSupport::Native)
         }
-        (AppKind::Gemini, ProviderType::TraeSolo) => {
-            ("gemini_to_trae_solo", AdapterSupport::Native)
-        }
+        (
+            AppKind::Gemini,
+            ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl,
+        ) => ("gemini_to_trae_solo", AdapterSupport::Native),
     };
 
     AdapterProfile { adapter, support }
@@ -909,6 +921,8 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::CodeBuddyOAuth
                 | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
+                | ProviderType::TraeRaw
+                | ProviderType::TraeIntl
         ),
         AppKind::Codex => matches!(
             provider_type,
@@ -933,6 +947,8 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::CodeBuddyOAuth
                 | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
+                | ProviderType::TraeRaw
+                | ProviderType::TraeIntl
         ),
         AppKind::Gemini => matches!(
             provider_type,
@@ -953,6 +969,8 @@ fn requires_transform(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::CodeBuddyOAuth
                 | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
+                | ProviderType::TraeRaw
+                | ProviderType::TraeIntl
         ),
     }
 }
@@ -983,6 +1001,8 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::CodeBuddyOAuth
                 | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
+                | ProviderType::TraeRaw
+                | ProviderType::TraeIntl
         ) | (
             AppKind::Codex,
             ProviderType::Claude
@@ -1006,6 +1026,8 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::CodeBuddyOAuth
                 | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
+                | ProviderType::TraeRaw
+                | ProviderType::TraeIntl
         ) | (
             AppKind::Gemini,
             ProviderType::Gemini
@@ -1027,6 +1049,8 @@ fn supports_stream_usage(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::CodeBuddyOAuth
                 | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
+                | ProviderType::TraeRaw
+                | ProviderType::TraeIntl
         )
     )
 }
@@ -1048,6 +1072,8 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::CodeBuddyOAuth
                 | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
+                | ProviderType::TraeRaw
+                | ProviderType::TraeIntl
         ) | (
             AppKind::Codex,
             ProviderType::Codex
@@ -1062,6 +1088,8 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::CodeBuddyOAuth
                 | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
+                | ProviderType::TraeRaw
+                | ProviderType::TraeIntl
         ) | (
             AppKind::Gemini,
             ProviderType::Gemini
@@ -1074,6 +1102,8 @@ fn supports_model_list(app: AppKind, provider_type: ProviderType) -> bool {
                 | ProviderType::CodeBuddyOAuth
                 | ProviderType::WorkBuddyOAuth
                 | ProviderType::TraeSolo
+                | ProviderType::TraeRaw
+                | ProviderType::TraeIntl
         )
     )
 }
@@ -1099,7 +1129,9 @@ fn header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
         | ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
         | ProviderType::WorkBuddyOAuth
-        | ProviderType::TraeSolo => app,
+        | ProviderType::TraeSolo
+        | ProviderType::TraeRaw
+        | ProviderType::TraeIntl => app,
         ProviderType::Gemini | ProviderType::GeminiCli => AppKind::Gemini,
         ProviderType::OpenRouter => {
             if app == AppKind::Gemini {
@@ -1157,6 +1189,14 @@ fn transform_body_for_upstream(
             "request body must be valid json for transform: {error}"
         ))
     })?;
+    let trae_controls = if stored.provider_type.is_trae() {
+        Some(
+            super::trae::TraeSourceControls::from_request(stored.app, &input)
+                .map_err(ProxyError::bad_request)?,
+        )
+    } else {
+        None
+    };
     if stored.provider_type.is_buddy_oauth() {
         super::codebuddy_runtime::validate_buddy_source_images(stored.app, &input).map_err(
             |error| {
@@ -1288,10 +1328,15 @@ fn transform_body_for_upstream(
         _ => Ok(input),
     }
     .map_err(|error| ProxyError::bad_request(format!("request transform failed: {error}")))?;
+
     if let Some(controls) = qoder_controls {
         for (field, value) in controls {
             output[field] = value;
         }
+    }
+
+    if let Some(controls) = trae_controls {
+        controls.apply(&mut output);
     }
 
     if let Some(effort) = buddy_requested_effort {
@@ -1688,7 +1733,9 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             ProviderType::QoderCosy => Some(UpstreamFormat::OpenAiChat),
             ProviderType::CodeBuddyOAuth
             | ProviderType::WorkBuddyOAuth
-            | ProviderType::TraeSolo => Some(UpstreamFormat::OpenAiChat),
+            | ProviderType::TraeSolo
+            | ProviderType::TraeRaw
+            | ProviderType::TraeIntl => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Gemini | ProviderType::GeminiCli => Some(UpstreamFormat::GeminiNative),
             ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 Some(UpstreamFormat::GeminiNative)
@@ -1708,7 +1755,9 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             | ProviderType::QoderCosy
             | ProviderType::CodeBuddyOAuth
             | ProviderType::WorkBuddyOAuth
-            | ProviderType::TraeSolo => Some(UpstreamFormat::OpenAiChat),
+            | ProviderType::TraeSolo
+            | ProviderType::TraeRaw
+            | ProviderType::TraeIntl => Some(UpstreamFormat::OpenAiChat),
             ProviderType::KiroOAuth | ProviderType::AmazonQOAuth => {
                 Some(UpstreamFormat::AnthropicMessages)
             }
@@ -1736,7 +1785,9 @@ fn upstream_format_for(stored: &StoredProvider, body: &[u8]) -> Option<UpstreamF
             | ProviderType::QoderCosy
             | ProviderType::CodeBuddyOAuth
             | ProviderType::WorkBuddyOAuth
-            | ProviderType::TraeSolo => Some(UpstreamFormat::OpenAiChat),
+            | ProviderType::TraeSolo
+            | ProviderType::TraeRaw
+            | ProviderType::TraeIntl => Some(UpstreamFormat::OpenAiChat),
             ProviderType::Codex | ProviderType::CodexOAuth => Some(UpstreamFormat::OpenAiResponses),
             ProviderType::GeminiCli | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
                 Some(UpstreamFormat::GeminiNative)
@@ -4496,6 +4547,7 @@ fn is_stream_requested(body: &[u8]) -> bool {
 fn route_implies_stream(route: ProxyRoute, gemini_path: Option<&str>) -> bool {
     route == ProxyRoute::Gemini
         && gemini_path.is_some_and(|path| {
+            let path = path.split('?').next().unwrap_or(path);
             path.ends_with(":streamGenerateContent") || path.ends_with("streamGenerateContent")
         })
 }
@@ -7209,6 +7261,25 @@ mod tests {
             assert_eq!(request.actual_model.as_deref(), Some("gemini-2.5-pro"));
             assert_eq!(request.actual_model_source.as_deref(), Some("request"));
         }
+    }
+
+    #[test]
+    fn gemini_route_model_accepts_api_prefixes_and_stream_queries() {
+        for path in [
+            "models/Exact-Model:generateContent",
+            "/models/Exact-Model:generateContent",
+            "/v1/models/Exact-Model:generateContent",
+            "/v1beta/models/Exact-Model:streamGenerateContent?alt=sse",
+        ] {
+            assert_eq!(
+                gemini_model_from_path(Some(path)).as_deref(),
+                Some("Exact-Model")
+            );
+        }
+        assert_eq!(
+            gemini_model_from_path(Some("models/:generateContent")),
+            None
+        );
     }
 
     #[test]

@@ -52,6 +52,7 @@ export interface ProviderMeta {
   codexWebsocketEnabled?: boolean;
   codexResponsesKeepaliveIntervalMs?: number;
   codexRoutingHintEnabled?: boolean;
+  traeToolSimulationEnabled?: boolean;
   customUserAgent?: string;
   providerType?: string;
   githubAccountId?: string;

@@ -2,15 +2,15 @@
   "format": "cc-switch-provider-registry-expectations",
   "schemaVersion": 1,
   "counts": {
-    "families": 37,
-    "profiles": 85,
+    "families": 39,
+    "profiles": 91,
     "legacyPresetMappings": 31,
-    "drivers": 26
+    "drivers": 28
   },
   "firstClassProfiles": {
-    "claude": 36,
-    "codex": 29,
-    "gemini": 14
+    "claude": 38,
+    "codex": 31,
+    "gemini": 16
   },
   "requiredProfileIds": [
     "claude.amazon_q_oauth",
@@ -27,7 +27,13 @@
     "gemini.workbuddy_oauth",
     "claude.trae_solo",
     "codex.trae_solo",
-    "gemini.trae_solo"
+    "gemini.trae_solo",
+    "claude.trae_raw_chat",
+    "codex.trae_raw_chat",
+    "gemini.trae_raw_chat",
+    "claude.trae_raw_chat_intl",
+    "codex.trae_raw_chat_intl",
+    "gemini.trae_raw_chat_intl"
   ],
   "requiredDriverIds": [
     "special.amazon_q",
@@ -35,12 +41,16 @@
     "special.perplexity_web_session",
     "special.codebuddy_oauth",
     "special.workbuddy_oauth",
-    "special.trae_solo"
+    "special.trae_solo",
+    "special.trae_raw_chat",
+    "special.trae_raw_chat_intl"
   ],
   "requiredFamilyIds": [
     "family.amazon_q_oauth",
     "family.codebuddy_oauth",
     "family.workbuddy_oauth",
-    "family.trae_solo"
+    "family.trae_solo",
+    "family.trae_raw_chat",
+    "family.trae_raw_chat_intl"
   ]
 }

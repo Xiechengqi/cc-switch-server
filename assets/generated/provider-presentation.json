@@ -151,6 +151,14 @@
       "category": "trae",
       "icon": "custom"
     },
+    "family.trae_raw_chat": {
+      "category": "trae",
+      "icon": "custom"
+    },
+    "family.trae_raw_chat_intl": {
+      "category": "trae",
+      "icon": "custom"
+    },
     "family.kiro_oauth": {
       "category": "kiro",
       "icon": "kiro"
@@ -688,5 +696,5 @@
       "sha256": "a4813730fcfa95f5c97821b451c1e04a9e5f3626b895ebfd63bd30f146629f2e"
     }
   },
-  "catalogVersion": "148b68978ecc526fbe7f3d98cc1b01e5c73196629e924707ab9ce7cd7dd44926"
+  "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95"
 }

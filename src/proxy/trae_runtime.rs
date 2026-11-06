@@ -34,6 +34,7 @@ impl TraeRuntimeScope {
         profile: &TraeAccountProfile,
         auth_identity_generation: u64,
         token_refresh_generation: u64,
+        account_incarnation: u64,
     ) -> Result<Self, String> {
         let required = [
             app.trim(),
@@ -48,25 +49,25 @@ impl TraeRuntimeScope {
             return Err("Trae runtime scope contains an empty identity component".to_string());
         }
         let mut digest = Sha256::new();
-        digest.update(b"cc-switch-server:trae-cn-solo-runtime:v1\0");
+        digest.update(b"cc-switch-server:trae-runtime:v2\0");
         for value in [
             required[0],
             required[1],
             &provider_revision.to_string(),
             required[2],
             required[3],
-            "cn",
             required[4],
             profile.enterprise_id.trim(),
             required[5],
             required[6],
             &auth_identity_generation.to_string(),
             &token_refresh_generation.to_string(),
+            &account_incarnation.to_string(),
         ] {
             digest.update((value.len() as u64).to_be_bytes());
             digest.update(value.as_bytes());
         }
-        Ok(Self(format!("trae-runtime-v1:{:x}", digest.finalize())))
+        Ok(Self(format!("trae-runtime-v2:{:x}", digest.finalize())))
     }
 }
 
@@ -97,6 +98,14 @@ pub struct TraeModelCatalog {
 }
 
 impl TraeModelCatalog {
+    pub(crate) fn resolve_raw_model(&self, requested: &str) -> Result<String, String> {
+        raw_passthrough_capability(requested)?;
+        if !self.raw_configs.contains_key(requested) {
+            return Err("Trae raw_chat model is not present in the bound account catalog".into());
+        }
+        Ok(requested.to_string())
+    }
+
     pub fn exact_config(&self, model_id: &str) -> Option<&Value> {
         self.raw_configs.get(model_id.trim())
     }
@@ -171,6 +180,7 @@ pub struct PreparedTraeRuntime {
     pub account_id: String,
     pub auth_identity_generation: u64,
     pub token_refresh_generation: u64,
+    pub account_incarnation: u64,
 }
 
 impl std::fmt::Debug for PreparedTraeRuntime {
@@ -652,6 +662,7 @@ mod tests {
             &profile(enterprise_id),
             7,
             token_generation,
+            1,
         )
         .unwrap()
     }
@@ -761,4 +772,120 @@ mod tests {
             .await
             .is_none());
     }
+}
+
+/// Intl has no reviewed live discovery endpoint. This capability record only
+/// describes request syntax; it is never returned as account entitlement.
+pub(crate) fn raw_passthrough_capability(model: &str) -> Result<TraeModelCapability, String> {
+    if model.is_empty()
+        || model.trim() != model
+        || model.len() > MAX_MODEL_ID_BYTES
+        || model.chars().any(char::is_control)
+        || model.eq_ignore_ascii_case("auto")
+    {
+        return Err("Trae raw_chat requires an explicit exact upstream model name".into());
+    }
+    Ok(TraeModelCapability {
+        id: model.into(),
+        display_name: model.into(),
+        context_window: None,
+        context_window_max: None,
+        max_output_tokens: None,
+        prompt_max_tokens: None,
+        supports_tools: false,
+        supports_reasoning: true,
+        reasoning_efforts: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+        reasoning_default: None,
+        reasoning_type: None,
+        max_mode: false,
+    })
+}
+
+pub(crate) fn parse_trae_raw_catalog(value: &Value) -> Result<FetchedTraeModelCatalog, String> {
+    let entries = value
+        .as_array()
+        .or_else(|| {
+            [
+                "/model_configs",
+                "/models",
+                "/Result/model_configs",
+                "/data/model_configs",
+            ]
+            .iter()
+            .find_map(|pointer| value.pointer(pointer).and_then(Value::as_array))
+        })
+        .ok_or("Trae raw model_list must contain model_configs or models array")?;
+    if entries.len() > MAX_MODEL_CATALOG_ENTRIES {
+        return Err("Trae raw catalog has too many models".into());
+    }
+    let mut fetched = FetchedTraeModelCatalog {
+        enabled_models: Vec::new(),
+        raw_configs: BTreeMap::new(),
+        capabilities: BTreeMap::new(),
+    };
+    let mut names = std::collections::BTreeSet::new();
+    for entry in entries {
+        let id = entry
+            .get("model_name")
+            .or_else(|| entry.get("name"))
+            .and_then(Value::as_str)
+            .ok_or("Trae raw model list entry is missing model_name")?;
+        let mut capability = raw_passthrough_capability(id)?;
+        if !names.insert(id.to_ascii_lowercase()) {
+            return Err("Trae raw model list contains duplicate names".into());
+        }
+        if entry.get("is_invisible_to_user").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        capability.display_name = entry
+            .get("display_name")
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .into();
+        capability.max_output_tokens = positive_u64(entry.get("max_tokens"));
+        capability.context_window = positive_u64(entry.get("context_window"));
+        fetched.enabled_models.push(id.into());
+        fetched.raw_configs.insert(id.into(), entry.clone());
+        fetched.capabilities.insert(id.into(), capability);
+    }
+    Ok(fetched)
+}
+
+#[cfg(test)]
+#[test]
+fn trae_raw_catalog_requires_exact_names_without_solo_aliases() {
+    let fetched = parse_trae_raw_catalog(&serde_json::json!({"model_configs":[
+        {"model_name":"DeepSeek-V4-Pro-Official"}, {"model_name":"glm-5.2"}
+    ]}))
+    .unwrap();
+    let catalog = TraeModelCatalog {
+        enabled_models: fetched.enabled_models,
+        raw_configs: fetched.raw_configs,
+        capabilities: fetched.capabilities,
+        fetched_at_ms: 0,
+        stale: false,
+        expires_at_ms: 1,
+    };
+    assert_eq!(
+        catalog
+            .resolve_raw_model("DeepSeek-V4-Pro-Official")
+            .unwrap(),
+        "DeepSeek-V4-Pro-Official"
+    );
+    for invalid in [
+        "auto",
+        "trae/glm-5.2",
+        "deepseek-v4-pro-official",
+        "DeepSeek_V4_Pro_Official",
+        "glm-5.2 ",
+    ] {
+        assert!(catalog.resolve_raw_model(invalid).is_err(), "{invalid}");
+    }
+    assert!(
+        parse_trae_raw_catalog(&serde_json::json!({"model_configs":[]}))
+            .unwrap()
+            .enabled_models
+            .is_empty()
+    );
+    assert!(parse_trae_raw_catalog(&serde_json::json!({"config_info_list":[]})).is_err());
 }

@@ -15,7 +15,9 @@ export type ManagedAuthProvider =
   | "qoder_cosy"
   | "codebuddy_oauth"
   | "workbuddy_oauth"
-  | "trae_solo";
+  | "trae_solo"
+  | "trae_raw_chat"
+  | "trae_raw_chat_intl";
 
 export type QoderSite = "global" | "cn";
 export type CodeBuddySite = "intl" | "cn";

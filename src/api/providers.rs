@@ -1352,7 +1352,7 @@ pub(in crate::api) async fn test_provider_inner(
         .await;
     }
 
-    if execution.driver_is("special.trae_solo") {
+    if execution.stored.provider_type.trae_driver_id() == Some(execution.plan.driver_id.as_str()) {
         return Box::pin(test_trae_provider_inner(
             state,
             execution,
@@ -2003,7 +2003,9 @@ async fn test_trae_provider_inner(
         reconciliation: None,
         message,
     };
-    let Some((ProviderType::TraeSolo, _, _)) = execution.managed_account_identity_target() else {
+    let Some((ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl, _, _)) =
+        execution.managed_account_identity_target()
+    else {
         return Ok(base_response(
             false,
             ProviderOperationOutcome::InvalidConfig,
@@ -2011,8 +2013,8 @@ async fn test_trae_provider_inner(
             None,
             None,
             None,
-            Some("Trae Provider must bind one exact trae_solo Account".to_string()),
-            "Trae Provider must bind one exact trae_solo Account".to_string(),
+            Some("Trae Provider must bind one exact Account of the same channel".to_string()),
+            "Trae Provider must bind one exact Account of the same channel".to_string(),
         ));
     };
     if !query.network.unwrap_or(false) {
@@ -2024,8 +2026,25 @@ async fn test_trae_provider_inner(
             None,
             None,
             None,
-            "configuration check passed; Trae fixed Agent/Billing origins, exact managed Account binding, and Solo driver are valid; no network call was executed".to_string(),
+            "configuration check passed; Trae fixed Agent/Billing origins, exact managed Account binding, and channel driver are valid; no network call was executed".to_string(),
         ));
+    }
+    if matches!(
+        stored.provider_type,
+        ProviderType::TraeRaw | ProviderType::TraeIntl
+    ) {
+        if let Err(message) = proxy::trae_runtime::raw_passthrough_capability(&model) {
+            return Ok(base_response(
+                false,
+                ProviderOperationOutcome::InvalidConfig,
+                false,
+                None,
+                None,
+                None,
+                Some(message.clone()),
+                message,
+            ));
+        }
     }
     ensure_provider_outbound_allowed(state, &execution).await?;
     let body = provider_test_body(
@@ -3372,9 +3391,13 @@ pub(in crate::api) async fn fetch_provider_models_inner(
         ensure_provider_outbound_allowed(state, execution).await?;
         return fetch_codebuddy_provider_models(state, execution, timeout_ms).await;
     }
-    if stored.provider_type == ProviderType::TraeSolo || execution.driver_is("special.trae_solo") {
-        if stored.provider_type != ProviderType::TraeSolo
-            || !execution.driver_is("special.trae_solo")
+    if stored.provider_type.is_trae()
+        || execution.stored.provider_type.trae_driver_id()
+            == Some(execution.plan.driver_id.as_str())
+    {
+        if !stored.provider_type.is_trae()
+            || execution.stored.provider_type.trae_driver_id()
+                != Some(execution.plan.driver_id.as_str())
         {
             return Err(ApiError::conflict(
                 "Trae model discovery ProviderType and Driver do not match",
@@ -4167,17 +4190,21 @@ async fn fetch_trae_provider_models(
     execution: &proxy::provider_ops::ProviderExecution,
     timeout_ms: Option<u64>,
 ) -> Result<ProviderModelsFetchResult, ApiError> {
-    let (ProviderType::TraeSolo, account_id, expected_generation) =
-        execution.managed_account_identity_target().ok_or_else(|| {
-            ApiError::bad_request(
-                "Trae model discovery requires one explicit managed Account binding",
-            )
-        })?
+    let (
+        provider_type @ (ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl),
+        account_id,
+        expected_generation,
+    ) = execution.managed_account_identity_target().ok_or_else(|| {
+        ApiError::bad_request("Trae model discovery requires one explicit managed Account binding")
+    })?
     else {
         return Err(ApiError::bad_request(
             "Trae model discovery managed Account has the wrong ProviderType",
         ));
     };
+    if provider_type == ProviderType::TraeIntl {
+        return Err(ApiError::bad_request("Trae Intl live model discovery is unavailable; configure an explicit upstream model. No CN or static entitlement fallback is used."));
+    }
     let timeout = timeout_ms
         .filter(|value| *value > 0)
         .map(std::time::Duration::from_millis)
@@ -4201,7 +4228,7 @@ async fn fetch_trae_provider_models(
                 recovery_attempted = true;
                 state
                     .refresh_managed_account_now_for_generation(
-                        ProviderType::TraeSolo,
+                        provider_type,
                         account_id,
                         expected_generation,
                     )
@@ -4230,7 +4257,10 @@ async fn fetch_trae_provider_models(
                             "capabilities": {
                                 "stream": true,
                                 "tools": capability.supports_tools,
-                                "images": false,
+                                "images": provider_type != ProviderType::TraeSolo,
+                                "toolMode": if provider_type == ProviderType::TraeSolo { "native" } else { "prompt_emulation_opt_in" },
+                                "structuredOutput": false,
+                                "previousResponseId": true,
                                 "reasoning": capability.supports_reasoning,
                                 "reasoningEfforts": capability.reasoning_efforts,
                                 "reasoningDefault": capability.reasoning_default,
@@ -4249,7 +4279,10 @@ async fn fetch_trae_provider_models(
         url: format!(
             "{}{}",
             runtime.agent_origin.trim_end_matches('/'),
-            crate::domain::trae::TRAE_MODEL_DETAIL_PATH
+            crate::domain::trae::TraeProtocol::for_provider(provider_type)
+                .map_err(ApiError::bad_request)?
+                .catalog_path
+                .unwrap_or_default()
         ),
         models,
         source: Some("trae_live_model_catalog".to_string()),
@@ -5105,6 +5138,12 @@ fn s1_provider_for_profile(
             ("WorkBuddy OAuth", json!({}))
         }
         "claude.trae_solo" | "codex.trae_solo" | "gemini.trae_solo" => ("Trae CN Solo", json!({})),
+        "claude.trae_raw_chat" | "codex.trae_raw_chat" | "gemini.trae_raw_chat" => {
+            ("Trae CN raw_chat", json!({}))
+        }
+        "claude.trae_raw_chat_intl" | "codex.trae_raw_chat_intl" | "gemini.trae_raw_chat_intl" => {
+            ("Trae Intl raw_chat", json!({}))
+        }
         "gemini.cursor_api_key" => ("Cursor API Key", json!({})),
         "gemini.cursor_oauth" => ("Cursor OAuth", json!({})),
         "codex.openai_api_key" => (
@@ -5323,6 +5362,32 @@ pub(in crate::api) fn provider_test_model(
     override_model: Option<&str>,
     defaults: Option<&crate::domain::providers::runtime::ProviderHealthCheckConfig>,
 ) -> String {
+    if matches!(
+        stored.provider_type,
+        ProviderType::TraeRaw | ProviderType::TraeIntl
+    ) {
+        return override_model
+            .or_else(|| {
+                stored
+                    .provider
+                    .settings_config
+                    .get("testModel")
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                (crate::domain::providers::bundle::bundle_test_app(&stored.provider)
+                    .ok()
+                    .flatten()
+                    == Some(app))
+                .then(|| {
+                    crate::domain::providers::bundle::bundle_test_model_override(&stored.provider)
+                })
+                .flatten()
+            })
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+    }
     let mut defaults = defaults.cloned().unwrap_or_default();
     if stored.provider_type.is_buddy_oauth() {
         if let Some(model) = crate::domain::providers::runtime::buddy_fixed_test_model(stored) {
@@ -6548,20 +6613,33 @@ mod tests {
         }
     }
 
+    include!("providers/trae_enhancement_tests.rs");
+
     async fn install_trae_discovery_execution(
         state: &ServerState,
         agent_origin: String,
         app: AppKind,
+    ) -> proxy::provider_ops::ProviderExecution {
+        install_trae_channel_execution(state, agent_origin, app, ProviderType::TraeSolo, false)
+            .await
+    }
+
+    async fn install_trae_channel_execution(
+        state: &ServerState,
+        agent_origin: String,
+        app: AppKind,
+        provider_type: ProviderType,
+        simulation: bool,
     ) -> proxy::provider_ops::ProviderExecution {
         state
             .mutate_accounts_immediate(move |accounts| {
                 accounts.upsert(
                     serde_json::from_value(json!({
                         "id": "trae-discovery-account",
-                        "providerType": "trae_solo",
+                        "providerType": provider_type.as_str(),
                         "accessToken": "trae-discovery-access",
                         "refreshToken": "trae-discovery-refresh",
-                        "tokenType": "Cloud-IDE-JWT",
+                        "tokenType": crate::domain::trae::TraeProtocol::for_provider(provider_type).unwrap().token_type(),
                         "expiresAt": i64::MAX / 2,
                         "profile": {
                             "uid": "trae-discovery-uid",
@@ -6582,28 +6660,30 @@ mod tests {
             })
             .await
             .unwrap();
-        let profile_id = match app {
-            AppKind::Claude => "claude.trae_solo",
-            AppKind::Codex => "codex.trae_solo",
-            AppKind::Gemini => "gemini.trae_solo",
-        };
+        let profile_id = format!("{}.{}", app.as_str(), provider_type.as_str());
         let stored = StoredProvider {
             app,
             provider: Provider {
                 id: "trae-discovery-provider".to_string(),
                 name: "Trae discovery fixture".to_string(),
-                settings_config: json!({
-                    "modelMapping": {
-                        "mode": "single",
-                        "upstreamModel": "DeepSeek-V4-Pro-Official"
-                    }
-                }),
+                settings_config: if provider_type != ProviderType::TraeSolo {
+                    json!({"modelMapping":{"mode":"passthrough"}})
+                } else {
+                    json!({
+                        "modelMapping": {
+                            "mode": "single",
+                            "upstreamModel": "DeepSeek-V4-Pro-Official"
+                        }
+                    })
+                },
                 category: None,
                 meta: Some(ProviderMeta {
-                    provider_type: Some("trae_solo".to_string()),
+                    trae_tool_simulation_enabled: (provider_type != ProviderType::TraeSolo)
+                        .then_some(simulation),
+                    provider_type: Some(provider_type.as_str().to_string()),
                     auth_binding: Some(AuthBinding {
                         source: Some("account_store".to_string()),
-                        auth_provider: Some("trae_solo".to_string()),
+                        auth_provider: Some(provider_type.as_str().to_string()),
                         account_id: Some("trae-discovery-account".to_string()),
                         auth_identity_generation: Some(1),
                     }),
@@ -6611,11 +6691,11 @@ mod tests {
                 }),
                 extra: Default::default(),
             },
-            provider_type: ProviderType::TraeSolo,
-            provider_type_id: "trae_solo".to_string(),
+            provider_type,
+            provider_type_id: provider_type.as_str().to_string(),
             resource: crate::domain::providers::store::ProviderResourceMetadata {
                 profile_id: Some(
-                    crate::domain::providers::registry::ProfileId::parse(profile_id).unwrap(),
+                    crate::domain::providers::registry::ProfileId::parse(&profile_id).unwrap(),
                 ),
                 profile_schema_revision: Some(1),
                 revision: 1,
