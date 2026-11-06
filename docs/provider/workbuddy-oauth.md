@@ -118,3 +118,20 @@ Claude Code 身份句。CN 同账号对照证实保留该 billing 元数据仍�
 管理员 REST 为 `GET /api/accounts/:id/checkin?authIdentityGeneration=N`、同路径 `PUT` 策略（`authIdentityGeneration/revision/enabled/time`）及 `POST` 手动执行（`authIdentityGeneration`）。Web invoke `auth_get_checkin` / `auth_set_checkin_policy` / `auth_checkin` 使用相同编排与管理员鉴权，额外携带 `accountId`；GET 只读缓存，不触发网络。账号变化或旧 revision 写入返回冲突。
 
 协议证据为 `workbuddy-switch@22b318c1f44b335c2222e444abcc2d0f74e160f7` 与 `cli2api@28ddb2fb8f0fa3c3563105130bab6c330ff551e1`，完整固定来源见本仓 `workBuddyCheckinExtension`。历史 CB-R2 拒绝记录保持；本次授权只扩展上述窄范围，不引入账号池或运营轮换。国际区参考策略有冲突，不能据此宣称支持。真实账号签到、奖励额度和期限验收均为 `live_pending`，本地 fixture 不替代真实回执。
+
+## 积分获取能力边界
+
+按用户明确决定，外部项目中获取积分的方式只借鉴上述“中国站个人账号每日签到”：
+仅限 WorkBuddy 国内个人账号的 billing 自动签到，沿用既有资格、默认关闭和状态查证合同。
+此决定不扩展为 CodeBuddy、国际站或企业账号的签到支持。
+
+不接入新手任务、桌面端任务、增长活动连续登录、奖励领取/兑换、抽奖或国际每日活跃等
+其他积分获取自动化，也不保留这些方向的预检工具、测试 fixture、后台任务或配置入口。
+正常使用客户端后达标的奖励自动领取/兑换亦不在接入范围，不作为后续实施计划。
+
+2026-11-06 正式环境研究中，三个国内账号的新手任务均未完成、兑换档位均锁定；
+其中一个账号的真实网页任务及对话成功结束后，即时和后续回读均未计入新手完成、
+今日活跃或连登。该样本不足以证明这些路径可可靠自动获取积分。
+因此撤除此前新增的研究预检实现，仅保留研究结论作为不接入依据；
+这不是断言上游永远无法实现，也不构成国内签到奖励真实到账的新增验收。
+证据记录见根目录 PROTOCOL_EVIDENCE.md 的积分获取范围收敛条目。
