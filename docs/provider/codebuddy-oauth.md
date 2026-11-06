@@ -948,3 +948,14 @@ Router 私有账号卡片第二行复用既有 `accountLabel`，与 Server 的 O
 ## WorkBuddy 签到范围说明
 
 本文件中“不实现签到”的历史决策继续适用于 `codebuddy_oauth`。2026-11-04 用户明确授权的每日签到仅是中国站个人 `workbuddy_oauth` Account 的可选控制面维护，默认关闭，独立于推理；详见 [WorkBuddy 每日签到合同](workbuddy-oauth.md#中国站个人账号每日签到)。旧 CB-R2 和冻结审计记录不改写，不扩展到 CodeBuddy、国际站、企业账号、账号池或积分轮换。
+
+
+## 2026-11-06 单账号反代兼容增量
+
+生成协议收敛到 `src/proxy/buddy_wire.rs`，保持受审 CLI 2.142.0 的 endpoint、请求头、请求 ID 与紧凑 JSON 行为。现有身份 revision 已进入 runtime fingerprint；本轮没有升级客户端、切换 Desktop/VSCode、改变 refresh source 或启用新模型。
+
+工具历史仅合并相邻的纯 assistant 调用声明：无文本、无推理或额外语义字段，调用参数完整、ID 唯一且合并后不超过 128 个；完整结果保持内容与顺序。完整批次中夹入 system/developer 指令时返回本地错误，避免移动指令或静默丢失工具结果；真正残缺历史仍沿用原合同。不从模型正文构造可执行工具调用。
+
+实时目录保留有界排除原因：`upstream_disabled`、`not_enabled_for_generation_identity`、`not_reviewed_by_server`；未出现模型为 `not_authorized_in_bound_catalog`。这些原因用于生成拒绝，管理发现的已授权模型 raw 附三类排除数量；不公开被排除模型清单，不保留未受审 payload，不改变准入。全未受审目录仍按既有合同拒绝，空授权不回填静态模型。
+
+推理档位选择与字段编码分离，继续使用实时目录默认档位及现有顶层 `reasoning_effort`。新版本、字段分支及模型仍需独立协议/真实回执，不凭外部实现自动启用。外部提交及暂不启用项见 `PROTOCOL_EVIDENCE.md`。

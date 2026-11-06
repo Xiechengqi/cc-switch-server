@@ -183,3 +183,80 @@ fn buddy_channel_policy_errors_keep_product_label_and_never_refresh_or_replay() 
         }
     });
 }
+
+#[test]
+fn buddy_custom_and_namespace_tools_survive_the_complete_responses_bridge() {
+    run_codebuddy_async_test(async {
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for site in [CodeBuddySite::Cn, CodeBuddySite::Intl] {
+                let (address, fixture, server) =
+                    spawn_codebuddy_upstream(site, vec![CodeBuddyGenerationReply::Success]).await;
+                let state = codebuddy_test_state("buddy-tool-identities");
+                let (id, _) = install_buddy_provider(
+                    &state,
+                    product,
+                    "tool-identities",
+                    AppKind::Codex,
+                    site,
+                    &format!("http://{address}"),
+                )
+                .await;
+                install_codebuddy_share(
+                    &state,
+                    "tool-identities-share",
+                    AppKind::Codex,
+                    &id,
+                    "owner@example.com",
+                )
+                .await;
+                for stream in [false, true] {
+                    let input = json!({"model":"auto","stream":stream,
+                        "tools":[{"type":"custom","name":"lookup"},
+                            {"type":"namespace","name":"files","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]}],
+                        "input":[{"role":"user","content":"Start"},
+                            {"type":"custom_tool_call","call_id":"old-custom","name":"lookup","input":"pwd"},
+                            {"type":"custom_tool_call_output","call_id":"old-custom","output":"/workspace"},
+                            {"type":"function_call","call_id":"old-namespace","name":"read","namespace":"files","arguments":"{}"},
+                            {"type":"function_call_output","call_id":"old-namespace","output":"file contents"},
+                            {"role":"user","content":"Continue"}]});
+                    let response = super::forward_for_test_surface(
+                        state.clone(),
+                        ProxyRoute::CodexResponses,
+                        id.clone(),
+                        None,
+                        codebuddy_headers(
+                            "tool-identities-share",
+                            "owner@example.com",
+                            "tool-identities-session",
+                        ),
+                        Bytes::from(input.to_string()),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let output = String::from_utf8(collect(response).await).unwrap();
+                    assert!(output.contains("custom_tool_call"), "{output}");
+                    let observations = fixture.generation_observations();
+                    let sent = &observations.last().unwrap().body;
+                    let messages = sent["messages"].as_array().unwrap();
+                    for (call_id, result) in [
+                        ("old-custom", "/workspace"),
+                        ("old-namespace", "file contents"),
+                    ] {
+                        assert!(messages
+                            .iter()
+                            .any(|message| message["tool_call_id"] == call_id
+                                && message["content"] == result));
+                        assert!(messages.iter().any(|message| message["tool_calls"]
+                            .as_array()
+                            .is_some_and(|calls| calls.iter().any(|call| call["id"] == call_id))));
+                    }
+                    assert_eq!(sent["tools"].as_array().unwrap().len(), 2);
+                }
+                assert_eq!(fixture.count(&fixture.generation_requests), 2);
+                assert_eq!(fixture.count(&fixture.refresh_requests), 0);
+                server.abort();
+            }
+        }
+    });
+}

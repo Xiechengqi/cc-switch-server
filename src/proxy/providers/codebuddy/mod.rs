@@ -181,7 +181,7 @@ pub(crate) fn prepare_generation(
         return Err(GenerationPreparationError::RecordFailure(ProxyError {
             status: StatusCode::FORBIDDEN,
             message: format!(
-                "{product} model {model_id} is not enabled in the bound account's live catalog"
+                "{product} model {model_id} is not enabled in the bound account's live catalog ({})", prepared_runtime.catalog.exclusion_reason(&model_id)
             ),
         }));
     }

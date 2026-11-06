@@ -177,6 +177,7 @@ mod tests {
         FetchedCodeBuddyModelCatalog {
             enabled_models: vec![model.to_string()],
             preferred_models: vec![model.to_string()],
+            exclusions: BTreeMap::new(),
             raw_configs: BTreeMap::from([(model.into(), json!({"id":model}))]),
             capabilities: BTreeMap::new(),
         }
@@ -225,6 +226,7 @@ mod tests {
                 FetchedCodeBuddyModelCatalog {
                     enabled_models: Vec::new(),
                     preferred_models: Vec::new(),
+                    exclusions: BTreeMap::new(),
                     raw_configs: BTreeMap::new(),
                     capabilities: BTreeMap::new(),
                 },

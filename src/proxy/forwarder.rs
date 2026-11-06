@@ -20149,58 +20149,20 @@ async fn send_codebuddy_generation(
         })
         .transpose()
         .map_err(|error| CodeBuddyForwardAttemptError::Proxy(error.into_proxy_error()))?;
-    let body = serde_json::to_vec(payload).map_err(|error| {
+    let body = super::buddy_wire::encode_body(payload).map_err(|error| {
         CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_gateway(format!(
             "encode CodeBuddy generation payload: {error}"
         )))
     })?;
     debug_assert_eq!(body.len(), serialized_body_bytes);
     let request_id = super::codebuddy::random_codebuddy_request_id();
-    let mut target_headers = vec![
-        ("accept".to_string(), "text/event-stream".to_string()),
-        ("content-type".to_string(), "application/json".to_string()),
-        (
-            "authorization".to_string(),
-            format!("Bearer {}", runtime.access_token),
-        ),
-        ("x-user-id".to_string(), profile.uid.clone()),
-        ("x-domain".to_string(), profile.domain.clone()),
-        ("x-product".to_string(), "SaaS".to_string()),
-        ("x-requested-with".to_string(), "XMLHttpRequest".to_string()),
-        ("x-request-id".to_string(), request_id.clone()),
-        ("x-conversation-id".to_string(), request_id.clone()),
-        ("x-conversation-request-id".to_string(), request_id.clone()),
-        ("x-conversation-message-id".to_string(), request_id.clone()),
-        ("x-root-request-id".to_string(), request_id.clone()),
-        ("x-agent-intent".to_string(), "craft".to_string()),
-        ("x-agent-purpose".to_string(), "conversation".to_string()),
-        ("x-agent-type".to_string(), "main".to_string()),
-        ("x-private-data".to_string(), "false".to_string()),
-        ("x-codebuddy-request".to_string(), "1".to_string()),
-        (
-            "user-agent".to_string(),
-            crate::domain::codebuddy::buddy_product_policy(
-                execution.stored.provider_type,
-                profile.site,
-            )
-            .map_err(|message| {
-                CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_request(message))
-            })?
-            .client_identity
-            .user_agent()
-            .to_string(),
-        ),
-    ];
-    if profile.enterprise_id.trim().is_empty() {
-        target_headers.push(("x-no-enterprise-id".to_string(), "true".to_string()));
-    } else {
-        target_headers.push(("x-enterprise-id".to_string(), profile.enterprise_id.clone()));
-    }
-    if profile.site == crate::domain::codebuddy::CodeBuddySite::Cn {
-        let origin = profile.site.profile().browser_origin.to_string();
-        target_headers.push(("origin".to_string(), origin.clone()));
-        target_headers.push(("referer".to_string(), format!("{origin}/")));
-    }
+    let target_headers = super::buddy_wire::generation_headers(
+        execution.stored.provider_type,
+        profile,
+        &runtime.access_token,
+        &request_id,
+    )
+    .map_err(|message| CodeBuddyForwardAttemptError::Proxy(ProxyError::bad_request(message)))?;
     let target_header_bytes = target_headers.iter().fold(
         target_headers
             .capacity()

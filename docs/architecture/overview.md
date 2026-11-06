@@ -138,6 +138,8 @@ Buddy 的固定模型表单通过受认证的 `fetch_buddy_account_models` Web i
 
 Buddy Driver revision 3 仅从精确账号、站点和受审 CLI 通道目录读取模型的 `supportsImages`。图片输入在 Claude / Chat / Responses / Gemini 转换前校验原生结构，在 canonical Chat 边界按实际模型授权并校验数量、base64、MIME 与内嵌大小；auto 同时匹配图片、工具和推理需求，固定模型不兼容时拒绝。图片和 HTTPS URL 原样转发，不增加 Server 图片下载或生成能力。公开和管理目录及模型选择器使用同一能力投影，原请求体、内存、绑定、恢复和严格流终态边界继续适用。
 
+Buddy 生成线格式集中在 `proxy/buddy_wire.rs`，保留 CLI 2.142.0 的受审请求行为；目录和认证使用各自边界。runtime 只合并结果完整、ID 唯一的相邻纯工具声明；完整结果被指令隔开时拒绝，不重排指令或吞掉结果。实时目录内部保存有界排除 reason 并计入常驻内存，管理发现只附排除数量，生成拒绝带固定原因，不放宽模型准入。上游默认推理档位选择与字段编码独立，未证实的新身份、编码或模型不自动启用。
+
 CodeBuddy / WorkBuddy Bundle 的可选 `buddyLoginSite` 是新登录／导入的管理偏好，只接受 `cn` / `intl`，随现有多 Surface 原子保存和 revision 校验落盘；旧请求省略时保留原值。反代仍使用绑定账号 profile 的实际站点，偏好不参与 runtime fingerprint 或账号身份。Web 依次使用保存偏好、精确匹配产品/账号/身份世代的 `ManagedAuthAccount.buddy.site`、国际站作为默认值，派生默认不写草稿；绑定账号实际站点单独只读显示，未知不猜测。登录与导入互斥，进行中的操作固定启动时站点。
 
 AuthCenter 的入口元数据与组件统一在类型化注册表中维护，并按 `/api/accounts/capabilities` 过滤；UI 矩阵审计对照 Rust 的托管账号 ownership 检查遗漏，既有 `trae_solo` 缺口以 `known_gap` 在 Web runtime contract 中登记，不能伪称已支持。CodeBuddy / WorkBuddy 使用各自入口和同一套已有认证组件；此处的站点选择仅在当前页面按产品隔离保留，账号行读取实际 `buddy.site`，账号管理不直接改写 Provider 绑定。成功导入即刷新共享视图，表单异步结果仍受原操作 scope 约束。

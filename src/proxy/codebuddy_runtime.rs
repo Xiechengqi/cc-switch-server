@@ -298,6 +298,9 @@ impl CodeBuddyModelCatalog {
             )
             .saturating_add(raw_configs)
             .saturating_add(capabilities)
+            .saturating_add(self.exclusions.iter().fold(0usize, |bytes, (id, _)| {
+                bytes.saturating_add(id.capacity()).saturating_add(128)
+            }))
     }
 }
 
@@ -309,6 +312,34 @@ pub struct FetchedCodeBuddyModelCatalog {
     pub preferred_models: Vec<String>,
     pub raw_configs: BTreeMap<String, Value>,
     pub capabilities: BTreeMap<String, CodeBuddyModelCapability>,
+    /// Bounded reason codes only. Never retain unreviewed model payloads.
+    pub exclusions: BTreeMap<String, BuddyModelExclusion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuddyModelExclusion {
+    Disabled,
+    InactiveAgent,
+    Unreviewed,
+}
+
+impl BuddyModelExclusion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "upstream_disabled",
+            Self::InactiveAgent => "not_enabled_for_generation_identity",
+            Self::Unreviewed => "not_reviewed_by_server",
+        }
+    }
+}
+
+impl FetchedCodeBuddyModelCatalog {
+    pub fn exclusion_reason(&self, id: &str) -> &'static str {
+        self.exclusions
+            .get(id)
+            .map(|reason| reason.as_str())
+            .unwrap_or("not_authorized_in_bound_catalog")
+    }
 }
 
 #[derive(Clone)]
@@ -465,6 +496,7 @@ pub fn parse_buddy_model_catalog(
     let mut raw_configs = BTreeMap::new();
     let mut capabilities = BTreeMap::new();
     let mut unreviewed_enabled = 0_usize;
+    let mut exclusions = BTreeMap::new();
     for (index, entry) in entries.iter().enumerate() {
         let object = entry
             .as_object()
@@ -489,15 +521,20 @@ pub fn parse_buddy_model_catalog(
         }
         let disabled = bool_field(object, "disabled")?.unwrap_or(false)
             || bool_field(object, "enable")?.is_some_and(|enabled| !enabled);
-        if disabled
-            || agent_models
-                .as_ref()
-                .is_some_and(|models| !models.contains(&id))
+        if disabled {
+            exclusions.insert(id, BuddyModelExclusion::Disabled);
+            continue;
+        }
+        if agent_models
+            .as_ref()
+            .is_some_and(|models| !models.contains(&id))
         {
+            exclusions.insert(id, BuddyModelExclusion::InactiveAgent);
             continue;
         }
         if !reviewed.contains(&id.as_str()) {
             unreviewed_enabled = unreviewed_enabled.saturating_add(1);
+            exclusions.insert(id, BuddyModelExclusion::Unreviewed);
             continue;
         }
         let capability = codebuddy_model_capability(&id, object)?;
@@ -544,6 +581,7 @@ pub fn parse_buddy_model_catalog(
         preferred_models,
         raw_configs,
         capabilities,
+        exclusions,
     })
 }
 
@@ -812,7 +850,7 @@ pub fn build_codebuddy_payload(
         };
         canonicalize_codebuddy_assistant_reasoning(message);
     }
-    repair_codebuddy_tool_history(messages);
+    repair_codebuddy_tool_history(messages)?;
     messages.retain(codebuddy_message_is_semantic);
     if messages
         .first()
@@ -844,9 +882,7 @@ pub fn build_codebuddy_payload(
     request.insert("stream_options".to_string(), json!({"include_usage": true}));
     let mut payload = Value::Object(request);
     clear_buddy_reasoning_controls(&mut payload)?;
-    if let Some(effort) = capability.upstream_default_reasoning_effort()? {
-        payload["reasoning_effort"] = Value::String(effort.to_string());
-    }
+    reasoning::encode_default_reasoning(&mut payload, capability)?;
     Ok(payload)
 }
 
@@ -874,7 +910,111 @@ fn canonicalize_codebuddy_assistant_reasoning(message: &mut Map<String, Value>) 
 /// contiguous result for every call. Preserve complete rounds byte-for-byte,
 /// but remove only the unusable protocol portion of incomplete history. This
 /// never invents a tool result or changes tool output content.
-fn repair_codebuddy_tool_history(messages: &mut Vec<Value>) {
+/// Merge adjacent pure declarations only when their complete results follow;
+/// never combine text or reasoning histories.
+fn merge_codebuddy_split_tool_calls(messages: &mut Vec<Value>) {
+    fn pure(value: &Value) -> bool {
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        object.get("role").and_then(Value::as_str) == Some("assistant")
+            && object.iter().all(|(key, value)| match key.as_str() {
+                "role" | "tool_calls" => true,
+                "content" => value.is_null() || value.as_str() == Some(""),
+                _ => false,
+            })
+            && object
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    !calls.is_empty()
+                        && calls.iter().all(|call| {
+                            call.as_object().is_some_and(|call| {
+                                codebuddy_nonempty_string(call.get("id")).is_some()
+                                    && codebuddy_tool_call_is_complete(call)
+                            })
+                        })
+                })
+    }
+    let mut source = std::mem::take(messages).into_iter();
+    let mut merged = Vec::with_capacity(source.len());
+    while let Some(mut current) = source.next() {
+        if pure(&current) {
+            let following = source.as_slice();
+            let count = following
+                .iter()
+                .take(128)
+                .take_while(|value| pure(value))
+                .count();
+            if count > 0 {
+                let calls = current["tool_calls"].as_array().expect("validated calls");
+                let all_calls: Vec<_> =
+                    calls
+                        .iter()
+                        .chain(following[..count].iter().flat_map(|value| {
+                            value["tool_calls"].as_array().expect("validated calls")
+                        }))
+                        .collect();
+                let ids: std::collections::BTreeSet<_> = all_calls
+                    .iter()
+                    .filter_map(|call| call.get("id").and_then(Value::as_str))
+                    .collect();
+                let results: Vec<_> = following[count..]
+                    .iter()
+                    .take_while(|value| value.get("role").and_then(Value::as_str) == Some("tool"))
+                    .collect();
+                let result_ids: std::collections::BTreeSet<_> = results
+                    .iter()
+                    .filter_map(|value| value.get("tool_call_id").and_then(Value::as_str))
+                    .collect();
+                // Commit a merge only when the entire resulting batch is complete.
+                // Otherwise a later valid round must not be lost with an earlier
+                // interrupted declaration.
+                if all_calls.len() <= 128
+                    && ids.len() == all_calls.len()
+                    && results.len() == all_calls.len()
+                    && result_ids == ids
+                {
+                    for _ in 0..count {
+                        let mut next = source.next().expect("validated declaration");
+                        current["tool_calls"]
+                            .as_array_mut()
+                            .expect("validated calls")
+                            .append(next["tool_calls"].as_array_mut().expect("validated calls"));
+                    }
+                }
+            }
+        }
+        merged.push(current);
+    }
+    *messages = merged;
+}
+
+fn repair_codebuddy_tool_history(messages: &mut Vec<Value>) -> Result<(), String> {
+    merge_codebuddy_split_tool_calls(messages);
+    // Do not silently discard a complete tool batch just because an instruction
+    // separates its results. Moving that instruction could change semantics.
+    for (index, message) in messages.iter().enumerate() {
+        let Some(assistant) = message.as_object() else {
+            continue;
+        };
+        if codebuddy_message_role(assistant) != "assistant" || !assistant.contains_key("tool_calls")
+        {
+            continue;
+        }
+        let mut results = Vec::new();
+        let mut separated = false;
+        for next in &messages[index + 1..] {
+            match next.get("role").and_then(Value::as_str) {
+                Some("tool") => results.push(next),
+                Some("system" | "developer") => separated = true,
+                _ => break,
+            }
+        }
+        if separated && codebuddy_tool_round_is_complete_refs(assistant, &results) {
+            return Err("Buddy complete tool results are separated by instructions; refusing to reorder or discard them".into());
+        }
+    }
     let mut source = std::mem::take(messages).into_iter().peekable();
     let mut repaired = Vec::with_capacity(source.len());
     while let Some(mut current) = source.next() {
@@ -915,9 +1055,17 @@ fn repair_codebuddy_tool_history(messages: &mut Vec<Value>) {
         }
     }
     *messages = repaired;
+    Ok(())
 }
 
 fn codebuddy_tool_round_is_complete(assistant: &Map<String, Value>, results: &[Value]) -> bool {
+    codebuddy_tool_round_is_complete_refs(assistant, &results.iter().collect::<Vec<_>>())
+}
+
+fn codebuddy_tool_round_is_complete_refs(
+    assistant: &Map<String, Value>,
+    results: &[&Value],
+) -> bool {
     let Some(calls) = assistant.get("tool_calls").and_then(Value::as_array) else {
         return false;
     };
@@ -1438,6 +1586,7 @@ mod tests {
                 FetchedCodeBuddyModelCatalog {
                     enabled_models: vec!["default-model".to_string()],
                     preferred_models: Vec::new(),
+                    exclusions: BTreeMap::new(),
                     raw_configs: BTreeMap::new(),
                     capabilities: BTreeMap::new(),
                 },
@@ -1506,6 +1655,7 @@ mod tests {
                 FetchedCodeBuddyModelCatalog {
                     enabled_models: vec!["default-model".to_string()],
                     preferred_models: Vec::new(),
+                    exclusions: BTreeMap::new(),
                     raw_configs: BTreeMap::new(),
                     capabilities: BTreeMap::new(),
                 },
@@ -2180,10 +2330,128 @@ mod tests {
             json!({"role":"user", "content":"continue"}),
         ];
         let pointer = messages[1]["content"].as_str().unwrap().as_ptr();
-        repair_codebuddy_tool_history(&mut messages);
+        repair_codebuddy_tool_history(&mut messages).unwrap();
         assert_eq!(messages[1]["content"].as_str().unwrap().as_ptr(), pointer);
         assert_eq!(messages.len(), 3);
     }
 
     include!("codebuddy_runtime/image_tests.rs");
+}
+
+#[cfg(test)]
+mod compatibility_increment_tests {
+    use super::*;
+    fn call(id: &str) -> Value {
+        json!({"id":id,"type":"function","function":{"name":"lookup","arguments":"{}"}})
+    }
+    fn result(id: &str) -> Value {
+        json!({"role":"tool","tool_call_id":id,"content":format!("result-{id}")})
+    }
+    #[test]
+    fn buddy_split_parallel_calls_preserve_results_in_both_orders() {
+        for reversed in [false, true] {
+            let mut messages = vec![
+                json!({"role":"user","content":"before"}),
+                json!({"role":"assistant","content":"","tool_calls":[call("a")]}),
+                json!({"role":"assistant","content":null,"tool_calls":[call("b")]}),
+                result(if reversed { "b" } else { "a" }),
+                result(if reversed { "a" } else { "b" }),
+                json!({"role":"user","content":"after"}),
+            ];
+            let original_results = messages[3..5].to_vec();
+            repair_codebuddy_tool_history(&mut messages).unwrap();
+            assert_eq!(messages.len(), 5);
+            assert_eq!(messages[1]["tool_calls"], json!([call("a"), call("b")]));
+            assert_eq!(messages[2..4], original_results);
+            assert_eq!(messages[4]["content"], "after");
+        }
+    }
+    #[test]
+    fn buddy_interleaved_instructions_fail_instead_of_losing_complete_results() {
+        for role in ["developer", "system"] {
+            let mut messages = vec![
+                json!({"role":"assistant","tool_calls":[call("a"),call("b")]}),
+                result("a"),
+                json!({"role":role,"content":"Do not change these instructions"}),
+                result("b"),
+            ];
+            assert!(repair_codebuddy_tool_history(&mut messages)
+                .unwrap_err()
+                .contains("refusing to reorder or discard"));
+        }
+    }
+    #[test]
+    fn buddy_split_calls_never_merge_reasoning_text_or_duplicate_ids() {
+        for extra in [
+            json!({"content":"explanation"}),
+            json!({"reasoning_content":"reason"}),
+        ] {
+            let mut first = json!({"role":"assistant","tool_calls":[call("a")]});
+            first
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let mut messages = vec![
+                first.clone(),
+                json!({"role":"assistant","tool_calls":[call("b")]}),
+                result("b"),
+            ];
+            merge_codebuddy_split_tool_calls(&mut messages);
+            assert_eq!(messages[0], first);
+            assert_eq!(messages.len(), 3);
+        }
+        let mut messages = vec![
+            json!({"role":"assistant","tool_calls":[call("a")]}),
+            json!({"role":"assistant","tool_calls":[call("a")]}),
+        ];
+        merge_codebuddy_split_tool_calls(&mut messages);
+        assert_eq!(messages.len(), 2);
+    }
+    #[test]
+    fn buddy_interrupted_declaration_never_erases_later_complete_round() {
+        for interrupted in ["interrupted", ""] {
+            let mut messages = vec![
+                json!({"role":"assistant","tool_calls":[call(interrupted)]}),
+                json!({"role":"assistant","tool_calls":[call("complete")]}),
+                result("complete"),
+            ];
+            repair_codebuddy_tool_history(&mut messages).unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0]["tool_calls"], json!([call("complete")]));
+            assert_eq!(messages[1], result("complete"));
+        }
+    }
+    #[test]
+    fn buddy_catalog_exclusion_reasons_never_grant_entitlement() {
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for site in [CodeBuddySite::Cn, CodeBuddySite::Intl] {
+                let catalog = parse_buddy_model_catalog(
+                    &json!({"models":[
+                    {"id":"hy3","supportsReasoning":false},
+                    {"id":"glm-5.2","enable":false},
+                    {"id":"kimi-k2.5"},
+                    {"id":"unreviewed-test-model","secret":"must not retain"}],
+                    "agents":[{"name":"cli","models":["hy3","glm-5.2","unreviewed-test-model"]}]}),
+                    product,
+                    site,
+                )
+                .unwrap();
+                assert_eq!(catalog.enabled_models, ["hy3"]);
+                assert_eq!(catalog.exclusion_reason("glm-5.2"), "upstream_disabled");
+                assert_eq!(
+                    catalog.exclusion_reason("kimi-k2.5"),
+                    "not_enabled_for_generation_identity"
+                );
+                assert_eq!(
+                    catalog.exclusion_reason("unreviewed-test-model"),
+                    "not_reviewed_by_server"
+                );
+                assert_eq!(
+                    catalog.exclusion_reason("absent"),
+                    "not_authorized_in_bound_catalog"
+                );
+                assert!(!catalog.raw_configs.contains_key("unreviewed-test-model"));
+            }
+        }
+    }
 }

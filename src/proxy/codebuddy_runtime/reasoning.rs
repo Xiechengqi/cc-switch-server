@@ -23,6 +23,18 @@ impl BuddyReasoningDefaultSource {
     }
 }
 
+/// Encode the reviewed CLI wire independently of default selection. Alternative
+/// field layouts remain gated on product/site-specific acceptance evidence.
+pub(super) fn encode_default_reasoning(
+    payload: &mut Value,
+    capability: &CodeBuddyModelCapability,
+) -> Result<(), String> {
+    if let Some(effort) = capability.upstream_default_reasoning_effort()? {
+        payload["reasoning_effort"] = Value::String(effort.to_string());
+    }
+    Ok(())
+}
+
 fn object<'a>(
     value: Option<&'a Value>,
     path: &str,

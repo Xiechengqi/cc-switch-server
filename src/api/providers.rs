@@ -4082,6 +4082,11 @@ pub(in crate::api) fn buddy_catalog_models(
                             "id": capability.id,
                             "source": format!("{}_live_model_catalog", if provider_type == ProviderType::WorkBuddyOAuth { "workbuddy" } else { "codebuddy" }),
                             "stale": catalog.stale,
+                            "catalogExclusions": {
+                                "upstream_disabled": catalog.exclusions.values().filter(|reason| reason.as_str() == "upstream_disabled").count(),
+                                "not_enabled_for_generation_identity": catalog.exclusions.values().filter(|reason| reason.as_str() == "not_enabled_for_generation_identity").count(),
+                                "not_reviewed_by_server": catalog.exclusions.values().filter(|reason| reason.as_str() == "not_reviewed_by_server").count(),
+                            },
                             "capabilities": {
                                 "stream": true,
                                 "tools": capability.supports_tools,

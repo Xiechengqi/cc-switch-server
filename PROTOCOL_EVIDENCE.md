@@ -2955,3 +2955,27 @@ Server 的 Anthropic→Responses 转换原来把 assistant 历史文本也固定
 验证：4 项旧实现反例先失败，修复后 7 项新增回归全部通过。严格回环上游先拒绝旧 assistant `input_text` 请求，再验证 Claude 字符串/数组历史的流式与非流式调用、固定 OAuth 身份、文本及用量返回；同时覆盖 HTTP、Compact、平铺/嵌套 WebSocket、HTTP 回退、工具顺序、系统文本数组、加密 reasoning 历史和幂等/不透明边界。完整 `cargo test` 为 4,116 通过、0 失败、3 项既有忽略；fmt（含所有独立 include 源文件）、check、严格全目标 Clippy、build、新二进制本地 smoke、覆盖文档/接口矩阵/产品边界/文档索引审计及 13 项 smoke 脚本测试通过。验证后的本次 Rust 源文件摘要与完整测试开始时一致。
 
 全仓 Node 审计为 1,911 通过、4 失败，均因工作区原有且并行推进的 `src/state.rs` 未同步 Provider writer 源码摘要；本次未修改该文件、无关额度/Router 改动或其审计清单，也未放宽门禁。离线 readiness 为 `failures=0`、`blocked_inputs`，真实凭据/部署及脚本内跳过的本地门禁仍明确阻塞，不能等同于发布通过。整体 review 未发现本次修复的阻断问题；未提交、推送或部署，真实 OpenAI 接受性验收仍待执行。
+
+
+## 2026-11-06 Buddy 单账号反代兼容增量
+
+目标基线 `54f389a`。外部只读证据固定为：
+
+| 项目 / 提交 | 源码 | 适用范围与决策 |
+| --- | --- | --- |
+| workbuddy2api-hub `6e1e54869d27ef0dce803e2293c4b95b1ecc470f` | `wb_proxy.py` 的 `merge_adjacent_tool_calls`、`repack_tool_result_blocks`、`parse_remote_catalog`；`wb_identity.py` | CN/Intl 多客户端参考实现；借鉴拆分工具声明场景，不照搬任意指令重排、静态目录回填或正文转工具调用 |
+| cli2api `099d69b66f4d850dd2733f1a066fec7e59bbf0c3` | `internal/providers/workbuddy/{headers,mapping,catalog,sse}.go` | CLI chat，Global 目录存在 desktop UA 差异；版本、字段编码和 endpoint 不能与当前受审协议混拼 |
+| workbuddy-switch `22b318c1f44b335c2222e444abcc2d0f74e160f7` | `crates/wb-switch-core/src/modules/{oauth,refresh,credits,official_usage}.rs` | 原生 WorkBuddy 登录和额度交叉证据；现有登录/额度合同已吸收，不重复迁入桌面会话 |
+
+本轮实施：
+
+- `proxy/buddy_wire.rs` 集中当前 CLI 2.142.0 生成头和紧凑 JSON 编码；与原转发路径 wire 保持一致，认证/目录头不混用。`BuddyClientIdentity::revision` 及现有 request identity fingerprint 继续约束缓存；本次没有出站 wire 变化，不伪造新厂商版本。
+- 只合并相邻、无文本/推理/额外字段、参数完整且 ID 唯一的纯 assistant 工具声明，合并最多 128 个调用；结果可按任意顺序完整返回。完整结果被 system/developer 指令隔开时明确拒绝，既不移动指令，也不静默丢弃完整结果。原有真正残缺历史策略保留。
+- 精确实时目录内部仅保留有界 model ID 与排除 reason，不保留未受审原始 payload；区分 upstream_disabled、not_enabled_for_generation_identity、not_reviewed_by_server。生成拒绝附固定 reason；缺失项为 not_authorized_in_bound_catalog。管理发现 raw 摘要仅增加三类数量，不增加可调用模型或公开被排除模型列表。目录内存计费覆盖新增记录。
+- 上游默认档位选择与 wire 编码分离；继续采用已有受审顶层 reasoning_effort，不改变档位或加入 thinking/verbosity 等字段。
+
+未启用候选：Hub CLI 2.168.2 / Desktop / VSCode、cli2api CLI 2.161.0 和 Global Desktop 目录身份、新头字段、分层会话 ID、gzip/cache retention、refresh source/endpoint 变更、嵌套 reasoning 分支与新增模型。原因是缺当前目标产品 × 站点 × 会话来源的独立接受性证据；参考源码不提升真实验证状态。CB-N4 等既有门禁保持。
+
+不研究或新增积分自动获取、礼包、旅行、活动任务、活跃上报、兑换、抽奖；既有国内 billing 自动签到保持原合同。
+
+验证：在基于 `54f389a`、仅包含本次 Buddy 增量的隔离 worktree 完成 4,290 项 Rust 测试（另 3 项 ignored）、2,128 项 Node 审计、Clippy（all targets，warnings denied）、构建、格式及服务启动 HTTP smoke；文档测试无用例。主工作区同期有独立 Trae 开发，因此这些结果仅代表冻结的 Buddy 增量快照，不代表持续变化的整个工作区。离线 readiness 无失败，但缺真实环境输入，结论仍为 blocked。本地回环不等于真实账号接受性，不部署、不声称 live_verified。当前增量未提交，不追加伪造 committed-target observation。已核对 `docs/provider/coverage.md`：Provider 类型和 Surface 不变，生成矩阵不需变更。

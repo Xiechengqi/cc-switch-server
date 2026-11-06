@@ -10,6 +10,7 @@ pub(crate) mod antigravity_replay;
 mod antigravity_retry;
 pub(crate) mod antigravity_transport;
 mod buddy_schema;
+mod buddy_wire;
 mod cache_injector;
 mod claude_client_detection;
 pub(crate) mod claude_oauth;
