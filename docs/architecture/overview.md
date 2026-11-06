@@ -160,6 +160,8 @@ Router 主调度 UTC 半小时槽，Server 本地 scheduler 兜底：同一 App/
 
 旧 `testApp` 字段只保留 wire/storage 兼容，不再允许人工指定自动检查接口；Web UI 只读显示自动结果，无探针时显示不支持。旧接口的 Bundle 测试模型不自动迁到新的代表 App；模型优先级为本 App override → 属于本 App 的 Bundle override → 本 App Server 默认值。每 App 的 `modelProbe` 仍服务手动诊断，手动连接测试可逐接口执行，不改变自动调度策略。历史其他接口记录保持真实，不删除或重写为新策略的结果。代表性探测不证明其他未测接口可用；本策略减少重复探测，不消除上游免费模型的全局限流。
 
+手动验证与周期统计分层：受认证的 `/_share-router/share-runtime` 根响应可额外返回 `manualModelHealth`（最新真实手动结果及有效期内最新非正常结果，最多两条）和 Server 当前 `modelHealthDegradedThresholdMs`。证据来自当前代表 App、Provider、测试模型及 health fingerprint 完全匹配的已接受 `cc-switch-manual` 检查日志，有效期 65 分钟；保留原始检查状态和耗时，不用调度的容错可用状态替代，也不传出错误正文或账号。Router 用它更新独立 `liveModelHealthStatus` 卡片投影，不改写周期槽、热力图、信誉、service readiness、调度或结算。最新非正常结果随同交付，避免断线期间多次成功点击掩盖先前失败。该扩展仅在控制响应根对象，不改变 descriptor 签名或旧契约结构，支持新旧版本交错升级。
+
 检查结果、调度资格和隧道连通性是独立信号。Share runtime 保留真实的 Healthy／Degraded／Unhealthy 观测；即使首个瞬态失败仍暂时允许调度，HTTP 429 也不能显示为成功。Router 以当前代表 App 和当前配置的固定周期证据统一卡片颜色：检查异常先黄，最近三次全失败红，证据缺失或过期灰，恢复需逐步排出最近失败；不据此改动 Server 的瞬态容错或市场资金结算。
 
 ## 5. 相关文档

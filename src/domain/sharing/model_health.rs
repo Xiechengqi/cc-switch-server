@@ -9,13 +9,138 @@ use crate::domain::health::ProviderHealthStatus;
 use crate::domain::providers::model::AppKind;
 use crate::domain::providers::model_routing::{policy_from_settings, ModelRoutingMode};
 use crate::domain::providers::probe::{automatic_probe_app, provider_has_probe};
-use crate::domain::providers::runtime::{authoritative_managed_account, ProviderRuntimePlan};
+use crate::domain::providers::runtime::{
+    authoritative_managed_account, ProviderRuntimePlan, RuntimeModelPolicy,
+};
 use crate::domain::providers::store::{ProviderStore, StoredProvider};
 use crate::domain::sharing::shares::Share;
 use crate::domain::usage::store::{UsageLog, UsageStore};
 use crate::infra::time::now_ms;
 
 const RECENT_RESULT_LIMIT: usize = 3;
+
+/// Additive control-runtime evidence; never inserted into a Router cycle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareManualModelHealthObservation {
+    pub observation_id: String,
+    pub app_type: String,
+    pub provider_id: String,
+    pub health_fingerprint: String,
+    pub requested_model: String,
+    pub actual_model: String,
+    pub status: String,
+    pub status_code: Option<u16>,
+    pub latency_ms: u64,
+    pub checked_at: i64,
+}
+
+pub fn manual_observations_for_share(
+    share: &Share,
+    providers: &ProviderStore,
+    usage: &UsageStore,
+) -> Vec<ShareManualModelHealthObservation> {
+    if !share.enabled || share.status != "active" {
+        return Vec::new();
+    }
+    let Some(provider) = automatic_share_probe(share, providers) else {
+        return Vec::new();
+    };
+    let Some(plan) = providers.runtime_plan(provider.app, &provider.provider.id) else {
+        return Vec::new();
+    };
+    let fingerprint = plan.health_fingerprint();
+    let Some(model) = plan.test_model.as_deref() else {
+        return Vec::new();
+    };
+    let now = now_ms();
+    let matching = || {
+        usage.logs.iter().filter(|log| {
+            log.is_health_check
+                && log.data_source.as_deref() == Some("cc-switch-manual")
+                && log.share_id.as_deref() == Some(share.id.as_str())
+                && log.app == provider.app
+                && log.provider_id == provider.provider.id
+                && log.provider_health_fingerprint.as_deref() == Some(fingerprint.as_str())
+                && log.requested_model.as_deref() == Some(model)
+                && log.created_at_ms > 0
+                && log.created_at_ms <= now
+                && now.saturating_sub(log.created_at_ms) < 65 * 60 * 1000
+                && log.provider_health_result.as_ref().is_some_and(|result| {
+                    matches!(
+                        result.status.as_str(),
+                        "operational" | "degraded" | "failed"
+                    )
+                })
+        })
+    };
+    let rank = |log: &&UsageLog| {
+        (
+            log.created_at_ms,
+            log.provider_health_result
+                .as_ref()
+                .map(|result| result.status != "operational")
+                .unwrap_or(false),
+            log.request_id.clone(),
+        )
+    };
+    let Some(latest) = matching().max_by_key(rank) else {
+        return Vec::new();
+    };
+    // Also deliver the latest adverse manual result: a disconnected Router
+    // must not miss a failure just because the user clicked success repeatedly
+    // before notification delivery recovered. This is not a cycle projection.
+    let adverse = matching()
+        .filter(|log| {
+            log.provider_health_result
+                .as_ref()
+                .is_some_and(|result| result.status != "operational")
+        })
+        .max_by_key(rank)
+        .filter(|log| log.request_id != latest.request_id);
+    // The accepted raw result, not effective scheduling availability. In
+    // particular a tolerated first 429 must remain a failed observation.
+    [Some(latest), adverse]
+        .into_iter()
+        .flatten()
+        .map(|log| {
+            let result = log
+                .provider_health_result
+                .as_ref()
+                .expect("filtered health result");
+            let status = match result.status.as_str() {
+                "operational" => "success",
+                "degraded" => "degraded",
+                _ => "failed",
+            };
+            ShareManualModelHealthObservation {
+                observation_id: log.request_id.clone(),
+                app_type: provider.app.as_str().into(),
+                provider_id: provider.provider.id.clone(),
+                health_fingerprint: fingerprint.clone(),
+                requested_model: model.into(),
+                actual_model: match &plan.model_policy {
+                    RuntimeModelPolicy::Single { upstream_model } => upstream_model.clone(),
+                    RuntimeModelPolicy::Passthrough => {
+                        crate::domain::providers::runtime::build_provider_model_probe(
+                            provider.app,
+                            provider.provider_type,
+                            model,
+                            crate::domain::providers::runtime::PROVIDER_MODEL_PROBE_PROMPT,
+                            true,
+                            plan.health_fingerprint(),
+                        )
+                        .wire_model
+                    }
+                },
+                status: status.into(),
+                status_code: result.http_status,
+                latency_ms: u64::try_from(log.duration_ms).unwrap_or(u64::MAX),
+                checked_at: ms_to_seconds(log.created_at_ms),
+            }
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -427,6 +552,185 @@ mod tests {
     use crate::domain::providers::model::{AuthBinding, Provider, ProviderMeta, ProviderType};
     use crate::domain::sharing::shares::{ShareBinding, SharePolicy};
     use crate::domain::usage::store::{UsageLogContext, UsageModelMetadata};
+
+    fn manual_fixture(app: AppKind, kind: ProviderType) -> (Share, ProviderStore, UsageStore) {
+        let mut provider = test_provider(app, "manual-provider", kind);
+        provider.provider.meta = None;
+        provider.provider.settings_config = json!({
+            "testModel":"health-model", "modelMapping":{"mode":"passthrough"},
+            "env":{"OPENAI_BASE_URL":"https://fixture.invalid/v1"}
+        });
+        let share = test_share("manual-share", app, "manual-provider", kind, None);
+        let mut providers = ProviderStore {
+            providers: vec![provider.clone()],
+            ..Default::default()
+        };
+        providers
+            .rebuild_runtime_index(&AccountStore::default())
+            .unwrap();
+        let plan = providers.runtime_plan(app, "manual-provider").unwrap();
+        let mut log = health_log(
+            &share,
+            &provider,
+            200,
+            true,
+            Some("completed"),
+            plan.test_model.as_deref(),
+            None,
+        );
+        log.provider_health_fingerprint = Some(plan.health_fingerprint());
+        log.provider_health_result = Some(crate::domain::usage::store::UsageProviderHealthResult {
+            status: "operational".into(),
+            http_status: Some(200),
+        });
+        log.data_source = Some("cc-switch-manual".into());
+        log.created_at_ms = now_ms().saturating_sub(1000);
+        (
+            share,
+            providers,
+            UsageStore {
+                logs: vec![log],
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn manual_evidence_covers_all_apps_and_excludes_private_error_and_account_data() {
+        for (app, kind) in [
+            (AppKind::Codex, ProviderType::OpenRouter),
+            (AppKind::Claude, ProviderType::Claude),
+            (AppKind::Gemini, ProviderType::Gemini),
+        ] {
+            let (share, providers, mut usage) = manual_fixture(app, kind);
+            usage.logs[0].error_message = Some("private@example.test secret-key".into());
+            let results = manual_observations_for_share(&share, &providers, &usage);
+            assert_eq!(results.len(), 1, "{app:?}");
+            assert_eq!(results[0].app_type, app.as_str());
+            assert_eq!(results[0].requested_model, "health-model");
+            assert_eq!(results[0].status, "success");
+            let wire = serde_json::to_string(&results[0]).unwrap();
+            assert!(wire.contains("\"healthFingerprint\""));
+            assert!(wire.contains("\"checkedAt\""));
+            assert!(!wire.contains("private@example.test"));
+            assert!(!wire.contains("secret-key"));
+        }
+    }
+
+    #[test]
+    fn manual_evidence_preserves_raw_slow_and_failed_checks_instead_of_scheduling_availability() {
+        let (share, providers, mut usage) =
+            manual_fixture(AppKind::Codex, ProviderType::OpenRouter);
+        usage.logs[0]
+            .provider_health_result
+            .as_mut()
+            .unwrap()
+            .status = "degraded".into();
+        usage.logs[0].duration_ms = 11321;
+        let result = manual_observations_for_share(&share, &providers, &usage).remove(0);
+        assert_eq!(result.status, "degraded");
+        assert_eq!(result.latency_ms, 11321);
+        assert_eq!(result.status_code, Some(200));
+        usage.logs[0].provider_health_result =
+            Some(crate::domain::usage::store::UsageProviderHealthResult {
+                status: "failed".into(),
+                http_status: Some(429),
+            });
+        let result = manual_observations_for_share(&share, &providers, &usage).remove(0);
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.status_code, Some(429));
+    }
+
+    #[test]
+    fn manual_evidence_rejects_old_future_mismatched_and_non_manual_records() {
+        let (mut share, providers, usage) =
+            manual_fixture(AppKind::Codex, ProviderType::OpenRouter);
+        for variant in 0..9 {
+            let mut bad = usage.clone();
+            let log = &mut bad.logs[0];
+            match variant {
+                0 => log.created_at_ms = now_ms().saturating_sub(65 * 60 * 1000),
+                1 => log.created_at_ms = now_ms() + 3600000,
+                2 => log.provider_health_fingerprint = Some("old-configuration".into()),
+                3 => log.share_id = Some("another-share".into()),
+                4 => log.provider_id = "another-provider".into(),
+                5 => log.requested_model = Some("another-model".into()),
+                6 => log.is_health_check = false,
+                7 => log.data_source = Some("cc-switch-scheduled".into()),
+                _ => log.provider_health_result = None,
+            }
+            assert!(
+                manual_observations_for_share(&share, &providers, &bad).is_empty(),
+                "{variant}"
+            );
+        }
+        share.enabled = false;
+        assert!(manual_observations_for_share(&share, &providers, &usage).is_empty());
+    }
+
+    #[test]
+    fn manual_evidence_selects_latest_original_event_and_fixed_execution_model() {
+        let (share, mut providers, mut usage) =
+            manual_fixture(AppKind::Codex, ProviderType::OpenRouter);
+        providers.providers[0].provider.settings_config["modelMapping"] =
+            json!({"mode":"single","upstreamModel":"fixed-model"});
+        providers
+            .rebuild_runtime_index(&AccountStore::default())
+            .unwrap();
+        let plan = providers
+            .runtime_plan(AppKind::Codex, "manual-provider")
+            .unwrap();
+        usage.logs[0].provider_health_fingerprint = Some(plan.health_fingerprint());
+        usage.logs[0].requested_model = plan.test_model.clone();
+        let mut older = usage.logs[0].clone();
+        older.request_id = "older".into();
+        older.created_at_ms -= 1000;
+        usage.logs.push(older);
+        let result = manual_observations_for_share(&share, &providers, &usage).remove(0);
+        assert_eq!(result.observation_id, usage.logs[0].request_id);
+        assert_eq!(result.actual_model, "fixed-model");
+    }
+
+    #[test]
+    fn manual_evidence_delivers_latest_adverse_event_even_after_repeated_success_and_deduplicates()
+    {
+        let (share, providers, mut usage) =
+            manual_fixture(AppKind::Codex, ProviderType::OpenRouter);
+        let mut failed = usage.logs[0].clone();
+        failed.request_id = "failed-check".into();
+        failed.created_at_ms -= 2000;
+        failed.provider_health_result =
+            Some(crate::domain::usage::store::UsageProviderHealthResult {
+                status: "failed".into(),
+                http_status: Some(429),
+            });
+        let mut older = failed.clone();
+        older.request_id = "older-failure".into();
+        older.created_at_ms -= 1000;
+        usage.logs.extend([failed.clone(), older]);
+        for index in 1..4 {
+            let mut success = usage.logs[0].clone();
+            success.request_id = format!("success-{index}");
+            success.created_at_ms -= index * 100;
+            usage.logs.push(success);
+        }
+        let result = manual_observations_for_share(&share, &providers, &usage);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].observation_id, usage.logs[0].request_id);
+        assert_eq!(result[0].status, "success");
+        assert_eq!(result[1].observation_id, "failed-check");
+        assert_eq!(result[1].status, "failed");
+        usage.logs.reverse();
+        assert_eq!(
+            manual_observations_for_share(&share, &providers, &usage),
+            result
+        );
+        failed.created_at_ms = now_ms().saturating_sub(1);
+        usage.logs.push(failed);
+        let result = manual_observations_for_share(&share, &providers, &usage);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].observation_id, "failed-check");
+    }
 
     #[test]
     fn summary_filters_by_share_id_and_bound_apps() {

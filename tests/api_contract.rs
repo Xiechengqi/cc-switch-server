@@ -706,8 +706,9 @@ async fn share_router_runtime_reports_health_for_requested_share_binding() {
             .unwrap();
     }
 
-    let app = app_router(state);
+    let app = app_router(state.clone());
     let response = app
+        .clone()
         .oneshot(share_router_request(
             Method::GET,
             "/_share-router/share-runtime?shareId=share-runtime-health",
@@ -732,6 +733,77 @@ async fn share_router_runtime_reports_health_for_requested_share_binding() {
     );
     assert_eq!(results[0]["source"], "cc-switch-scheduled-confirmation");
     assert_eq!(results[0]["errorMessage"], "upstream connection timed out");
+    assert!(body.get("manualModelHealth").is_none());
+    assert_eq!(body["modelHealthDegradedThresholdMs"], 6000);
+
+    let mut config = state.config_snapshot().await.provider_health_check;
+    config.degraded_threshold_seconds = 15;
+    state
+        .set_provider_health_check_config(config)
+        .await
+        .unwrap();
+    let plan = state
+        .provider_runtime_plan(AppKind::Codex, "provider-bound")
+        .await
+        .unwrap();
+    let model = plan.test_model.clone().unwrap();
+    let mut manual = UsageLog::new(
+        AppKind::Codex,
+        "provider-bound".into(),
+        "Bound Provider".into(),
+        provider.provider_type,
+        200,
+        11321,
+        UsageModelMetadata {
+            model: Some(model.clone()),
+            requested_model: Some(model.clone()),
+            ..Default::default()
+        },
+        Default::default(),
+    );
+    manual.apply_context(UsageLogContext {
+        share_id: Some("share-runtime-health".into()),
+        data_source: Some("cc-switch-manual".into()),
+        is_health_check: true,
+        error_message: Some("private@example.test fixture-secret".into()),
+        ..Default::default()
+    });
+    manual.provider_health_fingerprint = Some(plan.health_fingerprint());
+    manual.provider_health_result = Some(
+        cc_switch_server::domain::usage::store::UsageProviderHealthResult {
+            status: "operational".into(),
+            http_status: Some(200),
+        },
+    );
+    let request_id = manual.request_id.clone();
+    state.push_usage_log(manual).await.unwrap();
+    let response = app
+        .oneshot(share_router_request(
+            Method::GET,
+            "/_share-router/share-runtime?shareId=share-runtime-health",
+            &["share-runtime-health"],
+            "nonce-runtime-manual-health",
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["modelHealthDegradedThresholdMs"], 15000);
+    let observations = body["manualModelHealth"].as_array().unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0]["observationId"], request_id);
+    assert_eq!(observations[0]["providerId"], "provider-bound");
+    assert_eq!(
+        observations[0]["healthFingerprint"],
+        plan.health_fingerprint()
+    );
+    assert_eq!(observations[0]["requestedModel"], model);
+    assert_eq!(observations[0]["status"], "success");
+    assert_eq!(observations[0]["latencyMs"], 11321);
+    let public = serde_json::to_string(&observations).unwrap();
+    assert!(!public.contains("private@example.test"));
+    assert!(!public.contains("fixture-secret"));
 }
 
 #[tokio::test]

@@ -93,7 +93,17 @@ pub(crate) async fn share_router_runtime(
     state
         .project_router_provider_identity(&mut descriptor)
         .await;
-    Ok(Json(runtime_response_from_descriptor(descriptor)))
+    let mut response = runtime_response_from_descriptor(descriptor);
+    response.manual_model_health =
+        crate::domain::sharing::model_health::manual_observations_for_share(
+            &share, &providers, &usage,
+        );
+    response.model_health_degraded_threshold_ms = Some(
+        web_provider_health_check_config(&state)
+            .await
+            .degraded_threshold_ms(),
+    );
+    Ok(Json(response))
 }
 
 pub(crate) async fn share_router_model_health(
@@ -512,6 +522,8 @@ pub(crate) fn runtime_response_from_descriptor(
         app_providers: descriptor.app_providers,
         app_availability: descriptor.app_availability,
         model_health: descriptor.model_health,
+        manual_model_health: Vec::new(),
+        model_health_degraded_threshold_ms: None,
     }
 }
 
@@ -569,6 +581,11 @@ pub(crate) struct ShareRouterRuntimeResponse {
     app_providers: ShareAppProviders,
     app_availability: ShareAppAvailability,
     model_health: crate::domain::sharing::model_health::ShareModelHealthSummary,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    manual_model_health:
+        Vec<crate::domain::sharing::model_health::ShareManualModelHealthObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_health_degraded_threshold_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
