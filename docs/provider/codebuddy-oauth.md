@@ -959,3 +959,5 @@ Router 私有账号卡片第二行复用既有 `accountLabel`，与 Server 的 O
 实时目录保留有界排除原因：`upstream_disabled`、`not_enabled_for_generation_identity`、`not_reviewed_by_server`；未出现模型为 `not_authorized_in_bound_catalog`。这些原因用于生成拒绝，管理发现的已授权模型 raw 附三类排除数量；不公开被排除模型清单，不保留未受审 payload，不改变准入。全未受审目录仍按既有合同拒绝，空授权不回填静态模型。
 
 推理档位选择与字段编码分离，继续使用实时目录默认档位及现有顶层 `reasoning_effort`。新版本、字段分支及模型仍需独立协议/真实回执，不凭外部实现自动启用。外部提交及暂不启用项见 `PROTOCOL_EVIDENCE.md`。
+
+Responses 工具桥接支持 namespace 内混合 function/custom：custom 使用字符串 input 参数封装，历史、tool_choice 与流式/非流式回包保留类型、名称和 namespace。非法子类型和身份碰撞仍拒绝；此桥接不提供上游原生 grammar 约束保证。2026-11-06 修复的本地验证及真实验收边界见 `PROTOCOL_EVIDENCE.md` 的 namespace 内 custom 工具条目。

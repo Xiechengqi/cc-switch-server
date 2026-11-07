@@ -28,6 +28,7 @@ enum CodeBuddyGenerationReply {
     Value(WorkBuddyValueReply),
     Success,
     SuccessZeroCache,
+    EchoCustomTool,
     HttpUnauthorized,
     HttpUnauthorizedWithLimitCode,
     HttpUnauthorizedWithTerminalCode(i64),
@@ -413,6 +414,10 @@ async fn codebuddy_generation(
     body: Bytes,
 ) -> Response {
     let body: Value = serde_json::from_slice(&body).unwrap();
+    let first_tool_name = body
+        .pointer("/tools/0/function/name")
+        .cloned()
+        .unwrap_or(Value::Null);
     if let Some(dir) = state.value_admission_dir.lock().unwrap().as_ref() {
         let db = rusqlite::Connection::open(crate::repository::server_sqlite::database_path(dir))
             .unwrap();
@@ -447,6 +452,10 @@ async fn codebuddy_generation(
     match reply {
         CodeBuddyGenerationReply::Value(value) => workbuddy_value_reply(value),
         CodeBuddyGenerationReply::Success => success_response(),
+        CodeBuddyGenerationReply::EchoCustomTool => sse_response(vec![
+            Bytes::from(format!("data: {}\n\n", json!({"id":"chatcmpl-custom", "choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-custom","type":"function","function":{"name":first_tool_name,"arguments":"{\"input\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}))),
+            Bytes::from_static(b"data: [DONE]\n\n")
+        ]),
         CodeBuddyGenerationReply::SuccessZeroCache => zero_cache_success_response(),
         CodeBuddyGenerationReply::HttpUnauthorized => Response::builder()
             .status(StatusCode::UNAUTHORIZED)

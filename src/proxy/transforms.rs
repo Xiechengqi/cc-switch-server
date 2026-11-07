@@ -231,14 +231,17 @@ impl ResponsesToolContext {
                 "execution": "client",
                 "arguments": parse_tool_search_arguments(arguments)
             }),
-            Some(spec) if spec.kind == ResponsesToolKind::Custom => json!({
-                "id": item_id,
-                "type": "custom_tool_call",
-                "status": status,
-                "call_id": call_id,
-                "name": spec.name,
-                "input": unwrap_custom_tool_input(arguments)
-            }),
+            Some(spec) if spec.kind == ResponsesToolKind::Custom => {
+                let mut item = json!({
+                    "id": item_id, "type": "custom_tool_call", "status": status,
+                    "call_id": call_id, "name": spec.name,
+                    "input": unwrap_custom_tool_input(arguments)
+                });
+                if let Some(namespace) = &spec.namespace {
+                    item["namespace"] = json!(namespace);
+                }
+                item
+            }
             Some(spec) if spec.kind == ResponsesToolKind::ApplyPatch => json!({
                 "id": item_id,
                 "type": "apply_patch_call",
@@ -368,10 +371,11 @@ impl ResponsesToolContext {
                 {
                     if !matches!(
                         child.get("type").and_then(Value::as_str),
-                        None | Some("" | "function")
+                        None | Some("" | "function" | "custom")
                     ) {
                         self.validation_error.get_or_insert_with(|| {
-                            "Responses namespace may contain only function tools".to_string()
+                            "Responses namespace may contain only function or custom tools"
+                                .to_string()
                         });
                         continue;
                     }
@@ -382,7 +386,11 @@ impl ResponsesToolContext {
                     self.add_spec(
                         chat_name,
                         ResponsesToolSpec {
-                            kind: ResponsesToolKind::Namespace,
+                            kind: if child.get("type").and_then(Value::as_str) == Some("custom") {
+                                ResponsesToolKind::Custom
+                            } else {
+                                ResponsesToolKind::Namespace
+                            },
                             name,
                             namespace: Some(namespace.to_string()),
                         },
@@ -667,9 +675,12 @@ fn normalize_grok_response_tool(
                 })?;
             let mut output = Vec::new();
             for child in children {
-                if child.get("type").and_then(Value::as_str) != Some("function") {
+                if !matches!(
+                    child.get("type").and_then(Value::as_str),
+                    Some("function" | "custom")
+                ) {
                     return Err(TransformError::new(
-                        "Grok Responses namespace may contain only function tools",
+                        "Grok Responses namespace may contain only function or custom tools",
                     ));
                 }
                 if child.get("defer_loading").and_then(Value::as_bool) == Some(true)
@@ -684,7 +695,11 @@ fn normalize_grok_response_tool(
                 let mut normalized = child.as_object().cloned().unwrap_or_default();
                 normalized.insert("name".to_string(), Value::String(alias));
                 normalized.remove("defer_loading");
-                output.push(Value::Object(normalized));
+                output.extend(normalize_grok_response_tool(
+                    &Value::Object(normalized),
+                    context,
+                    force_deferred,
+                )?);
             }
             Ok(output)
         }
@@ -4364,7 +4379,14 @@ fn openai_response_tool_to_chat_tools(
                     let child_name = response_tool_name(child)?;
                     let name =
                         tool_context.chat_name_for_response_function(&child_name, Some(namespace));
-                    openai_response_function_tool_to_chat(child, &name)
+                    if child.get("type").and_then(Value::as_str) == Some("custom") {
+                        Some(openai_response_custom_tool_to_chat(
+                            &name,
+                            child.get("description").unwrap_or(&Value::Null),
+                        ))
+                    } else {
+                        openai_response_function_tool_to_chat(child, &name)
+                    }
                 })
                 .collect();
         }
@@ -12017,6 +12039,154 @@ mod tests {
         }
         let without_history = responses_tool_context(&json!({"tools":request["tools"]}));
         assert!(context.retained_bytes() > without_history.retained_bytes() + arguments.len());
+    }
+
+    #[test]
+    fn namespaced_custom_tools_preserve_identity_across_bridges() {
+        for field in ["tools", "children"] {
+            let mut ns = json!({"type":"namespace","name":"functions"});
+            ns[field] = json!([
+                {"type":"custom","name":"exec"},
+                {"type":"function","name":"wait","parameters":{"type":"object"}}
+            ]);
+            for dynamic in [false, true] {
+                let mut request = json!({"input":[
+                    {"type":"custom_tool_call","call_id":"old","namespace":"functions","name":"exec","input":"pwd\n你好"},
+                    {"type":"custom_tool_call_output","call_id":"old","output":"ok"}
+                ],"tool_choice":{"type":"custom","namespace":"functions","name":"exec"}});
+                if dynamic {
+                    request["input"]
+                        .as_array_mut()
+                        .unwrap()
+                        .insert(0, json!({"type":"additional_tools","tools":[ns]}));
+                } else {
+                    request["tools"] = json!([ns]);
+                }
+                let alias = flatten_namespace_tool_name("functions", "exec");
+                let context = responses_tool_context(&request);
+                let chat = openai_responses_to_chat(&request).unwrap();
+                assert_eq!(chat["tools"][0]["function"]["name"], alias);
+                assert_eq!(
+                    chat["tools"][0]["function"]["parameters"]["required"],
+                    json!(["input"])
+                );
+                assert_eq!(chat["tool_choice"]["function"]["name"], alias);
+                assert_eq!(
+                    chat["messages"][0]["tool_calls"][0]["function"]["name"],
+                    alias
+                );
+                let arguments = chat["messages"][0]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(arguments).unwrap()["input"],
+                    "pwd\n你好"
+                );
+                let anthropic = openai_responses_to_anthropic(&request).unwrap();
+                assert_eq!(anthropic["tools"][0]["name"], alias);
+                assert_eq!(anthropic["tool_choice"]["name"], alias);
+                let response = openai_chat_response_to_responses_with_tool_context(&json!({
+                    "choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[
+                        {"id":"new","type":"function","function":{"name":alias,"arguments":arguments}}
+                    ]}}]
+                }), &context).unwrap();
+                let item = &response["output"][0];
+                assert_eq!(item["type"], "custom_tool_call");
+                assert_eq!(item["namespace"], "functions");
+                assert_eq!(item["name"], "exec");
+                assert_eq!(item["input"], "pwd\n你好");
+                let anthropic_response = anthropic_response_to_openai_responses_with_tool_context(&json!({
+                    "id":"msg-custom", "content":[{"type":"tool_use","id":"new","name":alias,"input":{"input":"pwd\n你好"}}],"stop_reason":"tool_use"
+                }), &context).unwrap();
+                assert_eq!(anthropic_response["output"][0]["namespace"], "functions");
+                assert_eq!(anthropic_response["output"][0]["type"], "custom_tool_call");
+                assert_eq!(anthropic_response["output"][0]["input"], "pwd\n你好");
+                let mut wrong = request.clone();
+                wrong["tool_choice"]["type"] = json!("function");
+                assert!(openai_responses_to_chat(&wrong).is_err());
+                let mut missing = request.clone();
+                missing["tool_choice"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("namespace");
+                assert!(openai_responses_to_chat(&missing).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn namespaced_custom_same_names_and_explicit_reset_remain_isolated() {
+        let mut request = json!({"input":"hi","tools":[
+            {"type":"custom","name":"exec"},
+            {"type":"namespace","name":"a","tools":[{"type":"custom","name":"exec"}]},
+            {"type":"namespace","name":"b","tools":[{"type":"custom","name":"exec"}]}
+        ]});
+        let context = responses_tool_context(&request);
+        let chat = openai_responses_to_chat(&request).unwrap();
+        let names: BTreeSet<_> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 3);
+        for (alias, ns) in [
+            ("exec", None),
+            ("a__exec", Some("a")),
+            ("b__exec", Some("b")),
+        ] {
+            let item =
+                context.response_item("id", "completed", "call", alias, "{\"input\":\"pwd\"}");
+            assert_eq!(item["type"], "custom_tool_call");
+            assert_eq!(item["namespace"].as_str(), ns);
+        }
+        request["input"] = json!([
+            {"type":"additional_tools","tools":[{"type":"namespace","name":"a","tools":[{"type":"custom","name":"exec"}]}]},
+            {"type":"custom_tool_call","call_id":"old","namespace":"a","name":"exec","input":"pwd"},
+            {"type":"custom_tool_call_output","call_id":"old","output":"ok"}
+        ]);
+        request["tools"] = json!([]);
+        assert!(openai_responses_to_chat(&request)
+            .unwrap()
+            .get("tools")
+            .is_none());
+        request["tool_choice"] = json!({"type":"custom","namespace":"a","name":"exec"});
+        assert!(openai_responses_to_chat(&request).is_err());
+    }
+
+    #[test]
+    fn namespaced_custom_grok_and_invalid_children() {
+        let mut request = json!({"input":"hi","tools":[{"type":"namespace","name":"functions","tools":[
+            {"type":"custom","name":"exec"},
+            {"type":"function","name":"wait","parameters":{"type":"object"}}
+        ]}],"tool_choice":{"type":"custom","namespace":"functions","name":"exec"}});
+        let context = responses_tool_context(&request);
+        assert!(normalize_grok_responses_tool_compatibility(&mut request).unwrap());
+        assert_eq!(
+            request["tools"][0]["name"],
+            flatten_namespace_tool_name("functions", "exec")
+        );
+        assert_eq!(
+            request["tools"][0]["parameters"]["required"],
+            json!(["input"])
+        );
+        let item = context.response_item(
+            "id",
+            "completed",
+            "call",
+            request["tools"][0]["name"].as_str().unwrap(),
+            "{\"input\":\"pwd\"}",
+        );
+        assert_eq!(item["namespace"], "functions");
+        assert_eq!(item["type"], "custom_tool_call");
+        for kind in ["namespace", "web_search", "unknown"] {
+            let invalid = json!({"input":"hi","tools":[{"type":"namespace","name":"functions","tools":[{"type":kind,"name":"bad"}]}]});
+            assert!(openai_responses_to_chat(&invalid).is_err());
+            assert!(openai_responses_to_anthropic(&invalid).is_err());
+            assert!(normalize_grok_responses_tool_compatibility(&mut invalid.clone()).is_err());
+        }
+        let collision = json!({"input":"hi","tools":[{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec"},{"type":"function","name":"exec"}]}]});
+        assert!(openai_responses_to_chat(&collision).is_err());
     }
 
     #[test]

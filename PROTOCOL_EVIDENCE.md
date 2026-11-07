@@ -3005,3 +3005,13 @@ Server 的 Anthropic→Responses 转换原来把 assistant 历史文本也固定
 不研究或新增积分自动获取、礼包、旅行、活动任务、活跃上报、兑换、抽奖；既有国内 billing 自动签到保持原合同。
 
 验证：在基于 `54f389a`、仅包含本次 Buddy 增量的隔离 worktree 完成 4,290 项 Rust 测试（另 3 项 ignored）、2,128 项 Node 审计、Clippy（all targets，warnings denied）、构建、格式及服务启动 HTTP smoke；文档测试无用例。主工作区同期有独立 Trae 开发，因此这些结果仅代表冻结的 Buddy 增量快照，不代表持续变化的整个工作区。离线 readiness 无失败，但缺真实环境输入，结论仍为 blocked。本地回环不等于真实账号接受性，不部署、不声称 live_verified。当前增量未提交，不追加伪造 committed-target observation。已核对 `docs/provider/coverage.md`：Provider 类型和 Surface 不变，生成矩阵不需变更。
+
+## 2026-11-06 Responses namespace 内 custom 工具修复
+
+问题：Codex → WorkBuddy/CodeBuddy 的 Responses → Chat 转换曾只允许 namespace 内的 function，显式 custom 子工具在本地转换阶段返回 `Responses namespace may contain only function tools`。远程只读核对 Server 为干净构建 `84834ed642b1803838445c18122e410e8db9d20b`；未从现存日志找到请求 `55e78db0-6bb5-41bd-9f53-d2e1d8c7f065`，因此实际子工具类型和名称尚未从该请求取证。
+
+协议参考：Hub 本地已提交 `6e1e548` 的 `tests/_test_custom_tools.py` 第 13–15 组提供 namespace 内 custom、namespace 回程和 additional_tools 的合成用例。仅作为只读补充证据，目标构建及测试无外部项目依赖，不据此宣称真实账号调用通过。
+
+实现：共享 Responses 工具上下文以 Custom 类型和独立 namespace 保存身份；namespace 内 function/custom 分别编码，custom 使用现有字符串 input 桥接；Chat/Anthropic 回程及流式工具项恢复原始名称、namespace、custom 类型。Grok 专用 namespace 规范化复用其既有 custom 桥接。工具选择器仍严格匹配类型和 namespace，非法子类型及别名碰撞仍拒绝；历史不能赋予当前声明权限，显式工具重置语义不变。不增加多层 namespace、宿主工具执行、grammar 引擎、模型权限或身份切换。
+
+验证：在基于 `84834ed`、仅包含本次修复的隔离 worktree 中，4 项定向回归（含双产品、双站点、流式/非流式 HTTP 回环）、完整 Rust all-targets 共 4,339 项通过（另 3 项 ignored）、2,135 项 Node 审计、Clippy all-targets（warnings denied）、cargo check、构建、文档测试（0 用例）、cargo fmt 和全部 include 源文件 rustfmt 检查、Provider 覆盖/UI 矩阵/Phase 0 合同/文档索引均通过。服务 smoke 首次 cargo run 启动窗口未连通，期间存在构建锁竞争；改为直接启动本轮已构建二进制后，原脚本全部 HTTP 断言通过，未修改仓库 smoke 脚本。离线 readiness 为 blocked_inputs，failures=0；缺真实输入及部署验收，RUN_TESTS=0 导致其内部 local-contracts-unverified，不等于上述独立本地检查失败。主工作区存在并行 Trae 修改，验证结论仅覆盖隔离快照。本地合成与 HTTP 回环不代表生产 Codex CLI 或真实 WorkBuddy 账号验收，未部署。
