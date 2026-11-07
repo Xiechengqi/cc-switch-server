@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { authApi } from "@/lib/api";
 import type {
   ManagedAuthProvider,
+  ManagedAuthAccount,
   ManagedAuthStatus,
   ManagedAuthDeviceCodeResponse,
   QoderSite,
@@ -25,6 +26,7 @@ interface ManagedAuthCallbackParams {
   operationGeneration: number;
   deviceCode: string;
   callbackUrl: string;
+  inFlightPoll: Promise<ManagedAuthAccount | null> | null;
 }
 
 export function useManagedAuth(
@@ -44,6 +46,9 @@ export function useManagedAuth(
   );
   const pollingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const operationGenerationRef = useRef(0);
+  const pollingGenerationRef = useRef(0);
+  const resumePollingRef = useRef<(() => void) | null>(null);
+  const pollRequestRef = useRef<Promise<ManagedAuthAccount | null> | null>(null);
 
   const {
     data: authStatus,
@@ -75,6 +80,9 @@ export function useManagedAuth(
   );
 
   const stopPolling = useCallback(() => {
+    pollingGenerationRef.current += 1;
+    resumePollingRef.current = null;
+    pollRequestRef.current = null;
     if (pollingIntervalRef.current) {
       clearInterval(pollingIntervalRef.current);
       pollingIntervalRef.current = null;
@@ -157,6 +165,10 @@ export function useManagedAuth(
 
       const pollOnce = async () => {
         if (!isCurrentOperation(generation)) return;
+        const pollingGeneration = pollingGenerationRef.current;
+        const isCurrentPoll = () =>
+          isCurrentOperation(generation) &&
+          pollingGenerationRef.current === pollingGeneration;
         if (Date.now() > expiresAt) {
           if (retireOperation(generation) === null) return;
           stopPolling();
@@ -166,13 +178,15 @@ export function useManagedAuth(
         }
 
         try {
-          const newAccount = await authApi.authPollForAccount(
+          const request = authApi.authPollForAccount(
             authProvider,
             response.device_code,
             githubDomain,
             response.state,
           );
-          if (!isCurrentOperation(generation)) return;
+          pollRequestRef.current = request;
+          const newAccount = await request;
+          if (!isCurrentPoll()) return;
           if (newAccount) {
             const completionGeneration = retireOperation(generation);
             if (completionGeneration === null) return;
@@ -186,7 +200,7 @@ export function useManagedAuth(
             return;
           }
         } catch (e) {
-          if (!isCurrentOperation(generation)) return;
+          if (!isCurrentPoll()) return;
           const errorMessage = e instanceof Error ? e.message : String(e);
           if (
             !errorMessage.includes("pending") &&
@@ -200,12 +214,13 @@ export function useManagedAuth(
           }
         }
 
-        if (!isCurrentOperation(generation)) return;
+        if (!isCurrentPoll()) return;
         pollingIntervalRef.current = setTimeout(() => {
           void pollOnce();
         }, interval);
       };
 
+      resumePollingRef.current = () => void pollOnce();
       void pollOnce();
       pollingTimeoutRef.current = setTimeout(() => {
         if (retireOperation(generation) === null) return;
@@ -223,7 +238,14 @@ export function useManagedAuth(
   });
 
   const submitOauthCallbackMutation = useMutation({
-    mutationFn: (params: ManagedAuthCallbackParams) => {
+    mutationFn: async (params: ManagedAuthCallbackParams) => {
+      // A poll may already have persisted the automatic callback's account.
+      // Wait for that result before manually consuming the same flow.
+      const polledAccount = await params.inFlightPoll?.catch(() => null);
+      if (!isCurrentOperation(params.operationGeneration)) {
+        throw new Error("OAuth session is not active.");
+      }
+      if (polledAccount) return polledAccount;
       return authApi.authSubmitOauthCallback(
         authProvider,
         params.deviceCode,
@@ -245,6 +267,7 @@ export function useManagedAuth(
     onError: (e, params) => {
       if (!isCurrentOperation(params.operationGeneration)) return;
       setError(e instanceof Error ? e.message : String(e));
+      resumePollingRef.current?.();
     },
   });
 
@@ -402,10 +425,19 @@ export function useManagedAuth(
       if (!activeDeviceCode) {
         return Promise.reject(new Error("OAuth session is not active."));
       }
+      // Manual completion may consume the flow before an older poll returns.
+      // Retire those polls, retaining the expiry deadline and retry on failure.
+      pollingGenerationRef.current += 1;
+      if (pollingIntervalRef.current) {
+        clearTimeout(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
+      setError(null);
       return submitOauthCallbackMutation.mutateAsync({
         operationGeneration: operationGenerationRef.current,
         deviceCode: activeDeviceCode,
         callbackUrl,
+        inFlightPoll: pollRequestRef.current,
       });
     },
     [deviceCode?.device_code, submitOauthCallbackMutation],

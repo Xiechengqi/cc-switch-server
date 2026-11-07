@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::domain::accounts::oauth::{merge_account_refresh_raw, OAuthErrorKind};
 use crate::domain::accounts::store::{Account, AccountRefreshUpdate, UpsertAccountInput};
@@ -28,10 +29,14 @@ const FLOW_TTL_SECS: u64 = 10 * 60;
 const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 const MAX_RUNTIME_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const IDE_CLIENT_ID: &str = "ono9krqynydwx5";
+const CODE_EXCHANGE_PATH: &str = "/trae/api/v3/oauth/ExchangeToken";
+const MAX_CALLBACK_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 struct TraeOAuthEndpoints {
     oauth_origin: Url,
+    code_exchange_origin: Url,
     protocol: crate::domain::trae::TraeProtocol,
 }
 
@@ -42,6 +47,12 @@ impl TraeOAuthEndpoints {
         Ok(Self {
             oauth_origin: Url::parse(protocol.oauth_origin)
                 .map_err(|error| TraeClientError::protocol(error.to_string()))?,
+            code_exchange_origin: Url::parse(if protocol.intl {
+                protocol.oauth_origin
+            } else {
+                "https://api.trae.cn"
+            })
+            .map_err(|error| TraeClientError::protocol(error.to_string()))?,
             protocol,
         })
     }
@@ -50,6 +61,7 @@ impl TraeOAuthEndpoints {
     fn for_test(origin: &str) -> Self {
         Self {
             oauth_origin: Url::parse(origin).unwrap(),
+            code_exchange_origin: Url::parse(origin).unwrap(),
             protocol: crate::domain::trae::TraeProtocol::for_provider(ProviderType::TraeSolo)
                 .unwrap(),
         }
@@ -83,6 +95,16 @@ impl TraeOAuthEndpoints {
         self.oauth_origin.join(path).map_err(|error| {
             TraeClientError::protocol(format!("invalid Trae OAuth path {path}: {error}"))
         })
+    }
+
+    fn login_version(&self) -> &'static str {
+        // SOLO inference is a separate channel; browser login uses the current
+        // IDE client, including for SOLO, rather than its legacy refresh client.
+        if self.protocol.raw {
+            self.protocol.version
+        } else {
+            "3.4.3"
+        }
     }
 }
 
@@ -173,15 +195,29 @@ pub struct TraeLoginStart {
     pub account_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PendingTraeLoginFlow {
     expires_at_ms: i64,
-    capability_digest: [u8; 32],
+    state_digest: [u8; 32],
+    callback_base_url: String,
+    code_verifier: Zeroizing<String>,
+    device_private_key_pem: Zeroizing<String>,
     machine_id: String,
     device_id: String,
     expected_account_id: Option<String>,
     expected_uid: Option<String>,
+    expected_enterprise_id: Option<String>,
     endpoints: TraeOAuthEndpoints,
+}
+
+impl fmt::Debug for PendingTraeLoginFlow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingTraeLoginFlow")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("provider_type", &self.endpoints.protocol.provider_type)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -190,25 +226,46 @@ struct TraeLoginFlowEntry {
     state: TraeLoginFlowState,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum TraeLoginFlowState {
     Pending,
     Completing,
     Completed(Box<UpsertAccountInput>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum TraeLoginStatus {
     Pending,
     Completing,
     Completed(Box<UpsertAccountInput>),
 }
 
+impl fmt::Debug for TraeLoginFlowState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Pending => "Pending",
+            Self::Completing => "Completing",
+            Self::Completed(_) => "Completed(<redacted>)",
+        })
+    }
+}
+
+impl fmt::Debug for TraeLoginStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Pending => "Pending",
+            Self::Completing => "Completing",
+            Self::Completed(_) => "Completed(<redacted>)",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraeLoginFlowError {
     NotFound,
     Expired,
-    CapabilityMismatch,
+    StateMismatch,
+    CallbackMismatch,
     AlreadyConsumed,
     InvalidTransition,
 }
@@ -218,8 +275,9 @@ impl fmt::Display for TraeLoginFlowError {
         formatter.write_str(match self {
             Self::NotFound => "Trae login flow was not found",
             Self::Expired => "Trae login flow expired; restart login",
-            Self::CapabilityMismatch => "Trae callback capability does not match the login flow",
-            Self::AlreadyConsumed => "Trae callback capability was already consumed",
+            Self::StateMismatch => "Trae callback state does not match the login flow",
+            Self::CallbackMismatch => "Trae callback address does not match the login flow",
+            Self::AlreadyConsumed => "Trae login callback was already consumed",
             Self::InvalidTransition => "Trae login flow is not ready for this transition",
         })
     }
@@ -247,7 +305,7 @@ impl TraeLoginFlowStore {
     pub fn begin_completion(
         &mut self,
         flow_id: &str,
-        capability: &str,
+        callback: &TraeCallbackPayload,
         now_ms: i64,
     ) -> Result<PendingTraeLoginFlow, TraeLoginFlowError> {
         self.cleanup(now_ms);
@@ -259,9 +317,12 @@ impl TraeLoginFlowStore {
             self.pending.remove(flow_id);
             return Err(TraeLoginFlowError::Expired);
         }
-        let candidate = capability_digest(capability);
-        if !constant_time_eq(&candidate, &entry.flow.capability_digest) {
-            return Err(TraeLoginFlowError::CapabilityMismatch);
+        let candidate = capability_digest(&callback.flow_id);
+        if !constant_time_eq(&candidate, &entry.flow.state_digest) {
+            return Err(TraeLoginFlowError::StateMismatch);
+        }
+        if callback.callback_base_url != entry.flow.callback_base_url {
+            return Err(TraeLoginFlowError::CallbackMismatch);
         }
         match entry.state {
             TraeLoginFlowState::Pending => {
@@ -315,14 +376,22 @@ impl TraeLoginFlowStore {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TraeCallbackPayload {
     pub flow_id: String,
-    pub capability: String,
-    refresh_token: String,
+    callback_base_url: String,
+    auth_code: Zeroizing<String>,
     callback_uid: Option<String>,
     callback_name: Option<String>,
     callback_enterprise_id: Option<String>,
+}
+
+impl fmt::Debug for TraeCallbackPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TraeCallbackPayload")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +526,15 @@ pub fn start_login(
     )
 }
 
+pub(crate) fn login_http_client() -> Result<reqwest::Client, TraeClientError> {
+    crate::infra::http::outbound_client_builder()
+        .map_err(|_| TraeClientError::protocol("could not configure Trae login HTTP client"))?
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| TraeClientError::protocol("could not build Trae login HTTP client"))
+}
+
 pub fn start_login_for_provider(
     callback_base_url: &str,
     provider_type: ProviderType,
@@ -487,7 +565,7 @@ pub fn start_login_for_provider(
             let (machine_id, device_id) = random_trae_identity();
             (machine_id, device_id, None, None)
         };
-    start_login_with_endpoints(
+    let (start, mut flow) = start_login_with_endpoints(
         callback_base_url,
         machine_id,
         device_id,
@@ -495,7 +573,45 @@ pub fn start_login_for_provider(
         expected_uid,
         TraeOAuthEndpoints::production_for(provider_type)?,
         now_ms,
+    )?;
+    if let Some(account) = expected_account {
+        let profile = TraeAccountProfile::parse(account.profile.as_ref())
+            .map_err(TraeClientError::bad_request)?;
+        flow.expected_enterprise_id = Some(profile.enterprise_id);
+        if let Some(key) = account
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("devicePrivateKeyPem"))
+        {
+            let key = key
+                .as_str()
+                .ok_or_else(|| TraeClientError::bad_request("Trae device key must be PEM text"))?;
+            device_proof::public_key_pem(key)?;
+            flow.device_private_key_pem = Zeroizing::new(key.to_string());
+        }
+    }
+    Ok((start, flow))
+}
+
+#[cfg(test)]
+pub(crate) fn start_test_login(
+    callback_base_url: &str,
+    provider_type: ProviderType,
+    origin: &str,
+    now_ms: i64,
+) -> (TraeLoginStart, PendingTraeLoginFlow) {
+    let mut endpoints = TraeOAuthEndpoints::for_test(origin);
+    endpoints.protocol = crate::domain::trae::TraeProtocol::for_provider(provider_type).unwrap();
+    start_login_with_endpoints(
+        callback_base_url,
+        "test-machine".into(),
+        "test-device".into(),
+        None,
+        None,
+        endpoints,
+        now_ms,
     )
+    .unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -508,25 +624,31 @@ fn start_login_with_endpoints(
     endpoints: TraeOAuthEndpoints,
     now_ms: i64,
 ) -> Result<(TraeLoginStart, PendingTraeLoginFlow), TraeClientError> {
-    let flow_id = random_secret();
-    let capability = random_secret();
-    let trace = random_hex(16);
-    let callback_url = build_callback_url(callback_base_url, &flow_id, &capability)?;
+    // The website echoes login_trace_id as loginTraceID. It is our 256-bit,
+    // one-use OAuth state; no parameters may be preloaded into its callback URL.
+    let flow_id = random_hex(32);
+    validate_callback_base_url(callback_base_url)?;
+    let code_verifier = Zeroizing::new(random_secret());
     let auth_url = build_login_url(
         &machine_id,
         &device_id,
-        callback_url.as_str(),
-        &trace,
-        endpoints.protocol,
+        callback_base_url,
+        &flow_id,
+        &code_verifier,
+        &endpoints,
     )?;
     let expires_at_ms = now_ms.saturating_add((FLOW_TTL_SECS as i64).saturating_mul(1_000));
     let flow = PendingTraeLoginFlow {
         expires_at_ms,
-        capability_digest: capability_digest(&capability),
+        state_digest: capability_digest(&flow_id),
+        callback_base_url: callback_base_url.to_string(),
+        code_verifier,
+        device_private_key_pem: device_proof::generate_key_pem()?,
         machine_id,
         device_id,
         expected_account_id: expected_account_id.clone(),
         expected_uid,
+        expected_enterprise_id: None,
         endpoints,
     };
     Ok((
@@ -542,18 +664,82 @@ fn start_login_with_endpoints(
 }
 
 pub fn parse_callback_url(raw_url: &str) -> Result<TraeCallbackPayload, TraeClientError> {
-    let parsed = Url::parse(raw_url.trim())
-        .map_err(|_| TraeClientError::bad_request("Trae callback URL is invalid"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
+    if raw_url.len() > MAX_CALLBACK_BYTES {
         return Err(TraeClientError::bad_request(
-            "Trae callback URL must use HTTP(S)",
+            "Trae callback URL exceeds 64 KiB",
         ));
     }
-    let flow_id = unique_query_value(&parsed, &["flowId", "flow_id"])?
-        .ok_or_else(|| TraeClientError::bad_request("Trae callback is missing flowId"))?;
-    let capability = unique_query_value(&parsed, &["capability"])?
-        .ok_or_else(|| TraeClientError::bad_request("Trae callback is missing capability"))?;
-    let mut refresh_token = unique_query_value(&parsed, &["refreshToken", "refresh_token"])?;
+    let raw_url = raw_url.trim();
+    let raw_callback_base_url = raw_url.split('?').next().unwrap_or_default();
+    // Browsers omit the default HTTP port in the final address. The URL sent
+    // to the website still always contains the explicit port required there.
+    let callback_base_url = if raw_callback_base_url == "http://127.0.0.1/authorize" {
+        "http://127.0.0.1:80/authorize"
+    } else {
+        raw_callback_base_url
+    };
+    validate_callback_base_url(callback_base_url)?;
+    let parsed = Url::parse(raw_url.trim())
+        .map_err(|_| TraeClientError::bad_request("Trae callback URL is invalid"))?;
+    if parsed.fragment().is_some() {
+        return Err(TraeClientError::bad_request(
+            "Trae callback URL must not contain a fragment",
+        ));
+    }
+    let flow_id = unique_query_value(&parsed, &["loginTraceID", "login_trace_id"])?
+        .ok_or_else(|| TraeClientError::bad_request("Trae callback is missing loginTraceID"))?;
+    if flow_id.len() != 64 || !flow_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(TraeClientError::bad_request(
+            "Trae callback loginTraceID is invalid",
+        ));
+    }
+    if unique_query_value(&parsed, &["scope"])?.as_deref() != Some("trae") {
+        return Err(TraeClientError::bad_request(
+            "Trae callback must use the trae IDE scope",
+        ));
+    }
+    let code_info =
+        unique_query_value(&parsed, &["authCodeInfo", "auth_code_info"])?.ok_or_else(|| {
+            TraeClientError::bad_request(
+                "Trae callback is missing authCodeInfo; restart login with PKCE",
+            )
+        })?;
+    #[derive(serde::Deserialize)]
+    struct AuthCodeInfo {
+        #[serde(rename = "AuthCode")]
+        auth_code: String,
+    }
+    let info: AuthCodeInfo = serde_json::from_str(&code_info)
+        .map_err(|_| TraeClientError::bad_request("Trae callback authCodeInfo is invalid"))?;
+    if info.auth_code.trim().is_empty()
+        || info.auth_code.len() > 8192
+        || info.auth_code.chars().any(char::is_control)
+    {
+        return Err(TraeClientError::bad_request(
+            "Trae callback authorization code is invalid",
+        ));
+    }
+    // A PKCE flow must not silently downgrade to refresh/access-token import.
+    if parsed.query_pairs().any(|(key, _)| {
+        matches!(
+            key.as_ref(),
+            "refreshToken"
+                | "refresh_token"
+                | "userJwt"
+                | "user_jwt"
+                | "accessToken"
+                | "code"
+                | "authCode"
+                | "auth_code"
+                | "flowId"
+                | "flow_id"
+                | "capability"
+        )
+    }) {
+        return Err(TraeClientError::bad_request(
+            "Trae PKCE callback contains conflicting credential fields",
+        ));
+    }
     let mut callback_uid = None;
     let mut callback_name = None;
     let mut callback_enterprise_id = None;
@@ -567,37 +753,10 @@ pub fn parse_callback_url(raw_url: &str) -> Result<TraeCallbackPayload, TraeClie
         callback_enterprise_id =
             string_at_including_empty(&value, &["/TenantID", "/EnterpriseID", "/enterpriseId"]);
     }
-    if let Some(user_jwt) = unique_query_value(&parsed, &["userJwt", "user_jwt"])? {
-        if user_jwt.trim_start().starts_with('{') {
-            let value: Value = serde_json::from_str(&user_jwt).map_err(|_| {
-                TraeClientError::bad_request("Trae callback userJwt is not valid JSON")
-            })?;
-            let nested_refresh = string_at(
-                &value,
-                &["/RefreshToken", "/refreshToken", "/refresh_token"],
-            );
-            match (refresh_token.as_deref(), nested_refresh.as_deref()) {
-                (Some(existing), Some(nested)) if existing != nested => {
-                    return Err(TraeClientError::bad_request(
-                        "Trae callback contains conflicting refresh tokens",
-                    ));
-                }
-                (None, Some(nested)) => refresh_token = Some(nested.to_string()),
-                _ => {}
-            }
-        }
-    }
-    let refresh_token = refresh_token
-        .ok_or_else(|| TraeClientError::bad_request("Trae callback is missing refreshToken"))?;
-    if refresh_token.len() > 64 * 1024 {
-        return Err(TraeClientError::bad_request(
-            "Trae callback refreshToken is too large",
-        ));
-    }
     Ok(TraeCallbackPayload {
         flow_id,
-        capability,
-        refresh_token,
+        callback_base_url: callback_base_url.to_string(),
+        auth_code: Zeroizing::new(info.auth_code),
         callback_uid,
         callback_name,
         callback_enterprise_id,
@@ -610,16 +769,21 @@ pub async fn complete_login(
     callback: &TraeCallbackPayload,
     now_ms: i64,
 ) -> Result<UpsertAccountInput, TraeClientError> {
-    let receipt = exchange_token(
+    if !constant_time_eq(&flow.state_digest, &capability_digest(&callback.flow_id))
+        || flow.callback_base_url != callback.callback_base_url
+    {
+        return Err(TraeClientError::bad_request(
+            "Trae callback does not match the login flow",
+        ));
+    }
+    let receipt = exchange_auth_code(http, flow, &callback.auth_code, now_ms).await?;
+    let identity = fetch_user_info(
         http,
         &flow.endpoints,
-        &callback.refresh_token,
-        callback.callback_uid.as_deref().unwrap_or_default(),
-        None,
-        now_ms,
+        &receipt.access_token,
+        flow.endpoints.login_version(),
     )
     .await?;
-    let identity = fetch_user_info(http, &flow.endpoints, &receipt.access_token).await?;
     if let Some(callback_uid) = callback.callback_uid.as_deref() {
         if callback_uid != identity.uid {
             return Err(TraeClientError::conflict(
@@ -633,6 +797,15 @@ pub async fn complete_login(
                 "Trae login returned a different uid; start a new account login",
             ));
         }
+    }
+    if flow
+        .expected_enterprise_id
+        .as_deref()
+        .is_some_and(|expected| expected != identity.enterprise_id)
+    {
+        return Err(TraeClientError::conflict(
+            "Trae login returned a different enterprise identity",
+        ));
     }
     if let Some(callback_enterprise_id) = callback.callback_enterprise_id.as_deref() {
         if callback_enterprise_id != identity.enterprise_id {
@@ -680,6 +853,8 @@ pub async fn complete_login(
         })),
         raw: Some(json!({
             "source": "trae_oauth_login",
+            "oauthClientId": IDE_CLIENT_ID,
+            "devicePrivateKeyPem": flow.device_private_key_pem.as_str(),
             "refreshExpiresAtMs": receipt.refresh_expires_at_ms,
             "observedAtMs": now_ms,
         })),
@@ -724,12 +899,15 @@ where
         .ok_or_else(|| AccountRefreshFailure::bad_request("Trae refresh token is required"))?;
     let endpoints =
         TraeOAuthEndpoints::for_account(account).map_err(trae_refresh_client_failure)?;
+    let client_id =
+        refresh_client_id(account, endpoints.protocol).map_err(trae_refresh_client_failure)?;
     let receipt = exchange_token(
         http,
         &endpoints,
+        client_id,
         refresh_token,
         &profile.uid,
-        device_proof::device_proof(account, &profile.uid, refresh_token, now_ms)
+        device_proof::device_proof(account, &profile.uid, client_id, refresh_token, now_ms)
             .map_err(trae_refresh_client_failure)?,
         now_ms,
     )
@@ -751,7 +929,12 @@ where
     // ExchangeToken may rotate the refresh token. Persist the complete receipt
     // before the identity closure request so a crash never retries the old token.
     receipt_hook(&refresh_update)?;
-    let identity = fetch_user_info(http, &endpoints, &receipt.access_token)
+    let version = if client_id == IDE_CLIENT_ID {
+        endpoints.login_version()
+    } else {
+        endpoints.protocol.version
+    };
+    let identity = fetch_user_info(http, &endpoints, &receipt.access_token, version)
         .await
         .map_err(trae_refresh_client_failure)?;
     if identity.uid != profile.uid || identity.enterprise_id != profile.enterprise_id {
@@ -991,9 +1174,92 @@ struct TraeUserIdentity {
     enterprise_id: String,
 }
 
+fn refresh_client_id(
+    account: &Account,
+    protocol: crate::domain::trae::TraeProtocol,
+) -> Result<&'static str, TraeClientError> {
+    match account
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.get("oauthClientId"))
+    {
+        None | Some(Value::Null) => Ok(protocol.client_id),
+        Some(Value::String(value)) if value == IDE_CLIENT_ID => Ok(IDE_CLIENT_ID),
+        Some(Value::String(value)) if value == protocol.client_id => Ok(protocol.client_id),
+        _ => Err(TraeClientError::bad_request(
+            "Trae account has an unsupported OAuth client binding",
+        )),
+    }
+}
+
+async fn exchange_auth_code(
+    http: &reqwest::Client,
+    flow: &PendingTraeLoginFlow,
+    auth_code: &str,
+    now_ms: i64,
+) -> Result<TraeTokenReceipt, TraeClientError> {
+    let endpoints = &flow.endpoints;
+    let url = endpoints
+        .code_exchange_origin
+        .join(CODE_EXCHANGE_PATH)
+        .map_err(|_| TraeClientError::protocol("invalid Trae code exchange URL"))?;
+    let public_key = device_proof::public_key_pem(&flow.device_private_key_pem)?;
+    let request = http
+        .post(url)
+        .header(ACCEPT, "application/json")
+        .header(USER_AGENT, format!("Trae/{}", endpoints.login_version()))
+        .json(&json!({
+            "ClientID": IDE_CLIENT_ID,
+            "AuthCode": auth_code,
+            "CodeVerifier": flow.code_verifier.as_str(),
+            "IDEVersion": endpoints.login_version(),
+            "DeviceInfo": {
+                "DeviceID": flow.device_id,
+                "MachineID": flow.machine_id,
+                "PlatformCode": "IDE_PC",
+                "DeviceType": "PC",
+                "DeviceName": "cc-switch-server",
+                "DeviceModel": "",
+                "ClientVersion": endpoints.login_version(),
+                "DeviceBrand": "PC",
+                "DeviceCPU": "",
+                "OSInfo": std::env::consts::OS,
+                "OSVersion": "1.0",
+                "DevicePublicKey": public_key,
+            }
+        }));
+    // Single-use codes are exchanged exactly once at a reviewed origin. Neither
+    // callback host hints nor an error response can redirect credentials.
+    let (status, body) = execute_bounded(request, "authorization code exchange").await?;
+    if !status.is_success() {
+        let mut error = TraeClientError::upstream(status, "authorization code exchange", &body);
+        // Upstream diagnostics may reflect the request's code or verifier.
+        error.message = format!(
+            "Trae authorization code exchange failed with upstream HTTP {}",
+            status.as_u16()
+        );
+        return Err(error);
+    }
+    let value: Value = serde_json::from_slice(&body)
+        .map_err(|_| TraeClientError::protocol("Trae code exchange response is not valid JSON"))?;
+    let receipt = parse_token_receipt(&value, None, now_ms).map_err(|mut error| {
+        if error.business_code.is_some() {
+            error.message = "Trae authorization code exchange was rejected".to_string();
+        }
+        error
+    })?;
+    if receipt.expires_at_ms <= now_ms {
+        return Err(TraeClientError::protocol(
+            "Trae code exchange returned an expired token",
+        ));
+    }
+    Ok(receipt)
+}
+
 async fn exchange_token(
     http: &reqwest::Client,
     endpoints: &TraeOAuthEndpoints,
+    client_id: &str,
     refresh_token: &str,
     uid: &str,
     proof: Option<Value>,
@@ -1004,7 +1270,7 @@ async fn exchange_token(
             "Trae refresh token is required",
         ));
     }
-    let mut payload = json!({"ClientID": endpoints.protocol.client_id, "RefreshToken": refresh_token, "ClientSecret":"-", "UserID":if endpoints.protocol.raw { uid } else { "" }});
+    let mut payload = json!({"ClientID": client_id, "RefreshToken": refresh_token, "ClientSecret":"-", "UserID":if client_id == IDE_CLIENT_ID { uid } else { "" }});
     if let Some(Value::Object(proof)) = proof {
         payload.as_object_mut().unwrap().extend(proof);
     }
@@ -1014,7 +1280,12 @@ async fn exchange_token(
             .header(CONTENT_TYPE, "application/json")
             .json(&payload),
     );
-    let request = request.header(USER_AGENT, format!("Trae/{}", endpoints.protocol.version));
+    let version = if client_id == IDE_CLIENT_ID {
+        endpoints.login_version()
+    } else {
+        endpoints.protocol.version
+    };
+    let request = request.header(USER_AGENT, format!("Trae/{version}"));
     let (status, body) = execute_bounded(request, "token exchange").await?;
     if !status.is_success() {
         return Err(TraeClientError::upstream(status, "token exchange", &body));
@@ -1022,19 +1293,30 @@ async fn exchange_token(
     let value: Value = serde_json::from_slice(&body).map_err(|error| {
         TraeClientError::protocol(format!("Trae token response is not valid JSON: {error}"))
     })?;
-    ensure_success_envelope(&value, "token exchange")?;
+    parse_token_receipt(&value, Some(refresh_token), now_ms)
+}
+
+fn parse_token_receipt(
+    value: &Value,
+    previous_refresh: Option<&str>,
+    now_ms: i64,
+) -> Result<TraeTokenReceipt, TraeClientError> {
+    ensure_success_envelope(value, "token exchange")?;
     let result = value
         .get("Result")
         .or_else(|| value.get("result"))
         .or_else(|| value.get("data"))
-        .unwrap_or(&value);
+        .unwrap_or(value);
     let access_token = string_at(result, &["/Token", "/token", "/accessToken"])
         .ok_or_else(|| TraeClientError::protocol("Trae token response is missing Token"))?;
     let rotated_refresh = string_at(
         result,
         &["/RefreshToken", "/refreshToken", "/refresh_token"],
     )
-    .unwrap_or_else(|| refresh_token.to_string());
+    .or_else(|| previous_refresh.map(str::to_string))
+    .ok_or_else(|| {
+        TraeClientError::protocol("Trae code exchange response is missing RefreshToken")
+    })?;
     let expires_at_ms = timestamp_ms_at(result, &["/TokenExpireAt", "/tokenExpireAt"])
         .or_else(|| {
             i64_at(
@@ -1061,15 +1343,16 @@ async fn fetch_user_info(
     http: &reqwest::Client,
     endpoints: &TraeOAuthEndpoints,
     access_token: &str,
+    version: &str,
 ) -> Result<TraeUserIdentity, TraeClientError> {
     let url = endpoints.url(TRAE_USER_INFO_PATH)?;
     let request = oauth_request(
         http.request(Method::POST, url)
             .header(CONTENT_TYPE, "application/json")
             .header("X-Cloudide-Token", access_token)
-            .json(&json!({"ReqSource": "IDE", "IDEVersion": endpoints.protocol.version})),
+            .json(&json!({"ReqSource": "IDE", "IDEVersion": version})),
     );
-    let request = request.header(USER_AGENT, format!("Trae/{}", endpoints.protocol.version));
+    let request = request.header(USER_AGENT, format!("Trae/{version}"));
     let (status, body) = execute_bounded(request, "user info").await?;
     if !status.is_success() {
         return Err(TraeClientError::upstream(status, "user info", &body));
@@ -1098,34 +1381,20 @@ async fn fetch_user_info(
     })
 }
 
-fn build_callback_url(
-    callback_base_url: &str,
-    flow_id: &str,
-    capability: &str,
-) -> Result<Url, TraeClientError> {
-    let mut callback = Url::parse(callback_base_url)
-        .map_err(|_| TraeClientError::bad_request("Trae callback base URL is not a valid URL"))?;
-    if callback.scheme() != "http"
-        || !callback.username().is_empty()
-        || callback.password().is_some()
-        || callback.fragment().is_some()
-        || callback.query().is_some()
-    {
+fn validate_callback_base_url(callback_base_url: &str) -> Result<(), TraeClientError> {
+    let port = callback_base_url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|suffix| suffix.strip_suffix("/authorize"));
+    if !port.is_some_and(|port| {
+        !port.is_empty()
+            && port.bytes().all(|byte| byte.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|port| port != 0)
+    }) {
         return Err(TraeClientError::bad_request(
-            "Trae callback base URL must be a plain HTTP loopback URL",
+            "Trae callback must be http://127.0.0.1:<port>/authorize without query parameters",
         ));
     }
-    let host = callback.host_str().unwrap_or_default();
-    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
-        return Err(TraeClientError::bad_request(
-            "Trae callback base URL must use a loopback host",
-        ));
-    }
-    callback
-        .query_pairs_mut()
-        .append_pair("flowId", flow_id)
-        .append_pair("capability", capability);
-    Ok(callback)
+    Ok(())
 }
 
 fn build_login_url(
@@ -1133,8 +1402,10 @@ fn build_login_url(
     device_id: &str,
     callback_url: &str,
     trace: &str,
-    protocol: crate::domain::trae::TraeProtocol,
+    code_verifier: &str,
+    endpoints: &TraeOAuthEndpoints,
 ) -> Result<String, TraeClientError> {
+    let protocol = endpoints.protocol;
     let mut url = Url::parse(protocol.console_origin)
         .and_then(|origin| origin.join(TRAE_AUTHORIZATION_PATH))
         .map_err(|error| {
@@ -1142,13 +1413,18 @@ fn build_login_url(
         })?;
     url.query_pairs_mut()
         .append_pair("login_version", "1")
-        .append_pair("auth_from", if protocol.raw { "trae" } else { "solo" })
+        .append_pair("auth_from", "trae")
         .append_pair("login_channel", "native_ide")
         .append_pair("plugin_version", TRAE_PLUGIN_VERSION)
         .append_pair("auth_type", "local")
-        .append_pair("client_id", protocol.client_id)
+        .append_pair("client_id", IDE_CLIENT_ID)
         .append_pair("redirect", "0")
         .append_pair("login_trace_id", trace)
+        .append_pair(
+            "code_challenge",
+            &URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes())),
+        )
+        .append_pair("code_challenge_method", "S256")
         .append_pair("auth_callback_url", callback_url)
         .append_pair("machine_id", machine_id)
         .append_pair("device_id", device_id)
@@ -1157,7 +1433,7 @@ fn build_login_url(
         .append_pair("x_device_brand", "PC")
         .append_pair("x_device_type", "PC")
         .append_pair("x_os_version", "1.0")
-        .append_pair("x_app_version", protocol.version)
+        .append_pair("x_app_version", endpoints.login_version())
         .append_pair("x_app_type", "stable");
     Ok(url.into())
 }
@@ -1228,8 +1504,7 @@ fn unique_query_value(url: &Url, names: &[&str]) -> Result<Option<String>, TraeC
     let values = url
         .query_pairs()
         .filter(|(key, _)| names.iter().any(|name| key == *name))
-        .map(|(_, value)| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .map(|(_, value)| value.into_owned())
         .collect::<Vec<_>>();
     if values.len() > 1 {
         return Err(TraeClientError::bad_request(format!(
@@ -1237,7 +1512,7 @@ fn unique_query_value(url: &Url, names: &[&str]) -> Result<Option<String>, TraeC
             names[0]
         )));
     }
-    Ok(values.into_iter().next())
+    Ok(values.into_iter().next().filter(|value| !value.is_empty()))
 }
 
 fn string_at(value: &Value, pointers: &[&str]) -> Option<String> {
@@ -1412,6 +1687,7 @@ fn trae_refresh_identity_failure(
 #[cfg(test)]
 mod tests {
     include!("trae/enhancement_tests.rs");
+    include!("trae/login_tests.rs");
     use super::*;
     use crate::domain::accounts::store::AccountStore;
     use crate::domain::trae::*;
@@ -1458,7 +1734,7 @@ mod tests {
                     body,
                 });
                 let value = match path.as_str() {
-                    TRAE_EXCHANGE_TOKEN_PATH => json!({
+                    TRAE_EXCHANGE_TOKEN_PATH | CODE_EXCHANGE_PATH => json!({
                         "Code": 0,
                         "Result": {
                             "Token": "access-new",
@@ -1490,7 +1766,7 @@ mod tests {
         (format!("http://{address}"), observations, server)
     }
 
-    fn callback_from_start(start: &TraeLoginStart, refresh_token: &str) -> String {
+    fn callback_from_start(start: &TraeLoginStart, auth_code: &str) -> String {
         let auth = Url::parse(&start.auth_url).unwrap();
         let callback = auth
             .query_pairs()
@@ -1501,7 +1777,9 @@ mod tests {
         let mut callback = Url::parse(&callback).unwrap();
         callback
             .query_pairs_mut()
-            .append_pair("refreshToken", refresh_token)
+            .append_pair("loginTraceID", &start.flow_id)
+            .append_pair("scope", "trae")
+            .append_pair("authCodeInfo", &json!({"AuthCode":auth_code}).to_string())
             .append_pair(
                 "userInfo",
                 r#"{"UserID":"uid-1","TenantID":"enterprise-1"}"#,
@@ -1510,10 +1788,10 @@ mod tests {
     }
 
     #[test]
-    fn flow_capability_is_exact_once_only_and_expires() {
+    fn flow_state_is_exact_once_only_and_expires() {
         let endpoints = TraeOAuthEndpoints::for_test("http://127.0.0.1:9");
         let (start, flow) = start_login_with_endpoints(
-            "http://localhost:9911/api/accounts/trae/login/callback",
+            "http://127.0.0.1:9911/authorize",
             "machine".to_string(),
             "device".to_string(),
             None,
@@ -1525,24 +1803,26 @@ mod tests {
         let callback = parse_callback_url(&callback_from_start(&start, "refresh")).unwrap();
         let mut store = TraeLoginFlowStore::default();
         store.insert(start.flow_id.clone(), flow, 1_000);
+        let mut wrong_callback = callback.clone();
+        wrong_callback.flow_id = random_hex(32);
         assert_eq!(
             store
-                .begin_completion(&start.flow_id, "wrong-capability", 1_001)
+                .begin_completion(&start.flow_id, &wrong_callback, 1_001)
                 .unwrap_err(),
-            TraeLoginFlowError::CapabilityMismatch
+            TraeLoginFlowError::StateMismatch
         );
         store
-            .begin_completion(&start.flow_id, &callback.capability, 1_001)
+            .begin_completion(&start.flow_id, &callback, 1_001)
             .unwrap();
         assert_eq!(
             store
-                .begin_completion(&start.flow_id, &callback.capability, 1_001)
+                .begin_completion(&start.flow_id, &callback, 1_001)
                 .unwrap_err(),
             TraeLoginFlowError::AlreadyConsumed
         );
 
         let (expired, flow) = start_login_with_endpoints(
-            "http://localhost:9911/api/accounts/trae/login/callback",
+            "http://127.0.0.1:9911/authorize",
             "machine".to_string(),
             "device".to_string(),
             None,
@@ -1555,33 +1835,25 @@ mod tests {
         store.insert(expired.flow_id.clone(), flow, 0);
         assert_eq!(
             store
-                .begin_completion(&expired.flow_id, &callback.capability, 600_000)
+                .begin_completion(&expired.flow_id, &callback, 600_000)
                 .unwrap_err(),
             TraeLoginFlowError::NotFound
         );
     }
 
     #[test]
-    fn callback_parser_rejects_missing_or_ambiguous_capability_and_token() {
+    fn callback_parser_rejects_legacy_token_import() {
         assert!(parse_callback_url(
-            "http://localhost/callback?flowId=f&capability=c&refreshToken=r"
+            "http://127.0.0.1:9911/authorize?flowId=f&capability=c&refreshToken=r"
         )
-        .is_ok());
-        for callback in [
-            "http://localhost/callback?flowId=f&refreshToken=r",
-            "http://localhost/callback?flowId=f&capability=c",
-            "http://localhost/callback?flowId=f&flowId=g&capability=c&refreshToken=r",
-            "http://localhost/callback?flowId=f&capability=c&capability=d&refreshToken=r",
-        ] {
-            assert!(parse_callback_url(callback).is_err(), "{callback}");
-        }
+        .is_err());
     }
 
     #[tokio::test]
     async fn login_uses_fixed_exchange_shape_and_closes_trusted_identity() {
         let (origin, observations, server) = serve_oauth_fixture("uid-1", "enterprise-1").await;
         let (start, flow) = start_login_with_endpoints(
-            "http://localhost:9911/api/accounts/trae/login/callback",
+            "http://127.0.0.1:9911/authorize",
             "machine-1".to_string(),
             "device-1".to_string(),
             None,
@@ -1606,12 +1878,13 @@ mod tests {
 
         let observations = observations.lock().unwrap();
         assert_eq!(observations.len(), 2);
-        assert_eq!(observations[0].path, TRAE_EXCHANGE_TOKEN_PATH);
-        assert_eq!(observations[0].body["ClientID"], TRAE_CLIENT_ID);
-        assert_eq!(observations[0].body["RefreshToken"], "refresh-old");
+        assert_eq!(observations[0].path, CODE_EXCHANGE_PATH);
+        assert_eq!(observations[0].body["ClientID"], IDE_CLIENT_ID);
+        assert_eq!(observations[0].body["AuthCode"], "refresh-old");
+        assert!(observations[0].body.get("RefreshToken").is_none());
         assert_eq!(observations[1].path, TRAE_USER_INFO_PATH);
         assert_eq!(observations[1].headers["x-cloudide-token"], "access-new");
-        assert_eq!(observations[1].body["IDEVersion"], TRAE_IDE_VERSION);
+        assert_eq!(observations[1].body["IDEVersion"], "3.4.3");
         server.abort();
     }
 
@@ -1764,7 +2037,7 @@ mod tests {
     #[test]
     fn login_url_keeps_vendor_and_callback_origins_separate() {
         let (start, _) = start_login_with_endpoints(
-            "http://localhost:9911/api/accounts/trae/login/callback",
+            "http://127.0.0.1:9911/authorize",
             "machine".to_string(),
             "device".to_string(),
             None,
@@ -1782,7 +2055,8 @@ mod tests {
             .1
             .to_string();
         let callback = Url::parse(&callback).unwrap();
-        assert_eq!(callback.host_str(), Some("localhost"));
-        assert!(callback.query_pairs().any(|(key, _)| key == "capability"));
+        assert_eq!(callback.host_str(), Some("127.0.0.1"));
+        assert_eq!(callback.path(), "/authorize");
+        assert!(callback.query().is_none());
     }
 }

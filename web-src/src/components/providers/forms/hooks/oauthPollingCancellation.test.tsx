@@ -84,6 +84,141 @@ afterEach(async () => {
 });
 
 describe("OAuth polling cancellation", () => {
+  async function startTraeLogin() {
+    let latest!: ReturnType<typeof useManagedAuth>;
+    function Harness() {
+      latest = useManagedAuth("trae_solo");
+      return null;
+    }
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <Harness />
+        </QueryClientProvider>,
+      );
+      await Promise.resolve();
+    });
+    await act(async () => {
+      latest.addAccount();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(apiMocks.authPollForAccount).toHaveBeenCalledTimes(1);
+    return () => latest;
+  }
+
+  it("keeps manual Trae completion successful when an older poll reports a consumed flow", async () => {
+    const poll = deferred<void>();
+    const callback = deferred<unknown>();
+    apiMocks.authPollForAccount.mockImplementation(() =>
+      poll.promise.then(() => {
+        throw new Error("Trae login flow is expired or unknown");
+      }),
+    );
+    apiMocks.authSubmitOauthCallback.mockReturnValue(callback.promise);
+    const current = await startTraeLogin();
+    let submission!: Promise<unknown>;
+    act(() => {
+      submission = current().submitOauthCallback(
+        "http://127.0.0.1:15721/authorize?authCodeInfo=test",
+      );
+    });
+    await act(async () => {
+      poll.resolve();
+      await poll.promise;
+      await Promise.resolve();
+    });
+    await act(async () => {
+      callback.resolve({ id: "trae-account" });
+      await submission;
+    });
+    expect(current().pollingState).toBe("idle");
+    expect(current().deviceCode).toBeNull();
+    expect(current().error).toBeNull();
+    expect(apiMocks.authSubmitOauthCallback).toHaveBeenCalledWith(
+      "trae_solo",
+      "device-1",
+      "http://127.0.0.1:15721/authorize?authCodeInfo=test",
+    );
+  });
+
+  it("resumes Trae polling after a rejected manual callback and ignores its old poll", async () => {
+    const poll = deferred<void>();
+    apiMocks.authPollForAccount
+      .mockReset()
+      .mockImplementationOnce(() =>
+        poll.promise.then(() => {
+          throw new Error("obsolete poll failure");
+        }),
+      )
+      .mockResolvedValue(null);
+    apiMocks.authSubmitOauthCallback.mockRejectedValue(
+      new Error("Trae callback belongs to a different login session"),
+    );
+    const current = await startTraeLogin();
+    await act(async () => {
+      poll.resolve();
+      await expect(current().submitOauthCallback("wrong-callback")).rejects.toThrow(
+        "different login session",
+      );
+    });
+    expect(apiMocks.authPollForAccount).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      poll.resolve();
+      await poll.promise;
+      await Promise.resolve();
+    });
+    expect(current().pollingState).toBe("polling");
+    expect(current().deviceCode?.device_code).toBe("device-1");
+    expect(current().error).toContain("different login session");
+    apiMocks.authSubmitOauthCallback.mockResolvedValue({ id: "trae-account" });
+    await act(async () => {
+      await current().submitOauthCallback("corrected-callback");
+    });
+    expect(current().pollingState).toBe("idle");
+    expect(current().error).toBeNull();
+  });
+
+  it("uses an automatic Trae completion already being polled before submitting manually", async () => {
+    const poll = deferred<unknown>();
+    apiMocks.authPollForAccount.mockReturnValue(poll.promise);
+    apiMocks.authSubmitOauthCallback.mockRejectedValue(
+      new Error("Trae login flow was already consumed"),
+    );
+    const current = await startTraeLogin();
+    let submission!: Promise<unknown>;
+    act(() => {
+      submission = current().submitOauthCallback("duplicate-callback");
+    });
+    await act(async () => {
+      poll.resolve({ id: "automatic-trae-account" });
+      expect(await submission).toEqual({ id: "automatic-trae-account" });
+    });
+    expect(apiMocks.authSubmitOauthCallback).not.toHaveBeenCalled();
+    expect(current().pollingState).toBe("idle");
+    expect(current().deviceCode).toBeNull();
+    expect(current().error).toBeNull();
+  });
+
+  it("does not submit a queued manual Trae callback after cancellation", async () => {
+    const poll = deferred<unknown>();
+    apiMocks.authPollForAccount.mockReturnValue(poll.promise);
+    const current = await startTraeLogin();
+    let submission!: Promise<unknown>;
+    act(() => {
+      submission = current().submitOauthCallback("cancelled-callback");
+    });
+    act(() => current().cancelAuth());
+    await act(async () => {
+      poll.resolve(null);
+      await expect(submission).rejects.toThrow("not active");
+    });
+    expect(apiMocks.authSubmitOauthCallback).not.toHaveBeenCalled();
+    expect(current().pollingState).toBe("idle");
+    expect(current().deviceCode).toBeNull();
+    expect(current().error).toBeNull();
+  });
+
   it("ignores a managed-auth poll that succeeds after cancellation", async () => {
     const pollResult = deferred<unknown>();
     apiMocks.authPollForAccount.mockReturnValue(pollResult.promise);

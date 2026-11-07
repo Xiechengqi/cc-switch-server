@@ -583,7 +583,7 @@ pub fn app_router(state: ServerState) -> Router {
         )
         .route("/api/accounts/trae/login/cancel", post(cancel_trae_login))
         .route(
-            "/api/accounts/trae/login/callback",
+            "/authorize",
             get(trae_login_callback),
         )
         .route("/api/accounts/qoder/pat/import", post(import_qoder_pat))
@@ -740,7 +740,11 @@ pub fn app_router(state: ServerState) -> Router {
             verify_router_ingress,
         ))
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &Request| {
+            // OAuth callbacks carry single-use codes in their query string.
+            // Preserve request tracing without recording query credentials.
+            tracing::debug_span!("request", method = %request.method(), uri = request.uri().path(), version = ?request.version())
+        }))
         .with_state(state.clone());
 
     match state.web_dist_dir.as_ref() {

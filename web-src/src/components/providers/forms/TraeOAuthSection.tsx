@@ -34,11 +34,11 @@ export const TraeOAuthSection: React.FC<TraeOAuthSectionProps> = (props) => {
         }),
         hint: t("traeOauth.callbackHint", {
           defaultValue:
-            "If the browser cannot reach the Server localhost callback, paste the complete callback URL from the address bar here.",
+            "Finish authorization on the Trae website. If the browser then cannot open 127.0.0.1, copy the complete URL from its address bar and paste it here to finish remote sign-in.",
         }),
         placeholder: t("traeOauth.callbackPlaceholder", {
           defaultValue:
-            "http://localhost:15721/api/accounts/trae/login/callback?...",
+            "http://127.0.0.1:15721/authorize?...",
         }),
         submitLabel: t("traeOauth.submitCallback", {
           defaultValue: "Complete sign-in",

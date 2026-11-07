@@ -885,6 +885,9 @@ pub(in crate::api) struct TraeLoginStatusResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct CompleteTraeLoginRequest {
+    pub(in crate::api) flow_id: String,
+    #[serde(default)]
+    pub(in crate::api) provider_type: Option<ProviderType>,
     pub(in crate::api) callback_url: String,
 }
 

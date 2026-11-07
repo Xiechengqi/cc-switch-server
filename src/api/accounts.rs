@@ -1912,7 +1912,7 @@ async fn persist_completed_device_login(
             if provider_type.is_buddy_oauth() {
                 reuse_existing_codebuddy_identity_account(store, &mut account_input);
             }
-            if provider_type == ProviderType::TraeIntl {
+            if provider_type.is_trae() {
                 preserve_trae_login_device_proof(store, &mut account_input);
             }
             manager_for(provider_type)
@@ -1952,7 +1952,7 @@ fn preserve_trae_login_device_proof(
     let Some(existing) = input
         .id
         .as_deref()
-        .and_then(|id| store.find_for_provider(ProviderType::TraeIntl, Some(id)))
+        .and_then(|id| store.find_for_provider(input.provider_type, Some(id)))
     else {
         return;
     };
@@ -2724,10 +2724,7 @@ pub(in crate::api) async fn start_trae_login(
         ),
         None => None,
     };
-    let callback_base_url = format!(
-        "http://localhost:{}/api/accounts/trae/login/callback",
-        state.bind_addr.port()
-    );
+    let callback_base_url = format!("http://127.0.0.1:{}/authorize", state.bind_addr.port());
     let now = now_ms() as i64;
     let (login, flow) = crate::clients::oauth::trae::start_login_for_provider(
         &callback_base_url,
@@ -2819,9 +2816,22 @@ pub(in crate::api) async fn complete_trae_login(
     let principal = require_web_admin_session(&state, &headers).await?;
     let callback = crate::clients::oauth::trae::parse_callback_url(&input.callback_url)
         .map_err(map_trae_client_error)?;
+    if callback.flow_id != input.flow_id {
+        return Err(ApiError::bad_request(
+            "Trae callback belongs to a different login session",
+        ));
+    }
     let principal_id = principal.oauth_binding_id();
     let now = now_ms() as i64;
     let provider_type = owned_trae_flow_type(&state, &callback.flow_id, &principal_id, now).await?;
+    if input
+        .provider_type
+        .is_some_and(|expected| expected != provider_type)
+    {
+        return Err(ApiError::bad_request(
+            "Trae callback belongs to a different provider type",
+        ));
+    }
     require_device_flow_owner(
         &state,
         provider_type,
@@ -2887,38 +2897,58 @@ pub(in crate::api) async fn cancel_trae_login(
 
 pub(in crate::api) async fn trae_login_callback(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
-) -> Html<String> {
+) -> axum::response::Response {
+    let expected_host = format!("127.0.0.1:{}", state.bind_addr.port());
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    if host != Some(expected_host.as_str())
+        && !(state.bind_addr.port() == 80 && host == Some("127.0.0.1"))
+    {
+        return trae_callback_page(false);
+    }
     let Some(raw_query) = raw_query.filter(|value| !value.trim().is_empty()) else {
-        return Html(oauth_callback_html(
-            "Trae",
-            false,
-            "Trae callback query is missing",
-        ));
+        return trae_callback_page(false);
     };
-    let callback_url = format!("http://localhost/api/accounts/trae/login/callback?{raw_query}");
+    let callback_url = format!("http://{expected_host}/authorize?{raw_query}");
     let callback = match crate::clients::oauth::trae::parse_callback_url(&callback_url) {
         Ok(callback) => callback,
-        Err(error) => {
-            return Html(oauth_callback_html(
-                "Trae",
-                false,
-                &crate::api::providers::redact_provider_test_error(&error.message),
-            ));
-        }
+        Err(_) => return trae_callback_page(false),
     };
-    match execute_trae_login_completion(&state, &callback).await {
-        Ok(()) => Html(oauth_callback_html(
-            "Trae",
-            true,
-            "Trae authorization was accepted; return to the admin console to finish login",
-        )),
-        Err(_) => Html(oauth_callback_html(
-            "Trae",
-            false,
-            "Trae authorization could not be accepted; restart login from the admin console",
-        )),
-    }
+    trae_callback_page(
+        execute_trae_login_completion(&state, &callback)
+            .await
+            .is_ok(),
+    )
+}
+
+fn trae_callback_page(success: bool) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use base64::Engine;
+    use sha2::Digest;
+    let script = "history.replaceState(null,'','/authorize');";
+    let hash =
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(script.as_bytes()));
+    let message = if success {
+        "Trae authorization was accepted; return to the admin console to finish login"
+    } else {
+        "Trae authorization could not be accepted; restart login from the admin console"
+    };
+    let html = format!(
+        "{}<script>{script}</script>",
+        oauth_callback_html("Trae", success, message)
+    );
+    (
+        [
+            ("cache-control", "no-store".to_string()),
+            ("referrer-policy", "no-referrer".to_string()),
+            ("content-security-policy", format!("default-src 'none'; script-src 'sha256-{hash}'; base-uri 'none'; frame-ancestors 'none'")),
+            ("x-content-type-options", "nosniff".to_string()),
+        ],
+        Html(html),
+    ).into_response()
 }
 
 async fn execute_trae_login_completion(
@@ -2926,11 +2956,12 @@ async fn execute_trae_login_completion(
     callback: &crate::clients::oauth::trae::TraeCallbackPayload,
 ) -> Result<(), ApiError> {
     let now = now_ms() as i64;
+    // A single-use OAuth code must not follow even a same-origin 307 redirect.
+    let http = crate::clients::oauth::trae::login_http_client().map_err(map_trae_client_error)?;
     let flow = state
-        .begin_trae_login_completion(&callback.flow_id, &callback.capability, now)
+        .begin_trae_login_completion(&callback.flow_id, callback, now)
         .await
         .map_err(map_trae_login_flow_error)?;
-    let http = state.http_client().await;
     let account_input =
         match crate::clients::oauth::trae::complete_login(&http, &flow, callback, now).await {
             Ok(account_input) => account_input,
@@ -2949,7 +2980,9 @@ fn map_trae_login_flow_error(error: crate::clients::oauth::trae::TraeLoginFlowEr
     use crate::clients::oauth::trae::TraeLoginFlowError;
     match error {
         TraeLoginFlowError::NotFound => ApiError::not_found(error.to_string()),
-        TraeLoginFlowError::CapabilityMismatch => ApiError::unauthorized(error.to_string()),
+        TraeLoginFlowError::StateMismatch | TraeLoginFlowError::CallbackMismatch => {
+            ApiError::unauthorized(error.to_string())
+        }
         TraeLoginFlowError::Expired
         | TraeLoginFlowError::AlreadyConsumed
         | TraeLoginFlowError::InvalidTransition => ApiError::conflict(error.to_string()),
@@ -4183,6 +4216,7 @@ pub(in crate::api) fn is_oauth_secret_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     include!("buddy_import_tests.rs");
+    include!("trae_login_tests.rs");
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -4190,6 +4224,10 @@ mod tests {
     use crate::domain::accounts::oauth::{OAuthHttpRequest, OAuthRequestBodyFormat};
 
     fn account_api_test_state(name: &str) -> ServerState {
+        account_api_test_state_with_port(name, 0)
+    }
+
+    fn account_api_test_state_with_port(name: &str, port: u16) -> ServerState {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -4197,7 +4235,7 @@ mod tests {
         crate::state::ServerStateInner::load(
             crate::cli::Cli {
                 host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                port: 0,
+                port,
                 config_dir: Some(
                     std::env::temp_dir()
                         .join(format!("cc-switch-server-account-api-{name}-{nanos}")),
@@ -4616,17 +4654,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trae_completed_login_is_principal_bound_and_forgets_capability_flow() {
+    async fn trae_completed_login_is_principal_bound_and_forgets_callback_flow() {
         let state = account_api_test_state("trae-login-principal-binding");
         let config_dir = state.config_dir.clone();
         let now = crate::infra::time::now_ms() as i64;
         let principal_id = "owner:admin";
-        let (start, flow) = crate::clients::oauth::trae::start_login(
-            "http://localhost:9911/api/accounts/trae/login/callback",
-            None,
-            now,
-        )
-        .unwrap();
+        let (start, flow) =
+            crate::clients::oauth::trae::start_login("http://127.0.0.1:9911/authorize", None, now)
+                .unwrap();
         let auth = url::Url::parse(&start.auth_url).unwrap();
         let callback_url = auth
             .query_pairs()
@@ -4637,7 +4672,9 @@ mod tests {
         let mut callback_url = url::Url::parse(&callback_url).unwrap();
         callback_url
             .query_pairs_mut()
-            .append_pair("refreshToken", "callback-refresh");
+            .append_pair("loginTraceID", &start.flow_id)
+            .append_pair("scope", "trae")
+            .append_pair("authCodeInfo", r#"{"AuthCode":"callback-code"}"#);
         let callback =
             crate::clients::oauth::trae::parse_callback_url(callback_url.as_str()).unwrap();
         state
@@ -4653,7 +4690,7 @@ mod tests {
             )
             .await;
         state
-            .begin_trae_login_completion(&start.flow_id, &callback.capability, now)
+            .begin_trae_login_completion(&start.flow_id, &callback, now)
             .await
             .unwrap();
         let account_id = crate::domain::trae::trae_account_id("uid-1").unwrap();

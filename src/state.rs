@@ -16383,13 +16383,13 @@ impl ServerStateInner {
     pub async fn begin_trae_login_completion(
         &self,
         flow_id: &str,
-        capability: &str,
+        callback: &crate::clients::oauth::trae::TraeCallbackPayload,
         now_ms: i64,
     ) -> Result<PendingTraeLoginFlow, crate::clients::oauth::trae::TraeLoginFlowError> {
         self.trae_login_flows
             .write()
             .await
-            .begin_completion(flow_id, capability, now_ms)
+            .begin_completion(flow_id, callback, now_ms)
     }
 
     pub async fn finish_trae_login_completion(

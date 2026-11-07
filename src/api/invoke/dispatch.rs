@@ -1344,7 +1344,11 @@ async fn web_invoke_dispatch(
                 let response = complete_trae_login(
                     State(state.clone()),
                     headers.clone(),
-                    Json(CompleteTraeLoginRequest { callback_url }),
+                    Json(CompleteTraeLoginRequest {
+                        flow_id: web_arg_string_any(&args, &["deviceCode", "device_code", "flowId", "flow_id"] )?,
+                        provider_type: Some(provider_type),
+                        callback_url,
+                    }),
                 )
                 .await?
                 .0;

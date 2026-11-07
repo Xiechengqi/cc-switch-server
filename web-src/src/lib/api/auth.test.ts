@@ -155,7 +155,7 @@ describe("isOpenAiCliOAuthOriginAllowed", () => {
     await authSubmitOauthCallback(
       "trae_solo",
       "trae-flow",
-      "http://localhost:15721/api/accounts/trae/login/callback?code=x",
+      "http://127.0.0.1:15721/authorize?code=x",
     );
 
     expect(runtimeMocks.invokeCommand).toHaveBeenCalledWith(
@@ -164,7 +164,7 @@ describe("isOpenAiCliOAuthOriginAllowed", () => {
         authProvider: "trae_solo",
         deviceCode: "trae-flow",
         callbackUrl:
-          "http://localhost:15721/api/accounts/trae/login/callback?code=x",
+          "http://127.0.0.1:15721/authorize?code=x",
       },
     );
   });

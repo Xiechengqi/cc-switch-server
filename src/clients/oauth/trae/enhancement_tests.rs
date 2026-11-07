@@ -8,7 +8,7 @@ async fn trae_raw_login_and_refresh_use_the_bound_realm_client_and_receipt() {
         endpoints.protocol =
             crate::domain::trae::TraeProtocol::for_provider(provider_type).unwrap();
         let (start, flow) = start_login_with_endpoints(
-            "http://localhost:9911/api/accounts/trae/login/callback",
+            "http://127.0.0.1:9911/authorize",
             "machine-1".into(),
             "device-1".into(),
             None,
@@ -51,12 +51,10 @@ async fn trae_raw_login_and_refresh_use_the_bound_realm_client_and_receipt() {
         account.provider_type = provider_type;
         let secret = p256::SecretKey::from_slice(&[7u8; 32]).unwrap();
         let signing = SigningKey::from(secret.clone());
-        if provider_type == ProviderType::TraeIntl {
-            account.raw.as_mut().unwrap()["devicePrivateKeyPem"] = json!(secret
-                .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
-                .unwrap()
-                .as_str());
-        }
+        account.raw.as_mut().unwrap()["devicePrivateKeyPem"] = json!(secret
+            .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+            .unwrap()
+            .as_str());
         let mut receipt = None;
         let mut hook = |update: &AccountRefreshUpdate| {
             receipt = Some(update.clone());
@@ -84,7 +82,8 @@ async fn trae_raw_login_and_refresh_use_the_bound_realm_client_and_receipt() {
         );
         let seen = observations.lock().unwrap();
         assert_eq!(seen[0].body["ClientID"], "ono9krqynydwx5");
-        assert_eq!(seen[0].body["UserID"], "uid-1");
+        assert_eq!(seen[0].body["AuthCode"], "refresh-old");
+        assert_eq!(seen[0].body["DeviceInfo"]["DeviceID"], "device-1");
         let body = &seen[2].body;
         assert_eq!(body["ClientID"], "ono9krqynydwx5");
         assert_eq!(body["UserID"], "uid-1");
@@ -130,6 +129,7 @@ fn trae_channel_identity_and_production_origins_cannot_cross_realms() {
     let mut account = refresh_account("http://127.0.0.1:9");
     account.provider_type = ProviderType::TraeIntl;
     account.raw.as_mut().unwrap()["devicePrivateKeyPem"] = json!("malformed");
-    let error = device_proof::device_proof(&account, "uid-1", "refresh", 1000).unwrap_err();
+    let error =
+        device_proof::device_proof(&account, "uid-1", IDE_CLIENT_ID, "refresh", 1000).unwrap_err();
     assert!(!error.message.contains("malformed"));
 }
