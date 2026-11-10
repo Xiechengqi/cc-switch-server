@@ -134,3 +134,144 @@ async fn responses_message_text_types_cover_all_codex_transports() {
     .unwrap();
     assert_types(&serde_json::from_slice(&fallback.body).unwrap());
 }
+
+#[test]
+fn responses_cache_control_sanitizer_is_scoped_and_idempotent() {
+    let business = json!({"cache_control":{"type":"business"},"type":"input_text","text":"opaque"});
+    let mut body = json!({"input":[
+        {"role":"user","cache_control":null,"content":[
+            {"type":"input_text","text":"hello","cache_control":{"type":"ephemeral"},"data":business},
+            {"type":"input_image","image_url":"data:image/png;base64,AA==","cache_control":false},
+            {"type":"input_file","file_id":"file_1","cache_control":"legacy"},
+            {"type":"future_part","cache_control":business}
+        ]},
+        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer","cache_control":null,"annotations":[]}]},
+        {"role":"system","content":[{"type":"text","text":"system","cache_control":{}}]},
+        {"role":"developer","content":[{"type":"input_text","text":"developer","cache_control":{}}]},
+        {"type":"function_call_output","call_id":"a","output":[{"type":"input_text","text":"result","cache_control":{},"data":business}]},
+        {"type":"custom_tool_call_output","call_id":"b","output":[{"type":"input_image","image_url":"https://example.test/image.png","cache_control":{}}]},
+        {"type":"function_call","name":"lookup","arguments":business.to_string()},
+        {"type":"function_call_output","call_id":"c","output":business.to_string()},
+        {"type":"function_call_output","call_id":"d","output":business},
+        {"type":"future_item","role":"user","content":[business]},
+        {"type":"agent_message","role":"assistant","content":[business]},
+        {"role":"unknown","content":[business]},
+        {"type":null,"role":"user","content":[business]},
+        {"type":42,"role":"user","content":[business]}
+    ],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"cache_control":{"type":"string"}}}}]});
+    let original = body.clone();
+    sanitize_codex_oauth_request_body(&mut body);
+    assert!(body["input"][0].get("cache_control").is_none());
+    for index in 0..3 {
+        assert!(body["input"][0]["content"][index]
+            .get("cache_control")
+            .is_none());
+    }
+    for index in 1..4 {
+        assert!(body["input"][index]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+    for index in 4..6 {
+        assert!(body["input"][index]["output"][0]
+            .get("cache_control")
+            .is_none());
+    }
+    assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+    assert_eq!(body["input"][0]["content"][0]["data"], business);
+    assert_eq!(
+        body["input"][0]["content"][1]["image_url"],
+        original["input"][0]["content"][1]["image_url"]
+    );
+    assert_eq!(body["input"][0]["content"][2]["file_id"], "file_1");
+    assert_eq!(
+        body["input"][0]["content"][3],
+        original["input"][0]["content"][3]
+    );
+    for index in 6..14 {
+        assert_eq!(body["input"][index], original["input"][index]);
+    }
+    assert_eq!(
+        body["tools"][0]["parameters"],
+        original["tools"][0]["parameters"]
+    );
+    let once = body.clone();
+    sanitize_codex_oauth_request_body(&mut body);
+    assert_eq!(body, once);
+}
+
+#[tokio::test]
+async fn responses_cache_control_covers_all_codex_transports() {
+    let request = json!({"model":"gpt-5.4","input":[
+        {"role":"user","content":[{"type":"input_text","text":"question","cache_control":{"type":"ephemeral"}}]},
+        {"role":"assistant","content":[{"type":"output_text","text":"answer","cache_control":{"type":"ephemeral"}}]},
+        {"type":"function_call_output","call_id":"a","output":[{"type":"input_text","text":"result","cache_control":null}]}
+    ]});
+    let check = |body: &Value| {
+        assert_eq!(body["input"][0]["content"][0]["text"], "question");
+        assert_eq!(body["input"][1]["content"][0]["text"], "answer");
+        assert!(body["input"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(body["input"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(body["input"][2]["output"][0].get("cache_control").is_none());
+    };
+    let http = normalize_codex_oauth_responses_body_bytes(
+        &Bytes::from(request.to_string()),
+        None,
+        CodexImageToolStripPolicy::Never,
+    )
+    .unwrap();
+    check(&serde_json::from_slice(&http).unwrap());
+    let compact =
+        normalize_codex_oauth_compact_body_bytes(&Bytes::from(request.to_string())).unwrap();
+    check(&serde_json::from_slice(&compact).unwrap());
+    let provider = stored_provider(AppKind::Codex, ProviderType::CodexOAuth, json!({}), None);
+    let intent = crate::proxy::codex_request_policy::extract_intent(&request);
+    for nested in [false, true] {
+        for binary in [false, true] {
+            let frame = if nested {
+                json!({"type":"response.create","response":request})
+            } else {
+                let mut frame = request.clone();
+                frame["type"] = json!("response.create");
+                frame
+            };
+            let frame = if binary {
+                TungsteniteMessage::Binary(serde_json::to_vec(&frame).unwrap())
+            } else {
+                TungsteniteMessage::Text(frame.to_string())
+            };
+            let (prepared, _) = prepare_codex_responses_websocket_request(
+                frame, &provider, false, None, &intent, None,
+            )
+            .await
+            .unwrap();
+            let prepared: Value = match prepared {
+                TungsteniteMessage::Text(text) => serde_json::from_str(&text).unwrap(),
+                TungsteniteMessage::Binary(bytes) => serde_json::from_slice(&bytes).unwrap(),
+                _ => panic!("expected JSON frame"),
+            };
+            check(if nested {
+                &prepared["response"]
+            } else {
+                &prepared
+            });
+        }
+    }
+    let (state, execution) =
+        codex_bridge_test_context("cache-control-fallback", "http://127.0.0.1:9".into()).await;
+    let fallback = prepare_codex_http_fallback_target(
+        &state,
+        &execution,
+        &request,
+        Some("cache-control-session"),
+        None,
+        &intent,
+    )
+    .await
+    .unwrap();
+    check(&serde_json::from_slice(&fallback.body).unwrap());
+}

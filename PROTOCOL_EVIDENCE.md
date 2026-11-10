@@ -1,5 +1,19 @@
 # Protocol evidence policy
 
+## 2026-11-10 Anthropic cache_control 泄漏到 Responses 内容块
+
+使用用户明确授权的 Claude API 入口，只发送合成短提示词，在现网 /v1/messages 完成对照：用户文本不带 cache_control 返回 200，增加 ephemeral 标记返回 400 input[0].content[0].cache_control；两条 user 消息的流式对照不带标记返回 200 且 message_stop，第二条增加标记返回与报告一致的 400 input[1].content[0].cache_control。assistant-only 标记的流式样例返回 200，不据此宣称所有角色均被上游拒绝。凭据不进入仓库或证据文件；这些请求证明修复前故障，不能证明本地补丁已部署。
+
+本仓 anthropic_block_to_openai_response_content 和 openai_chat_content_part_to_response_part 主动复制 Anthropic 缓存标记；OAuth 共用出站清洗只去除 prompt_cache_breakpoint，未处理 cache_control。已有角色转换测试和旧缓存注入测试错误地要求保留该字段，严格 mock 未拒绝它。只读参考 CLIProxyAPI 6db7d4b8 internal/translator/codex/claude/codex_claude_request.go、codex2api 75ece5ac proxy/anthropic.go：对应文本块重新构建，不复制该字段。外仓仅协议证据，不是构建或测试输入。
+
+官方 Responses create 文档 https://developers.openai.com/api/reference/resources/responses/methods/create 本轮实际获取 HTTP 200；其 input_text 字段未定义 Anthropic cache_control。公共 API 的其他缓存控制不作为 OAuth 端点权限证明，不将 ephemeral/ttl 自动映射成 prompt_cache_key 或 prompt_cache_breakpoint。
+
+修复边界：仅 Responses 转换停止复制缓存标记，保留 Chat/Anthropic 其他边界原有行为；OAuth 共用清洗对已知角色消息与 function/custom tool output 的协议内容块定点移除遗留标记，覆盖 HTTP、Compact、WebSocket 文本/二进制平铺/嵌套帧及 HTTP fallback。未知 item/part、agent_message、工具参数、Schema、嵌套业务 JSON 和字符串工具结果保持不透明。文本、媒体、原生 Anthropic 缓存和现有 is_error 错误语义不变；不增加认证恢复、重放或部署。
+
+验证与整体 review：旧代码上的四项新增反例全部失败；修复后最终缓存相关回归 18/18、严格历史消息回归 7/7，全量 library 4242 passed / 0 failed / 3 ignored；三个集成目标分别 138/138、1/1、1/1。最终 Node 审计 2135/2135、全 src（含 include 文件）rustfmt、生成供应商覆盖/UI 矩阵检查通过。集成目标同时构建当前普通 Server 二进制；本地 smoke 使用该预编译二进制运行通过，避免独立 worktree 的构建元数据重编译超过 smoke 启动窗口。主工作目录补丁应用后再次通过相关源文件格式、生成覆盖/UI 矩阵及 diff 检查。
+
+Review 收紧显式 null/数字 item type 的处理：不能当作缺失 type 的普通消息；未知 item/part 与业务同名字段保持原样，已有 is_error 处理、角色修复、媒体/Schema/参数保留回归全部通过。离线 readiness failures=0，仍因缺完整真实 Share/Router/部署输入而 blocked，不标记发布通过。现网最终复测仍为同一 input[1].content[0].cache_control 400；本轮未部署本地补丁，修复后的真实部署接受性待发布后验证。
+
 ## 2026-11-10 Claude 工具失败标志到 OpenAI Responses 的协议边界
 
 用户提供 OpenAI OAuth 上游拒绝 `400 Unknown parameter: 'input[5].is_error'`。本仓转换器此前把 Anthropic `tool_result.is_error` 原样复制为 Responses `function_call_output.is_error`，且共用 OAuth 出站 sanitizer 未移除；显式 false 同样会泄漏。这是工具结果项字段映射缺陷，不以切换账号、删历史或重放推理处理。

@@ -3558,9 +3558,7 @@ fn openai_chat_content_part_to_response_part(
             if text.is_empty() {
                 return None;
             }
-            let mut output = json!({"type": text_type, "text": text});
-            copy_cache_control(part, &mut output);
-            Some(output)
+            Some(json!({"type": text_type, "text": text}))
         }
         Some("refusal") if role == "assistant" => part
             .get("refusal")
@@ -6386,14 +6384,10 @@ fn anthropic_block_to_openai_chat_content(block: &Value) -> Value {
 fn anthropic_block_to_openai_response_content(role: &str, block: &Value) -> Value {
     match block.get("type").and_then(Value::as_str) {
         Some("image") => anthropic_image_to_openai_response(block),
-        _ => {
-            let mut output = json!({
-                "type": responses_text_part_type(role),
-                "text": anthropic_text_from_block(block).unwrap_or_default()
-            });
-            copy_cache_control(block, &mut output);
-            output
-        }
+        _ => json!({
+            "type": responses_text_part_type(role),
+            "text": anthropic_text_from_block(block).unwrap_or_default()
+        }),
     }
 }
 
@@ -11371,6 +11365,66 @@ mod tests {
     }
 
     #[test]
+    fn responses_cache_control_conversion_preserves_business_data_and_chat_cache() {
+        let business = json!({"cache_control":{"type":"business","ttl":42}});
+        let source = json!({
+            "model":"gpt-5.4",
+            "system":[{"type":"text","text":"system","cache_control":{"type":"ephemeral"}}],
+            "tools":[{"name":"lookup","cache_control":{"type":"ephemeral"},
+                "input_schema":{"type":"object","properties":{"cache_control":{"type":"string"}}}}],
+            "messages":[
+                {"role":"user","content":[{"type":"text","text":"question","cache_control":{"type":"ephemeral","ttl":"1h"}}]},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"answer","cache_control":null},
+                    {"type":"tool_use","id":"a","name":"lookup","input":business}
+                ]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":business.to_string()}]}
+            ]
+        });
+        for instructions in [false, true] {
+            let result =
+                anthropic_to_openai_responses_with_system_mode(&source, instructions).unwrap();
+            for item in result["input"].as_array().unwrap() {
+                if let Some(parts) = item["content"].as_array() {
+                    for part in parts {
+                        assert!(part.get("cache_control").is_none(), "{part}");
+                    }
+                }
+                if item["type"] == "function_call" {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(item["arguments"].as_str().unwrap()).unwrap(),
+                        business
+                    );
+                }
+                if item["type"] == "function_call_output" {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(item["output"].as_str().unwrap()).unwrap(),
+                        business
+                    );
+                }
+            }
+            assert!(result["tools"][0].get("cache_control").is_none());
+            assert_eq!(
+                result["tools"][0]["parameters"]["properties"]["cache_control"]["type"],
+                "string"
+            );
+        }
+        let chat = anthropic_to_openai_chat(&source).unwrap();
+        assert_eq!(
+            chat["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        let result = openai_chat_to_responses(&chat).unwrap();
+        for item in result["input"].as_array().unwrap() {
+            if let Some(parts) = item["content"].as_array() {
+                for part in parts {
+                    assert!(part.get("cache_control").is_none(), "{part}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn anthropic_to_openai_responses_maps_user_message() {
         let input = json!({
             "model": "claude-sonnet-4",
@@ -11431,7 +11485,7 @@ mod tests {
                     assert_eq!(item["content"][0]["type"], text_type);
                     assert_eq!(item["content"][0]["text"], text);
                     if block_content {
-                        assert_eq!(item["content"][0]["cache_control"]["type"], "ephemeral");
+                        assert!(item["content"][0].get("cache_control").is_none());
                     }
                 }
             }

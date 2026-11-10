@@ -29227,6 +29227,28 @@ fn sanitize_codex_oauth_input_item_metadata(item: &mut Value) {
         return;
     };
     let native_agent_message = object.get("type").and_then(Value::as_str) == Some("agent_message");
+    // Anthropic cache hints have no equivalent on these Responses protocol
+    // objects. Unknown items/parts and nested business values stay opaque.
+    let known_message = object
+        .get("type")
+        .is_none_or(|kind| kind.as_str() == Some("message"))
+        && object
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| matches!(role, "user" | "assistant" | "system" | "developer"));
+    let cache_content_field = if known_message {
+        Some("content")
+    } else if matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("function_call_output" | "custom_tool_call_output")
+    ) {
+        Some("output")
+    } else {
+        None
+    };
+    if cache_content_field.is_some() {
+        object.remove("cache_control");
+    }
     for field in [
         "internal_chat_message_metadata_passthrough",
         "prompt_cache_breakpoint",
@@ -29244,6 +29266,22 @@ fn sanitize_codex_oauth_input_item_metadata(item: &mut Value) {
         for part in parts {
             if let Some(part) = part.as_object_mut() {
                 part.remove("prompt_cache_breakpoint");
+                if cache_content_field == Some(field)
+                    && matches!(
+                        part.get("type").and_then(Value::as_str),
+                        Some(
+                            "text"
+                                | "input_text"
+                                | "output_text"
+                                | "refusal"
+                                | "input_image"
+                                | "input_file"
+                                | "input_audio"
+                        )
+                    )
+                {
+                    part.remove("cache_control");
+                }
             }
         }
     }

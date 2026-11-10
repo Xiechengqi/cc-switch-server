@@ -7925,7 +7925,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_to_codex_preserves_injected_cache_control_after_transform() {
+    fn responses_cache_control_injection_is_not_forwarded_to_codex() {
         let adapter = adapter_for(AppKind::Claude, ProviderType::Codex);
         let stored = stored_provider(
             AppKind::Claude,
@@ -7950,7 +7950,7 @@ mod tests {
         let value: Value = serde_json::from_slice(&request.body).unwrap();
 
         assert!(value.get("input").and_then(Value::as_array).is_some());
-        assert!(count_cache_controls(&value) >= 1);
+        assert_eq!(count_cache_controls(&value), 0);
     }
 
     #[test]

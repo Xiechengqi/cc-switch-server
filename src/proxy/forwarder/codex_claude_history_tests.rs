@@ -1,4 +1,4 @@
-// A strict loopback upstream reproduces the role-specific Responses 400 without
+// A strict loopback upstream rejects invalid roles, cache metadata and tool flags without
 // using a real OAuth credential or contacting OpenAI.
 #[tokio::test]
 async fn responses_message_text_types_claude_history_passes_strict_oauth_upstream() {
@@ -27,7 +27,16 @@ async fn assert_claude_history_passes_strict_oauth_upstream(tool_result_errors: 
             let invalid_error_flag = body["input"].as_array().unwrap().iter().enumerate().find_map(|(index, item)| {
                 (matches!(item["type"].as_str(), Some("function_call_output" | "custom_tool_call_output")) && item.get("is_error").is_some()).then_some(index)
             });
+            let invalid_cache = body["input"].as_array().unwrap().iter().enumerate().find_map(|(index,item)| {
+                item["content"].as_array().and_then(|parts| parts.iter().position(|part| part.get("cache_control").is_some()))
+                    .map(|part| format!("input[{index}].content[{part}].cache_control"))
+            });
             observed.lock().unwrap().push((headers, body));
+            if let Some(path) = invalid_cache {
+                return Response::builder().status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"error":{"message":format!("Unknown parameter: '{path}'."),"type":"invalid_request_error"}}).to_string())).unwrap();
+            }
             if let Some(index) = invalid_error_flag {
                 return Response::builder().status(StatusCode::BAD_REQUEST)
                     .header(CONTENT_TYPE, "application/json")
@@ -87,6 +96,17 @@ async fn assert_claude_history_passes_strict_oauth_upstream(tool_result_errors: 
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     assert!(rejected.text().await.unwrap().contains("output_text"));
 
+    let rejected = crate::infra::http::direct_client().unwrap()
+        .post(format!("http://{address}/v1/responses"))
+        .json(&json!({"input":[{"role":"user","content":[{"type":"input_text","text":"old","cache_control":{"type":"ephemeral"}}]}]}))
+        .send().await.unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert!(rejected
+        .text()
+        .await
+        .unwrap()
+        .contains("input[0].content[0].cache_control"));
+
     if tool_result_errors {
         let rejected = crate::infra::http::direct_client().unwrap()
             .post(format!("http://{address}/v1/responses"))
@@ -118,7 +138,7 @@ async fn assert_claude_history_passes_strict_oauth_upstream(tool_result_errors: 
         for block_content in [false, true] {
             let content = |text: &str| {
                 if block_content {
-                    json!([{"type":"text", "text":text}])
+                    json!([{"type":"text", "text":text, "cache_control":{"type":"ephemeral"}}])
                 } else {
                     json!(text)
                 }
@@ -193,12 +213,12 @@ async fn assert_claude_history_passes_strict_oauth_upstream(tool_result_errors: 
     let observations = observations.lock().unwrap();
     assert_eq!(
         observations.len(),
-        if tool_result_errors { 6 } else { 5 },
+        if tool_result_errors { 7 } else { 6 },
         "rejected probes plus exactly four forwarded calls"
     );
     for (headers, body) in observations
         .iter()
-        .skip(if tool_result_errors { 2 } else { 1 })
+        .skip(if tool_result_errors { 3 } else { 2 })
     {
         assert_eq!(
             headers.get("authorization").unwrap(),
