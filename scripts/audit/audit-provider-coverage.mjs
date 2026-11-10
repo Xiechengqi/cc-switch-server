@@ -491,6 +491,7 @@ function serverEvidenceNotes(qoderVerification) {
     "- Buddy health probes retain their deliberate one-token output cap. A Responses max_output_tokens terminal counts as probe completion only when the sent request has a positive cap and structured terminal type/status/reason plus usage prove it was reached. Other incomplete/error/truncated streams fail; inference retains response.incomplete without extra budget or retries.",
     "",
     "### `codebuddy_oauth` (CodeBuddy OAuth)",
+    "- Buddy tool arguments are validated against request-local object/required/basic-type contracts before release at strict DONE+EOF. Tool events are buffered within the request memory budget; ambiguous missing-index association fails closed. This is structural validation, not full JSON Schema validation or live CLI acceptance. See docs/provider/codebuddy-oauth.md §5.12.",
     "",
     "- Shares the bounded Codex Responses preamble exception, enhanced connection probe and product-aware 11128 diagnostics described in §5.11 of docs/provider/codebuddy-oauth.md. The live evidence belongs to the exact WorkBuddy CN binding; CodeBuddy and Intl remain separately live_pending.",
     "",

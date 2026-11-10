@@ -20294,6 +20294,9 @@ async fn send_codebuddy_generation(
     let mut decoder =
         super::codebuddy::CodeBuddySseDecoder::with_request_memory(request_memory.cloned())
             .map_err(CodeBuddyForwardAttemptError::Proxy)?;
+    decoder
+        .set_tool_contract(payload, &request_id)
+        .map_err(CodeBuddyForwardAttemptError::Proxy)?;
     if value_attempt_guard.is_some() {
         decoder.enable_value_usage();
     }
@@ -20311,6 +20314,11 @@ async fn send_codebuddy_generation(
             })?;
             raw_usage.push(&tail);
             decoder.sync_value_usage(raw_usage);
+            if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
+                return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
+                    "CodeBuddy Provider or bound account changed before response commit",
+                )));
+            }
             return Ok(PreparedCodeBuddyWireResponse {
                 inner,
                 decoder,
@@ -20705,6 +20713,13 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                 TokenUsage::default(),
                 Some("streaming"),
             ).await;
+            // The first released Buddy chunk can already contain the validated
+            // terminal. Commit before yielding: clients may drop immediately.
+            if wire.decoder.is_terminal() {
+                finish_qoder_stream_success(&mut interrupt_guard).await;
+                yield Ok::<Bytes, std::io::Error>(first_transformed);
+                return;
+            }
             yield Ok::<Bytes, std::io::Error>(first_transformed);
         }
         if wire.decoder.is_terminal() {

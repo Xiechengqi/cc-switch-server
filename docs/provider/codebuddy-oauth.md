@@ -961,3 +961,13 @@ Router 私有账号卡片第二行复用既有 `accountLabel`，与 Server 的 O
 推理档位选择与字段编码分离，继续使用实时目录默认档位及现有顶层 `reasoning_effort`。新版本、字段分支及模型仍需独立协议/真实回执，不凭外部实现自动启用。外部提交及暂不启用项见 `PROTOCOL_EVIDENCE.md`。
 
 Responses 工具桥接支持 namespace 内混合 function/custom：custom 使用字符串 input 参数封装，历史、tool_choice 与流式/非流式回包保留类型、名称和 namespace。非法子类型和身份碰撞仍拒绝；此桥接不提供上游原生 grammar 约束保证。2026-11-06 修复的本地验证及真实验收边界见 `PROTOCOL_EVIDENCE.md` 的 namespace 内 custom 工具条目。
+
+### 5.12 工具参数执行边界
+
+CodeBuddy/WorkBuddy 共用 SSE 解码器按本次实际生成请求的工具 schema 校验对象参数、required 和基础字段类型（递归 properties/items，深度有界）。这不是完整 JSON Schema 引擎。空 Bash `{}`、仅 cmd 字段、字符串/双重编码或 command 类型错误不能作为成功调用下发。不会猜测命令、重命名参数或添加重试/身份切换。
+
+从首个工具事件起暂存后续事件，严格 DONE+EOF 与参数检查通过后统一交付；之前的普通文本仍流式输出。暂存及解析计入请求内存预算并设大小上限。代价是工具参数交付延迟。缺索引只在显式 ID 或唯一调用可关联时补齐，歧义或 ID/index 冲突失败关闭。诊断仅含请求关联 ID、调用索引、字节数和固定错误分类，不记录参数值或 schema。
+
+2026-11-10 远程同账号 Messages/Chat 流式均观察到 Bash `{}`，非流式观察到完整 command；证明空参数可来自上游，但不证明必现或已定位上游内部原因。没有执行返回的命令。修复提供明确协议错误及数据边界保护，不保证上游每次生成有效参数。真实 Claude CLI 验收、CodeBuddy/国际站验证及部署均需单独记录。
+
+本次最终独立快照验证：Rust 全套 4360 passed / 3 ignored，含 8 项参数/关联/内存底层测试与双产品 Claude 流式/非流式 Bash HTTP 回环矩阵；Node 审计 2135 passed。格式（含 include! 文件）、Provider 覆盖和 UI 矩阵检查通过。cargo check 通过；本地 smoke 在 Cargo 启动锁超时后改用已构建候选二进制并保留原断言通过。离线 readiness failures=0，真实输入与部署未验证，状态仍 blocked_inputs。无远程部署或真实 CLI 执行验收。

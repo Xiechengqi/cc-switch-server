@@ -272,6 +272,7 @@ impl From<ProxyError> for CodeBuddySseDecodeError {
 
 #[derive(Debug, Default)]
 pub struct CodeBuddySseDecoder {
+    tool_guard: ToolContractGuard,
     buffer: Vec<u8>,
     saw_done: bool,
     saw_finish_reason: bool,
@@ -285,7 +286,29 @@ pub struct CodeBuddySseDecoder {
     value_usage: Option<super::streaming::StreamUsageAccumulator>,
 }
 
+include!("codebuddy/tool_contract.rs");
+
 impl CodeBuddySseDecoder {
+    pub(crate) fn set_tool_contract(
+        &mut self,
+        payload: &Value,
+        request_id: &str,
+    ) -> Result<(), ProxyError> {
+        let schemas = payload.get("tools").filter(|tools| tools.is_array());
+        if let Some(memory) = &self.buffer_memory {
+            memory
+                .resize(
+                    self.retained_bytes()
+                        .saturating_add(schemas.map_or(0, retained_json_bytes))
+                        .saturating_add(request_id.len()),
+                )
+                .map_err(|error| error.into_proxy_error())?;
+        }
+        self.tool_guard.enabled = true;
+        self.tool_guard.schemas = schemas.cloned().unwrap_or_else(|| json!([]));
+        self.tool_guard.request_id = request_id.to_owned();
+        Ok(())
+    }
     pub(crate) fn enable_value_usage(&mut self) {
         self.value_usage = Some(super::streaming::StreamUsageAccumulator::default());
     }
@@ -314,6 +337,7 @@ impl CodeBuddySseDecoder {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         self.buffer.capacity()
+            + self.tool_guard.retained_bytes()
             + self
                 .value_usage
                 .as_ref()
@@ -408,6 +432,22 @@ impl CodeBuddySseDecoder {
                 ProxyError::bad_gateway("CodeBuddy SSE ended without exactly one [DONE]").into(),
             );
         }
+        let _tool_parse_memory = self
+            .request_memory
+            .as_ref()
+            .map(|budget| {
+                budget.reserve(
+                    RequestMemoryComponent::NormalizedEvent,
+                    self.tool_guard
+                        .calls
+                        .values()
+                        .map(|call| call.arguments.len().saturating_mul(8))
+                        .sum(),
+                )
+            })
+            .transpose()
+            .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))?;
+        self.tool_guard.validate()?;
         self.complete = true;
         if let Some(timing) = self
             .request_memory
@@ -419,7 +459,10 @@ impl CodeBuddySseDecoder {
         let output_capacity = projected_vec_capacity(
             0,
             0,
-            canonical.len().saturating_add(b"data: [DONE]\n\n".len()),
+            canonical
+                .len()
+                .saturating_add(self.tool_guard.pending.len())
+                .saturating_add(b"data: [DONE]\n\n".len()),
         );
         let output_memory = self
             .request_memory
@@ -429,6 +472,7 @@ impl CodeBuddySseDecoder {
             .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))?;
         let mut output = Vec::with_capacity(output_capacity);
         output.extend_from_slice(&canonical);
+        output.append(&mut self.tool_guard.pending);
         output.extend_from_slice(b"data: [DONE]\n\n");
         self.sync_buffer_memory()?;
         let output = Bytes::from(output);
@@ -552,6 +596,7 @@ impl CodeBuddySseDecoder {
         if !sanitize_codebuddy_stream_chunk(&mut value, &mut self.sent_role)? {
             return Ok(());
         }
+        self.tool_guard.observe(&mut value)?;
         let object = value
             .as_object()
             .ok_or_else(|| ProxyError::bad_gateway("CodeBuddy SSE chunk must be an object"))?;
@@ -585,6 +630,32 @@ impl CodeBuddySseDecoder {
         let canonical = serde_json::to_vec(&value).map_err(|error| {
             ProxyError::bad_gateway(format!("encode CodeBuddy SSE chunk: {error}"))
         })?;
+        if !self.tool_guard.calls.is_empty() {
+            let additional = canonical.len().saturating_add(8);
+            if self.tool_guard.pending.len().saturating_add(additional) > MAX_AGGREGATE_BYTES {
+                return Err(ProxyError::bad_gateway(
+                    "CodeBuddy pending tool stream exceeds the limit",
+                )
+                .into());
+            }
+            if let Some(memory) = &self.buffer_memory {
+                memory
+                    .resize(
+                        self.retained_bytes()
+                            .saturating_sub(self.tool_guard.pending.capacity())
+                            .saturating_add(projected_vec_capacity(
+                                self.tool_guard.pending.capacity(),
+                                self.tool_guard.pending.len(),
+                                additional,
+                            )),
+                    )
+                    .map_err(|error| CodeBuddySseDecodeError::Protocol(error.into_proxy_error()))?;
+            }
+            self.tool_guard.pending.extend_from_slice(b"data: ");
+            self.tool_guard.pending.extend_from_slice(&canonical);
+            self.tool_guard.pending.extend_from_slice(b"\n\n");
+            return Ok(());
+        }
         reserve_vec_append(
             output_memory,
             output,
@@ -604,6 +675,7 @@ impl CodeBuddySseDecoder {
             memory
                 .resize(
                     projected_vec_capacity(self.buffer.capacity(), self.buffer.len(), additional)
+                        .saturating_add(self.tool_guard.retained_bytes())
                         .saturating_add(
                             self.value_usage
                                 .as_ref()

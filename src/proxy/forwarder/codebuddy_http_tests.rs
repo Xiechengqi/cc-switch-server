@@ -29,6 +29,7 @@ enum CodeBuddyGenerationReply {
     Success,
     SuccessZeroCache,
     EchoCustomTool,
+    BashArguments { valid: bool, prefix: bool },
     HttpUnauthorized,
     HttpUnauthorizedWithLimitCode,
     HttpUnauthorizedWithTerminalCode(i64),
@@ -368,7 +369,8 @@ fn zero_cache_success_response() -> Response {
 
 fn large_memory_response(include_text: bool) -> Response {
     let fragment = "x".repeat(1_024);
-    let mut chunks = Vec::with_capacity(98);
+    let mut chunks = Vec::with_capacity(99);
+    chunks.push(chat_chunk("memory-prefix", None));
     for index in 0..96 {
         chunks.push(Bytes::from(format!(
             "data: {}\n\n",
@@ -418,6 +420,9 @@ async fn codebuddy_generation(
         .pointer("/tools/0/function/name")
         .cloned()
         .unwrap_or(Value::Null);
+    let custom_input = body
+        .pointer("/tools/0/function/parameters/properties/input")
+        .is_some();
     if let Some(dir) = state.value_admission_dir.lock().unwrap().as_ref() {
         let db = rusqlite::Connection::open(crate::repository::server_sqlite::database_path(dir))
             .unwrap();
@@ -451,7 +456,31 @@ async fn codebuddy_generation(
         .unwrap_or(CodeBuddyGenerationReply::Success);
     match reply {
         CodeBuddyGenerationReply::Value(value) => workbuddy_value_reply(value),
-        CodeBuddyGenerationReply::Success => success_response(),
+        CodeBuddyGenerationReply::BashArguments { valid, prefix } => {
+            let mut chunks = Vec::new();
+            if prefix { chunks.push(chat_chunk("before-tool", None)); }
+            chunks.push(Bytes::from(format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"bash-call","type":"function","function":{"name":"Bash","arguments":if valid {"{\"command\":\"printf fixture\"}"} else {"{}"}}}]},"finish_reason":"tool_calls"}]}))));
+            chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
+            sse_response(chunks)
+        },
+        CodeBuddyGenerationReply::Success if first_tool_name == "lookup" && !custom_input => success_response(),
+        CodeBuddyGenerationReply::Success if custom_input => sse_response(vec![
+            Bytes::from(format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-custom","type":"function","function":{"name":first_tool_name,"arguments":"{\"input\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}))),
+            Bytes::from_static(b"data: [DONE]\n\n")
+        ]),
+        CodeBuddyGenerationReply::Success => {
+            // Text-only requests must not receive undeclared lookup calls.
+            let mut chunks = Vec::new();
+            for chunk in tool_chunks() {
+                let text = std::str::from_utf8(&chunk).unwrap();
+                let mut value: Value = serde_json::from_str(text.trim().strip_prefix("data: ").unwrap()).unwrap();
+                if let Some(delta) = value.pointer_mut("/choices/0/delta").and_then(Value::as_object_mut) { delta.remove("tool_calls"); }
+                if value.pointer("/choices/0/finish_reason") == Some(&json!("tool_calls")) { value["choices"][0]["finish_reason"] = json!("stop"); }
+                chunks.push(Bytes::from(format!("data: {value}\n\n")));
+            }
+            chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
+            sse_response(chunks)
+        },
         CodeBuddyGenerationReply::EchoCustomTool => sse_response(vec![
             Bytes::from(format!("data: {}\n\n", json!({"id":"chatcmpl-custom", "choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-custom","type":"function","function":{"name":first_tool_name,"arguments":"{\"input\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}))),
             Bytes::from_static(b"data: [DONE]\n\n")
@@ -578,7 +607,11 @@ async fn codebuddy_generation(
         CodeBuddyGenerationReply::TruncatedBeforeDone => {
             sse_response(vec![chat_chunk("truncated", None)])
         }
-        CodeBuddyGenerationReply::UsageTailBeforeDoneTruncated => sse_response(tool_chunks()),
+        CodeBuddyGenerationReply::UsageTailBeforeDoneTruncated => {
+            let mut chunks = vec![chat_chunk("before-tool", None)];
+            chunks.extend(tool_chunks());
+            sse_response(chunks)
+        },
         CodeBuddyGenerationReply::StallBeforeDone => stalling_sse_response(
             chat_chunk("cancel-before-done", None),
             Arc::clone(&state.upstream_body_dropped),
@@ -3330,3 +3363,66 @@ fn codebuddy_core03_headers_and_committed_cancel_or_truncation_keep_last_owner_a
 }
 
 include!("codebuddy_image_tests.rs");
+
+#[test]
+fn buddy_claude_bash_required_command_is_checked_before_tool_delivery() {
+    run_codebuddy_async_test(async {
+        for product in [ProviderType::CodeBuddyOAuth, ProviderType::WorkBuddyOAuth] {
+            for streaming in [false, true] {
+                for (valid, prefix) in [(true, false), (false, false), (false, true)] {
+                    let (address, fixture, server) = spawn_codebuddy_upstream(
+                        CodeBuddySite::Cn,
+                        vec![CodeBuddyGenerationReply::BashArguments { valid, prefix }],
+                    )
+                    .await;
+                    let state = codebuddy_test_state("buddy-bash-contract");
+                    let (id, _) = install_buddy_provider(
+                        &state,
+                        product,
+                        "bash-contract",
+                        AppKind::Claude,
+                        CodeBuddySite::Cn,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    install_codebuddy_share(
+                        &state,
+                        "bash-share",
+                        AppKind::Claude,
+                        &id,
+                        "owner@example.com",
+                    )
+                    .await;
+                    let result = super::forward_for_test_surface(state.clone(), ProxyRoute::ClaudeMessages, id, None,
+                        codebuddy_headers("bash-share", "owner@example.com", "bash-fixture"),
+                        Bytes::from(json!({"model":"auto","max_tokens":2048,"stream":streaming,
+                            "messages":[{"role":"user","content":"fixture"}],
+                            "tools":[{"name":"Bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}],
+                            "tool_choice":{"type":"tool","name":"Bash"}
+                        }).to_string())).await;
+                    if valid {
+                        let response = result.unwrap();
+                        let body = String::from_utf8(collect(response).await).unwrap();
+                        assert!(body.contains("command"), "{body}");
+                        assert!(body.contains("printf fixture"), "{body}");
+                        assert!(!body.contains("event: error"), "{body}");
+                    } else if streaming && prefix {
+                        let body = String::from_utf8(collect(result.unwrap()).await).unwrap();
+                        assert!(body.contains("event: error"), "{body}");
+                        assert!(!body.contains("tool_use"), "{body}");
+                    } else {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+                        assert!(
+                            error.message.contains("missing_required_tool_argument"),
+                            "{error:?}"
+                        );
+                    }
+                    assert_eq!(fixture.count(&fixture.generation_requests), 1);
+                    assert_eq!(fixture.count(&fixture.refresh_requests), 0);
+                    server.abort();
+                }
+            }
+        }
+    });
+}

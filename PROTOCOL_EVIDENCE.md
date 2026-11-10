@@ -3021,3 +3021,13 @@ Server 的 Anthropic→Responses 转换原来把 assistant 历史文本也固定
 实现：共享 Responses 工具上下文以 Custom 类型和独立 namespace 保存身份；namespace 内 function/custom 分别编码，custom 使用现有字符串 input 桥接；Chat/Anthropic 回程及流式工具项恢复原始名称、namespace、custom 类型。Grok 专用 namespace 规范化复用其既有 custom 桥接。工具选择器仍严格匹配类型和 namespace，非法子类型及别名碰撞仍拒绝；历史不能赋予当前声明权限，显式工具重置语义不变。不增加多层 namespace、宿主工具执行、grammar 引擎、模型权限或身份切换。
 
 验证：在基于 `84834ed`、仅包含本次修复的隔离 worktree 中，4 项定向回归（含双产品、双站点、流式/非流式 HTTP 回环）、完整 Rust all-targets 共 4,339 项通过（另 3 项 ignored）、2,135 项 Node 审计、Clippy all-targets（warnings denied）、cargo check、构建、文档测试（0 用例）、cargo fmt 和全部 include 源文件 rustfmt 检查、Provider 覆盖/UI 矩阵/Phase 0 合同/文档索引均通过。服务 smoke 首次 cargo run 启动窗口未连通，期间存在构建锁竞争；改为直接启动本轮已构建二进制后，原脚本全部 HTTP 断言通过，未修改仓库 smoke 脚本。离线 readiness 为 blocked_inputs，failures=0；缺真实输入及部署验收，RUN_TESTS=0 导致其内部 local-contracts-unverified，不等于上述独立本地检查失败。主工作区存在并行 Trae 修改，验证结论仅覆盖隔离快照。本地合成与 HTTP 回环不代表生产 Codex CLI 或真实 WorkBuddy 账号验收，未部署。
+
+### 2026-11-10 Buddy 工具参数执行边界
+
+远程同一绑定账号的 Messages 流式请求与原生 Chat 流式请求均观察到 Bash 参数 `{}`；同账号非流式请求返回完整 command。该证据证明空参数可来自上游，不能归因于 Claude 转换器单点丢失，也不证明故障必现。没有执行模型返回的命令。
+
+Server 在 Buddy 共用 SSE 解码器中按本次生成请求的工具 schema 校验 JSON 对象、required 与基础字段类型（含嵌套 properties/items），不声称完整 JSON Schema 校验。自首个工具事件起暂存后续事件，直到严格 DONE+EOF 与参数检查通过才交付，避免调用块提前结束；保留内存预算和上限。失败诊断仅含请求关联 ID、索引、字节数和固定错误分类，不包含参数值。缺索引片段仅在 ID 或单一活动调用明确时关联，歧义拒绝，不采用 Hub/cli2api 的默认 index=0 规则。
+
+参考快照：workbuddy2api-hub `269385d` 的 wb_proxy.py 与 Anthropic 测试、cli2api `da74ec3` 的 internal/providers/workbuddy/sse.go；其宽松索引规则未迁入。Hub 的 Bash cmd fixture 不等于 Claude CLI required command 合同。此改动不添加重试、指令猜测、模型切换或账号切换。真实 Claude CLI 验收与发布仍待独立完成。
+
+本次最终独立快照验证：Rust 全套 4360 passed / 3 ignored，含 8 项参数/关联/内存底层测试与双产品 Claude 流式/非流式 Bash HTTP 回环矩阵；Node 审计 2135 passed。格式（含 include! 文件）、Provider 覆盖和 UI 矩阵检查通过。cargo check 通过；本地 smoke 在 Cargo 启动锁超时后改用已构建候选二进制并保留原断言通过。离线 readiness failures=0，真实输入与部署未验证，状态仍 blocked_inputs。无远程部署或真实 CLI 执行验收。
