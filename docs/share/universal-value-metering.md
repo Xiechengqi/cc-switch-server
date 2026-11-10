@@ -76,4 +76,6 @@ CI 应执行新增的资源计划/证据、audio 去重及长上下文、持久�
 
 接续 CI 修正迁移表数和未来版本断言、SQLite authority 激活顺序及 DeepSeek 完整执行模型价目夹具。Web Session 缺价按执行模型诊断，WorkBuddy 不支持的图片由模型能力校验拒绝；非认证限流且无用量证据仍按未知保守结算，相应回归按这些规则断言。
 
+非美元 WebSocket turn 在金额准入入口直接返回，避免握手后为大消息额外序列化和持久化而阻塞控制帧或取消；大消息 Ping 与取消回归接入 CI，沿用原有延迟门槛。
+
 复核状态写入仍经 ServerStateInner 域方法封装，未新增存储锁逆序、Provider 凭据白名单或钱包写入。严格 Clippy（全部目标）、两端类型检查、include! 源格式、Provider writer 证据、Registry/USD 覆盖、SQLite authority、Web 边界和文档索引静态检查通过。发布门槛仍包括 CI 产品回归与上述真实灰度，不能以静态覆盖代替。

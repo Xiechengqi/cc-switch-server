@@ -12405,6 +12405,21 @@ impl ResponsesWebsocketUsageTurn {
     async fn admit_generation(&mut self, body: &Value) -> Result<(), ProxyError> {
         // Reconnecting to an existing response does not call this method.
         // Every actual new generation, including HTTP fallback, does.
+        // Keep non-USD turns out of monetary serialization and persistence.
+        // The upstream handshake has completed, so serializing a large frame
+        // here would block control frames and cancellation on the bridge.
+        let value_metering = match (
+            self.request_context.share_id.as_deref(),
+            self.request_context.user_email.as_deref(),
+        ) {
+            (Some(share), Some(email)) => {
+                self.state.share_uses_value_quota(share, Some(email)).await
+            }
+            _ => false,
+        };
+        if !value_metering {
+            return Ok(());
+        }
         if self.generation_count > 0 {
             let raw = self
                 .accumulator

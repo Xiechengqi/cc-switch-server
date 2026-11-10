@@ -78,6 +78,7 @@ jobs:
           cargo test --locked domain::usage::value_pricing:: --lib
           cargo test --locked value_quota --lib
           cargo test --locked workbuddy_value --lib
+          cargo test --locked codex_websocket_large_upload --lib -- --test-threads=1
 
   # The committed web-dist can lag web-src. Generate release assets once and
   # pass exactly those bytes to both architecture builds.
