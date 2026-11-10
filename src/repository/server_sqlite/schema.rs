@@ -280,7 +280,10 @@ mod tests {
     fn quota_higher_schema_or_changed_migration_is_never_downgraded() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
-        connection.execute_batch("PRAGMA user_version=5;").unwrap();
+        let future_version = super::super::SCHEMA_VERSION + 1;
+        connection
+            .pragma_update(None, "user_version", future_version)
+            .unwrap();
         assert!(migrate_to_current(&connection)
             .unwrap_err()
             .to_string()
@@ -289,7 +292,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            future_version
         );
         connection.execute_batch("PRAGMA user_version=2; UPDATE schema_migrations SET checksum='modified' WHERE version=1;").unwrap();
         assert!(migrate_to_current(&connection).is_err());
