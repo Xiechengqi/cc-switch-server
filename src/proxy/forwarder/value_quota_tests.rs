@@ -458,9 +458,14 @@ async fn value_quota_deepseek_cached_recovery_admits_each_real_generation() {
         format!("http://{address}"),
     )
     .await;
-    // This helper installs a runtime-only Provider; persist it through the
-    // domain writer before the Share creates its SQLite foreign key.
-    state.mutate_providers_immediate(|_| ()).await.unwrap();
+    // The runtime helper builds a legacy S1 Provider. Promote it to encrypted
+    // S2 through the domain writer before the Share creates its SQLite foreign key.
+    let config_dir = state.config_dir.clone();
+    state
+        .try_mutate_providers_immediate(move |providers| providers.promote_to_s2(&config_dir))
+        .await
+        .unwrap()
+        .unwrap();
     let share_id = "value-deepseek-share";
     install_antigravity_test_share(
         &state,
