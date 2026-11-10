@@ -2529,19 +2529,11 @@ async fn forward_with_attempt_inner(
                 .await
         } else {
             false
-        } && (matches!(
-            route,
-            ProxyRoute::ClaudeMessages
-                | ProxyRoute::CodexChatCompletions
-                | ProxyRoute::CodexResponses
-                | ProxyRoute::CodexResponsesCompact
-        ) || (route == ProxyRoute::Gemini
-            && gemini_path.as_deref().is_some_and(|path| {
-                matches!(
-                    path.rsplit(':').next(),
-                    Some("generateContent" | "streamGenerateContent")
-                )
-            })));
+        } && route != ProxyRoute::ClaudeCountTokens
+            && !(route == ProxyRoute::Gemini
+                && gemini_path
+                    .as_deref()
+                    .is_some_and(|path| path.rsplit(':').next() == Some("countTokens")));
         let value_text_capable = crate::domain::usage::value_pricing::supports_value_text_runtime(
             execution.plan.profile_id.as_str(),
             execution.plan.driver_id.as_str(),

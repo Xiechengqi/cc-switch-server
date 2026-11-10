@@ -182,6 +182,11 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                 // Verify the durable IMMEDIATE admission exists before the
                 // upstream sees the first byte, not merely after settlement.
                 let db = rusqlite::Connection::open(server_sqlite::database_path(&config_dir)).unwrap();
+                if uri.path().ends_with(":countTokens") {
+                    assert_eq!(db.query_row("SELECT count(*) FROM value_quota_attempts", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+                    return Response::builder().header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({"totalTokens":7}).to_string())).unwrap();
+                }
                 let pending: (String, String) = db.query_row(
                     "SELECT pending_risk_picos,metering_status FROM value_quota_attempts ORDER BY watermark DESC LIMIT 1",
                     [], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -275,7 +280,31 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                     );
 
                     if app == AppKind::Gemini {
-                        for action in ["countTokens", "embedContent", "batchGenerateContent"] {
+                        if protocol.is_none() || protocol == Some("gemini_native") {
+                            let response = forward(
+                                state.clone(),
+                                route,
+                                Some("models/text-model:countTokens".into()),
+                                headers.clone(),
+                                Bytes::from(serde_json::to_vec(&request).unwrap()),
+                            )
+                            .await
+                            .unwrap();
+                            assert_eq!(response.status(), StatusCode::OK);
+                            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                                .await
+                                .unwrap();
+                            assert_eq!(
+                                serde_json::from_slice::<Value>(&body).unwrap()["totalTokens"],
+                                7
+                            );
+                            assert_eq!(calls.load(Ordering::SeqCst), 0);
+                            let status =
+                                ledger::status(&state.config_dir, &scope, &window).unwrap();
+                            assert_eq!(status.pending_risk_picos, "0");
+                            assert_eq!(status.observed_picos, "0");
+                        }
+                        for action in ["embedContent", "batchGenerateContent"] {
                             let error = forward(
                                 state.clone(),
                                 route,
@@ -419,12 +448,19 @@ async fn value_quota_deepseek_cached_recovery_admits_each_real_generation() {
     let (address, observations, server) =
         spawn_deepseek_session_fixture(DeepSeekSessionFixtureMode::RebuildCachedSession).await;
     let state = forwarder_test_state("value-deepseek-rebuild");
+    state
+        .configure_value_quota_router_for_test("value-deepseek-install")
+        .await;
+    server_sqlite::activate_authority(&state.config_dir).unwrap();
     let (provider_id, _) = install_deepseek_forwarder_test_provider(
         &state,
         "value-deepseek-rebuild",
         format!("http://{address}"),
     )
     .await;
+    // This helper installs a runtime-only Provider; persist it through the
+    // domain writer before the Share creates its SQLite foreign key.
+    state.mutate_providers_immediate(|_| ()).await.unwrap();
     let share_id = "value-deepseek-share";
     install_antigravity_test_share(
         &state,
@@ -434,10 +470,6 @@ async fn value_quota_deepseek_cached_recovery_admits_each_real_generation() {
         &provider_id,
     )
     .await;
-    state
-        .configure_value_quota_router_for_test("value-deepseek-install")
-        .await;
-    server_sqlite::activate_authority(&state.config_dir).unwrap();
     let config = state.config_snapshot().await;
     let scope = ledger::Scope {
         router_url: config.router_api_base().unwrap().into(),

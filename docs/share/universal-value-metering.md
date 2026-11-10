@@ -78,4 +78,6 @@ CI 应执行新增的资源计划/证据、audio 去重及长上下文、持久�
 
 非美元 WebSocket turn 在金额准入入口直接返回，避免握手后为大消息额外序列化和持久化而阻塞控制帧或取消；大消息 Ping 与取消回归接入 CI，沿用原有延迟门槛。
 
+辅助操作按明确入口豁免：Claude count_tokens 与 Gemini countTokens 不创建金额 attempt；未实现美元计量的 Gemini embedding、batch 等操作在发包前拒绝，不能因不属于文本生成入口而绕过准入。
+
 复核状态写入仍经 ServerStateInner 域方法封装，未新增存储锁逆序、Provider 凭据白名单或钱包写入。严格 Clippy（全部目标）、两端类型检查、include! 源格式、Provider writer 证据、Registry/USD 覆盖、SQLite authority、Web 边界和文档索引静态检查通过。发布门槛仍包括 CI 产品回归与上述真实灰度，不能以静态覆盖代替。
