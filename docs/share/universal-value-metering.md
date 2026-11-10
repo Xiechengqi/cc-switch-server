@@ -1,6 +1,6 @@
 # 全供应商美元等值额度
 
-> 状态：权威实现规范。仅静态验证；CI 产品回归与生产灰度独立待完成，全部真实 Provider/App 验收保持 `live_pending`。未部署。
+> 状态：权威实现规范。本地仅静态验证，产品回归由 GitHub CI 执行；生产灰度独立待完成，全部真实 Provider/App 验收保持 `live_pending`。未部署。
 
 美元表示平台执行价目中的 API 等值用量。OAuth 订阅、积分、百分比和实际成本不参与美元换算；钱包、租金和 Provider 收益沿用原合同。已有 Token 和 v1 策略不会因升级而改变。
 
@@ -73,5 +73,7 @@ CI 应执行新增的资源计划/证据、audio 去重及长上下文、持久�
 ## 整体 review 记录
 
 本轮 review 修正内部重试漏 attempt、准备阶段过早标记已发送、用户间资源 readiness 干扰、定时策略缺价激活、异步失败与估算资源计数低估、发送后新资源缺价以及历史 v2 ACK 版本依据丢失。新增回归进入 CI，包含 schema 5 回执、资源修订和窗口隔离；本地只编译目标。
+
+接续 CI 修正迁移表数和未来版本断言、SQLite authority 激活顺序及 DeepSeek 完整执行模型价目夹具。Web Session 缺价按执行模型诊断，WorkBuddy 不支持的图片由模型能力校验拒绝；非认证限流且无用量证据仍按未知保守结算，相应回归按这些规则断言。
 
 复核状态写入仍经 ServerStateInner 域方法封装，未新增存储锁逆序、Provider 凭据白名单或钱包写入。严格 Clippy（全部目标）、两端类型检查、include! 源格式、Provider writer 证据、Registry/USD 覆盖、SQLite authority、Web 边界和文档索引静态检查通过。发布门槛仍包括 CI 产品回归与上述真实灰度，不能以静态覆盖代替。

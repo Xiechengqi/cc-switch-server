@@ -372,7 +372,7 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                             &state,
                             AppKind::Codex,
                             "perplexity",
-                            format!("http://{address}/unverified-web-session"),
+                            format!("http://{address}/unpriced-web-session"),
                             1,
                         )
                         .await;
@@ -399,9 +399,10 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                         .unwrap_err();
                         assert_eq!(
                             error.error_code(),
-                            "quota_unavailable",
-                            "native compatibility type must not bypass the Web Session gate"
+                            "price_unavailable",
+                            "the Web Session execution model needs its own explicit price"
                         );
+                        assert!(error.message.contains("model_unpriced"), "{error:?}");
                         assert_eq!(calls.load(Ordering::SeqCst), 1);
                     }
                     server.abort();
@@ -451,9 +452,11 @@ async fn value_quota_deepseek_cached_recovery_admits_each_real_generation() {
     .unwrap();
     let mut snapshot: PricingSnapshot =
         serde_json::from_value(fixture["snapshot"].clone()).unwrap();
-    snapshot
-        .exact_aliases
-        .insert("deepseek-v4-pro".into(), "text-model".into());
+    for model in ["deepseek-v4-pro", "deepseek-v4-flash"] {
+        snapshot
+            .exact_aliases
+            .insert(model.into(), "text-model".into());
+    }
     let revision = snapshot.revision().unwrap();
     ledger::install_snapshot(
         &state.config_dir,

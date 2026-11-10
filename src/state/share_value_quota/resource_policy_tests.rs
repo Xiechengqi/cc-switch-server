@@ -11,6 +11,7 @@ async fn value_quota_resource_readiness_is_per_grant_and_fences_scheduled_activa
     state
         .configure_value_quota_router_for_test("resource-policy-install")
         .await;
+    server_sqlite::activate_authority(&state.config_dir).unwrap();
     state
         .upsert_provider_command(
             AppKind::Codex,
@@ -23,7 +24,6 @@ async fn value_quota_resource_readiness_is_per_grant_and_fences_scheduled_activa
         .await
         .unwrap()
         .unwrap();
-    server_sqlite::activate_authority(&state.config_dir).unwrap();
     state
         .mutate_shares_immediate(|store| {
             store

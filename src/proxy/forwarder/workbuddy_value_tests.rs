@@ -12,7 +12,7 @@ enum WorkBuddyValueReply {
     HttpErrorUsage,
     HttpErrorPartialUsage,
     HttpAuthOutput,
-    DeclaredRejection,
+    DeclaredRateLimit,
     Truncated,
     EmptyTruncated,
     NoUsage,
@@ -28,7 +28,7 @@ fn workbuddy_value_reply(reply: WorkBuddyValueReply) -> Response {
                 "choices":[{"index":0,"message":{"role":"assistant","content":"already generated"}}]}).to_string()))
             .unwrap();
     }
-    if reply == WorkBuddyValueReply::DeclaredRejection {
+    if reply == WorkBuddyValueReply::DeclaredRateLimit {
         let body = async_stream::stream! {
             yield Ok::<_, std::io::Error>(Bytes::from("data: {\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n"));
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -445,7 +445,8 @@ fn workbuddy_value_missing_prices_opaque_models_and_media_never_generate() {
             assert!(error.message.contains(reason), "{}", error.message);
         }
         let error=super::forward_for_test_surface(state.clone(),route,provider,None,codebuddy_headers("workbuddy-value-share","owner@example.com","media"),Bytes::from(json!({"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://invalid.example/image.png"}}]}]}).to_string())).await.unwrap_err();
-        assert_eq!(error.error_code(), "quota_unavailable");
+        assert_eq!(error.error_code(), "cc_switch_invalid_request");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert_eq!(fixture.count(&fixture.generation_requests), 0);
         server.abort();
     });
@@ -511,14 +512,14 @@ fn workbuddy_value_conflicting_missing_error_and_partial_evidence_settles_conser
 }
 
 #[test]
-fn workbuddy_value_declared_rejections_without_generation_are_free() {
+fn workbuddy_value_non_auth_rejections_without_usage_remain_unknown() {
     run_codebuddy_async_test(async {
         for streaming in [false, true] {
             let route = ProxyRoute::CodexChatCompletions;
             let (state, provider, fixture, server, _) = workbuddy_value_setup(
                 route,
                 vec![CodeBuddyGenerationReply::Value(
-                    WorkBuddyValueReply::DeclaredRejection,
+                    WorkBuddyValueReply::DeclaredRateLimit,
                 )],
                 "1000000",
             )
@@ -534,9 +535,14 @@ fn workbuddy_value_declared_rejections_without_generation_are_free() {
             if let Ok(response) = result {
                 collect(response).await;
             }
+            let (used, pending, metering, attempts) = workbuddy_value_totals(&state);
+            assert_ne!(
+                used, "0",
+                "a rate limit without usage does not prove no execution"
+            );
             assert_eq!(
-                workbuddy_value_totals(&state),
-                ("0".into(), "0".into(), "observed".into(), 1)
+                (pending, metering, attempts),
+                ("0".into(), "conservative".into(), 1)
             );
             assert_eq!(fixture.count(&fixture.generation_requests), 1);
             assert_eq!(fixture.count(&fixture.refresh_requests), 0);
