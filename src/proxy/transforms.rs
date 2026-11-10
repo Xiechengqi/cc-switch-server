@@ -3475,6 +3475,56 @@ pub(super) fn normalize_responses_message_text_parts(item: &mut Value) {
     }
 }
 
+const RESPONSES_TOOL_EXECUTION_FAILED: &str = "[Tool execution failed]";
+
+// Responses has no top-level tool-result failure flag. Preserve explicit
+// failures in legal output content; nested business JSON remains opaque.
+fn responses_tool_output_with_error(output: Value, is_error: Option<&Value>) -> Value {
+    if is_error.and_then(Value::as_bool) != Some(true) {
+        return output;
+    }
+    match output {
+        Value::String(text) if !text.is_empty() => {
+            Value::String(format!("{RESPONSES_TOOL_EXECUTION_FAILED}\n{text}"))
+        }
+        Value::String(_) | Value::Null => Value::String(RESPONSES_TOOL_EXECUTION_FAILED.into()),
+        Value::Array(mut parts) => {
+            parts.insert(
+                0,
+                json!({"type":"input_text", "text":RESPONSES_TOOL_EXECUTION_FAILED}),
+            );
+            Value::Array(parts)
+        }
+        // Malformed output is not a license to serialize or rewrite arbitrary
+        // objects. Leave its existing validation/handling to the target path.
+        other => other,
+    }
+}
+
+/// Repair only known Responses tool-output items. Removing the legacy flag
+/// makes repeated normalization idempotent without inspecting user text.
+pub(super) fn normalize_responses_tool_result_error(item: &mut Value) {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call_output" | "custom_tool_call_output")
+    ) {
+        return;
+    }
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    let Some(is_error) = object.remove("is_error") else {
+        return;
+    };
+    if is_error.as_bool() == Some(true) {
+        let output = object.remove("output").unwrap_or(Value::Null);
+        object.insert(
+            "output".into(),
+            responses_tool_output_with_error(output, Some(&is_error)),
+        );
+    }
+}
+
 fn openai_chat_content_to_responses_content(role: &str, content: Option<&Value>) -> Vec<Value> {
     let text_type = responses_text_part_type(role);
     let Some(content) = content else {
@@ -5647,18 +5697,22 @@ fn anthropic_message_to_openai_response_items(message: &Value) -> Vec<Value> {
                     .unwrap_or("tool");
                 let output = block.get("content").cloned().unwrap_or(Value::Null);
                 let extraction = extract_tool_media(&output, ToolMediaScope::ResponsesNative);
-                let mut item = json!({
+                let text = extraction
+                    .as_ref()
+                    .map(|value| sanitized_tool_text(&value.sanitized))
+                    .unwrap_or_else(|| sanitized_tool_text(&output));
+                let result = if output.is_null()
+                    && block.get("is_error").and_then(Value::as_bool) == Some(true)
+                {
+                    Value::Null
+                } else {
+                    Value::String(text)
+                };
+                items.push(json!({
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": extraction
-                        .as_ref()
-                        .map(|value| sanitized_tool_text(&value.sanitized))
-                        .unwrap_or_else(|| sanitized_tool_text(&output))
-                });
-                if let Some(is_error) = block.get("is_error") {
-                    item["is_error"] = is_error.clone();
-                }
-                items.push(item);
+                    "output": responses_tool_output_with_error(result, block.get("is_error"))
+                }));
                 if let Some(extraction) = extraction {
                     queue_responses_tool_media(&mut pending_media, call_id, &extraction.media);
                 }
@@ -9058,6 +9112,106 @@ mod tests {
         .unwrap();
 
         assert_eq!(output["max_tokens"], DEFAULT_OPENAI_TO_ANTHROPIC_MAX_TOKENS);
+    }
+
+    #[test]
+    fn responses_tool_result_error_conversion_preserves_failure_and_history() {
+        for flag in [
+            None,
+            Some(json!(false)),
+            Some(json!(true)),
+            Some(json!(null)),
+            Some(json!("true")),
+            Some(json!(1)),
+        ] {
+            for content in [
+                None,
+                Some(Value::Null),
+                Some(json!("")),
+                Some(json!("Permission denied")),
+                Some(json!([{"type":"text","text":"failed", "data":{"is_error":true}}])),
+            ] {
+                let mut result = json!({"type":"tool_result","tool_use_id":"call_1"});
+                if let Some(flag) = &flag {
+                    result["is_error"] = flag.clone();
+                }
+                if let Some(content) = &content {
+                    result["content"] = content.clone();
+                }
+                let request = json!({"model":"fixture", "messages":[
+                    {"role":"user", "content":"run lookup"},
+                    {"role":"assistant", "content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{"is_error":true}}]},
+                    {"role":"user", "content":[result]}
+                ]});
+                for instructions in [false, true] {
+                    let converted =
+                        anthropic_to_openai_responses_with_system_mode(&request, instructions)
+                            .unwrap();
+                    let items = converted["input"].as_array().unwrap();
+                    assert_eq!(items.len(), 3);
+                    assert_eq!(items[1]["arguments"], r#"{"is_error":true}"#);
+                    let output = &items[2];
+                    assert_eq!(output["type"], "function_call_output");
+                    assert_eq!(output["call_id"], "call_1");
+                    assert!(output.get("is_error").is_none(), "{output}");
+                    let original = content.clone().unwrap_or(Value::Null);
+                    let text = sanitized_tool_text(&original);
+                    let expected = if flag == Some(json!(true)) {
+                        if original.is_null() || text.is_empty() {
+                            "[Tool execution failed]".to_string()
+                        } else {
+                            format!("[Tool execution failed]\n{text}")
+                        }
+                    } else {
+                        text
+                    };
+                    assert_eq!(output["output"], expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responses_tool_result_error_conversion_preserves_media_and_parallel_results() {
+        let request = json!({"model":"fixture", "messages":[
+            {"role":"assistant", "content":[
+                {"type":"tool_use","id":"a","name":"lookup","input":{}},
+                {"type":"tool_use","id":"b","name":"lookup","input":{}}
+            ]},
+            {"role":"user", "content":[
+                {"type":"tool_result","tool_use_id":"a","is_error":true,"content":[
+                    {"type":"text","text":"capture failed"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+                ]},
+                {"type":"tool_result","tool_use_id":"b","is_error":false,"content":"ok"}
+            ]}
+        ]});
+        let converted = anthropic_to_openai_responses_with_instructions(&request).unwrap();
+        let items = converted["input"].as_array().unwrap();
+        assert_eq!(items[0]["call_id"], "a");
+        assert_eq!(items[1]["call_id"], "b");
+        assert_eq!(items[2]["call_id"], "a");
+        assert!(items[2]["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Tool execution failed]\n"));
+        assert!(items[2]["output"]
+            .as_str()
+            .unwrap()
+            .contains("capture failed"));
+        assert_eq!(items[3]["call_id"], "b");
+        assert_eq!(items[3]["output"], "ok");
+        assert_eq!(items[4]["role"], "user");
+        assert!(items[4]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["image_url"] == "data:image/png;base64,AA=="));
+        assert!(items.iter().all(|item| item.get("is_error").is_none()));
+        // The source/native Anthropic protocol still retains its failure flag.
+        assert_eq!(request["messages"][1]["content"][0]["is_error"], true);
+        let native = anthropic_tool_result_block("a", &json!("denied"), Some(&json!(true)));
+        assert_eq!(native["is_error"], true);
     }
 
     #[test]

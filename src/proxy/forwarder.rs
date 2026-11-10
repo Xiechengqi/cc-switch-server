@@ -29061,6 +29061,7 @@ fn sanitize_codex_oauth_request_body(body: &mut Value) {
         for item in input {
             sanitize_codex_oauth_input_item_metadata(item);
             super::transforms::normalize_responses_message_text_parts(item);
+            super::transforms::normalize_responses_tool_result_error(item);
             if item.get("type").and_then(Value::as_str) == Some("function_call") {
                 if let Some(Value::String(arguments)) = item.get_mut("arguments") {
                     if arguments.trim().is_empty() {
@@ -32255,6 +32256,7 @@ fn count_tokens_metric_outcome(status: StatusCode) -> &'static str {
 mod tests {
     include!("forwarder/codex_claude_history_tests.rs");
     include!("forwarder/codex_message_content_tests.rs");
+    include!("forwarder/codex_tool_result_error_tests.rs");
     include!("forwarder/codex_r4_tests.rs");
     include!("forwarder/claude_timing_tests.rs");
     include!("forwarder/antigravity_timing_tests.rs");

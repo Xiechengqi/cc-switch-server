@@ -2,6 +2,10 @@
 // using a real OAuth credential or contacting OpenAI.
 #[tokio::test]
 async fn responses_message_text_types_claude_history_passes_strict_oauth_upstream() {
+    assert_claude_history_passes_strict_oauth_upstream(false).await;
+}
+
+async fn assert_claude_history_passes_strict_oauth_upstream(tool_result_errors: bool) {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -20,7 +24,15 @@ async fn responses_message_text_types_claude_history_passes_strict_oauth_upstrea
                         })
                     })
             });
+            let invalid_error_flag = body["input"].as_array().unwrap().iter().enumerate().find_map(|(index, item)| {
+                (matches!(item["type"].as_str(), Some("function_call_output" | "custom_tool_call_output")) && item.get("is_error").is_some()).then_some(index)
+            });
             observed.lock().unwrap().push((headers, body));
+            if let Some(index) = invalid_error_flag {
+                return Response::builder().status(StatusCode::BAD_REQUEST)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"error": {"message":format!("Unknown parameter: 'input[{index}].is_error'."), "type":"invalid_request_error"}}).to_string())).unwrap();
+            }
             if invalid {
                 return Response::builder()
                     .status(StatusCode::BAD_REQUEST)
@@ -75,6 +87,14 @@ async fn responses_message_text_types_claude_history_passes_strict_oauth_upstrea
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     assert!(rejected.text().await.unwrap().contains("output_text"));
 
+    if tool_result_errors {
+        let rejected = crate::infra::http::direct_client().unwrap()
+            .post(format!("http://{address}/v1/responses"))
+            .json(&json!({"input":[{"type":"function_call_output","call_id":"a","output":"denied","is_error":false}]}))
+            .send().await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert!(rejected.text().await.unwrap().contains("input[0].is_error"));
+    }
     let name = "claude-oauth-message-text-types";
     let endpoint = format!("http://{address}");
     let (state, execution) = codex_bridge_test_context(name, endpoint.clone()).await;
@@ -105,17 +125,38 @@ async fn responses_message_text_types_claude_history_passes_strict_oauth_upstrea
             };
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            let mut request = json!({
+                "model":"gpt-6-astra", "max_tokens":64, "stream":stream, "system":"be helpful",
+                "messages":[
+                    {"role":"user", "content":content("first")},
+                    {"role":"assistant", "content":content("previous answer")},
+                    {"role":"user", "content":content("next")}
+                ]
+            });
+            if tool_result_errors {
+                request["tools"] =
+                    json!([{"name":"lookup","input_schema":{"type":"object","properties":{}}}]);
+                request["messages"].as_array_mut().unwrap().extend([
+                    json!({"role":"assistant","content":[
+                        {"type":"tool_use","id":"a","name":"lookup","input":{}},
+                        {"type":"tool_use","id":"b","name":"lookup","input":{}}
+                    ]}),
+                    json!({"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"a","content":content("denied"),"is_error":true},
+                        {"type":"tool_result","tool_use_id":"b","content":"ok","is_error":false}
+                    ]})
+                ]);
+            }
             let response = forward_for_test_surface(
-                state.clone(), ProxyRoute::ClaudeMessages, provider_id.clone(), None, headers,
-                Bytes::from(json!({
-                    "model":"gpt-6-astra", "max_tokens":64, "stream":stream, "system":"be helpful",
-                    "messages":[
-                        {"role":"user", "content":content("first")},
-                        {"role":"assistant", "content":content("previous answer")},
-                        {"role":"user", "content":content("next")}
-                    ]
-                }).to_string()),
-            ).await.unwrap();
+                state.clone(),
+                ProxyRoute::ClaudeMessages,
+                provider_id.clone(),
+                None,
+                headers,
+                Bytes::from(request.to_string()),
+            )
+            .await
+            .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let content_type = response
                 .headers()
@@ -152,10 +193,13 @@ async fn responses_message_text_types_claude_history_passes_strict_oauth_upstrea
     let observations = observations.lock().unwrap();
     assert_eq!(
         observations.len(),
-        5,
-        "one rejected probe plus exactly four forwarded calls"
+        if tool_result_errors { 6 } else { 5 },
+        "rejected probes plus exactly four forwarded calls"
     );
-    for (headers, body) in observations.iter().skip(1) {
+    for (headers, body) in observations
+        .iter()
+        .skip(if tool_result_errors { 2 } else { 1 })
+    {
         assert_eq!(
             headers.get("authorization").unwrap(),
             format!("Bearer {name}-access-token").as_str()
@@ -164,6 +208,17 @@ async fn responses_message_text_types_claude_history_passes_strict_oauth_upstrea
             headers.get("chatgpt-account-id").unwrap(),
             format!("{name}-workspace").as_str()
         );
+        if tool_result_errors {
+            let items = body["input"].as_array().unwrap();
+            assert_eq!(items[5]["type"], "function_call_output");
+            assert_eq!(items[5]["call_id"], "a");
+            let output = items[5]["output"].as_str().unwrap();
+            assert!(output.starts_with("[Tool execution failed]\n"));
+            assert!(output.contains("denied"));
+            assert_eq!(items[6]["call_id"], "b");
+            assert_eq!(items[6]["output"], "ok");
+            assert!(items.iter().all(|item| item.get("is_error").is_none()));
+        }
         assert_eq!(body["instructions"], "be helpful");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);

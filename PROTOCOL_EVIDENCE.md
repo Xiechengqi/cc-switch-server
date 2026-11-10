@@ -1,5 +1,20 @@
 # Protocol evidence policy
 
+## 2026-11-10 Claude 工具失败标志到 OpenAI Responses 的协议边界
+
+用户提供 OpenAI OAuth 上游拒绝 `400 Unknown parameter: 'input[5].is_error'`。本仓转换器此前把 Anthropic `tool_result.is_error` 原样复制为 Responses `function_call_output.is_error`，且共用 OAuth 出站 sanitizer 未移除；显式 false 同样会泄漏。这是工具结果项字段映射缺陷，不以切换账号、删历史或重放推理处理。
+
+只读参考 CLIProxyAPI `6db7d4b8` 的 `internal/translator/codex/claude/codex_claude_request.go` 与 codex2api `75ece5ac` 的 `proxy/anthropic.go`：两者重建工具输出，不复制该顶层字段。其省略错误标志的行为不作为本仓完整语义模板；本仓独立保留明确失败说明。官方 OpenAI documentation 检索与页面获取返回 HTTP 403，未把未取得的页面作为协议证明。外仓不是构建、测试或运行时输入；回归仅使用本仓合成 fixture，不证明任何真实 OAuth 请求已通过。
+
+源头转换不再生成 Responses 顶层 is_error；只有严格布尔 true 映射为 output 中固定的 `[Tool execution failed]` 文本，原文本完整保留，空/缺失失败结果仍有标志。OAuth 共用 sanitizer 对 function_call_output/custom_tool_call_output 的遗留顶层标志做相同定点处理，覆盖普通 HTTP、Compact、平铺/嵌套 response.create（文本/二进制）和 HTTP 回退。富媒体 output 数组仅前置 input_text，保留原有内容；重复清洗不追加标志。false/null/非布尔标志移除但不宣称失败；不推测文本含义，不解析标志反推原生状态，不递归删除嵌套业务 JSON。未知 item、参数、reasoning、agent 元数据保持不透明；非法 object output 仍留给既有验证，不自动序列化成另一个语义。Claude 原生 tool_result.is_error 与其他协议的原有错误载体保持。
+
+
+
+本轮验证与整体 review：旧代码上的两项新增转换反例均失败；修复后最终六项专项回归全部通过。严格 loopback 上游主动拒绝工具输出顶层 is_error（包括 false），完整 Claude→OAuth 转发覆盖流式/非流式与字符串/块内容，确认转换后第六项工具失败和相邻成功结果均保留。原有 assistant 历史文本严格上游回归也通过。三个集成目标分别 138/138、1/1、1/1；Node 审计 2144/2144；全 src（含 include 文件）rustfmt、cargo check、binary build、供应商/UI 覆盖审计及本地 smoke 通过。smoke 首次因 cargo 构建锁未在脚本启动窗口内完成而未启动服务，预编译后重跑通过，不把首次失败归为业务请求故障。
+
+全量 Rust library 运行 4286 passed / 8 failed / 3 ignored，不能标记全量通过；随后新增端到端专项另行验证通过。八项失败在同一测试二进制中按单项串行复核仍复现：workbuddy_value_declared_rejections_without_generation_are_free、workbuddy_value_missing_prices_opaque_models_and_media_never_generate、codex_websocket_large_upload_cancellation_is_not_write_starved、codex_websocket_large_upload_keeps_both_ping_lanes_responsive、value_quota_deepseek_cached_recovery_admits_each_real_generation、value_quota_native_text_surfaces_admit_before_send_and_settle_exactly、quota_higher_schema_or_changed_migration_is_never_downgraded、value_quota_resource_readiness_is_per_grant_and_fences_scheduled_activation。失败涉及额度/价格、SQLite 迁移和 WS 时序断言；未扩大本次协议修复范围修改这些模块，不据此宣称它们在本轮开始前已通过或失败。离线 readiness failures=0，但缺真实凭据/Share/部署输入，维持 blocked；无真实 OAuth 推理、部署或远程修改。 提交前在隔离暂存树重跑专项测试时，rustc 测试编译进程被系统以 SIGKILL 终止，未得到新的测试结果；隔离树的格式及生成覆盖文档检查通过。
+
+
 ## 2026-11-06 Qoder 单账号 capability revision 3
 
 本轮仅增强 `cc-switch-server` 的单绑定 Qoder 反代，不新增账号池、自动切站、跨账号/Provider fallback 或额外重试。Global OAuth、Global PAT job-token、CN OAuth 三 rail 及 Account/Provider/Share/generation fencing、同绑定账号唯一一次 eligible pre-business 401 恢复、唯一终态与 EOF 合同均保持。CN PAT 仍是 R4-QD-02 独立候选门禁，未以 Global PAT 冒充实现。
