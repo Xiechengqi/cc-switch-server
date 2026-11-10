@@ -2395,6 +2395,7 @@ async fn forward_with_attempt(
     attempt_context: ForwardAttemptContext,
 ) -> Result<Response, ProxyError> {
     let slot = attempt_context.timing.clone();
+    let _timing_owner = slot.owner_guard();
     let result = slot
         .run(forward_with_attempt_inner(
             state,
@@ -2574,13 +2575,16 @@ async fn forward_with_attempt_inner(
                 );
             }
         }
-        if let Some(timing) = attempt_context.timing.begin_for_provider(
+        if let Some(timing) = attempt_context.timing.begin_for_driver(
             execution.stored.provider_type,
+            execution.plan.driver_id.as_str(),
             forward_timing_surface(route, gemini_path.as_deref()),
             attempt_started,
         ) {
             if let Some(budget) = attempt_context.request_memory() {
                 budget.set_timing(timing);
+            } else {
+                attempt_context.timing.track_unbudgeted_owners();
             }
         }
         if execution.driver_is("oauth.claude_messages") {
@@ -2602,7 +2606,7 @@ async fn forward_with_attempt_inner(
         if let Some(timing) = attempt_context.timing.get() {
             timing.mark(Milestone::Admission);
         }
-        let stored = execution.runtime_stored_view();
+        let mut stored = execution.runtime_stored_view();
         audit_forward_attempt(&state, route, &request_context, &stored, &attempt_context);
         super::antigravity_compaction::enforce_disabled_contract(
             stored.provider_type,
@@ -2700,6 +2704,7 @@ async fn forward_with_attempt_inner(
                 account_in_flight_guard,
                 share_invocation_guard,
                 started,
+                timing: attempt_context.timing.clone(),
             })
             .await;
         }
@@ -2714,6 +2719,7 @@ async fn forward_with_attempt_inner(
                 account_in_flight_guard,
                 share_invocation_guard,
                 started,
+                timing: attempt_context.timing.clone(),
             })
             .await;
         }
@@ -2785,13 +2791,76 @@ async fn forward_with_attempt_inner(
                 ))
                 .map_err(|error| error.into_proxy_error())?;
         }
-        let adapter_request = adapter.transform_request_for_route_with_metadata(
-            body,
-            &stored,
-            route,
-            gemini_path_for_request.as_deref(),
-            &copilot_metadata,
-        )?;
+        let mut copilot_inference_plan = None;
+        let adapter_request = if execution.driver_is("special.copilot") {
+            use crate::domain::accounts::copilot::CopilotEndpoint;
+            let prepared = adapter.prepare_copilot_request_for_route(
+                body,
+                &stored,
+                route,
+                gemini_path_for_request.as_deref(),
+                &copilot_metadata,
+            )?;
+            let (_, account_id, generation) =
+                execution.managed_account_identity_target().ok_or_else(|| {
+                    ProxyError::bad_request("Copilot requires one bound managed Account")
+                })?;
+            let preferred = match adapters::downstream_format_for_route(route) {
+                UpstreamFormat::AnthropicMessages => CopilotEndpoint::Messages,
+                UpstreamFormat::OpenAiResponses => CopilotEndpoint::Responses,
+                _ => CopilotEndpoint::Chat,
+            };
+            let plan = state
+                .prepare_copilot_inference_plan(
+                    account_id,
+                    generation,
+                    prepared.model()?,
+                    preferred,
+                    execution.request_timeout(),
+                    !attempt_context.auth_refresh_attempted() && attempt_context.retry_allowed(),
+                    #[cfg(test)]
+                    execution
+                        .plan
+                        .driver_options
+                        .get("testCopilotModelsUrl")
+                        .and_then(Value::as_str),
+                )
+                .await
+                .map_err(copilot_model_catalog_error_to_proxy_error)?;
+            if plan.auth_recovered_during_discovery {
+                attempt_context = attempt_context
+                    .reserve_auth_refresh(&execution)
+                    .ok_or_else(|| {
+                        ProxyError::conflict(
+                            "Copilot authentication recovery budget exhausted during discovery",
+                        )
+                    })?;
+                request_context.attempt_count = Some(attempt_context.attempt().saturating_add(1));
+            }
+            // This is a non-persisted view of the driver-selected capability.
+            // Provider/Share identity and the immutable runtime plan stay intact.
+            stored
+                .provider
+                .meta
+                .get_or_insert_with(Default::default)
+                .api_format = Some(plan.endpoint.api_format().to_string());
+            let request = adapter.transform_prepared_copilot_for_route(
+                prepared,
+                &stored,
+                route,
+                gemini_path_for_request.as_deref(),
+            )?;
+            copilot_inference_plan = Some(plan);
+            request
+        } else {
+            adapter.transform_request_for_route_with_metadata(
+                body,
+                &stored,
+                route,
+                gemini_path_for_request.as_deref(),
+                &copilot_metadata,
+            )?
+        };
         let mut adapter_request = adapter_request;
         let codex_responses_lite_requested = execution.driver_is("oauth.openai_codex")
             && matches!(
@@ -2946,6 +3015,7 @@ async fn forward_with_attempt_inner(
                 started,
                 continuation: trae_continuation,
                 request_memory: attempt_context.request_memory().cloned(),
+                timing: attempt_context.timing.clone(),
             })
             .await;
         }
@@ -3067,22 +3137,6 @@ async fn forward_with_attempt_inner(
             if !adapter_request.is_gemini_count_tokens() {
                 ensure_execution_gemini_v1internal_project(&state, &execution).await?;
             }
-            let copilot_upstream_auth = if execution.driver_is("special.copilot") {
-                let (_, account_id, expected_generation) =
-                    execution.managed_account_identity_target().ok_or_else(|| {
-                        ProxyError::bad_request(
-                            "github_copilot provider must bind one explicit managed account",
-                        )
-                    })?;
-                Some(
-                    state
-                        .prepare_copilot_upstream_auth(account_id, expected_generation)
-                        .await
-                        .map_err(copilot_upstream_auth_error_to_proxy_error)?,
-                )
-            } else {
-                None
-            };
             let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
             let mut target_headers = adapter.build_headers(app, &stored, &accounts)?;
             target_headers.extend(adapter_request.upstream_headers.iter().cloned());
@@ -3112,14 +3166,21 @@ async fn forward_with_attempt_inner(
                     "token-counting-2024-11-01".to_string(),
                 );
             }
-            if let Some(auth) = copilot_upstream_auth {
-                let inference_origin = copilot_inference_origin(&execution, &auth.api_endpoint)?;
-                url = super::join_url(&inference_origin, "/chat/completions");
+            if let Some(plan) = &copilot_inference_plan {
+                let origin = copilot_inference_origin(&execution, &plan.auth.api_endpoint)?;
+                url = super::join_url(&origin, plan.endpoint.path());
                 replace_or_push_header(
                     &mut target_headers,
                     "authorization",
-                    format!("Bearer {}", auth.token),
+                    format!("Bearer {}", plan.auth.token),
                 );
+                if plan.endpoint == crate::domain::accounts::copilot::CopilotEndpoint::Messages {
+                    replace_or_push_header(
+                        &mut target_headers,
+                        "anthropic-version",
+                        "2023-06-01".to_string(),
+                    );
+                }
             }
             if execution.driver_is("oauth.openai_codex") {
                 crate::codex_identity::finalize_headers(&mut target_headers);
@@ -3367,10 +3428,25 @@ async fn forward_with_attempt_inner(
         } else {
             None
         };
+        if let Some(plan) = &copilot_inference_plan {
+            let final_body: Value = serde_json::from_slice(&adapter_request.body)
+                .map_err(|_| ProxyError::bad_request("invalid final Copilot inference body"))?;
+            if final_body.get("model").and_then(Value::as_str) != Some(plan.model()) {
+                return Err(ProxyError::conflict(
+                    "Copilot final model differs from authenticated endpoint plan",
+                ));
+            }
+            state
+                .ensure_copilot_inference_plan_current(plan)
+                .await
+                .map_err(copilot_model_catalog_error_to_proxy_error)?;
+        }
         let request = build_upstream_post_request(
             &http_client,
             &url,
-            adapter_request.body.clone(),
+            attempt_context
+                .timing
+                .retain_bytes(adapter_request.body.clone()),
             &headers,
             &target_headers,
             execution.request_timeout(),
@@ -4015,8 +4091,17 @@ async fn forward_with_attempt_inner(
             }
             record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
                 .await;
+            // Keep rate-limit evidence above, then redact the client payload
+            // on this early return just as on the ordinary error response path.
+            let bedrock_error = super::bedrock::is_profile(&stored);
+            let response_body = if bedrock_error {
+                content_type = Some("application/json".to_string());
+                super::bedrock::http_error_body()
+            } else {
+                decoded.body
+            };
             let response_body = retain_request_bytes(
-                decoded.body,
+                response_body,
                 attempt_context.request_memory(),
                 RequestMemoryComponent::NormalizedEvent,
             )?;
@@ -4027,7 +4112,7 @@ async fn forward_with_attempt_inner(
                     response.headers_mut().insert(CONTENT_TYPE, value);
                 }
             }
-            if decoded.preserve_content_encoding {
+            if decoded.preserve_content_encoding && !bedrock_error {
                 if let Some(value) = content_encoding {
                     response.headers_mut().insert(CONTENT_ENCODING, value);
                 }
@@ -4309,7 +4394,7 @@ async fn forward_with_attempt_inner(
                 first_byte: execution.stream_first_byte_timeout(),
                 idle: execution.stream_idle_timeout(),
             };
-            let mut inner = if stored.provider_type == ProviderType::ClaudeOAuth
+            let inner = if stored.provider_type == ProviderType::ClaudeOAuth
                 && route == ProxyRoute::ClaudeMessages
             {
                 match prepare_claude_streaming_response(
@@ -4382,6 +4467,24 @@ async fn forward_with_attempt_inner(
             } else {
                 upstream.bytes_stream().boxed()
             };
+            let bedrock_response = super::bedrock::is_profile(&stored);
+            let mut inner = if bedrock_response {
+                content_type = Some("text/event-stream".to_string());
+                response_headers.remove(CONTENT_ENCODING);
+                response_headers.remove(CONTENT_LENGTH);
+                normalize_bedrock_stream(
+                    inner,
+                    adapter_request
+                        .actual_model
+                        .as_deref()
+                        .or(adapter_request.model.as_deref())
+                        .unwrap_or("bedrock")
+                        .to_string(),
+                    attempt_context.request_memory(),
+                )?
+            } else {
+                inner.map_err(StreamReadError::Upstream).boxed()
+            };
             let mut pending_chunk = None;
             let mut sse_error_detector = claude_sse_error_detector_for(&stored, route);
             let mut sse_error_outcome_recorded = false;
@@ -4389,11 +4492,7 @@ async fn forward_with_attempt_inner(
                 adapters::upstream_format_for_route(&stored, Some(route), &adapter_request.body)
                     .unwrap_or_else(|| adapters::downstream_format_for_route(route));
             let mut terminal_detector = UpstreamTerminalDetector::new(upstream_format);
-            if stored.provider_type == ProviderType::ClaudeOAuth
-                || antigravity::is_provider(stored.provider_type)
-            {
-                terminal_detector.set_timing(attempt_context.timing.get());
-            }
+            terminal_detector.set_timing(attempt_context.timing.get());
             let responses_image_transport = upstream_format == UpstreamFormat::OpenAiResponses
                 && responses_body_requests_image_generation(route, &adapter_request.body);
             let grok_responses_sse = (status.is_success()
@@ -4410,7 +4509,8 @@ async fn forward_with_attempt_inner(
                         .then(|| (account_id.to_string(), auth_identity_generation))
                 },
             );
-            let mandatory_semantic_contract = execution.plan.coding_plan.is_some()
+            let mandatory_semantic_contract = bedrock_response
+                || execution.plan.coding_plan.is_some()
                 || matches!(
                     stored.provider_type,
                     ProviderType::KimiCode | ProviderType::GrokOAuth
@@ -4539,7 +4639,7 @@ async fn forward_with_attempt_inner(
                             .first_byte
                             .expect("a semantic commit deadline requires a first-byte timeout");
                         match tokio::time::timeout_at(deadline, inner.try_next()).await {
-                            Ok(result) => result.map_err(StreamReadError::Upstream),
+                            Ok(result) => result,
                             Err(_) => Err(StreamReadError::Timeout {
                                 kind: StreamTimeoutKind::FirstByte,
                                 timeout,
@@ -4554,11 +4654,11 @@ async fn forward_with_attempt_inner(
                         match timeout {
                             Some(timeout) => {
                                 match tokio::time::timeout(timeout, inner.try_next()).await {
-                                    Ok(result) => result.map_err(StreamReadError::Upstream),
+                                    Ok(result) => result,
                                     Err(_) => Err(StreamReadError::Timeout { kind, timeout }),
                                 }
                             }
-                            None => inner.try_next().await.map_err(StreamReadError::Upstream),
+                            None => inner.try_next().await,
                         }
                     };
                     drop(wait);
@@ -5101,6 +5201,19 @@ async fn forward_with_attempt_inner(
                             return Err(ProxyError::bad_gateway(error));
                         }
                     }
+                    Err(StreamReadError::Normalization(error)) => {
+                        if !error.is_request_memory_exhausted() {
+                            record_provider_outcome(
+                                &state,
+                                &stored,
+                                ProviderOutcome::Failure {
+                                    status_code: error.status.as_u16(),
+                                },
+                            )
+                            .await;
+                        }
+                        return Err(error);
+                    }
                     Err(error) => {
                         // A read failure may follow a completed upstream generation.
                         record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
@@ -5364,9 +5477,8 @@ async fn forward_with_attempt_inner(
                 let mut image_heartbeat = false;
                 let mut text_keepalive = false;
                 let wait = stream_state
-                    .request_memory
-                    .as_ref()
-                    .and_then(RequestMemoryBudget::timing)
+                    .terminal_detector
+                    .timing()
                     .map(|timing| timing.wait(WaitKind::UpstreamRead));
                 let next_chunk = if let Some(chunk) = stream_state.pending_chunk.take() {
                     chunk_already_inspected = stream_state.pending_chunk_already_inspected;
@@ -5393,7 +5505,7 @@ async fn forward_with_attempt_inner(
                                 Ok(Some(Bytes::new()))
                             }
                             result = stream_state.inner.try_next() => {
-                                result.map_err(StreamReadError::Upstream)
+                                result
                             }
                         }
                     } else {
@@ -5404,7 +5516,7 @@ async fn forward_with_attempt_inner(
                                 Ok(Some(Bytes::new()))
                             }
                             result = stream_state.inner.try_next() => {
-                                result.map_err(StreamReadError::Upstream)
+                                result
                             }
                         }
                     }
@@ -5430,7 +5542,7 @@ async fn forward_with_attempt_inner(
                                 Ok(Some(Bytes::new()))
                             }
                             result = stream_state.inner.try_next() => {
-                                result.map_err(StreamReadError::Upstream)
+                                result
                             }
                         },
                         (Some(upstream_deadline), None) => tokio::select! {
@@ -5442,7 +5554,7 @@ async fn forward_with_attempt_inner(
                                 })
                             }
                             result = stream_state.inner.try_next() => {
-                                result.map_err(StreamReadError::Upstream)
+                                result
                             }
                         },
                         (None, Some(keepalive_deadline)) => tokio::select! {
@@ -5452,14 +5564,10 @@ async fn forward_with_attempt_inner(
                                 Ok(Some(Bytes::new()))
                             }
                             result = stream_state.inner.try_next() => {
-                                result.map_err(StreamReadError::Upstream)
+                                result
                             }
                         },
-                        (None, None) => stream_state
-                            .inner
-                            .try_next()
-                            .await
-                            .map_err(StreamReadError::Upstream),
+                        (None, None) => stream_state.inner.try_next().await,
                     }
                 };
 
@@ -5824,6 +5932,15 @@ async fn forward_with_attempt_inner(
                     }
                     Ok(None) => {
                         Box::pin(async move {
+                            if stream_state.stored.provider_type == ProviderType::OllamaCloud
+                                && stream_state.terminal_detector.terminal().is_none()
+                            {
+                                return stream_state
+                                    .terminate_transform_error(ProxyError::bad_gateway(
+                                        "Ollama Cloud stream ended before [DONE]",
+                                    ))
+                                    .await;
+                            }
                             let mut responses_transport_finished = false;
                             let mut normalized_finish_semantics = None;
                             let transport_tail = if stream_state.normalize_responses_transport {
@@ -6168,6 +6285,9 @@ async fn forward_with_attempt_inner(
                         })
                         .await
                     }
+                    Err(StreamReadError::Normalization(error)) => {
+                        stream_state.terminate_transform_error(error).await
+                    }
                     Err(error) => {
                         Box::pin(async move {
                             let usage_result =
@@ -6402,13 +6522,9 @@ async fn forward_with_attempt_inner(
                     status = StatusCode::BAD_GATEWAY;
                     status_code = status.as_u16();
                 }
-                if antigravity::is_provider(stored.provider_type) {
-                    if let Some(timing) = attempt_context.timing.get() {
-                        timing.observe_gemini_document(
-                            &value,
-                            adapter_request.is_gemini_count_tokens(),
-                        );
-                    }
+                if let Some(timing) = attempt_context.timing.get() {
+                    timing
+                        .observe_gemini_document(&value, adapter_request.is_gemini_count_tokens());
                 }
             }
         }
@@ -6449,6 +6565,56 @@ async fn forward_with_attempt_inner(
         bytes = rewritten;
         if version_gate_rewritten || grok_version_gate_rewritten {
             preserve_content_encoding = false;
+        }
+        let _bedrock_response_memory = if super::bedrock::is_profile(&stored) && status.is_success()
+        {
+            let memory = attempt_context
+                .request_memory()
+                .map(|budget| {
+                    budget
+                        .reserve(
+                            RequestMemoryComponent::NormalizedEvent,
+                            super::request_memory::json_parse_working_bytes(&bytes)
+                                .saturating_mul(3)
+                                .saturating_add(bytes.len().saturating_mul(4)),
+                        )
+                        .map_err(|error| error.into_proxy_error())
+                })
+                .transpose()?;
+            bytes = match adapter.transform_response_for_request(
+                bytes,
+                &stored,
+                route,
+                &adapter_request,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    record_provider_outcome(
+                        &state,
+                        &stored,
+                        ProviderOutcome::Failure {
+                            status_code: error.status.as_u16(),
+                        },
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            if let Some(memory) = memory.as_ref() {
+                memory
+                    .resize(bytes.len())
+                    .map_err(|error| error.into_proxy_error())?;
+            }
+            preserve_content_encoding = false;
+            content_type = Some("application/json".to_string());
+            memory
+        } else {
+            None
+        };
+        if super::bedrock::is_profile(&stored) && !status.is_success() {
+            bytes = super::bedrock::http_error_body();
+            preserve_content_encoding = false;
+            content_type = Some("application/json".to_string());
         }
         let semantic_upstream_format =
             adapters::upstream_format_for_route(&stored, Some(route), &adapter_request.body)
@@ -6493,7 +6659,6 @@ async fn forward_with_attempt_inner(
             None
         };
         if status.is_success()
-            && stored.provider_type == ProviderType::ClaudeOAuth
             && route == ProxyRoute::ClaudeCountTokens
             && semantic_upstream_format == UpstreamFormat::AnthropicMessages
             && anthropic_json_observation.is_none()
@@ -6621,6 +6786,21 @@ async fn forward_with_attempt_inner(
         };
         let is_count_tokens_request =
             route == ProxyRoute::ClaudeCountTokens || adapter_request.is_gemini_count_tokens();
+        if status.is_success()
+            && (adapter_request.is_gemini_count_tokens()
+                || attempt_context
+                    .timing
+                    .get()
+                    .is_some_and(|timing| timing.surface() == "gemini_count_tokens"))
+            && !adapters::is_gemini_v1internal_provider_type(stored.provider_type)
+        {
+            if let (Some(timing), Ok(value)) = (
+                attempt_context.timing.get(),
+                serde_json::from_slice::<Value>(&bytes),
+            ) {
+                timing.observe_gemini_document(&value, true);
+            }
+        }
         let codex_reported_model = if execution.driver_is("oauth.openai_codex")
             && semantic_upstream_format == UpstreamFormat::OpenAiResponses
         {
@@ -6662,29 +6842,30 @@ async fn forward_with_attempt_inner(
                     resource_observer.observe(value);
                     request_context.value_resources = resource_observer.usage();
                 }
-                if status.is_success()
-                    && stored.provider_type == ProviderType::GrokOAuth
-                    && semantic_upstream_format == UpstreamFormat::OpenAiResponses
-                {
+                if status.is_success() {
                     if let Some(timing) = attempt_context.timing.get() {
-                        timing.observe_responses_document(
-                            value,
-                            &response_semantics::classify_value(value),
-                        );
+                        match semantic_upstream_format {
+                            UpstreamFormat::OpenAiResponses => timing.observe_responses_document(
+                                value,
+                                &response_semantics::classify_value(value),
+                            ),
+                            UpstreamFormat::OpenAiChat => timing.observe_chat_document(value),
+                            UpstreamFormat::GeminiNative => {
+                                timing.observe_gemini_document(value, false)
+                            }
+                            UpstreamFormat::AnthropicMessages
+                                if anthropic_json_observation.is_none() =>
+                            {
+                                // Observation failure cannot change the protocol decision.
+                                let _ = anthropic_semantics::inspect_json_value_with_timing(
+                                    value,
+                                    false,
+                                    Some(&timing),
+                                );
+                            }
+                            _ => {}
+                        }
                     }
-                }
-                if status.is_success()
-                    && stored.provider_type == ProviderType::ClaudeOAuth
-                    && semantic_upstream_format == UpstreamFormat::AnthropicMessages
-                    && anthropic_json_observation.is_none()
-                {
-                    // Observation failures remain non-authoritative on bridge
-                    // surfaces and when the semantic guard is disabled.
-                    let _ = anthropic_semantics::inspect_json_value_with_timing(
-                        value,
-                        false,
-                        attempt_context.timing.get().as_ref(),
-                    );
                 }
             })
         };
@@ -6721,7 +6902,11 @@ async fn forward_with_attempt_inner(
             None
         };
         let bytes = if status.is_success() {
-            match adapter.transform_response_for_request(bytes, &stored, route, &adapter_request) {
+            match if super::bedrock::is_profile(&stored) {
+                Ok(bytes)
+            } else {
+                adapter.transform_response_for_request(bytes, &stored, route, &adapter_request)
+            } {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     record_provider_outcome(
@@ -19610,6 +19795,7 @@ struct WebSessionForwardOptions {
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
+    timing: TimingSlot,
 }
 
 fn web_session_requested_model(body: &[u8]) -> Option<String> {
@@ -19722,6 +19908,7 @@ async fn forward_web_session_metered(
         account_in_flight_guard: _account_in_flight_guard,
         share_invocation_guard: _share_invocation_guard,
         started,
+        timing,
     } = options;
     if !matches!(
         route,
@@ -19797,25 +19984,31 @@ async fn forward_web_session_metered(
         )
         .await?;
     }
-    let result =
-        match super::web_session::execute(&state, &execution, route, body, value_attempt.as_ref())
+    let result = match super::web_session::execute(
+        &state,
+        &execution,
+        route,
+        body,
+        value_attempt.as_ref(),
+        &timing,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return finish_web_session_failure(
+                &state,
+                &stored,
+                &request_context,
+                started,
+                requested_model,
+                Some(actual_model),
+                true,
+                error,
+            )
             .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                return finish_web_session_failure(
-                    &state,
-                    &stored,
-                    &request_context,
-                    started,
-                    requested_model,
-                    Some(actual_model),
-                    true,
-                    error,
-                )
-                .await
-            }
-        };
+        }
+    };
     let usage = TokenUsage {
         raw_input_tokens: Some(result.input_tokens),
         input_tokens: Some(result.input_tokens),
@@ -21364,12 +21557,35 @@ struct TraeForwardOptions {
     started: Instant,
     continuation: Option<TraeContinuation>,
     request_memory: Option<RequestMemoryBudget>,
+    timing: TimingSlot,
 }
 
 struct PreparedTraeWireResponse {
     inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     decoder: super::trae::TraeSseDecoder,
     first_canonical: Bytes,
+    timing_detector: UpstreamTerminalDetector,
+    _timing_owner: Arc<super::request_timing::TimingOwnerToken>,
+}
+
+impl PreparedTraeWireResponse {
+    fn observe_canonical(&mut self, bytes: &[u8]) {
+        observe_trae_canonical(&mut self.timing_detector, bytes);
+    }
+}
+
+fn observe_trae_canonical(detector: &mut UpstreamTerminalDetector, bytes: &[u8]) {
+    // The Trae decoder remains the protocol owner. Observation cannot reject
+    // output, renew a deadline, authorize recovery, or synthesize a terminal.
+    let _ = detector.push(bytes);
+    if let Some(timing) = detector.timing() {
+        match detector.terminal() {
+            Some(UpstreamTerminal::Completed) => timing.observe_terminal(TimingResult::Complete),
+            Some(UpstreamTerminal::Incomplete) => timing.observe_terminal(TimingResult::Incomplete),
+            Some(UpstreamTerminal::Failed) => timing.observe_terminal(TimingResult::Failed),
+            None => {}
+        }
+    }
 }
 
 enum TraeForwardAttemptError {
@@ -21400,6 +21616,7 @@ async fn forward_trae_metered(
         started,
         continuation,
         request_memory,
+        timing,
     } = options;
     let (
         provider_type @ (ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl),
@@ -21429,6 +21646,21 @@ async fn forward_trae_metered(
 
     let mut auth_recovery_attempted = false;
     loop {
+        if auth_recovery_attempted {
+            if let Some(previous) = timing.get() {
+                if let Some(next) = timing.begin_for_driver(
+                    stored.provider_type,
+                    execution.plan.driver_id.as_str(),
+                    previous.surface(),
+                    Instant::now(),
+                ) {
+                    next.mark(Milestone::Admission);
+                    if let Some(memory) = &request_memory {
+                        memory.set_timing(next);
+                    }
+                }
+            }
+        }
         let runtime = match state
             .prepare_trae_runtime(
                 stored.app,
@@ -21445,6 +21677,7 @@ async fn forward_trae_metered(
             Err(error) if error.is_authentication_failure() && !auth_recovery_attempted => {
                 super::value_metering::authentication_rejected(value_attempt).await;
                 auth_recovery_attempted = true;
+                let _retry_wait = timing.get().map(|timing| timing.wait(WaitKind::Retry));
                 recover_trae_auth(&state, &execution, None).await?;
                 continue;
             }
@@ -21468,17 +21701,17 @@ async fn forward_trae_metered(
             runtime
                 .catalog
                 .resolve_raw_model(&requested_model)
-                .map_err(ProxyError::bad_request)?
+                .map_err(|error| ProxyError::bad_request(error.to_string()))?
         } else {
             runtime
                 .catalog
                 .resolve_model(&requested_model)
-                .map_err(ProxyError::bad_request)?
+                .map_err(|error| ProxyError::bad_request(error.to_string()))?
         };
         let intl_capability;
         let capability = if provider_type == ProviderType::TraeIntl {
             intl_capability = super::trae_runtime::raw_passthrough_capability(&model_id)
-                .map_err(ProxyError::bad_request)?;
+                .map_err(|error| ProxyError::bad_request(error.to_string()))?;
             &intl_capability
         } else {
             runtime.catalog.capabilities.get(&model_id).ok_or_else(|| {
@@ -21590,6 +21823,7 @@ async fn forward_trae_metered(
             simulate_tools,
             request_memory: request_memory.as_ref(),
             value_attempt: value_attempt.as_ref(),
+            timing: &timing,
         })
         .await
         {
@@ -21599,6 +21833,7 @@ async fn forward_trae_metered(
             {
                 super::value_metering::authentication_rejected(value_attempt).await;
                 auth_recovery_attempted = true;
+                let _retry_wait = timing.get().map(|timing| timing.wait(WaitKind::Retry));
                 recover_trae_auth(&state, &execution, Some(&runtime)).await?;
                 continue;
             }
@@ -21644,6 +21879,7 @@ async fn forward_trae_metered(
                 started,
                 continuation,
                 request_memory,
+                timing,
             }));
             return await_provider_stream_task(task, "Trae").await;
         }
@@ -21690,6 +21926,7 @@ async fn forward_trae_metered(
             {
                 super::value_metering::authentication_rejected(value_attempt).await;
                 auth_recovery_attempted = true;
+                let _retry_wait = timing.get().map(|timing| timing.wait(WaitKind::Retry));
                 recover_trae_auth(&state, &execution, Some(&runtime)).await?;
             }
             Err(TraeForwardAttemptError::Upstream(error)) => {
@@ -21731,6 +21968,7 @@ struct TraeGenerationOptions<'a> {
     simulate_tools: bool,
     request_memory: Option<&'a RequestMemoryBudget>,
     value_attempt: Option<&'a crate::state::ValueAttemptGuard>,
+    timing: &'a TimingSlot,
 }
 
 async fn send_trae_generation(
@@ -21746,6 +21984,7 @@ async fn send_trae_generation(
         simulate_tools,
         request_memory,
         value_attempt,
+        timing,
     } = options;
     // One deadline covers response headers, error bodies and all queue/progress
     // frames before the first semantic output. Transport activity cannot renew it.
@@ -21778,7 +22017,7 @@ async fn send_trae_generation(
         .await
         .post(url)
         .headers(headers)
-        .body(body);
+        .body(timing.retain_bytes(Bytes::from(body)));
     let remaining = prelude_deadline.saturating_duration_since(tokio::time::Instant::now());
     let header_timeout = execution
         .stream_first_byte_timeout()
@@ -21786,6 +22025,13 @@ async fn send_trae_generation(
     if let Some(attempt) = value_attempt {
         attempt.mark_sent();
     }
+    let forward_timing = timing.get();
+    if let Some(timing) = &forward_timing {
+        timing.mark(Milestone::SendStarted);
+    }
+    let header_wait = forward_timing
+        .as_ref()
+        .map(|timing| timing.wait(WaitKind::Headers));
     let response = tokio::time::timeout(header_timeout, request.send())
         .await
         .map_err(|_| {
@@ -21798,6 +22044,10 @@ async fn send_trae_generation(
             })
         })?
         .map_err(|error| TraeForwardAttemptError::Proxy(ProxyError::bad_gateway(error)))?;
+    drop(header_wait);
+    if let Some(timing) = &forward_timing {
+        timing.mark(Milestone::Headers);
+    }
     if !trae_runtime_is_current(state, execution, runtime).await {
         return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
             "Trae Provider or bound account changed while inference was starting",
@@ -21838,6 +22088,8 @@ async fn send_trae_generation(
         .map_err(TraeForwardAttemptError::Proxy)?;
     // Transport progress cannot extend the first semantic output deadline.
     let mut received_chunk = false;
+    let mut timing_detector = UpstreamTerminalDetector::new(UpstreamFormat::OpenAiChat);
+    timing_detector.set_timing(forward_timing.clone());
     loop {
         let timeout = if received_chunk {
             execution.stream_idle_timeout()
@@ -21846,9 +22098,10 @@ async fn send_trae_generation(
         };
         let remaining = prelude_deadline.saturating_duration_since(tokio::time::Instant::now());
         let timeout = Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)));
-        let next = trae_next_wire_chunk(&mut inner, timeout).await?;
+        let next = trae_next_wire_chunk(&mut inner, timeout, forward_timing.as_ref()).await?;
         let Some(chunk) = next else {
             let tail = decoder.finish_classified().map_err(map_trae_decode_error)?;
+            observe_trae_canonical(&mut timing_detector, &tail);
             if !trae_runtime_is_current(state, execution, runtime).await {
                 return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
                     "Trae Provider or bound account changed before response commit",
@@ -21858,12 +22111,15 @@ async fn send_trae_generation(
                 inner,
                 decoder,
                 first_canonical: tail,
+                timing_detector,
+                _timing_owner: timing.owner_guard(),
             });
         };
         received_chunk = true;
         let canonical = decoder
             .push_classified(chunk)
             .map_err(map_trae_decode_error)?;
+        observe_trae_canonical(&mut timing_detector, &canonical);
         if !canonical.is_empty() {
             if !trae_runtime_is_current(state, execution, runtime).await {
                 return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
@@ -21874,6 +22130,8 @@ async fn send_trae_generation(
                 inner,
                 decoder,
                 first_canonical: canonical,
+                timing_detector,
+                _timing_owner: timing.owner_guard(),
             });
         }
     }
@@ -21891,7 +22149,9 @@ fn map_trae_decode_error(error: super::trae::TraeSseDecodeError) -> TraeForwardA
 async fn trae_next_wire_chunk(
     inner: &mut BoxStream<'static, Result<Bytes, reqwest::Error>>,
     timeout: Option<Duration>,
+    timing: Option<&ForwardTiming>,
 ) -> Result<Option<Bytes>, TraeForwardAttemptError> {
+    let _read_wait = timing.map(|timing| timing.wait(WaitKind::UpstreamRead));
     let next = match timeout {
         Some(timeout) => tokio::time::timeout(timeout, inner.try_next())
             .await
@@ -21952,6 +22212,11 @@ async fn recover_trae_auth(
 
 fn trae_runtime_error_to_proxy_error(error: TraeRuntimeError) -> ProxyError {
     match error {
+        TraeRuntimeError::Capacity => ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Trae runtime memory or catalog-flight capacity is temporarily unavailable"
+                .into(),
+        },
         TraeRuntimeError::NotFound => ProxyError::not_found("Trae managed account not found"),
         TraeRuntimeError::IdentityChanged => ProxyError::conflict(
             "Trae Provider or bound account identity changed during runtime preparation",
@@ -21989,21 +22254,31 @@ async fn aggregate_trae_nonstream(
 ) -> Result<(Value, Option<RequestMemoryReservation>), TraeForwardAttemptError> {
     // The decoder already owns the aggregate; discard its redundant first delta.
     wire.first_canonical = Bytes::new();
+    let forward_timing = wire.timing_detector.timing();
     while !wire.decoder.is_terminal() {
-        let chunk =
-            match trae_next_wire_chunk(&mut wire.inner, execution.stream_idle_timeout()).await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => {
-                    wire.decoder
-                        .finish_classified()
-                        .map_err(map_trae_decode_error)?;
-                    break;
-                }
-                Err(error) => return Err(error),
-            };
-        wire.decoder
+        let chunk = match trae_next_wire_chunk(
+            &mut wire.inner,
+            execution.stream_idle_timeout(),
+            forward_timing.as_ref(),
+        )
+        .await
+        {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => {
+                let tail = wire
+                    .decoder
+                    .finish_classified()
+                    .map_err(map_trae_decode_error)?;
+                wire.observe_canonical(&tail);
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let canonical = wire
+            .decoder
             .push_classified(chunk)
             .map_err(map_trae_decode_error)?;
+        wire.observe_canonical(&canonical);
         if !trae_runtime_is_current(state, execution, runtime).await {
             return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
                 "Trae Provider or bound account changed during inference",
@@ -22047,6 +22322,7 @@ struct TraeStreamOptions {
     started: Instant,
     continuation: Option<TraeContinuation>,
     request_memory: Option<RequestMemoryBudget>,
+    timing: TimingSlot,
 }
 
 async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, ProxyError> {
@@ -22064,8 +22340,11 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
         started,
         continuation,
         request_memory,
+        timing,
     } = options;
-    let first_canonical = wire.first_canonical;
+    let first_canonical = std::mem::take(&mut wire.first_canonical);
+    let forward_timing = wire.timing_detector.timing();
+    let _timing_owner = timing.owner_guard();
     let mut stream_transform =
         super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
             &stored,
@@ -22111,6 +22390,7 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
     let share_id = request_context.share_id.clone();
     let user_email = request_context.user_email.clone();
     let stream = async_stream::stream! {
+        let _timing_owner = _timing_owner;
         let _account_in_flight_guard = account_in_flight_guard;
         let _share_invocation_guard = share_invocation_guard;
         let mut interrupt_guard = ShareStreamInterruptGuard {
@@ -22159,7 +22439,7 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
             let remaining = upstream_deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
             let next = if let Some(deadline) = keepalive.as_ref().and_then(|keepalive| keepalive.deadline()) {
                 tokio::select! {
-                    next = trae_next_wire_chunk(&mut wire.inner, remaining) => next,
+                    next = trae_next_wire_chunk(&mut wire.inner, remaining, forward_timing.as_ref()) => next,
                     _ = tokio::time::sleep_until(deadline) => {
                         if let Some(keepalive) = &mut keepalive {
                             keepalive.emitted(tokio::time::Instant::now());
@@ -22169,7 +22449,7 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
                     }
                 }
             } else {
-                trae_next_wire_chunk(&mut wire.inner, remaining).await
+                trae_next_wire_chunk(&mut wire.inner, remaining, forward_timing.as_ref()).await
             };
             if matches!(&next, Ok(Some(_))) {
                 upstream_deadline = execution.stream_idle_timeout()
@@ -22180,6 +22460,7 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
                     Ok(canonical) => canonical,
                     Err(error) => {
                         let error = error.into_proxy_error();
+                        if let Some(timing) = &forward_timing { timing.observe_terminal(TimingResult::Failed); }
                         if let Some(frame) = finish_qoder_stream_failure(
                             &mut interrupt_guard,
                             route,
@@ -22194,6 +22475,7 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
                     Ok(canonical) => canonical,
                     Err(error) => {
                         let error = error.into_proxy_error();
+                        if let Some(timing) = &forward_timing { timing.observe_terminal(TimingResult::Failed); }
                         if let Some(frame) = finish_qoder_stream_failure(
                             &mut interrupt_guard,
                             route,
@@ -22205,7 +22487,8 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
                     }
                 },
                 Err(TraeForwardAttemptError::Proxy(error)) => {
-                    if let Some(frame) = finish_qoder_stream_failure(
+                    if let Some(timing) = &forward_timing { timing.observe_terminal(TimingResult::Failed); }
+                        if let Some(frame) = finish_qoder_stream_failure(
                         &mut interrupt_guard,
                         route,
                         &error,
@@ -22216,7 +22499,8 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
                 }
                 Err(TraeForwardAttemptError::Upstream(error)) => {
                     let error = error.into_proxy_error();
-                    if let Some(frame) = finish_qoder_stream_failure(
+                    if let Some(timing) = &forward_timing { timing.observe_terminal(TimingResult::Failed); }
+                        if let Some(frame) = finish_qoder_stream_failure(
                         &mut interrupt_guard,
                         route,
                         &error,
@@ -22230,7 +22514,8 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
                 let error = ProxyError::conflict(
                     "Trae Provider or bound account changed during inference",
                 );
-                if let Some(frame) = finish_qoder_stream_failure(
+                if let Some(timing) = &forward_timing { timing.observe_terminal(TimingResult::Failed); }
+                        if let Some(frame) = finish_qoder_stream_failure(
                     &mut interrupt_guard,
                     route,
                     &error,
@@ -22239,6 +22524,7 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
                 }
                 return;
             }
+            wire.observe_canonical(&canonical);
             if !canonical.is_empty() {
                 interrupt_guard.usage.push(&canonical);
             }
@@ -22251,7 +22537,8 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
             ) {
                 Ok(transformed) => transformed,
                 Err(error) => {
-                    if let Some(frame) = finish_qoder_stream_failure(
+                    if let Some(timing) = &forward_timing { timing.observe_terminal(TimingResult::Failed); }
+                        if let Some(frame) = finish_qoder_stream_failure(
                         &mut interrupt_guard, route, &error,
                     ).await {
                         yield Ok(frame);
@@ -22263,7 +22550,8 @@ async fn forward_trae_stream(options: TraeStreamOptions) -> Result<Response, Pro
                 if let Err(error) = trae_store_continuation(
                     _continuation.as_ref(), &wire.decoder, request_memory.as_ref(),
                 ) {
-                    if let Some(frame) = finish_qoder_stream_failure(
+                    if let Some(timing) = &forward_timing { timing.observe_terminal(TimingResult::Failed); }
+                        if let Some(frame) = finish_qoder_stream_failure(
                         &mut interrupt_guard, route, &error,
                     ).await {
                         yield Ok(frame);
@@ -23132,6 +23420,11 @@ async fn send_qoder_generation(
         .post(url)
         .headers(headers)
         .body(encoded_body);
+    if !qoder_provider::runtime_is_current(state, execution, runtime).await {
+        return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
+            "Qoder bound identity or catalog changed before generation send",
+        )));
+    }
     let timing = request_memory.and_then(RequestMemoryBudget::timing);
     if let Some(timing) = &timing {
         timing.mark(Milestone::SendStarted);
@@ -23311,7 +23604,7 @@ async fn recover_qoder_auth(
                 .await
                 .ok_or_else(|| ProxyError::not_found("Qoder managed account not found"))?;
             crate::domain::qoder::QoderAccountProfile::parse(account.profile.as_ref())
-                .map_err(ProxyError::bad_request)?
+                .map_err(|error| ProxyError::bad_request(error.to_string()))?
                 .credential_rail
         }
     };
@@ -24531,6 +24824,7 @@ struct ClaudeDeepSeekForwardOptions {
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
+    timing: TimingSlot,
 }
 
 async fn forward_claude_deepseek(
@@ -24554,6 +24848,7 @@ async fn forward_claude_deepseek_metered(
         account_in_flight_guard,
         share_invocation_guard,
         started,
+        timing,
     } = options;
     let (body, model_selection) =
         adapters::apply_provider_model_routing(body, &stored, ProxyRoute::ClaudeMessages);
@@ -24656,6 +24951,15 @@ async fn forward_claude_deepseek_metered(
         resource_plan,
         number: 0,
     };
+    let send_timing = timing.clone();
+    // Session creation and PoW precede the completion send. Measure only the
+    // actual completion headers, including each existing same-session repair.
+    let headers_wait = Arc::new(std::sync::Mutex::new(None));
+    let send_wait = headers_wait.clone();
+    let received_wait = headers_wait.clone();
+    let received_timing = timing.clone();
+    let repair_wait = headers_wait.clone();
+    let repair_timing = timing.clone();
     let upstream = state
         .start_deepseek_chat_completion_metered(
             stored.app,
@@ -24672,9 +24976,50 @@ async fn forward_claude_deepseek_metered(
             prepared.thinking_enabled,
             prepared.search_enabled,
             Some(&mut metering),
+            move |bytes| {
+                drop(
+                    send_wait
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take(),
+                );
+                if let Some(timing) = send_timing.get() {
+                    timing.mark(Milestone::SendStarted);
+                    *send_wait.lock().unwrap_or_else(|error| error.into_inner()) =
+                        Some(timing.wait(WaitKind::Headers));
+                }
+                send_timing.retain_bytes(bytes)
+            },
+            move || {
+                drop(
+                    received_wait
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take(),
+                );
+                if let Some(timing) = received_timing.get() {
+                    timing.mark(Milestone::Headers);
+                }
+            },
+            move || {
+                if let Some(previous) = repair_timing.get() {
+                    if let Some(next) = repair_timing.begin_for_provider(
+                        ProviderType::DeepSeekAccount,
+                        previous.surface(),
+                        Instant::now(),
+                    ) {
+                        next.mark(Milestone::Admission);
+                        *repair_wait
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) =
+                            Some(next.wait(WaitKind::Retry));
+                    }
+                }
+            },
         )
         .await
         .map_err(deepseek_upstream_error_to_proxy_error)?;
+    drop(headers_wait);
     let status = upstream.status();
     let status_code = status.as_u16();
 
@@ -24721,11 +25066,16 @@ async fn forward_claude_deepseek_metered(
         let user_email = request_context.user_email.clone();
         let sse_stream: BoxStream<'static, Result<Bytes, std::io::Error>> = if prepared.has_tools()
         {
-            let collected = deepseek::collect_deepseek_response(
-                upstream.bytes_stream(),
-                prepared.thinking_enabled,
-            )
-            .await?;
+            let collected = {
+                let _read_wait = timing
+                    .get()
+                    .map(|timing| timing.wait(WaitKind::UpstreamRead));
+                deepseek::collect_deepseek_response(
+                    upstream.bytes_stream(),
+                    prepared.thinking_enabled,
+                )
+                .await?
+            };
             let collected = deepseek::finalize_collected_response(collected, &prepared)?;
             stream::iter(
                 deepseek::collected_response_to_claude_sse(
@@ -24746,6 +25096,7 @@ async fn forward_claude_deepseek_metered(
             )
             .boxed()
         };
+        let forward_timing = timing.get();
         let stream = async_stream::stream! {
             let _account_in_flight_guard = account_in_flight_guard;
             let _share_invocation_guard = share_invocation_guard;
@@ -24763,11 +25114,18 @@ async fn forward_claude_deepseek_metered(
                 usage: StreamUsageAccumulator::default(),
             };
             let mut first_token_ms = None;
+            let mut timing_detector = UpstreamTerminalDetector::new(UpstreamFormat::AnthropicMessages);
+            timing_detector.set_timing(forward_timing.clone());
             tokio::pin!(sse_stream);
-            while let Some(chunk) = sse_stream.next().await {
+            loop {
+                let read_wait = forward_timing.as_ref().map(|timing| timing.wait(WaitKind::UpstreamRead));
+                let chunk = sse_stream.next().await;
+                drop(read_wait);
+                let Some(chunk) = chunk else { break; };
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(error) => {
+                        if let Some(timing) = &forward_timing { timing.observe_terminal(TimingResult::Failed); }
                         let usage_result = std::mem::take(&mut interrupt_guard.usage)
                             .finish_with_status();
                         let usage = usage_result.usage;
@@ -24795,12 +25153,23 @@ async fn forward_claude_deepseek_metered(
                         return;
                     }
                 };
+                // The existing renderer owns all protocol decisions. This
+                // independent observer cannot reject, rewrite or retry a frame.
+                let _ = timing_detector.push(&chunk);
                 interrupt_guard.usage.push(&chunk);
                 if first_token_ms.is_none() && !chunk.is_empty() {
                     first_token_ms = Some(started.elapsed().as_millis());
                     interrupt_guard.first_token_ms = first_token_ms;
                 }
                 yield Ok::<Bytes, std::io::Error>(chunk);
+            }
+            if let Some(timing) = &forward_timing {
+                match timing_detector.terminal() {
+                    Some(UpstreamTerminal::Completed) => timing.observe_terminal(TimingResult::Complete),
+                    Some(UpstreamTerminal::Incomplete) => timing.observe_terminal(TimingResult::Incomplete),
+                    Some(UpstreamTerminal::Failed) => timing.observe_terminal(TimingResult::Failed),
+                    None => {}
+                }
             }
             let usage_result = std::mem::take(&mut interrupt_guard.usage)
                 .finish_with_status();
@@ -24834,11 +25203,19 @@ async fn forward_claude_deepseek_metered(
         return Ok(response);
     }
 
-    let collected =
+    let collected = {
+        let _read_wait = timing
+            .get()
+            .map(|timing| timing.wait(WaitKind::UpstreamRead));
         deepseek::collect_deepseek_response(upstream.bytes_stream(), prepared.thinking_enabled)
-            .await?;
+            .await?
+    };
     let collected = deepseek::finalize_collected_response(collected, &prepared)?;
     let message = deepseek::claude_message_json(&collected, &response_model, input_tokens);
+    if let Some(timing) = timing.get() {
+        timing.observe_anthropic_value(&message);
+        timing.observe_terminal(TimingResult::Complete);
+    }
     let output_tokens =
         deepseek::estimate_tokens(&format!("{}{}", collected.thinking, collected.content));
     let bytes =
@@ -24881,6 +25258,16 @@ async fn forward_claude_deepseek_metered(
 
 fn deepseek_upstream_error_to_proxy_error(error: DeepSeekUpstreamError) -> ProxyError {
     match error {
+        DeepSeekUpstreamError::RuntimeCapacity => ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message:
+                "DeepSeek runtime memory or session-flight capacity is temporarily unavailable"
+                    .into(),
+        },
+        DeepSeekUpstreamError::PowCapacity => ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "DeepSeek local proof-of-work capacity is exhausted; retry later".to_string(),
+        },
         DeepSeekUpstreamError::ValueQuota(error) => value_quota_proxy_error(error),
         DeepSeekUpstreamError::NotFound => {
             ProxyError::not_found("deepseek_account managed account not found")
@@ -27719,6 +28106,23 @@ pub(crate) fn managed_account_refresh_error_to_proxy_error(
     }
 }
 
+fn copilot_model_catalog_error_to_proxy_error(
+    error: crate::state::CopilotModelCatalogError,
+) -> ProxyError {
+    match error {
+        crate::state::CopilotModelCatalogError::Auth(error) => {
+            copilot_upstream_auth_error_to_proxy_error(error)
+        }
+        crate::state::CopilotModelCatalogError::Discovery {
+            status_code,
+            message,
+        } => ProxyError {
+            status: StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            message,
+        },
+    }
+}
+
 fn copilot_upstream_auth_error_to_proxy_error(error: CopilotUpstreamAuthError) -> ProxyError {
     match error {
         CopilotUpstreamAuthError::NotFound => {
@@ -29666,10 +30070,7 @@ async fn commit_kimi_thinking_replay(
                     kimi_replay_now_ms(),
                 )
                 .await;
-            crate::metrics::record_kimi_thinking_replay(
-                if stored { "stored" } else { "write_conflict" },
-                1,
-            );
+            crate::metrics::record_kimi_thinking_replay(stored.metric(), 1);
         }
         Some(_) => {
             crate::metrics::record_kimi_thinking_replay("invalid_content", 1);
@@ -29791,8 +30192,42 @@ fn resize_grok_prime_memory(
         .map_err(|error| error.into_proxy_error())
 }
 
-struct StreamForwardState {
+/// Backpressure and cancellation retain the actual upstream/decoder owner.
+fn normalize_bedrock_stream(
     inner: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    model: String,
+    memory: Option<&RequestMemoryBudget>,
+) -> Result<BoxStream<'static, Result<Bytes, StreamReadError>>, ProxyError> {
+    let decoder = super::bedrock::ConverseStream::new(model).with_memory(memory)?;
+    Ok(stream::try_unfold(
+        (inner, decoder, false),
+        |(mut inner, mut decoder, finished)| async move {
+            if finished {
+                return Ok(None);
+            }
+            loop {
+                match inner.try_next().await.map_err(StreamReadError::Upstream)? {
+                    Some(chunk) => {
+                        let output = decoder
+                            .push(&chunk)
+                            .map_err(StreamReadError::Normalization)?;
+                        if !output.is_empty() {
+                            return Ok(Some((output, (inner, decoder, false))));
+                        }
+                    }
+                    None => {
+                        let tail = decoder.finish().map_err(StreamReadError::Normalization)?;
+                        return Ok(Some((tail, (inner, decoder, true))));
+                    }
+                }
+            }
+        },
+    )
+    .boxed())
+}
+
+struct StreamForwardState {
+    inner: BoxStream<'static, Result<Bytes, StreamReadError>>,
     stored: StoredProvider,
     state: ServerState,
     route: ProxyRoute,
@@ -30570,11 +31005,7 @@ impl StreamForwardState {
                 })
             })
             .unwrap_or("completed");
-        if let Some(timing) = self
-            .request_memory
-            .as_ref()
-            .and_then(RequestMemoryBudget::timing)
-        {
+        if let Some(timing) = self.terminal_detector.timing() {
             timing.observe_terminal(match stream_status {
                 "completed" => TimingResult::Complete,
                 "incomplete" => TimingResult::Incomplete,
@@ -30774,11 +31205,7 @@ impl StreamForwardState {
         mut self: Box<Self>,
         error: ProxyError,
     ) -> Result<Option<(Bytes, Box<Self>)>, std::io::Error> {
-        if let Some(timing) = self
-            .request_memory
-            .as_ref()
-            .and_then(RequestMemoryBudget::timing)
-        {
+        if let Some(timing) = self.terminal_detector.timing() {
             timing.observe_terminal(TimingResult::Failed);
         }
         let message = error.client_message().to_string();
@@ -31698,6 +32125,7 @@ enum StreamTimeoutKind {
 
 enum StreamReadError {
     Upstream(reqwest::Error),
+    Normalization(ProxyError),
     Timeout {
         kind: StreamTimeoutKind,
         timeout: Duration,
@@ -31708,6 +32136,7 @@ impl StreamReadError {
     fn status_code(&self) -> u16 {
         match self {
             Self::Upstream(_) => StatusCode::BAD_GATEWAY.as_u16(),
+            Self::Normalization(error) => error.status.as_u16(),
             Self::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT.as_u16(),
         }
     }
@@ -31715,6 +32144,7 @@ impl StreamReadError {
     fn stream_status(&self) -> &'static str {
         match self {
             Self::Upstream(_) => "upstream_error",
+            Self::Normalization(_) => "protocol_error",
             Self::Timeout { .. } => "timeout",
         }
     }
@@ -31724,6 +32154,7 @@ impl std::fmt::Display for StreamReadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Upstream(error) => write!(formatter, "upstream stream error: {error}"),
+            Self::Normalization(error) => write!(formatter, "{}", error.client_message()),
             Self::Timeout { kind, timeout } => write!(
                 formatter,
                 "upstream stream {} timeout after {}ms",
@@ -32257,6 +32688,7 @@ fn stream_error_code_and_message(message: &str) -> (&'static str, &str) {
         || normalized.contains("responses content output repeat limit")
         || normalized.contains("responses reasoning output repeat limit")
         || normalized.contains("terminal event exceeded")
+        || normalized.contains("bedrock converse response")
     {
         return ("upstream_stream_protocol_error", message);
     }
@@ -32304,11 +32736,20 @@ mod tests {
     include!("forwarder/codex_tool_result_error_tests.rs");
     include!("forwarder/codex_r4_tests.rs");
     include!("forwarder/claude_timing_tests.rs");
+    include!("forwarder/r5_timing_tests.rs");
+    include!("forwarder/claude_r5_tests.rs");
     include!("forwarder/antigravity_timing_tests.rs");
+    include!("forwarder/antigravity_r5_tests.rs");
     include!("forwarder/grok_r4_tests.rs");
+    include!("forwarder/grok_r5_tests.rs");
     include!("forwarder/grok_timing_tests.rs");
     include!("forwarder/kiro_timing_tests.rs");
+    include!("forwarder/kiro_image_tests.rs");
+    include!("forwarder/gemini_onboarding_tests.rs");
+    include!("forwarder/ollama_r5_tests.rs");
+    include!("forwarder/bedrock_r5_tests.rs");
     include!("forwarder/value_quota_tests.rs");
+    include!("forwarder/copilot_native_tests.rs");
     use serde_json::{json, Value};
 
     use crate::domain::providers::model::{
@@ -34293,6 +34734,8 @@ mod tests {
                 (AppKind::Claude, ProxyRoute::ClaudeMessages, false),
                 (AppKind::Claude, ProxyRoute::ClaudeMessages, true),
                 (AppKind::Codex, ProxyRoute::CodexChatCompletions, false),
+                (AppKind::Codex, ProxyRoute::CodexChatCompletions, true),
+                (AppKind::Codex, ProxyRoute::CodexResponses, false),
                 (AppKind::Codex, ProxyRoute::CodexResponses, true),
             ] {
                 let path = if driver == "grok" {
@@ -34339,23 +34782,34 @@ mod tests {
                     "x-malicious-upstream",
                     HeaderValue::from_static("must-not-forward"),
                 );
-                let response = forward_provider_test(
+                let (response, timing) = r5_timing_forward(
                     state.clone(),
                     route,
-                    execution,
+                    execution.stored.provider.id.clone(),
                     None,
                     headers,
                     Bytes::from(body.to_string()),
                 )
-                .await
-                .unwrap();
+                .await;
                 assert_eq!(response.status(), StatusCode::OK);
                 assert!(response.headers().get("set-cookie").is_none());
                 assert!(response.headers().get("location").is_none());
                 let downstream = axum::body::to_bytes(response.into_body(), 1024 * 1024)
                     .await
                     .unwrap();
-                let downstream = String::from_utf8(downstream.to_vec()).unwrap();
+                let downstream_text = String::from_utf8(downstream.to_vec()).unwrap();
+                drop(downstream);
+                let downstream = downstream_text;
+                r5_timing_assert_delivery(
+                    &timing,
+                    if driver == "grok" {
+                        "grok_web_session"
+                    } else {
+                        "perplexity_web_session"
+                    },
+                    "complete",
+                )
+                .await;
                 assert!(downstream.contains("fixture-answer"), "{downstream}");
                 if stream && app == AppKind::Claude {
                     assert!(downstream.contains("event: message_stop"));
@@ -34368,7 +34822,7 @@ mod tests {
         }
 
         let observations = observations.lock().unwrap().clone();
-        assert_eq!(observations.len(), 8);
+        assert_eq!(observations.len(), 12);
         for observation in observations {
             assert_eq!(observation["method"], "POST");
             assert!(observation["authorization"].is_null());
@@ -38144,7 +38598,7 @@ mod tests {
                             b"data: {\"id\":\"chatcmpl_copilot_stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
                         )),
                         Ok::<_, std::convert::Infallible>(Bytes::from_static(
-                            b"data: {\"id\":\"chatcmpl_copilot_stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_weather\",\"type\":\"function\",\"function\":{\"name\":\"lookup_weather\",\"arguments\":\"{\\\"city\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+                            b"data: {\"id\":\"chatcmpl_copilot_stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_weather\",\"type\":\"function\",\"function\":{\"name\":\"lookup_weather\",\"arguments\":\"{\\\"city\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n",
                         )),
                         Ok::<_, std::convert::Infallible>(Bytes::from_static(
                             b"data: {\"id\":\"chatcmpl_copilot_stream\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-5\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"Paris\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
@@ -38174,6 +38628,15 @@ mod tests {
         let app = axum::Router::new()
             .route("/token", axum::routing::get(token))
             .route("/chat/completions", axum::routing::post(inference))
+            .route(
+                "/models",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"data":[
+                        {"id":"claude-sonnet-5", "supported_endpoints":["/chat/completions"]},
+                        {"id":"gpt-5.5", "supported_endpoints":["/chat/completions"]}
+                    ]}))
+                }),
+            )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -38224,7 +38687,7 @@ mod tests {
         let mut stored = stored_provider(
             app,
             ProviderType::GitHubCopilot,
-            json!({"testCopilotInferenceUrl": inference_origin}),
+            json!({"testCopilotInferenceUrl": inference_origin, "testCopilotModelsUrl": format!("{inference_origin}/models")}),
             Some(&account_id),
         );
         stored.provider.id = provider_id.clone();
@@ -47064,6 +47527,10 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
     #[test]
     fn deepseek_upstream_errors_map_to_proxy_status_codes() {
         assert_eq!(
+            deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::PowCapacity).status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
             deepseek_upstream_error_to_proxy_error(DeepSeekUpstreamError::NotFound).status,
             StatusCode::NOT_FOUND
         );
@@ -50858,81 +51325,98 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
 
     #[tokio::test]
     async fn responses_lifecycle_events_do_not_extend_first_semantic_event_deadline() {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        for grok in [false, true] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = axum::Router::new().route(
+                "/v1/responses",
+                axum::routing::post(|| async move {
+                    let events = futures_util::stream::unfold(0_u8, |index| async move {
+                        if index >= 5 {
+                            return None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        let event = if index < 4 {
+                            json!({
+                                "type": "response.created",
+                                "response": {
+                                    "id": format!("resp-lifecycle-{index}"),
+                                    "status": "in_progress"
+                                }
+                            })
+                        } else {
+                            json!({
+                                "type": "response.output_text.delta",
+                                "delta": "too late"
+                            })
+                        };
+                        Some((
+                            Ok::<_, std::convert::Infallible>(Bytes::from(format!(
+                                "data: {event}\n\n"
+                            ))),
+                            index + 1,
+                        ))
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(events))
+                        .unwrap()
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let (state, mut execution) = if grok {
+                let state = forwarder_test_state("grok-semantic-deadline");
+                let execution = install_grok_test_execution(
+                    &state,
+                    "grok-semantic-deadline",
+                    format!("http://{address}/v1"),
+                    None,
+                    "grok-semantic-access",
+                    None,
+                    &[],
+                )
+                .await;
+                (state, execution)
+            } else {
+                codex_bridge_test_context("codex-semantic-deadline", format!("http://{address}"))
+                    .await
+            };
+            let plan = std::sync::Arc::make_mut(&mut execution.plan);
+            plan.transport_policy.stream_first_byte_timeout_ms = Some(100);
+            plan.transport_policy.stream_idle_timeout_ms = Some(500);
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+            let result = tokio::time::timeout(
+                Duration::from_millis(350),
+                forward_with_attempt(
+                    state,
+                    ProxyRoute::CodexResponses,
+                    None,
+                    headers,
+                    Bytes::from(json!({"model": if grok {"grok-4.6"} else {"gpt-5.4"},"input":"ping","stream":true}).to_string()),
+                    ForwardAttemptContext {
+                        execution: Some(execution),
+                        ..ForwardAttemptContext::default()
+                    },
+                ),
+            )
             .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
-        let app = axum::Router::new().route(
-            "/v1/responses",
-            axum::routing::post(|| async move {
-                let events = futures_util::stream::unfold(0_u8, |index| async move {
-                    if index >= 5 {
-                        return None;
-                    }
-                    tokio::time::sleep(Duration::from_millis(40)).await;
-                    let event = if index < 4 {
-                        json!({
-                            "type": "response.created",
-                            "response": {
-                                "id": format!("resp-lifecycle-{index}"),
-                                "status": "in_progress"
-                            }
-                        })
-                    } else {
-                        json!({
-                            "type": "response.output_text.delta",
-                            "delta": "too late"
-                        })
-                    };
-                    Some((
-                        Ok::<_, std::convert::Infallible>(Bytes::from(format!(
-                            "data: {event}\n\n"
-                        ))),
-                        index + 1,
-                    ))
-                });
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from_stream(events))
-                    .unwrap()
-            }),
-        );
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let (state, mut execution) =
-            codex_bridge_test_context("codex-semantic-deadline", format!("http://{address}")).await;
-        let plan = std::sync::Arc::make_mut(&mut execution.plan);
-        plan.transport_policy.stream_first_byte_timeout_ms = Some(100);
-        plan.transport_policy.stream_idle_timeout_ms = Some(500);
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            .expect("the absolute first semantic event deadline must terminate priming");
+            let error = match result {
+                Ok(_) => panic!("lifecycle events must not satisfy the semantic commit deadline"),
+                Err(error) => error,
+            };
+            assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
+            assert!(error.message.contains("first byte timeout"));
 
-        let result = tokio::time::timeout(
-            Duration::from_millis(350),
-            forward_with_attempt(
-                state,
-                ProxyRoute::CodexResponses,
-                None,
-                headers,
-                Bytes::from_static(br#"{"model":"gpt-5.4","input":"ping","stream":true}"#),
-                ForwardAttemptContext {
-                    execution: Some(execution),
-                    ..ForwardAttemptContext::default()
-                },
-            ),
-        )
-        .await
-        .expect("the absolute first semantic event deadline must terminate priming");
-        let error = match result {
-            Ok(_) => panic!("lifecycle events must not satisfy the semantic commit deadline"),
-            Err(error) => error,
-        };
-        assert_eq!(error.status, StatusCode::GATEWAY_TIMEOUT);
-        assert!(error.message.contains("first byte timeout"));
-
-        server.abort();
+            server.abort();
+        }
     }
 
     fn image_generation_responses_sse() -> Bytes {

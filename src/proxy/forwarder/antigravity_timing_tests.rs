@@ -536,5 +536,5 @@ fn antigravity_core03_semantic_content_excludes_metadata_and_retains_attempt_loc
             "gemini_generate_content",
             Instant::now()
         )
-        .is_none());
+        .is_some());
 }

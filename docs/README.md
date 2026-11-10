@@ -47,8 +47,11 @@
 | [codex-oauth.md](provider/codex-oauth.md) | 权威 | Codex OAuth 单账号反代 |
 | [grok-oauth.md](provider/grok-oauth.md) | 权威 | Grok OAuth 单账号反代 |
 | [kiro-prompt-cache.md](provider/kiro-prompt-cache.md) | 权威 | Kiro Prompt Caching 语义、usage 来源与 SQLite 持久化边界 |
+| [kiro-images.md](provider/kiro-images.md) | 权威 | Kiro/Amazon Q 最终图片字段预算、动画保真、blocking 工作量与取消资源归属 |
+| [gemini-cli.md](provider/gemini-cli.md) | 权威 | Gemini CLI 既有项目发现、精确 OAuth 身份、首次开通研究门禁及双 App 边界 |
+| [copilot.md](provider/copilot.md) | 权威 | Copilot 精确账号目录、Messages/Responses/Chat 原生端点、请求语义保护与 scope fencing |
 | [kimi-code.md](provider/kimi-code.md) | 权威 | Kimi Code 单账号反代 |
-| [qoder-cosy.md](provider/qoder-cosy.md) | 权威 | Qoder COSY 单账号反代、站点/凭据 rail、动态模型 capability 与签名边界 |
+| [qoder-cosy.md](provider/qoder-cosy.md) | 权威 | Qoder COSY 单账号反代、站点/凭据 rail、chat/app 发现与推理权限、动态 capability 与签名边界 |
 | [codebuddy-oauth.md](provider/codebuddy-oauth.md) | 权威 | CodeBuddy OAuth 单账号反代实现合同：单 ProviderType + 国内/国际站点、固定身份 OAuth/refresh、三 Surface、严格终态与 `fixture_verified / live_pending` 边界 |
 | [workbuddy-oauth.md](provider/workbuddy-oauth.md) | 权威 | 独立 WorkBuddy 产品、原生双站 OAuth、固定账号、共享协议原语与真实验收边界 |
 | [trae-solo.md](provider/trae-solo.md) | 权威 | Trae SOLO / CN raw_chat / Intl raw_chat 单账号反代合同：四协议、工具往返、续接、资源预算、固定身份与真实验收门禁 |

@@ -615,6 +615,10 @@ pub fn record_responses_phase_downgrade(
     .increment(1);
 }
 
+pub(crate) fn record_resident_retention_refused(owner: &'static str) {
+    metrics::counter!("cc_switch_resident_retention_refused_total", "owner" => owner).increment(1);
+}
+
 pub fn record_kimi_thinking_replay(outcome: &'static str, count: u64) {
     metrics::counter!(
         "cc_switch_kimi_thinking_replay_total",
@@ -797,6 +801,10 @@ fn describe() {
     metrics::describe_counter!(
         "cc_switch_codex_quota_observer_total",
         "Passive Codex quota queue, coalescing and persistence outcomes; never generation usage"
+    );
+    metrics::describe_counter!(
+        "cc_switch_resident_retention_refused_total",
+        "Optional retained owners refused by local capacity; not account authentication failures"
     );
     metrics::describe_gauge!(
         "cc_switch_process_resident_memory_used_bytes",

@@ -35,7 +35,7 @@ for (const needle of ["pub(crate) fn response(", "pub(crate) fn series_response(
 const state = read("src/state.rs");
 const deepseek = state.slice(state.indexOf("pub(crate) async fn start_deepseek_chat_completion_metered("), state.indexOf("async fn deepseek_runtime_generation_matches(")).replace(/\s+/g, "");
 assert(deepseek.includes("meter.begin(self)"), "DeepSeek session rebuild must admit each generation");
-assert(deepseek.indexOf("meter.begin(self)") < deepseek.indexOf(".completion("), "DeepSeek admission must precede generation IO");
+assert(deepseek.indexOf("meter.begin(self)") < deepseek.indexOf(".completion_observed("), "DeepSeek admission must precede generation IO");
 for (const helper of ["send_qoder_generation", "send_trae_generation"]) {
   const start = forwarder.indexOf("async fn " + helper + "(");
   const end = forwarder.indexOf("\nasync fn ", start + 1);

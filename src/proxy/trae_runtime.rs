@@ -1,13 +1,19 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::RwLock;
 
 use crate::domain::trae::{TraeAccountProfile, TRAE_DEFAULT_MODEL};
+use crate::infra::resident_flights::{node_bytes, ResidentFlightGuard, ResidentFlights};
+use crate::infra::resident_memory::{
+    process_resident_memory, retained_json_bytes, ResidentMemoryBudget, ResidentMemoryReservation,
+};
 
 const MAX_RUNTIME_ENTRIES: usize = 128;
+const MAX_ACTIVE_CATALOG_FLIGHTS: usize = 64;
+const MAX_RUNTIME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MODEL_CATALOG_ENTRIES: usize = 256;
 const MAX_MODEL_ID_BYTES: usize = 256;
 const MAX_STALE_CATALOG_AGE_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -20,7 +26,7 @@ const HIDDEN_CONFIG_NAMES: &[&str] = &[
     "summary",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TraeRuntimeScope(String);
 
 impl TraeRuntimeScope {
@@ -87,14 +93,39 @@ pub struct TraeModelCapability {
     pub max_mode: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TraeModelCatalog {
-    pub enabled_models: Vec<String>,
-    pub raw_configs: BTreeMap<String, Value>,
-    pub capabilities: BTreeMap<String, TraeModelCapability>,
+    data: Arc<TraeModelCatalogData>,
     pub fetched_at_ms: i64,
     pub stale: bool,
     expires_at_ms: i64,
+}
+
+#[derive(Debug)]
+pub struct TraeModelCatalogData {
+    pub enabled_models: Vec<String>,
+    pub raw_configs: BTreeMap<String, Value>,
+    pub capabilities: BTreeMap<String, TraeModelCapability>,
+    retained_bytes: usize,
+    _memory: Option<ResidentMemoryReservation>,
+}
+
+impl std::ops::Deref for TraeModelCatalog {
+    type Target = TraeModelCatalogData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl PartialEq for TraeModelCatalog {
+    fn eq(&self, other: &Self) -> bool {
+        self.enabled_models == other.enabled_models
+            && self.raw_configs == other.raw_configs
+            && self.capabilities == other.capabilities
+            && self.fetched_at_ms == other.fetched_at_ms
+            && self.stale == other.stale
+            && self.expires_at_ms == other.expires_at_ms
+    }
 }
 
 impl TraeModelCatalog {
@@ -199,10 +230,16 @@ impl std::fmt::Debug for PreparedTraeRuntime {
     }
 }
 
-#[derive(Default)]
 pub struct TraeRuntimeCache {
-    catalogs: RwLock<HashMap<TraeRuntimeScope, TraeModelCatalog>>,
-    catalog_flights: Mutex<HashMap<TraeRuntimeScope, Arc<Mutex<()>>>>,
+    catalogs: RwLock<BTreeMap<TraeRuntimeScope, TraeModelCatalog>>,
+    catalog_flights: ResidentFlights<TraeRuntimeScope>,
+    parent: ResidentMemoryBudget,
+}
+
+impl Default for TraeRuntimeCache {
+    fn default() -> Self {
+        Self::with_parent(process_resident_memory())
+    }
 }
 
 impl std::fmt::Debug for TraeRuntimeCache {
@@ -214,10 +251,18 @@ impl std::fmt::Debug for TraeRuntimeCache {
 }
 
 impl TraeRuntimeCache {
+    pub(crate) fn with_parent(parent: ResidentMemoryBudget) -> Self {
+        Self {
+            catalogs: RwLock::new(BTreeMap::new()),
+            catalog_flights: ResidentFlights::new(parent.clone(), MAX_ACTIVE_CATALOG_FLIGHTS),
+            parent,
+        }
+    }
+
     pub async fn catalog(&self, scope: &TraeRuntimeScope, now_ms: i64) -> Option<TraeModelCatalog> {
-        self.catalogs
-            .read()
-            .await
+        let mut catalogs = self.catalogs.write().await;
+        catalogs.retain(|_, catalog| catalog.is_usable_stale(now_ms));
+        catalogs
             .get(scope)
             .filter(|catalog| catalog.is_fresh(now_ms))
             .cloned()
@@ -228,9 +273,9 @@ impl TraeRuntimeCache {
         scope: &TraeRuntimeScope,
         now_ms: i64,
     ) -> Option<TraeModelCatalog> {
-        self.catalogs
-            .read()
-            .await
+        let mut catalogs = self.catalogs.write().await;
+        catalogs.retain(|_, catalog| catalog.is_usable_stale(now_ms));
+        catalogs
             .get(scope)
             .filter(|catalog| catalog.is_usable_stale(now_ms))
             .map(TraeModelCatalog::as_stale)
@@ -241,18 +286,41 @@ impl TraeRuntimeCache {
         scope: TraeRuntimeScope,
         fetched: FetchedTraeModelCatalog,
         now_ms: i64,
-    ) -> TraeModelCatalog {
+    ) -> Result<TraeModelCatalog, TraeCatalogCapacity> {
+        let mut catalogs = self.catalogs.write().await;
+        catalogs.remove(&scope);
+        catalogs.retain(|_, catalog| catalog.is_usable_stale(now_ms));
+        let bytes = catalog_bytes(&scope, &fetched);
+        let Some(memory) = self.parent.reserve(bytes) else {
+            crate::metrics::record_resident_retention_refused("trae_catalog");
+            return Err(TraeCatalogCapacity);
+        };
         let catalog = TraeModelCatalog {
-            enabled_models: fetched.enabled_models,
-            raw_configs: fetched.raw_configs,
-            capabilities: fetched.capabilities,
+            data: Arc::new(TraeModelCatalogData {
+                enabled_models: fetched.enabled_models,
+                raw_configs: fetched.raw_configs,
+                capabilities: fetched.capabilities,
+                retained_bytes: bytes,
+                _memory: Some(memory),
+            }),
             fetched_at_ms: now_ms,
             stale: false,
             expires_at_ms: now_ms.saturating_add(TRAE_MODEL_CATALOG_TTL_MS),
         };
-        let mut catalogs = self.catalogs.write().await;
-        catalogs.insert(scope, catalog.clone());
-        while catalogs.len() > MAX_RUNTIME_ENTRIES {
+        if bytes > MAX_RUNTIME_BYTES {
+            // A valid live catalog can serve this call without being cached.
+            // Its actual shared owner still holds the process reservation.
+            crate::metrics::record_resident_retention_refused("trae_catalog");
+            return Ok(catalog);
+        }
+        while catalogs.len() >= MAX_RUNTIME_ENTRIES
+            || catalogs
+                .values()
+                .map(|catalog| catalog.retained_bytes)
+                .sum::<usize>()
+                .saturating_add(bytes)
+                > MAX_RUNTIME_BYTES
+        {
             let Some(oldest) = catalogs
                 .iter()
                 .min_by_key(|(_, catalog)| catalog.fetched_at_ms)
@@ -262,24 +330,84 @@ impl TraeRuntimeCache {
             };
             catalogs.remove(&oldest);
         }
-        catalog
+        catalogs.insert(scope, catalog.clone());
+        Ok(catalog)
     }
 
     pub async fn invalidate_scope(&self, scope: &TraeRuntimeScope) {
         self.catalogs.write().await.remove(scope);
     }
 
-    pub async fn catalog_lock(&self, scope: &TraeRuntimeScope) -> OwnedMutexGuard<()> {
-        let flight = {
-            let mut flights = self.catalog_flights.lock().await;
-            flights.retain(|key, flight| key == scope || Arc::strong_count(flight) > 1);
-            flights
-                .entry(scope.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        flight.lock_owned().await
+    pub(crate) async fn catalog_lock(
+        &self,
+        scope: &TraeRuntimeScope,
+    ) -> Option<ResidentFlightGuard> {
+        let guard = self.catalog_flights.lock(scope, scope.0.capacity()).await;
+        if guard.is_none() {
+            crate::metrics::record_resident_retention_refused("trae_catalog_flight");
+        }
+        guard
     }
+}
+
+#[derive(Debug)]
+pub struct TraeCatalogCapacity;
+
+fn catalog_bytes(scope: &TraeRuntimeScope, fetched: &FetchedTraeModelCatalog) -> usize {
+    let models = fetched
+        .enabled_models
+        .capacity()
+        .saturating_mul(std::mem::size_of::<String>())
+        .saturating_add(
+            fetched
+                .enabled_models
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>(),
+        );
+    let configs = fetched
+        .raw_configs
+        .iter()
+        .map(|(key, value)| {
+            node_bytes::<String, Value>(key.capacity().saturating_add(retained_json_bytes(value)))
+        })
+        .sum::<usize>();
+    let capabilities = fetched
+        .capabilities
+        .iter()
+        .map(|(key, value)| {
+            let dynamic = key
+                .capacity()
+                .saturating_add(value.id.capacity())
+                .saturating_add(value.display_name.capacity())
+                .saturating_add(
+                    value
+                        .reasoning_efforts
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<String>()),
+                )
+                .saturating_add(
+                    value
+                        .reasoning_efforts
+                        .iter()
+                        .map(String::capacity)
+                        .sum::<usize>(),
+                )
+                .saturating_add(value.reasoning_default.as_ref().map_or(0, String::capacity))
+                .saturating_add(value.reasoning_type.as_ref().map_or(0, String::capacity));
+            node_bytes::<String, TraeModelCapability>(dynamic)
+        })
+        .sum::<usize>();
+    node_bytes::<TraeRuntimeScope, TraeModelCatalog>(
+        scope
+            .0
+            .capacity()
+            .saturating_add(std::mem::size_of::<TraeModelCatalogData>())
+            .saturating_add(std::mem::size_of::<usize>() * 2)
+            .saturating_add(models)
+            .saturating_add(configs)
+            .saturating_add(capabilities),
+    )
 }
 
 pub fn parse_trae_model_catalog(value: &Value) -> Result<FetchedTraeModelCatalog, String> {
@@ -725,9 +853,13 @@ mod tests {
         }))
         .unwrap();
         let catalog = TraeModelCatalog {
-            enabled_models: fetched.enabled_models,
-            raw_configs: fetched.raw_configs,
-            capabilities: fetched.capabilities,
+            data: Arc::new(TraeModelCatalogData {
+                enabled_models: fetched.enabled_models,
+                raw_configs: fetched.raw_configs,
+                capabilities: fetched.capabilities,
+                retained_bytes: 0,
+                _memory: None,
+            }),
             fetched_at_ms: 0,
             stale: false,
             expires_at_ms: i64::MAX,
@@ -750,7 +882,8 @@ mod tests {
                 },
                 1_000,
             )
-            .await;
+            .await
+            .unwrap();
         assert!(cache.catalog(&current, 1_001).await.is_some());
         assert!(cache
             .catalog(&scope("enterprise-2", 4), 1_001)
@@ -859,9 +992,13 @@ fn trae_raw_catalog_requires_exact_names_without_solo_aliases() {
     ]}))
     .unwrap();
     let catalog = TraeModelCatalog {
-        enabled_models: fetched.enabled_models,
-        raw_configs: fetched.raw_configs,
-        capabilities: fetched.capabilities,
+        data: Arc::new(TraeModelCatalogData {
+            enabled_models: fetched.enabled_models,
+            raw_configs: fetched.raw_configs,
+            capabilities: fetched.capabilities,
+            retained_bytes: 0,
+            _memory: None,
+        }),
         fetched_at_ms: 0,
         stale: false,
         expires_at_ms: 1,
@@ -888,4 +1025,167 @@ fn trae_raw_catalog_requires_exact_names_without_solo_aliases() {
             .is_empty()
     );
     assert!(parse_trae_raw_catalog(&serde_json::json!({"config_info_list":[]})).is_err());
+}
+
+#[cfg(test)]
+mod r5_resource_tests {
+    use super::*;
+    fn key(name: &str) -> TraeRuntimeScope {
+        TraeRuntimeScope(format!("trae-runtime-v2:{name}"))
+    }
+    fn fetched(name: &str) -> FetchedTraeModelCatalog {
+        parse_trae_model_catalog(&serde_json::json!({"config_info_list":[{"config_name":name,"display_config":{"display_name":name},"reasoning_effort_config":{"support_thinking":true,"options":["high"],"default_level":"high"}}]})).unwrap()
+    }
+    #[tokio::test]
+    async fn r5_resource_trae_snapshots_stale_expiry_and_drop_share_exact_owner() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = TraeRuntimeCache::with_parent(parent.clone());
+        let current = cache
+            .insert_catalog(key("first"), fetched("glm-5.2"), 1000)
+            .await
+            .unwrap();
+        let bytes = parent.snapshot().used_bytes;
+        let view = cache.catalog(&key("first"), 1001).await.unwrap();
+        assert!(Arc::ptr_eq(&current.data, &view.data));
+        assert_eq!(parent.snapshot().used_bytes, bytes);
+        assert!(cache
+            .catalog(&key("first"), 1000 + TRAE_MODEL_CATALOG_TTL_MS)
+            .await
+            .is_none());
+        let stale = cache
+            .stale_catalog(&key("first"), 1000 + TRAE_MODEL_CATALOG_TTL_MS)
+            .await
+            .unwrap();
+        assert!(stale.stale);
+        assert!(Arc::ptr_eq(&current.data, &stale.data));
+        assert!(cache
+            .stale_catalog(&key("first"), 1001 + MAX_STALE_CATALOG_AGE_MS)
+            .await
+            .is_none());
+        drop(cache);
+        drop(current);
+        drop(view);
+        assert_eq!(parent.snapshot().used_bytes, bytes);
+        drop(stale);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+    #[tokio::test]
+    async fn r5_resource_trae_empty_and_refused_replacements_never_reuse_old_entitlement() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = TraeRuntimeCache::with_parent(parent.clone());
+        let held = cache
+            .insert_catalog(key("scope"), fetched("glm-5.2"), 1000)
+            .await
+            .unwrap();
+        let empty = FetchedTraeModelCatalog {
+            enabled_models: vec![],
+            raw_configs: BTreeMap::new(),
+            capabilities: BTreeMap::new(),
+        };
+        let current = cache
+            .insert_catalog(key("scope"), empty, 1001)
+            .await
+            .unwrap();
+        assert!(cache
+            .catalog(&key("scope"), 1002)
+            .await
+            .unwrap()
+            .enabled_models
+            .is_empty());
+        assert!(current.resolve_model("glm-5.2").is_err());
+        parent.configure_limit(Some(parent.snapshot().used_bytes));
+        assert!(cache
+            .insert_catalog(key("scope"), fetched("other-model"), 1003)
+            .await
+            .is_err());
+        assert!(cache.stale_catalog(&key("scope"), 1004).await.is_none());
+        drop(cache);
+        assert!(parent.snapshot().used_bytes > 0);
+        drop(held);
+        drop(current);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+    #[tokio::test]
+    async fn r5_resource_trae_optional_oversized_catalog_retention_keeps_live_owner_charged() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = TraeRuntimeCache::with_parent(parent.clone());
+        let mut input = fetched("glm-5.2");
+        input.raw_configs.insert(
+            "large".into(),
+            serde_json::json!("x".repeat(MAX_RUNTIME_BYTES)),
+        );
+        let live = cache
+            .insert_catalog(key("large"), input, 1000)
+            .await
+            .unwrap();
+        assert!(cache.catalog(&key("large"), 1001).await.is_none());
+        assert_eq!(live.resolve_model("glm-5.2").unwrap(), "glm-5.2");
+        let bytes = parent.snapshot().used_bytes;
+        assert!(bytes > MAX_RUNTIME_BYTES);
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, bytes);
+        drop(live);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+    #[tokio::test]
+    async fn r5_resource_trae_invalidation_and_eviction_do_not_release_external_snapshots() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = TraeRuntimeCache::with_parent(parent.clone());
+        let held = cache
+            .insert_catalog(key("first"), fetched("glm-5.2"), 1000)
+            .await
+            .unwrap();
+        let bytes = parent.snapshot().used_bytes;
+        for index in 0..MAX_RUNTIME_ENTRIES {
+            cache
+                .insert_catalog(
+                    key(&format!("key-{index}")),
+                    fetched("glm-5.2"),
+                    1001 + index as i64,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(cache.catalogs.read().await.len(), MAX_RUNTIME_ENTRIES);
+        assert!(cache.catalog(&key("first"), 2000).await.is_none());
+        cache.invalidate_scope(&key("key-0")).await;
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, bytes);
+        drop(held);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+    #[tokio::test]
+    async fn r5_resource_trae_distinct_flights_and_waiter_cancellation_preserve_parent() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = Arc::new(TraeRuntimeCache::with_parent(parent.clone()));
+        let mut guards = Vec::new();
+        for index in 0..MAX_ACTIVE_CATALOG_FLIGHTS {
+            guards.push(
+                cache
+                    .catalog_lock(&key(&format!("scope-{index}")))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(cache.catalog_lock(&key("overflow")).await.is_none());
+        let bytes = parent.snapshot().used_bytes;
+        let waiting_cache = cache.clone();
+        let waiter = tokio::spawn(async move { waiting_cache.catalog_lock(&key("scope-0")).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        assert!(parent.snapshot().used_bytes > bytes);
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(parent.snapshot().used_bytes, bytes);
+        drop(cache);
+        assert!(parent.snapshot().used_bytes > 0);
+        drop(guards);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        let zero = TraeRuntimeCache::with_parent(ResidentMemoryBudget::new(Some(0)));
+        assert!(zero.catalog_lock(&key("zero")).await.is_none());
+        assert!(zero
+            .insert_catalog(key("zero"), fetched("glm-5.2"), 1000)
+            .await
+            .is_err());
+    }
 }

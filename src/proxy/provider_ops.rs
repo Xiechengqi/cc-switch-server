@@ -3269,4 +3269,5 @@ mod tests {
             ]
         );
     }
+    include!("provider_ops/static_r5_tests.rs");
 }

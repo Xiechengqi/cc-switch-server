@@ -1,0 +1,190 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "codex_oauth",
+  "liveState": "live_pending",
+  "references": [
+    {
+      "repository": "CLIProxyAPI",
+      "commit": "681ce41b6e44c45b15b79378b003909d6ba29e68",
+      "tree": "00d0ecf4594b47495d82d1efd429c17551ab6d51",
+      "files": [
+        {
+          "path": "internal/runtime/executor/codex_executor.go",
+          "sha256": "bcf3517325e3c2e156f4ede44854071185909af443077f817e5aac3a1f1b616c"
+        },
+        {
+          "path": "internal/runtime/executor/codex_websockets_executor.go",
+          "sha256": "947115eb3fc41370b091d4da48d58350d911bd771cb278e90dfefcb6e918b9a0"
+        },
+        {
+          "path": "internal/runtime/executor/codex_websockets_interrupt_test.go",
+          "sha256": "8b21b25a09dc62cc2f1d2a57d102e7a3a5e614e4d80c1dc560e0206d5f7ff7e6"
+        },
+        {
+          "path": "internal/runtime/executor/codex_websockets_late_interrupt_test.go",
+          "sha256": "90c9c8e06d8259a64f9286b460a05a37f3dd373fa27eecf2d062913a5a55fdaf"
+        },
+        {
+          "path": "internal/runtime/executor/codex_websockets_write_loss_test.go",
+          "sha256": "46b05879753584c8f5cde54671fbaf95512ae2b22cc1fa2cccb7a34d8dd2ebc2"
+        }
+      ]
+    },
+    {
+      "repository": "Codex/codex2api",
+      "commit": "b6a827f9357a6cf1ac4c211854726d808406c44f",
+      "tree": "5b5467905377806bd10dcef1fb494f358de34779",
+      "files": [
+        {
+          "path": "proxy/responses_ws_interrupt.go",
+          "sha256": "1676cdddd493301a9e5bb1f5cda8513ab3bd4be57c06dd55b3b12e0889ec6e32"
+        },
+        {
+          "path": "proxy/responses_ws_recovery_regression_test.go",
+          "sha256": "d61f06803b09a69f7bba1ddd8a1204e3fb07d7782484ce4080fb247a514aaf36"
+        },
+        {
+          "path": "proxy/account_bound_responses_ws_test.go",
+          "sha256": "ac5f004b22e6a892b867c2b3fdf36febc67101cdad0be4acd889d2ae9b8dbf87"
+        }
+      ]
+    }
+  ],
+  "reference": {
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false
+  },
+  "scope": {
+    "providerType": "codex_oauth",
+    "profiles": [
+      "claude.openai_oauth",
+      "codex.openai_oauth"
+    ],
+    "compatibilityApps": [
+      "claude",
+      "codex",
+      "gemini"
+    ],
+    "product": "ChatGPT Codex OAuth",
+    "sites": [
+      "https://chatgpt.com",
+      "https://auth.openai.com"
+    ],
+    "credentialRail": "one explicitly bound managed Codex OAuth Account and verified workspace",
+    "excludedIdentity": [
+      "SIWC",
+      "borrowed API key",
+      "other Account or workspace"
+    ]
+  },
+  "localPolicy": {
+    "interrupt": "only exact current physical connection and response ID; stale/duplicate/unsolicited controls never acquire a new socket, replay, change generation or extend the ACK deadline",
+    "ack": {
+      "timeoutMs": 30000,
+      "terminalIsAck": false,
+      "controlFailureIsGenerationFailure": false,
+      "newCreateWhileAwaitingAck": false,
+      "oldConnectionAckCanAcknowledgeNewTurn": false,
+      "nativeAckFields": "preserved after reviewed control-envelope validation"
+    },
+    "httpFallback": "a matching interrupt returns local interrupt_not_supported and leaves HTTP generation active; no fake accepted/incomplete or discard guarantee",
+    "continuation": "exact credential/session/caller/share/Provider/Account/model/endpoint scope and matching tool-call kind; orphan output does not manufacture call history",
+    "postCommit": "no generic HTTP/WS fallback or replay after create/business output, ambiguous write loss, or client cancellation",
+    "refreshPartial": "after a partial token response outcome_unknown and immediate_relogin fence credentials; never reuse refresh token at another endpoint",
+    "restart": "post-validation encrypted journal preserves the same Account/provider/auth generation and rotated token bytes; stale identity cannot activate it; synthetic journal recovery is not JWT/vendor acceptance",
+    "identity": "retain existing JWKS/verified subject and selected workspace; SIWC is separately evaluated and not enabled by reference presence",
+    "phaseAndReasoning": "retain existing native Responses phase and authenticated encrypted replay; do not invent a private commentary signature",
+    "productionWireChanged": false,
+    "performanceClaim": false
+  },
+  "cases": [
+    {
+      "id": "stale-interrupt",
+      "tests": [
+        "codex_websocket_late_interrupt_does_not_reach_a_retained_socket",
+        "codex_terminal_interrupt_ids_are_bounded_and_connection_local"
+      ]
+    },
+    {
+      "id": "wrong-id-duplicate-and-late-ack",
+      "tests": [
+        "codex_r4_interrupt_ack_order_timeout_and_duplicate_requests_are_connection_local",
+        "codex_r4_failed_interrupt_preserves_generation_and_single_usage",
+        "codex_r4_http_fallback_interrupt_is_explicitly_unsupported_and_keeps_stream"
+      ]
+    },
+    {
+      "id": "old-physical-connection-ack",
+      "tests": [
+        "codex_r4_interrupt_state_fences_identity_duplicates_ack_and_terminal"
+      ]
+    },
+    {
+      "id": "orphan-tool-output",
+      "tests": [
+        "previous_response_409_requires_an_unpaired_tool_output",
+        "previous_response_tool_outputs_require_matching_call_kind",
+        "websocket_previous_response_rejects_mismatched_tool_kind_without_history"
+      ]
+    },
+    {
+      "id": "committed-ws-disconnect",
+      "tests": [
+        "codex_websocket_size_close_after_commit_does_not_replay",
+        "codex_websocket_first_byte_timeout_after_commit_does_not_replay",
+        "codex_websocket_does_not_fallback_after_business_event_is_emitted"
+      ]
+    },
+    {
+      "id": "committed-http-disconnect",
+      "tests": [
+        "codex_http_fallback_eof_after_business_does_not_switch_provider"
+      ]
+    },
+    {
+      "id": "codex-partial-refresh",
+      "tests": [
+        "refresh_response_body_failure_does_not_try_fallback_endpoint"
+      ],
+      "providerTypes": [
+        "claude_oauth",
+        "codex_oauth"
+      ],
+      "sample": "HTTP 200 with a partial rotated token JSON followed by invalid chunk framing",
+      "expected": [
+        "outcome_unknown",
+        "immediate_relogin",
+        "no endpoint fallback"
+      ]
+    },
+    {
+      "id": "codex-restart-journal",
+      "tests": [
+        "native_refresh_journal_recovers_rotated_credentials_after_restart_boundary"
+      ],
+      "providerTypes": [
+        "gemini_cli",
+        "codex_oauth"
+      ],
+      "boundary": "synthetic post-validation encrypted commit journal; no JWKS/vendor acceptance claim",
+      "restartCases": [
+        "matching_generation_recovers",
+        "reauthorized_credentials_fence_old_journal"
+      ]
+    },
+    {
+      "id": "same-account-auth-recovery",
+      "tests": [
+        "codex_non_stream_401_forces_one_signed_refresh_and_replays_same_provider",
+        "codex_websocket_http_fallback_401_refreshes_once_before_replay"
+      ]
+    },
+    {
+      "id": "continuation-credential-fence",
+      "tests": [
+        "codex_previous_response_scope_rejects_same_generation_credential_change"
+      ]
+    }
+  ]
+}

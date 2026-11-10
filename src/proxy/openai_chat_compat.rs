@@ -12,6 +12,7 @@ pub(crate) struct OpenAiChatStreamCanonicalizer {
     fallback_created: i64,
     frozen_created: Option<i64>,
     path: &'static str,
+    terminal: Option<super::ollama::ChatStreamTerminal>,
 }
 
 impl OpenAiChatStreamCanonicalizer {
@@ -29,7 +30,13 @@ impl OpenAiChatStreamCanonicalizer {
             fallback_created: fallback_created.max(1),
             frozen_created: None,
             path,
+            terminal: None,
         }
+    }
+
+    pub(crate) fn require_terminal(mut self) -> Self {
+        self.terminal = Some(super::ollama::ChatStreamTerminal::default());
+        self
     }
 
     pub(crate) fn push(&mut self, chunk: Bytes) -> Result<Bytes, ProxyError> {
@@ -43,7 +50,11 @@ impl OpenAiChatStreamCanonicalizer {
         let events = self.decoder.finish().inspect_err(|_error| {
             crate::metrics::record_openai_chat_compat("invalid_chunk", self.path);
         })?;
-        self.canonicalize_events(events)
+        let output = self.canonicalize_events(events)?;
+        if let Some(terminal) = self.terminal.as_ref() {
+            terminal.finish()?;
+        }
+        Ok(output)
     }
 
     fn canonicalize_events(&mut self, events: Vec<Vec<u8>>) -> Result<Bytes, ProxyError> {
@@ -59,6 +70,12 @@ impl OpenAiChatStreamCanonicalizer {
             return Ok(event);
         };
         let payload = trim_ascii_whitespace(&payload);
+        if payload == b"[DONE]" {
+            if let Some(terminal) = self.terminal.as_mut() {
+                terminal.complete()?;
+            }
+            return Ok(event);
+        }
         if payload.is_empty() || payload == b"[DONE]" || matches!(payload, b"ping" | b"keepalive") {
             return Ok(event);
         }
@@ -69,6 +86,9 @@ impl OpenAiChatStreamCanonicalizer {
                 return Ok(event);
             }
         };
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.observe(&value)?;
+        }
         if !looks_like_chat_stream_chunk(&value) {
             return Ok(event);
         }
@@ -584,5 +604,36 @@ mod tests {
 
     fn json_value(value: &str) -> Value {
         serde_json::from_str(value).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod ollama_r5_terminal_tests {
+    use super::*;
+
+    #[test]
+    fn ollama_r5_raw_chat_terminal_requires_finish_and_handles_fragmentation() {
+        let mut stream = OpenAiChatStreamCanonicalizer::new("passthrough").require_terminal();
+        let wire = b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7}}\n\ndata: [DONE]\n\n";
+        let mut output = Vec::new();
+        for chunk in wire.chunks(3) {
+            output.extend_from_slice(&stream.push(Bytes::copy_from_slice(chunk)).unwrap());
+        }
+        output.extend_from_slice(&stream.finish().unwrap());
+        assert!(String::from_utf8(output).unwrap().contains("[DONE]"));
+        for wire in [
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"\"}]}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+        ] {
+            let mut stream = OpenAiChatStreamCanonicalizer::new("passthrough").require_terminal();
+            assert!(
+                stream
+                    .push(Bytes::from(wire))
+                    .and_then(|_| stream.finish())
+                    .is_err(),
+                "{wire}"
+            );
+        }
     }
 }

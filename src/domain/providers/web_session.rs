@@ -453,7 +453,10 @@ impl ParsedWebSessionCredential {
             bail!("Web Session credential contains a control character");
         }
         let mut input = raw.trim();
-        if input.len() >= 7 && input[..7].eq_ignore_ascii_case("cookie:") {
+        if input
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cookie:"))
+        {
             input = input[7..].trim();
         }
         let lower = input.to_ascii_lowercase();
@@ -829,6 +832,23 @@ mod tests {
             "__Secure-next-auth.session-token=secret; unrelated=leak"
         )
         .is_err());
+    }
+
+    #[test]
+    fn web_session_r5_cookie_parser_rejects_utf8_names_without_panicking() {
+        for id in ["web_session.grok_web", "web_session.perplexity_web"] {
+            for prefix_bytes in 0..=7 {
+                let raw = format!("{}密钥=synthetic-value", "x".repeat(prefix_bytes));
+                let result = std::panic::catch_unwind(|| {
+                    ParsedWebSessionCredential::parse(profile(id), &raw)
+                });
+                assert!(
+                    result.is_ok(),
+                    "Cookie validation panicked for profile={id}, prefix bytes={prefix_bytes}"
+                );
+                assert!(result.unwrap().is_err());
+            }
+        }
     }
 
     #[test]

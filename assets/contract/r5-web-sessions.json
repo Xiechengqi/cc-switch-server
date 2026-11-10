@@ -1,0 +1,193 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "web_session",
+  "liveState": "live_pending",
+  "reference": {
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false,
+    "historicalBaseline": "assets/contract/web-session-source-baseline.json remains unchanged; R5 adds a separate current OmniRoute pin",
+    "negative": "Bearer/JSON/bare token normalization, browser clearance refresh/retry, Set-Cookie rotation, cross-connection session recovery, text tool emulation and EOF-success are not Server requirements"
+  },
+  "scope": {
+    "profiles": [
+      "claude.grok_web_session",
+      "codex.grok_web_session",
+      "claude.perplexity_web_session",
+      "codex.perplexity_web_session"
+    ],
+    "credentialRail": "one exact Provider-owned encrypted /settingsConfig/webSession/cookie slot; no Account/API-key/extra-header fallback",
+    "scopeFields": [
+      "provider_key",
+      "provider_revision",
+      "runtime_fingerprint",
+      "credential_generation",
+      "profile_id",
+      "fixed_origin"
+    ],
+    "webProfiles": [
+      {
+        "profile": "web_session.grok_web",
+        "origin": "https://grok.com",
+        "path": "/rest/app-chat/conversations/new",
+        "method": "POST",
+        "requiredFamily": "grok_sso",
+        "allowedCookies": [
+          "sso",
+          "sso-rw",
+          "cf_clearance",
+          "__cf_bm"
+        ],
+        "terminal": "unique modelResponse then complete EOF"
+      },
+      {
+        "profile": "web_session.perplexity_web",
+        "origin": "https://www.perplexity.ai",
+        "path": "/rest/sse/perplexity_ask",
+        "method": "POST",
+        "requiredFamily": "next_auth_session_token",
+        "allowedCookies": [
+          "__Secure-next-auth.session-token",
+          "__Secure-next-auth.session-token.0 through .15"
+        ],
+        "terminal": "COMPLETED then end_of_stream then complete EOF"
+      }
+    ]
+  },
+  "localPolicy": {
+    "productionChange": "reject invalid non-ASCII Cookie names without a UTF-8 slicing panic; preserve ASCII Cookie prefix and allowlist semantics",
+    "hidden": true,
+    "experimental": true,
+    "cookieMaxBytes": 16384,
+    "cookieMaxPairs": 16,
+    "requestMaxBytes": 1048576,
+    "responseMaxBytes": 8388608,
+    "frameMaxBytes": 1048576,
+    "authRecovery": "401/403 invalidate only exact scope; explicit credential generation reimport required; no retry/refresh/fallback",
+    "automaticCookieRotation": false,
+    "browserClearanceAcquisition": false,
+    "crossConnectionRecovery": false,
+    "redirects": false,
+    "cookieJar": false,
+    "crossOrigin": false,
+    "downstreamSetCookie": false,
+    "buffering": "collect and validate complete upstream under request/first/idle timeout and byte limits before downstream rendering",
+    "tokenByTokenStreaming": false,
+    "tools": false,
+    "images": false,
+    "previousResponseId": false,
+    "background": false,
+    "countTokens": "local conservative estimate, zero upstream",
+    "usage": "estimated text tokens only, no official web entitlement or token-counter claim",
+    "performanceClaim": false
+  },
+  "counterexample": {
+    "input": "xx密钥=synthetic-value",
+    "oldBehavior": "panics because byte index 7 is inside a UTF-8 character",
+    "expected": "validation error for each web profile, with no panic",
+    "failingTest": "web_session_r5_cookie_parser_rejects_utf8_names_without_panicking"
+  },
+  "cases": [
+    {
+      "id": "utf8-validation-is-an-error",
+      "tests": [
+        "web_session_r5_cookie_parser_rejects_utf8_names_without_panicking"
+      ]
+    },
+    {
+      "id": "provider-owned-encrypted-rail",
+      "tests": [
+        "web_session_cookie_uses_one_dedicated_provider_owned_secret_slot",
+        "grok_cookie_parser_keeps_only_allowlisted_minimum_and_redacts_debug",
+        "credential_rail_rejects_bearer_json_headers_controls_and_missing_family"
+      ]
+    },
+    {
+      "id": "bounded-chunks-and-fixed-endpoint",
+      "tests": [
+        "perplexity_cookie_parser_accepts_bounded_chunks_but_not_other_cookies",
+        "exact_request_guard_rejects_method_origin_path_query_and_fragment_drift",
+        "response_cookie_redirect_and_refresh_headers_never_reach_downstream"
+      ]
+    },
+    {
+      "id": "full-scope-lifecycle",
+      "tests": [
+        "credential_rotation_prunes_only_the_same_provider_runtime_scope",
+        "provider_delete_prunes_session_task_and_invalidation_state",
+        "authentication_failure_invalidates_exact_scope_without_retry_or_fallback"
+      ]
+    },
+    {
+      "id": "four-profiles-text-lifecycles",
+      "tests": [
+        "web_session_drivers_forward_claude_and_codex_text_lifecycles_with_fixed_rails"
+      ]
+    },
+    {
+      "id": "strict-web-terminals",
+      "tests": [
+        "grok_ndjson_requires_one_terminal_and_rejects_malformed_or_trailing_data",
+        "perplexity_sse_requires_completed_then_end_of_stream_and_strict_json",
+        "parsers_are_independent_of_transport_chunk_boundaries_after_bounded_collection",
+        "perplexity_diff_and_final_text_shapes_are_reconstructed_without_citations_rewrite"
+      ]
+    },
+    {
+      "id": "auth-rotation-and-cancel",
+      "tests": [
+        "web_session_auth_failure_never_retries_and_only_explicit_generation_rotation_recovers",
+        "web_session_client_cancellation_after_partial_frame_never_retries_or_falls_back"
+      ]
+    },
+    {
+      "id": "unsupported-controls-before-network",
+      "tests": [
+        "web_session_tools_images_and_count_tokens_finish_before_any_upstream_request",
+        "downstream_parsers_reject_tools_images_and_non_text_responses_items"
+      ]
+    },
+    {
+      "id": "hidden-catalog-and-estimated-usage",
+      "tests": [
+        "embedded_registry_is_fail_closed_and_keeps_candidates_hidden",
+        "web_session_discovery_is_reviewed_static_and_never_claims_live_entitlement",
+        "web_session_share_forward_records_estimated_usage_without_account_pooling",
+        "openai_chat_render_uses_one_positive_created_timestamp"
+      ]
+    }
+  ],
+  "references": [
+    {
+      "repository": "OmniRoute",
+      "commit": "443d66996d69d7ecf887fd61158404a3cca1b192",
+      "tree": "8d1c312f61d115767c9478416cb039750eaf113a",
+      "files": [
+        {
+          "path": "src/lib/providers/webCookieAuth.ts",
+          "sha256": "23cc43fd9a2dddd89f80234cffccc944b3c3011d210f1680522bb6851d534637"
+        },
+        {
+          "path": "open-sse/executors/grok-web.ts",
+          "sha256": "fd3b5c10dee1574b94e1d7274a675b40ce7dcd1a1564e70f05099173c55b526f"
+        },
+        {
+          "path": "open-sse/executors/perplexity-web.ts",
+          "sha256": "de16700312731e26b6cfdcabeaf0ba318411e214a3b74e424be27c5b77bb4b9a"
+        },
+        {
+          "path": "open-sse/executors/perplexity-web/protocol.ts",
+          "sha256": "683795104a43b967819b31df6c790504bc211c85e96d8491156d0ed1493ca28f"
+        },
+        {
+          "path": "open-sse/config/providers/registry/grok-web/index.ts",
+          "sha256": "f406695462a015f4791b19f44ffd92284bcc1b0278e5780ba3eab27417f7bcd1"
+        },
+        {
+          "path": "open-sse/config/providers/registry/perplexity/web/index.ts",
+          "sha256": "139ab467400347e037af576387c534b2f3b08615840a1bd58d406bbcdc29d5ad"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,152 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "grok_oauth",
+  "liveState": "live_pending",
+  "reference": {
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false,
+    "idleObservation": "sub2api uses upstream-read idle and SafeToFailoverAfterWrite with one same-account replay; this is a negative reference, not the Server semantic deadline contract"
+  },
+  "scope": {
+    "providerType": "grok_oauth",
+    "profiles": [
+      "claude.grok_oauth",
+      "codex.grok_oauth",
+      "gemini.grok_oauth"
+    ],
+    "apps": [
+      "claude",
+      "codex",
+      "gemini"
+    ],
+    "product": "Grok CLI OAuth",
+    "credentialRail": "one explicitly bound managed OAuth Account; never Web SSO",
+    "operations": [
+      "inference",
+      "media",
+      "remote_compaction"
+    ]
+  },
+  "localPolicy": {
+    "productionWireChanged": false,
+    "controlFramesAreSemantic": false,
+    "afterWriteReplay": false,
+    "mediaCoveredByChat": false,
+    "reasoning": "nonempty reasoning is progressive semantic content; long and repeated deltas remain opaque and unchanged",
+    "backpressure": "delayed body polling is separate from socket write completion; local demand fixture is not deployment throughput or vendor consumption evidence",
+    "idle": "first-semantic deadline is not extended by lifecycle-only bytes; existing deadlines and error classification remain",
+    "owner": "cancel/commit/error keeps actual final-owner release; media task bindings preserve original Provider/Account/identity generation/runtime/Share/plane",
+    "remoteCompaction": "existing independent capability and real-receipt gates retained",
+    "performanceClaim": false
+  },
+  "cases": [
+    {
+      "id": "control-only-first-semantic-deadline",
+      "tests": [
+        "responses_lifecycle_events_do_not_extend_first_semantic_event_deadline"
+      ]
+    },
+    {
+      "id": "long-reasoning-repeat-and-delayed-demand",
+      "tests": [
+        "grok_r5_long_reasoning_and_repeated_content_survive_delayed_body_demand"
+      ]
+    },
+    {
+      "id": "all-inference-formats",
+      "tests": [
+        "grok_core03_http_json_and_sse_cover_three_apps_and_all_inference_surfaces"
+      ]
+    },
+    {
+      "id": "quality-terminal-and-bulk-output",
+      "tests": [
+        "quality_observer_classifies_completed_shapes_without_retaining_content",
+        "quality_sse_observation_is_passthrough_only_and_flags_single_bulk_dump",
+        "grok_sse_quality_waits_for_complete_successful_stream",
+        "grok_sse_ping_with_error_payload_cannot_hide_a_failed_tail"
+      ]
+    },
+    {
+      "id": "precommit-5xx-never-resubmits",
+      "tests": [
+        "grok_r4_5xx_is_returned_once_without_new_transient_or_idempotency_headers"
+      ]
+    },
+    {
+      "id": "committed-error-and-cancel",
+      "tests": [
+        "grok_core03_committed_error_is_failed_once_and_body_cancel_waits_for_last_owner",
+        "grok_core03_websocket_header_and_body_abort_and_committed_protocol_error_finish_once"
+      ]
+    },
+    {
+      "id": "independent-media-authorization",
+      "tests": [
+        "grok_media_requires_independent_provider_and_share_opt_in",
+        "grok_core03_media_json_edit_video_submission_and_status_preserve_response_semantics"
+      ]
+    },
+    {
+      "id": "media-generation-and-durable-task",
+      "tests": [
+        "grok_video_task_commit_rejects_concurrent_account_identity_replacement",
+        "grok_video_status_rejects_provider_account_or_generation_binding_drift",
+        "grok_video_success_without_valid_task_id_fails_closed_and_releases_lease"
+      ]
+    },
+    {
+      "id": "media-cancel-and-capacity",
+      "tests": [
+        "grok_core03_media_header_and_body_cancellation_record_before_release",
+        "grok_r4_video_owner_capacity_failure_does_not_penalize_the_account_or_retry",
+        "grok_image_cancel_holds_account_and_share_leases_through_accounting"
+      ]
+    },
+    {
+      "id": "same-identity-recovery-and-replay-fence",
+      "tests": [
+        "grok_http_sse_401_refresh_reuses_authorization_context_and_client_turn",
+        "grok_reasoning_replay_does_not_cross_same_generation_bearer_change",
+        "grok_reasoning_replay_rejects_late_commit_after_bearer_change"
+      ]
+    }
+  ],
+  "references": [
+    {
+      "repository": "Grok/grok2api",
+      "commit": "e2fd7ab481a30a1965bb61395d437154cf247c92",
+      "tree": "79e1aa786df9cca9d38cb8a457a560b7edf56f2f",
+      "files": [
+        {
+          "path": "backend/internal/infra/provider/cli/definition.go",
+          "sha256": "611c76979ad413d73b7d46545bd3c991047ba3d42f00bded7f31cb95a22130b2"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/fallback.go",
+          "sha256": "9122f3f81cd4808c1923d282d19bac99124cfa44df37bf8b04997580c6302c52"
+        },
+        {
+          "path": "backend/internal/application/gateway/video.go",
+          "sha256": "8d7bb7417b5dda5d1db6b4e0b6f9d418dd756a9b91431c73a076ad4d53454325"
+        }
+      ]
+    },
+    {
+      "repository": "sub2api",
+      "commit": "ab99d56e9626e6cd731592dae8553c9758a0efa2",
+      "tree": "eb5691dbf93e303b3fddcf16370c7ae0bbb7190a",
+      "files": [
+        {
+          "path": "backend/internal/service/grok_stream_idle.go",
+          "sha256": "085a9368fdf90f719d5e2ca33da89b997219958210b0ef09cb3dcf13d34bc86b"
+        },
+        {
+          "path": "backend/internal/service/grok_stream_idle_test.go",
+          "sha256": "83dadfc60355f76068f785382859a0e54f625dc8fae394d8931c04cd8d403c32"
+        }
+      ]
+    }
+  ]
+}

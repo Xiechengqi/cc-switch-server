@@ -2,6 +2,12 @@
 
 本文描述 cc-switch-server 对 OpenAI/Codex OAuth 的生产边界、账号绑定、数据面行为和验收方式。目标是把 Provider Bundle 明确绑定的 ChatGPT OAuth 账号稳定暴露给 Codex/OpenAI-compatible 客户端；不提供账号池、轮询、权重调度、配额溢出或跨账号故障转移。
 
+## R5 离线差分
+
+`assets/contract/r5-codex-oauth.json` 固定 CLIProxyAPI `681ce41b`、codex2api `b6a827f` 的 committed-source 摘要和十组本仓合同。既有实际回环回归覆盖 stale/wrong/duplicate interrupt、迟到/缺失 ACK、旧物理连接、孤立工具输出和提交后断流；部分 refresh 响应与加密 journal 重启夹具增加了明确的 Codex 参数，未复制 driver 或改变生产 wire。
+
+部分 token 响应保持 `outcome_unknown` 与 `immediate_relogin`，不复用可能已消费的 refresh token 试另一端点；journal 用例只验证已验证凭据进入本地提交边界后的恢复与身份栅栏，不证明 JWT 或厂商接受性。正式 Profile 仍是 `claude.openai_oauth` / `codex.openai_oauth`；其他既有兼容入口不扩展 Bundle 权限。SIWC 单独评估，不扩展 workspace/credential fallback、create 后重放或私有 commentary 签名。所有真实 operation 保持 `live_pending`。
+
 ## 能力边界
 
 - 文本入口包括 Router Share URL 下的 `POST /v1/responses`、`POST /v1/chat/completions` 及兼容别名。

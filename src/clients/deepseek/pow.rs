@@ -1,6 +1,71 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::num::Wrapping;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+
+const MAX_POW_WORKERS: usize = 2;
+const POW_ADMISSION_WAIT: Duration = Duration::from_millis(100);
+const MAX_POW_WORK: Duration = Duration::from_secs(10);
+const POW_CONTROL_INTERVAL: i64 = 64;
+
+#[derive(Debug, thiserror::Error)]
+#[error("DeepSeek local proof-of-work capacity is exhausted")]
+pub(crate) struct PowCapacityError;
+
+struct PowSearchControl {
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl PowSearchControl {
+    fn check(&self) -> anyhow::Result<()> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            anyhow::bail!("DeepSeek proof-of-work request was cancelled");
+        }
+        if Instant::now() >= self.deadline {
+            anyhow::bail!("DeepSeek proof-of-work exceeded its local work deadline");
+        }
+        Ok(())
+    }
+}
+
+struct CancelPowOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelPowOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+fn pow_worker_slots() -> &'static Arc<Semaphore> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOTS.get_or_init(|| Arc::new(Semaphore::new(MAX_POW_WORKERS)))
+}
+
+async fn run_pow_work<T: Send + 'static>(
+    slots: &Arc<Semaphore>,
+    control: PowSearchControl,
+    work: impl FnOnce(&PowSearchControl) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    // Admission includes queued blocking work. Cancellation never frees a
+    // permit still owned by a blocking closure, including before it starts.
+    let permit = tokio::time::timeout(POW_ADMISSION_WAIT, slots.clone().acquire_owned())
+        .await
+        .map_err(|_| PowCapacityError)?
+        .map_err(|_| PowCapacityError)?;
+    let _cancel_on_drop = CancelPowOnDrop(control.cancelled.clone());
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        control.check()?;
+        work(&control)
+    })
+    .await?
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepSeekPowChallenge {
@@ -56,23 +121,27 @@ async fn solve_and_build_header_at(
     now_secs: i64,
 ) -> anyhow::Result<String> {
     let difficulty = validate_challenge(challenge, now_secs)?;
-    if challenge.algorithm != "DeepSeekHashV1" {
-        anyhow::bail!(
-            "unsupported DeepSeek PoW algorithm: {}",
-            challenge.algorithm
-        );
-    }
+    let validity_seconds = normalize_expiry_secs(challenge.expire_at)?
+        .saturating_add(MAX_CLOCK_SKEW_SECS)
+        .saturating_sub(now_secs)
+        .max(0) as u64;
+    let control = PowSearchControl {
+        cancelled: Arc::new(AtomicBool::new(false)),
+        deadline: Instant::now() + MAX_POW_WORK.min(Duration::from_secs(validity_seconds)),
+    };
     let challenge = challenge.clone();
-    tokio::task::spawn_blocking(move || {
+    run_pow_work(pow_worker_slots(), control, move |control| {
         let answer = solve_pow(
             &challenge.challenge,
             &challenge.salt,
             challenge.expire_at,
             difficulty,
+            control,
         )?;
+        control.check()?;
         build_pow_header(&challenge, answer)
     })
-    .await?
+    .await
 }
 
 fn validate_challenge(challenge: &DeepSeekPowChallenge, now_secs: i64) -> anyhow::Result<i64> {
@@ -142,6 +211,7 @@ fn solve_pow(
     salt: &str,
     expire_at: i64,
     difficulty: i64,
+    control: &PowSearchControl,
 ) -> anyhow::Result<i64> {
     if challenge_hex.len() != 64 {
         anyhow::bail!("challenge must be 64 hex chars");
@@ -159,6 +229,9 @@ fn solve_pow(
     let limit = difficulty;
     let prefix = format!("{salt}_{expire_at}_");
     for answer in 0..limit {
+        if answer % POW_CONTROL_INTERVAL == 0 {
+            control.check()?;
+        }
         let digest = deepseek_hash_v1(format!("{prefix}{answer}").as_bytes());
         let words = [
             u64::from_le_bytes(digest[0..8].try_into()?),
@@ -407,5 +480,117 @@ mod tests {
         let mut difficulty = challenge(now, 1);
         difficulty.difficulty = MAX_DIFFICULTY + 1;
         assert!(solve_and_build_header_at(&difficulty, now).await.is_err());
+    }
+
+    #[test]
+    fn pow_cancelled_search_must_not_return_a_valid_answer() {
+        let challenge = challenge(1_700_000_000, 42);
+        let control = PowSearchControl {
+            cancelled: Arc::new(AtomicBool::new(true)),
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let result = solve_pow(
+            &challenge.challenge,
+            &challenge.salt,
+            challenge.expire_at,
+            challenge.difficulty,
+            &control,
+        );
+        assert!(
+            result.is_err(),
+            "a cancelled request still completed its PoW search: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pow_expired_local_work_deadline_must_not_return_a_valid_answer() {
+        let challenge = challenge(1_700_000_000, 42);
+        let control = PowSearchControl {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline: Instant::now() - Duration::from_secs(1),
+        };
+        let result = solve_pow(
+            &challenge.challenge,
+            &challenge.salt,
+            challenge.expire_at,
+            challenge.difficulty,
+            &control,
+        );
+        assert!(
+            result.is_err(),
+            "an expired local work deadline still completed its PoW search: {result:?}"
+        );
+    }
+
+    fn search_control() -> PowSearchControl {
+        PowSearchControl {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline: Instant::now() + MAX_POW_WORK,
+        }
+    }
+
+    #[tokio::test]
+    async fn pow_capacity_is_bounded_before_cpu_work_and_closed_admission_is_local() {
+        for closed in [false, true] {
+            let slots = Arc::new(Semaphore::new(0));
+            if closed {
+                slots.close();
+            }
+            let called = Arc::new(AtomicBool::new(false));
+            let observed = called.clone();
+            let error = run_pow_work(&slots, search_control(), move |_| {
+                observed.store(true, Ordering::Relaxed);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+            assert!(error.is::<PowCapacityError>());
+            assert!(!called.load(Ordering::Relaxed));
+        }
+    }
+
+    #[tokio::test]
+    async fn pow_request_drop_cancels_work_but_keeps_the_real_worker_permit() {
+        let slots = Arc::new(Semaphore::new(1));
+        let control = search_control();
+        let cancelled = control.cancelled.clone();
+        let saw_cancel = Arc::new(AtomicBool::new(false));
+        let observed = saw_cancel.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_slots = slots.clone();
+        let request = tokio::spawn(async move {
+            run_pow_work(&worker_slots, control, move |control| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                observed.store(control.cancelled.load(Ordering::Relaxed), Ordering::Relaxed);
+                control.check()
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert_eq!(slots.available_permits(), 0);
+        let error = run_pow_work(&slots, search_control(), |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert!(error.is::<PowCapacityError>());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(saw_cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            run_pow_work(&slots, search_control(), |_| Ok(7))
+                .await
+                .unwrap(),
+            7
+        );
     }
 }

@@ -1,12 +1,23 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::infra::resident_memory::{ResidentMemoryBudget, ResidentMemoryReservation};
 use bytes::Bytes;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{Mutex, RwLock};
+
+mod resident;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KimiReplayWriteOutcome {
+    Stored,
+    Conflict,
+    CapacityRejected,
+    InvalidContent,
+}
 
 use crate::domain::kimi_cli::KimiDeviceIdentity;
 
@@ -43,7 +54,7 @@ pub fn kimi_thinking_replay_model_family(model: &str) -> Option<&'static str> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KimiModelCatalogScope(String);
 
 impl KimiModelCatalogScope {
@@ -72,7 +83,7 @@ impl KimiModelCatalogScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KimiThinkingReplayScope(String);
 
 impl KimiThinkingReplayScope {
@@ -139,119 +150,69 @@ fn scoped_digest<const N: usize>(domain: &[u8], values: [&str; N], prefix: &str)
     format!("{prefix}:{:x}", hasher.finalize())
 }
 
+#[derive(Debug)]
+pub struct KimiModelCatalogData {
+    pub models: Vec<String>,
+    _memory: Option<ResidentMemoryReservation>,
+    _payload_memory: Option<ResidentMemoryReservation>,
+}
+
 #[derive(Debug, Clone)]
 pub struct KimiModelCatalog {
-    pub models: Vec<String>,
+    data: Arc<KimiModelCatalogData>,
     pub source: &'static str,
     pub fetched_at_ms: i64,
     pub stale: bool,
     expires_at_ms: i64,
 }
 
-#[derive(Debug, Default)]
-pub struct KimiModelCatalogCache {
-    catalogs: RwLock<HashMap<KimiModelCatalogScope, KimiModelCatalog>>,
-    flights: Mutex<HashMap<KimiModelCatalogScope, Arc<Mutex<()>>>>,
+impl std::ops::Deref for KimiModelCatalog {
+    type Target = KimiModelCatalogData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
 }
 
-impl KimiModelCatalogCache {
-    pub async fn fresh(
-        &self,
-        scope: &KimiModelCatalogScope,
-        now_ms: i64,
-    ) -> Option<KimiModelCatalog> {
-        self.catalogs
-            .read()
-            .await
-            .get(scope)
-            .filter(|catalog| catalog.expires_at_ms > now_ms)
-            .cloned()
-    }
-
-    pub async fn stale(
-        &self,
-        scope: &KimiModelCatalogScope,
-        now_ms: i64,
-    ) -> Option<KimiModelCatalog> {
-        self.catalogs
-            .read()
-            .await
-            .get(scope)
-            .filter(|catalog| {
-                now_ms.saturating_sub(catalog.fetched_at_ms) < KIMI_STALE_MODEL_CATALOG_TTL_MS
-            })
-            .cloned()
-            .map(|mut catalog| {
-                catalog.source = "kimi_models_cache";
-                catalog.stale = true;
-                catalog
-            })
-    }
-
-    pub async fn insert(
-        &self,
-        scope: KimiModelCatalogScope,
-        mut models: Vec<String>,
-        fetched_at_ms: i64,
-    ) -> KimiModelCatalog {
-        models.retain(|model| !model.trim().is_empty());
-        models.sort();
-        models.dedup();
-        let catalog = KimiModelCatalog {
-            models,
-            source: "coding_v1_models",
-            fetched_at_ms,
-            stale: false,
-            expires_at_ms: fetched_at_ms.saturating_add(KIMI_MODEL_CATALOG_TTL_MS),
-        };
-        let mut catalogs = self.catalogs.write().await;
-        catalogs.insert(scope, catalog.clone());
-        while catalogs.len() > MAX_MODEL_CATALOG_ENTRIES {
-            let Some(oldest) = catalogs
-                .iter()
-                .min_by_key(|(_, catalog)| catalog.fetched_at_ms)
-                .map(|(scope, _)| scope.clone())
-            else {
-                break;
-            };
-            catalogs.remove(&oldest);
-        }
-        catalog
-    }
-
-    pub async fn invalidate(&self, scope: &KimiModelCatalogScope) {
-        self.catalogs.write().await.remove(scope);
-    }
-
-    pub async fn lock(&self, scope: &KimiModelCatalogScope) -> OwnedMutexGuard<()> {
-        let flight = {
-            let mut flights = self.flights.lock().await;
-            flights.retain(|key, flight| key == scope || Arc::strong_count(flight) > 1);
-            flights
-                .entry(scope.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        flight.lock_owned().await
-    }
+#[derive(Debug)]
+pub struct KimiModelCatalogCache {
+    catalogs: RwLock<BTreeMap<KimiModelCatalogScope, KimiModelCatalog>>,
+    flights: crate::infra::resident_flights::ResidentFlights<KimiModelCatalogScope>,
+    parent: ResidentMemoryBudget,
 }
 
 #[derive(Debug, Clone)]
 pub struct KimiModelFetchError {
+    pub capacity_rejected: bool,
     pub status: Option<StatusCode>,
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct FetchedKimiModelCatalog {
     pub models: Vec<String>,
     pub upstream_non_empty: bool,
+    _memory: Option<ResidentMemoryReservation>,
 }
 
+impl PartialEq for FetchedKimiModelCatalog {
+    fn eq(&self, other: &Self) -> bool {
+        self.models == other.models && self.upstream_non_empty == other.upstream_non_empty
+    }
+}
+impl Eq for FetchedKimiModelCatalog {}
+
 impl KimiModelFetchError {
+    fn capacity() -> Self {
+        crate::metrics::record_resident_retention_refused("kimi_catalog_fetch");
+        Self {
+            capacity_rejected: true,
+            status: Some(StatusCode::SERVICE_UNAVAILABLE),
+            message: "Kimi model discovery capacity is exhausted".into(),
+        }
+    }
     pub fn retryable(&self) -> bool {
-        self.status.is_none()
-            || self.status.is_some_and(|status| {
+        !self.capacity_rejected
+            && self.status.is_none_or(|status| {
                 status == StatusCode::REQUEST_TIMEOUT
                     || status == StatusCode::TOO_MANY_REQUESTS
                     || status.is_server_error()
@@ -274,6 +235,30 @@ pub async fn fetch_kimi_models(
     identity: &KimiDeviceIdentity,
     timeout: Duration,
 ) -> Result<FetchedKimiModelCatalog, KimiModelFetchError> {
+    fetch_kimi_models_with_parent(
+        http,
+        url,
+        access_token,
+        identity,
+        timeout,
+        crate::infra::resident_memory::process_resident_memory(),
+    )
+    .await
+}
+
+async fn fetch_kimi_models_with_parent(
+    http: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+    identity: &KimiDeviceIdentity,
+    timeout: Duration,
+    parent: ResidentMemoryBudget,
+) -> Result<FetchedKimiModelCatalog, KimiModelFetchError> {
+    let memory = crate::infra::resident_flights::CatalogFetchMemory::new(
+        parent,
+        MAX_MODEL_RESPONSE_BODY_BYTES,
+    )
+    .ok_or_else(KimiModelFetchError::capacity)?;
     let mut request = http
         .get(url)
         .bearer_auth(access_token)
@@ -284,6 +269,7 @@ pub async fn fetch_kimi_models(
         request = request.header(name, value);
     }
     let mut response = request.send().await.map_err(|error| KimiModelFetchError {
+        capacity_rejected: false,
         status: None,
         message: format!("Kimi model request failed: {error}"),
     })?;
@@ -294,23 +280,39 @@ pub async fn fetch_kimi_models(
     )
     .await
     .map_err(|error| KimiModelFetchError {
+        capacity_rejected: false,
         status: Some(status),
         message: format!("Kimi model response could not be read: {error}"),
     })?;
     if !status.is_success() {
         return Err(KimiModelFetchError {
+            capacity_rejected: false,
             status: Some(status),
             message: format!("Kimi model request returned HTTP {status}"),
         });
     }
+    let _parsing = memory
+        .parsing(body.len())
+        .ok_or_else(KimiModelFetchError::capacity)?;
     let value = serde_json::from_slice::<Value>(&body).map_err(|error| KimiModelFetchError {
+        capacity_rejected: false,
         status: Some(status),
         message: format!("Kimi model response is not valid JSON: {error}"),
     })?;
-    parse_kimi_models(&value).map_err(|message| KimiModelFetchError {
+    let mut fetched = parse_kimi_models(&value).map_err(|message| KimiModelFetchError {
+        capacity_rejected: false,
         status: Some(status),
         message,
-    })
+    })?;
+    fetched._memory = Some(
+        memory
+            .payload(
+                resident::models_bytes(&fetched.models)
+                    .saturating_add(std::mem::size_of::<FetchedKimiModelCatalog>()),
+            )
+            .ok_or_else(KimiModelFetchError::capacity)?,
+    );
+    Ok(fetched)
 }
 
 pub fn parse_kimi_models(value: &Value) -> Result<FetchedKimiModelCatalog, String> {
@@ -356,12 +358,17 @@ pub fn parse_kimi_models(value: &Value) -> Result<FetchedKimiModelCatalog, Strin
     Ok(FetchedKimiModelCatalog {
         models,
         upstream_non_empty,
+        _memory: None,
     })
 }
 
 pub fn unavailable_catalog() -> KimiModelCatalog {
     KimiModelCatalog {
-        models: Vec::new(),
+        data: Arc::new(KimiModelCatalogData {
+            models: Vec::new(),
+            _memory: None,
+            _payload_memory: None,
+        }),
         source: "kimi_models_unavailable",
         fetched_at_ms: 0,
         stale: false,
@@ -384,87 +391,15 @@ pub struct KimiThinkingReplaySnapshot {
 
 #[derive(Debug, Default)]
 struct ThinkingReplayStore {
-    entries: HashMap<KimiThinkingReplayScope, ThinkingReplayEntry>,
+    entries: BTreeMap<KimiThinkingReplayScope, ThinkingReplayEntry>,
     next_generation: u64,
     total_bytes: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct KimiThinkingReplayCache {
     store: Mutex<ThinkingReplayStore>,
-}
-
-impl KimiThinkingReplayCache {
-    pub async fn get(
-        &self,
-        scope: &KimiThinkingReplayScope,
-        now_ms: i64,
-    ) -> (Option<Bytes>, KimiThinkingReplaySnapshot) {
-        let mut store = self.store.lock().await;
-        let expired = prune_replay_store(&mut store, now_ms);
-        if expired > 0 {
-            crate::metrics::record_kimi_thinking_replay("expired", expired as u64);
-        }
-        let entry = store.entries.get(scope);
-        (
-            entry.map(|entry| entry.content.clone()),
-            KimiThinkingReplaySnapshot {
-                generation: entry.map(|entry| entry.generation),
-            },
-        )
-    }
-
-    pub async fn replace_if_unchanged(
-        &self,
-        scope: KimiThinkingReplayScope,
-        snapshot: KimiThinkingReplaySnapshot,
-        content: Bytes,
-        now_ms: i64,
-    ) -> bool {
-        if !valid_replay_content(&content) {
-            return false;
-        }
-        let mut store = self.store.lock().await;
-        let expired = prune_replay_store(&mut store, now_ms);
-        if expired > 0 {
-            crate::metrics::record_kimi_thinking_replay("expired", expired as u64);
-        }
-        if store.entries.get(&scope).map(|entry| entry.generation) != snapshot.generation {
-            return false;
-        }
-        if let Some(previous) = store.entries.remove(&scope) {
-            store.total_bytes = store.total_bytes.saturating_sub(previous.content.len());
-        }
-        store.next_generation = store.next_generation.saturating_add(1).max(1);
-        let generation = store.next_generation;
-        store.total_bytes = store.total_bytes.saturating_add(content.len());
-        store.entries.insert(
-            scope,
-            ThinkingReplayEntry {
-                content,
-                recorded_at_ms: now_ms,
-                expires_at_ms: now_ms.saturating_add(KIMI_THINKING_REPLAY_TTL_MS),
-                generation,
-            },
-        );
-        enforce_replay_limits(&mut store);
-        true
-    }
-
-    pub async fn delete_if_unchanged(
-        &self,
-        scope: &KimiThinkingReplayScope,
-        snapshot: KimiThinkingReplaySnapshot,
-    ) -> bool {
-        let mut store = self.store.lock().await;
-        if store.entries.get(scope).map(|entry| entry.generation) != snapshot.generation {
-            return false;
-        }
-        if let Some(previous) = store.entries.remove(scope) {
-            store.total_bytes = store.total_bytes.saturating_sub(previous.content.len());
-        }
-        true
-    }
+    parent: ResidentMemoryBudget,
 }
 
 fn prune_replay_store(store: &mut ThinkingReplayStore, now_ms: i64) -> usize {
@@ -481,22 +416,6 @@ fn prune_replay_store(store: &mut ThinkingReplayStore, now_ms: i64) -> usize {
         }
     }
     expired_count
-}
-
-fn enforce_replay_limits(store: &mut ThinkingReplayStore) {
-    while store.entries.len() > MAX_REPLAY_ENTRIES || store.total_bytes > MAX_REPLAY_TOTAL_BYTES {
-        let Some(oldest) = store
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.recorded_at_ms)
-            .map(|(scope, _)| scope.clone())
-        else {
-            break;
-        };
-        if let Some(entry) = store.entries.remove(&oldest) {
-            store.total_bytes = store.total_bytes.saturating_sub(entry.content.len());
-        }
-    }
 }
 
 pub fn valid_replay_content(content: &[u8]) -> bool {
@@ -627,7 +546,7 @@ struct KimiThinkingReplayStreamBlock {
     finished: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct KimiThinkingReplayStreamAccumulator {
     pending: Vec<u8>,
     blocks: BTreeMap<u64, KimiThinkingReplayStreamBlock>,
@@ -635,6 +554,7 @@ pub struct KimiThinkingReplayStreamAccumulator {
     complete: bool,
     abandoned: bool,
     bytes_used: usize,
+    memory: resident::ReplayStreamMemory,
 }
 
 impl KimiThinkingReplayStreamAccumulator {
@@ -662,6 +582,9 @@ impl KimiThinkingReplayStreamAccumulator {
                 return;
             }
         }
+        if !self.memory.resize(self.retained_bytes()) {
+            self.abandon_capacity();
+        }
     }
 
     pub fn finish(&mut self) -> KimiThinkingReplayStreamOutcome {
@@ -673,15 +596,37 @@ impl KimiThinkingReplayStreamAccumulator {
         {
             return KimiThinkingReplayStreamOutcome::Incomplete;
         }
+        if !self.memory.grow(
+            self.retained_bytes()
+                .saturating_mul(2)
+                .saturating_add(64 * 1024),
+        ) {
+            self.abandon_capacity();
+            return KimiThinkingReplayStreamOutcome::Incomplete;
+        }
         let content = Value::Array(
             self.blocks
                 .values()
                 .map(|block| block.value.clone())
                 .collect(),
         );
-        let Ok(content) = serde_json::to_vec(&content).map(Bytes::from) else {
+        let Some(encoded_bytes) = crate::infra::resident_memory::serialized_json_bytes(
+            &content,
+            MAX_REPLAY_BYTES_PER_ENTRY,
+        ) else {
             return KimiThinkingReplayStreamOutcome::Incomplete;
         };
+        let Some(memory) = self.memory.output(encoded_bytes) else {
+            self.abandon_capacity();
+            return KimiThinkingReplayStreamOutcome::Incomplete;
+        };
+        let Ok(content) = serde_json::to_vec(&content) else {
+            return KimiThinkingReplayStreamOutcome::Incomplete;
+        };
+        let content = Bytes::from_owner(resident::ReplayBytes {
+            content,
+            _memory: memory,
+        });
         if content.len() > MAX_REPLAY_BYTES_PER_ENTRY {
             return KimiThinkingReplayStreamOutcome::Incomplete;
         }
@@ -894,15 +839,26 @@ impl KimiThinkingReplayStreamAccumulator {
             self.abandon();
             return false;
         }
+        // Includes the pending event copy, JSON parsing, collection nodes and
+        // String growth. Shrink to the retained estimate after this push.
+        let transient = self
+            .retained_bytes()
+            .saturating_add(additional.saturating_mul(64))
+            .saturating_add(64 * 1024);
+        if !self.memory.grow(transient) {
+            self.abandon_capacity();
+            return false;
+        }
         self.bytes_used = total;
         true
     }
 
     fn abandon(&mut self) {
         self.abandoned = true;
-        self.pending.clear();
-        self.blocks.clear();
+        self.pending = Vec::new();
+        self.blocks = BTreeMap::new();
         self.bytes_used = 0;
+        self.memory.resize(0);
     }
 }
 
@@ -946,14 +902,16 @@ mod tests {
             cache
                 .replace_if_unchanged(first.clone(), missing, content.clone(), 1)
                 .await
+                == KimiReplayWriteOutcome::Stored
         );
         let (loaded, current) = cache.get(&first, 2).await;
         assert_eq!(loaded.as_deref(), Some(content.as_ref()));
         assert!(cache.get(&other, 2).await.0.is_none());
         assert!(
-            !cache
+            cache
                 .replace_if_unchanged(first.clone(), missing, content.clone(), 3)
                 .await
+                == KimiReplayWriteOutcome::Conflict
         );
         assert!(cache.delete_if_unchanged(&first, current).await);
         assert!(cache.get(&first, 4).await.0.is_none());
@@ -1251,6 +1209,7 @@ mod tests {
             FetchedKimiModelCatalog {
                 models: vec!["k3".to_string(), "kimi-for-coding".to_string()],
                 upstream_non_empty: true,
+                _memory: None,
             }
         );
         assert_eq!(
@@ -1258,6 +1217,7 @@ mod tests {
             FetchedKimiModelCatalog {
                 models: Vec::new(),
                 upstream_non_empty: false,
+                _memory: None,
             }
         );
         assert!(parse_kimi_models(&serde_json::json!({
@@ -1363,4 +1323,10 @@ mod tests {
         assert!(!denied.retryable());
         server.abort();
     }
+}
+
+#[cfg(test)]
+mod r5_resident_regression_tests {
+    use super::*;
+    include!("kimi_runtime/r5_resident_tests.rs");
 }

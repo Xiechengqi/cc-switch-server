@@ -7,7 +7,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -195,6 +195,7 @@ pub(super) struct TimingSlot {
     started: Instant,
     request: Arc<OnceLock<RequestTiming>>,
     current: Arc<Mutex<Option<ForwardTiming>>>,
+    owner: Arc<Mutex<Weak<TimingOwnerToken>>>,
 }
 
 impl Default for TimingSlot {
@@ -203,6 +204,7 @@ impl Default for TimingSlot {
             started: Instant::now(),
             request: Arc::new(OnceLock::new()),
             current: Arc::new(Mutex::new(None)),
+            owner: Arc::new(Mutex::new(Weak::new())),
         }
     }
 }
@@ -223,22 +225,33 @@ impl TimingSlot {
         surface: &'static str,
         started: Instant,
     ) -> Option<ForwardTiming> {
-        use crate::domain::providers::model::ProviderType;
-        let provider_type = match provider_type {
-            ProviderType::CodexOAuth => "codex_oauth",
-            ProviderType::ClaudeOAuth => "claude_oauth",
-            ProviderType::AntigravityOAuth => "antigravity_oauth",
-            ProviderType::AgyOAuth => "agy_oauth",
-            ProviderType::CursorOAuth => "cursor_oauth",
-            ProviderType::CursorApiKey => "cursor_apikey",
-            ProviderType::GrokOAuth => "grok_oauth",
-            ProviderType::KiroOAuth => "kiro_oauth",
-            ProviderType::AmazonQOAuth => "amazon_q_oauth",
-            ProviderType::QoderCosy => "qoder_cosy",
-            ProviderType::CodeBuddyOAuth => "codebuddy_oauth",
-            ProviderType::WorkBuddyOAuth => "workbuddy_oauth",
-            _ => return None,
+        self.begin_labeled(provider_type.as_str(), surface, started)
+    }
+
+    pub(super) fn begin_for_driver(
+        &self,
+        provider_type: crate::domain::providers::model::ProviderType,
+        driver_id: &str,
+        surface: &'static str,
+        started: Instant,
+    ) -> Option<ForwardTiming> {
+        // Driver ids have already been resolved by the Registry. Only these
+        // two experimental rails need labels distinct from their legacy type.
+        // No caller-controlled id, model, URL or credential becomes a label.
+        let label = match driver_id {
+            "special.grok_web_session" => "grok_web_session",
+            "special.perplexity_web_session" => "perplexity_web_session",
+            _ => provider_type.as_str(),
         };
+        self.begin_labeled(label, surface, started)
+    }
+
+    fn begin_labeled(
+        &self,
+        provider_type: &'static str,
+        surface: &'static str,
+        started: Instant,
+    ) -> Option<ForwardTiming> {
         let request = self
             .request
             .get_or_init(|| RequestTiming::for_provider(self.started, provider_type, surface));
@@ -255,6 +268,56 @@ impl TimingSlot {
             previous.finish_attempt(TimingResult::Retried);
         }
         Some(next)
+    }
+
+    /// The forwarding scope owns this token. Slot clones used only to inspect
+    /// observations hold a Weak reference and cannot delay payload release.
+    pub(super) fn owner_guard(&self) -> Arc<TimingOwnerToken> {
+        let mut slot = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(owner) = slot.upgrade() {
+            return owner;
+        }
+        let owner = Arc::new(TimingOwnerToken {
+            request: Mutex::new(None),
+        });
+        *slot = Arc::downgrade(&owner);
+        owner
+    }
+
+    /// Existing request budgets report their own final owner. Other drivers
+    /// use a lifetime token without introducing a memory admission policy.
+    pub(super) fn track_unbudgeted_owners(&self) {
+        if let (Some(owner), Some(timing)) = (self.owner_token(), self.get()) {
+            owner
+                .request
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_or_insert_with(|| timing.request());
+        }
+    }
+
+    fn owner_token(&self) -> Option<Arc<TimingOwnerToken>> {
+        self.owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade()
+    }
+
+    fn observed_owner(&self) -> Option<Arc<TimingOwnerToken>> {
+        self.owner_token().filter(|owner| {
+            owner
+                .request
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+        })
+    }
+
+    pub(super) fn retain_bytes(&self, bytes: Bytes) -> Bytes {
+        match self.observed_owner() {
+            Some(owner) => retain_observed_bytes(bytes, owner),
+            None => bytes,
+        }
     }
 
     pub(super) fn run<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
@@ -289,6 +352,45 @@ impl TimingSlot {
             None => response,
         }
     }
+}
+
+#[derive(Debug)]
+pub(super) struct TimingOwnerToken {
+    request: Mutex<Option<RequestTiming>>,
+}
+
+impl Drop for TimingOwnerToken {
+    fn drop(&mut self) {
+        if let Some(request) = self
+            .request
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            request.owner_released();
+        }
+    }
+}
+
+struct ObservedBytes {
+    bytes: Bytes,
+    _owner: Arc<TimingOwnerToken>,
+}
+
+impl AsRef<[u8]> for ObservedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn retain_observed_bytes(bytes: Bytes, owner: Arc<TimingOwnerToken>) -> Bytes {
+    if bytes.is_empty() {
+        return bytes;
+    }
+    Bytes::from_owner(ObservedBytes {
+        bytes,
+        _owner: owner,
+    })
 }
 
 // Drop runs before the pending forwarding future and its memory owners are
@@ -435,9 +537,9 @@ impl ForwardTiming {
         self.request.0.provider_type == "grok_oauth"
     }
 
-    /// Observe the already decoded Responses value. Grok's private control
-    /// and billing frames are filtered later in the existing wire pipeline;
-    /// they must not become first content here. This does not change commit,
+    /// Observe the already decoded Responses value. Control and billing
+    /// frames are filtered later in the existing wire pipeline; they must
+    /// not become first content here. This does not change commit,
     /// replay, visibility, usage, or any protocol classifier.
     pub(super) fn observe_responses_value(
         &self,
@@ -446,10 +548,6 @@ impl ForwardTiming {
         observation: &SemanticObservation,
     ) {
         use serde_json::Value;
-        if !self.is_grok() {
-            self.observe(observation);
-            return;
-        }
         let kind = value.get("type").and_then(Value::as_str);
         let content = match observation {
             SemanticObservation::Business => {
@@ -492,7 +590,7 @@ impl ForwardTiming {
         observation: &SemanticObservation,
     ) {
         self.observe_responses_value(value, None, observation);
-        if self.is_grok() && matches!(observation, SemanticObservation::ErrorFrame(_)) {
+        if matches!(observation, SemanticObservation::ErrorFrame(_)) {
             // A full JSON document has no later frame that can resolve an
             // error. This remains observation-only when the guard is off.
             self.observe_terminal(TimingResult::Failed);
@@ -674,6 +772,33 @@ impl ForwardTiming {
         }
     }
 
+    pub(super) fn observe_chat_document(&self, value: &serde_json::Value) {
+        use serde_json::Value;
+        if value
+            .get("error")
+            .is_some_and(super::response_semantics::error_value_is_substantive)
+        {
+            self.observe_terminal(TimingResult::Failed);
+            return;
+        }
+        self.observe_chat_value(value);
+        if value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                !choices.is_empty()
+                    && choices.iter().all(|choice| {
+                        choice
+                            .get("finish_reason")
+                            .and_then(Value::as_str)
+                            .is_some_and(|reason| !reason.trim().is_empty())
+                    })
+            })
+        {
+            self.observe_terminal(TimingResult::Complete);
+        }
+    }
+
     /// Observe decoded Gemini content without changing the existing commit or
     /// terminal contract. Empty signature carriers and metadata are excluded.
     pub(super) fn observe_gemini_value(&self, value: &serde_json::Value) {
@@ -842,6 +967,7 @@ impl ForwardTiming {
         if ended {
             self.finish_delivery(success);
         }
+        let owner = slot.as_ref().and_then(TimingSlot::observed_owner);
         Response::from_parts(
             parts,
             Body::new(TimedBody {
@@ -851,6 +977,7 @@ impl ForwardTiming {
                 success,
                 ended,
                 handed_off: None,
+                owner,
             }),
         )
     }
@@ -911,6 +1038,7 @@ struct TimedBody {
     success: bool,
     ended: bool,
     handed_off: Option<(Instant, ForwardTiming)>,
+    owner: Option<Arc<TimingOwnerToken>>,
 }
 
 impl TimedBody {
@@ -936,12 +1064,15 @@ impl HttpBody for TimedBody {
             // it is demand latency, never a successful socket-write duration.
             timing.record_wait(WaitKind::DownstreamDemand, handed_off.elapsed());
         }
-        let result = this.inner.as_mut().poll_frame(context);
+        let mut result = this.inner.as_mut().poll_frame(context);
         // Buffered drivers can start another upstream attempt while this body
         // is being polled. Delivery belongs to the attempt that produced it.
         let timing = this.current_timing();
-        match &result {
+        match &mut result {
             Poll::Ready(Some(Ok(frame))) => {
+                if let (Some(bytes), Some(owner)) = (frame.data_mut(), this.owner.as_ref()) {
+                    *bytes = retain_observed_bytes(std::mem::take(bytes), owner.clone());
+                }
                 if frame.data_ref().is_some_and(|bytes| !bytes.is_empty()) {
                     timing.mark(Milestone::HttpBodyHandoff);
                     this.handed_off = Some((Instant::now(), timing.clone()));
@@ -987,6 +1118,182 @@ mod tests {
     use super::*;
     use futures_util::StreamExt;
     use http_body_util::BodyExt;
+
+    #[test]
+    fn r5_timing_all_registry_types_and_experimental_drivers_have_static_labels() {
+        use crate::domain::providers::model::ProviderType;
+        let registry: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/contract/provider-registry.json"))
+                .unwrap();
+        let mut types = std::collections::BTreeSet::new();
+        let mut labels = std::collections::BTreeSet::new();
+        for item in registry["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(registry["customRecipes"].as_array().unwrap().iter())
+        {
+            if item["compatibilityProviderType"].is_null() {
+                continue;
+            }
+            let kind: ProviderType =
+                serde_json::from_value(item["compatibilityProviderType"].clone()).unwrap();
+            let driver = item
+                .pointer("/driverBinding/driverId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("custom.recipe");
+            let slot = TimingSlot::default();
+            let first = slot
+                .begin_for_driver(kind, driver, "anthropic_messages", Instant::now())
+                .unwrap();
+            let next = slot
+                .begin_for_driver(kind, driver, "anthropic_messages", Instant::now())
+                .unwrap();
+            assert!(Arc::ptr_eq(&first.request.0, &next.request.0));
+            assert!(!Arc::ptr_eq(&first.attempt, &next.attempt));
+            let expected = match driver {
+                "special.grok_web_session" => "grok_web_session",
+                "special.perplexity_web_session" => "perplexity_web_session",
+                _ => kind.as_str(),
+            };
+            assert_eq!(next.request().snapshot()["providerType"], expected);
+            types.insert(kind.as_str());
+            labels.insert(expected);
+        }
+        assert_eq!(types.len(), 28);
+        assert_eq!(labels.len(), 30);
+        let slot = TimingSlot::default();
+        let first = slot
+            .begin_for_driver(
+                ProviderType::Codex,
+                "special.grok_web_session",
+                "responses",
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(slot
+            .begin_for_driver(
+                ProviderType::Codex,
+                "special.perplexity_web_session",
+                "responses",
+                Instant::now()
+            )
+            .is_none());
+        assert!(slot
+            .begin_for_provider(ProviderType::Codex, "responses", Instant::now())
+            .is_none());
+        assert_eq!(
+            first.request().snapshot()["providerType"],
+            "grok_web_session"
+        );
+    }
+
+    #[test]
+    fn r5_timing_chat_role_and_responses_keepalive_are_not_first_semantic_content() {
+        use crate::domain::providers::model::ProviderType;
+        for kind in [
+            ProviderType::GeminiCli,
+            ProviderType::GitHubCopilot,
+            ProviderType::KimiCode,
+            ProviderType::TraeSolo,
+            ProviderType::TraeRaw,
+            ProviderType::TraeIntl,
+            ProviderType::OllamaCloud,
+            ProviderType::DeepSeekAccount,
+            ProviderType::AwsBedrock,
+        ] {
+            let slot = TimingSlot::default();
+            let timing = slot
+                .begin_for_provider(kind, "chat_completions", Instant::now())
+                .unwrap();
+            timing.observe_chat_value(
+                &serde_json::json!({"choices":[{"delta":{"role":"assistant"}}]}),
+            );
+            timing.observe_chat_value(&serde_json::json!({"choices":[{"delta":{"content":"","tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}));
+            for value in [
+                serde_json::json!({"type":"ping"}),
+                serde_json::json!({"type":"response.output_text.delta","delta":""}),
+            ] {
+                timing.observe_responses_value(&value, None, &SemanticObservation::Business);
+            }
+            assert!(timing.request().snapshot()["milestonesMs"]["first_semantic"].is_null());
+            timing.observe_chat_document(&serde_json::json!({"choices":[{"message":{"role":"assistant","reasoning_content":"reason"},"finish_reason":"length"}]}));
+            timing.finish_delivery(true);
+            let snapshot = timing.request().snapshot();
+            assert!(snapshot["milestonesMs"]["first_semantic"].is_number());
+            assert_eq!(snapshot["result"], "incomplete");
+            assert!(snapshot["milestonesMs"]["downstream_write_completed"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn r5_timing_unbudgeted_owner_waits_for_transport_and_response_slices() {
+        use crate::domain::providers::model::ProviderType;
+        let slot = TimingSlot::default();
+        let guard = slot.owner_guard();
+        let timing = slot
+            .begin_for_provider(ProviderType::KimiCode, "anthropic_messages", Instant::now())
+            .unwrap();
+        slot.track_unbudgeted_owners();
+        let transport = slot.retain_bytes(Bytes::from_static(b"outbound"));
+        let held_transport = transport.slice(..1);
+        drop(transport);
+        timing.observe_terminal(TimingResult::Complete);
+        let mut body = slot
+            .response(Response::new(Body::from(Bytes::from_static(b"hello"))))
+            .into_body();
+        let frame = body.frame().await.unwrap().unwrap();
+        let held_response = frame.data_ref().unwrap().slice(..1);
+        drop(frame);
+        drop(body);
+        drop(guard);
+        let snapshot = timing.request().snapshot();
+        assert_eq!(snapshot["result"], "complete");
+        assert!(snapshot["milestonesMs"]["http_body_handoff"].is_number());
+        assert!(snapshot["milestonesMs"]["downstream_write_completed"].is_null());
+        assert!(snapshot["milestonesMs"]["owner_released"].is_null());
+        drop(held_response);
+        assert!(timing.request().snapshot()["milestonesMs"]["owner_released"].is_null());
+        drop(held_transport);
+        assert!(timing.request().snapshot()["milestonesMs"]["owner_released"].is_number());
+    }
+
+    #[tokio::test]
+    async fn r5_timing_unbudgeted_cancellation_precedes_last_payload_release() {
+        use crate::domain::providers::model::ProviderType;
+        let slot = TimingSlot::default();
+        let inner_slot = slot.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _owner = inner_slot.owner_guard();
+            inner_slot
+                .run(async {
+                    inner_slot
+                        .begin_for_provider(
+                            ProviderType::GeminiCli,
+                            "gemini_generate_content",
+                            Instant::now(),
+                        )
+                        .unwrap();
+                    inner_slot.track_unbudgeted_owners();
+                    let held = inner_slot.retain_bytes(Bytes::from_static(b"pending send"));
+                    ready_tx.send(held).unwrap();
+                    std::future::pending::<()>().await;
+                })
+                .await;
+        });
+        let held = ready_rx.await.unwrap();
+        let timing = slot.get().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(timing.request().snapshot()["result"], "cancelled");
+        assert!(timing.request().snapshot()["milestonesMs"]["owner_released"].is_null());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        drop(held);
+        let snapshot = timing.request().snapshot();
+        assert!(snapshot["milestonesMs"]["owner_released"].is_number());
+        assert!(snapshot["waitsMs"]["cancel_drain"].as_f64().unwrap() > 0.0);
+    }
 
     #[tokio::test]
     async fn cursor_core03_buffered_retry_delivery_and_cancellation_follow_current_attempt() {

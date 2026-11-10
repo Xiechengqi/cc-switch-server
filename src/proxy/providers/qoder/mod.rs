@@ -374,19 +374,22 @@ pub(crate) async fn runtime_is_current(
     execution: &ProviderExecution,
     prepared_runtime: &PreparedQoderRuntime,
 ) -> bool {
-    state
-        .qoder_runtime_generation_matches(
-            execution.stored.app,
-            &execution.stored.provider.id,
-            execution.plan.provider_revision,
-            &execution.plan.runtime_fingerprint,
-            &prepared_runtime.account_id,
-            prepared_runtime.auth_identity_generation,
-            prepared_runtime.token_refresh_generation,
-            prepared_runtime.account_incarnation,
-            &prepared_runtime.scope,
-        )
-        .await
+    let now_ms = || crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+    prepared_runtime.catalog.is_current(now_ms())
+        && state
+            .qoder_runtime_generation_matches(
+                execution.stored.app,
+                &execution.stored.provider.id,
+                execution.plan.provider_revision,
+                &execution.plan.runtime_fingerprint,
+                &prepared_runtime.account_id,
+                prepared_runtime.auth_identity_generation,
+                prepared_runtime.token_refresh_generation,
+                prepared_runtime.account_incarnation,
+                &prepared_runtime.scope,
+            )
+            .await
+        && prepared_runtime.catalog.is_current(now_ms())
 }
 
 pub(crate) async fn record_limit_if_needed(

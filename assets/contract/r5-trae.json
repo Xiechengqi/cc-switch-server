@@ -1,0 +1,165 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "trae",
+  "liveState": "live_pending",
+  "reference": {
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false,
+    "negative": "Hub SOLO buffers before emitting; raw marker tools and EOF-success/transport reopen behavior do not justify weakening Server contracts"
+  },
+  "scope": {
+    "providerTypes": [
+      "trae_solo",
+      "trae_raw_chat",
+      "trae_raw_chat_intl"
+    ],
+    "profiles": [
+      "claude.trae_solo",
+      "claude.trae_raw_chat",
+      "claude.trae_raw_chat_intl",
+      "codex.trae_solo",
+      "codex.trae_raw_chat",
+      "codex.trae_raw_chat_intl",
+      "gemini.trae_solo",
+      "gemini.trae_raw_chat",
+      "gemini.trae_raw_chat_intl"
+    ],
+    "rails": [
+      {
+        "providerType": "trae_solo",
+        "site": "cn",
+        "operation": "native SOLO llm_utils_chat",
+        "tools": "structured native",
+        "images": "explicitly rejected"
+      },
+      {
+        "providerType": "trae_raw_chat",
+        "site": "cn",
+        "operation": "llm_raw_chat",
+        "tools": "explicit opt-in text simulation",
+        "images": "supported with source validation"
+      },
+      {
+        "providerType": "trae_raw_chat_intl",
+        "site": "intl",
+        "operation": "llm_raw_chat",
+        "tools": "explicit opt-in text simulation",
+        "images": "supported with source validation"
+      }
+    ],
+    "credentialRail": "one exact same-type managed Account; no cross channel/region/Account recovery"
+  },
+  "localPolicy": {
+    "productionWireChanged": false,
+    "rawToolsEnabledByDefault": false,
+    "soloImagesSupported": false,
+    "crossRailFallback": false,
+    "callback": "fixed loopback IPv4 authorize plus S256 and exact once 256-bit state; code exchange fixed to reviewed region/client, no redirect or legacy-token downgrade",
+    "refresh": "journal rotation before identity closure, retain issuing client and device ownership generation",
+    "terminal": "unique channel-native done plus EOF; partial/duplicate/late business/error fails, no synthetic stop",
+    "replay": "only existing one same-Account eligible precommit auth recovery; no postcommit replay or generic transport retry",
+    "catalog": "CN raw exact names and distinct SOLO; Intl discovery explicitly unsupported rather than borrowing CN",
+    "timingWork": "tracked_in_R5_CORE_01_separate_slice",
+    "performanceClaim": false
+  },
+  "cases": [
+    {
+      "id": "browser-pkce-all-rails",
+      "tests": [
+        "trae_browser_contract_requires_plain_ipv4_authorize_and_pkce_for_every_channel",
+        "trae_http_start_and_invoke_publish_the_official_callback_and_pkce"
+      ]
+    },
+    {
+      "id": "exact-once-callback",
+      "tests": [
+        "trae_manual_and_loopback_callbacks_persist_once_for_all_channels",
+        "trae_callback_rejects_ambiguous_state_codes_addresses_and_legacy_downgrades",
+        "trae_completed_login_is_principal_bound_and_forgets_callback_flow"
+      ]
+    },
+    {
+      "id": "callback-scope-and-cancel",
+      "tests": [
+        "trae_wrong_session_provider_owner_and_cancel_never_redeem_the_code",
+        "trae_cancel_during_code_exchange_discards_the_result",
+        "trae_exchange_redirects_and_reflected_failures_never_retry_or_leak_codes"
+      ]
+    },
+    {
+      "id": "refresh-client-and-rotation",
+      "tests": [
+        "refresh_journals_rotation_before_identity_closure",
+        "trae_pkce_accounts_refresh_with_issuing_client_while_legacy_solo_keeps_legacy_client",
+        "trae_raw_login_and_refresh_use_the_bound_realm_client_and_receipt"
+      ]
+    },
+    {
+      "id": "all-rails-native-tool-rounds",
+      "tests": [
+        "trae_all_channels_four_protocols_stream_and_nonstream_two_tool_roundtrips"
+      ]
+    },
+    {
+      "id": "images-distinct-rails",
+      "tests": [
+        "trae_raw_images_survive_all_four_client_bridges_and_solo_rejects_them",
+        "trae_four_entrypoints_reject_lost_or_conflicting_controls_before_network_io"
+      ]
+    },
+    {
+      "id": "strict-terminal-and-tools",
+      "tests": [
+        "eof_duplicate_done_and_event_after_done_fail_closed",
+        "solo_done_is_not_emitted_until_eof_is_verified",
+        "trae_raw_truncated_or_unknown_tool_markers_never_complete",
+        "trae_tool_completion_rejects_non_objects_truncation_and_undeclared_calls"
+      ]
+    },
+    {
+      "id": "quota-not-auth-or-cooldown",
+      "tests": [
+        "trae_quota_empty_or_non_authoritative_packs_are_unknown_errors_not_exhaustion",
+        "trae_quota_projects_only_entitlement_usage_and_never_installs_routing_cooldown",
+        "solo_error_codes_are_classified"
+      ]
+    },
+    {
+      "id": "catalog-and-session-generation",
+      "tests": [
+        "trae_raw_discovery_uses_cn_catalog_and_intl_stops_before_network_io",
+        "trae_raw_catalog_requires_exact_names_without_solo_aliases",
+        "trae_cache_fences_device_enterprise_and_both_generations"
+      ]
+    },
+    {
+      "id": "cancel-deadline-postcommit",
+      "tests": [
+        "trae_queue_timeout_heartbeat_idle_and_downstream_cancellation_are_bounded",
+        "trae_postcommit_stream_auth_error_never_refreshes_or_replays"
+      ]
+    }
+  ],
+  "references": [
+    {
+      "repository": "Trae/trae2api-hub",
+      "commit": "5ed619f314f75e3016392370d1b766467a5e92c1",
+      "tree": "31ce8c245c644bd301b3a7015708f6f2f7f71544",
+      "files": [
+        {
+          "path": "trae_client.py",
+          "sha256": "f9e5ad33825da3f0320eb0b49c23a4d70a07c3704bff450cd76135b40d52ee28"
+        },
+        {
+          "path": "trae_proxy.py",
+          "sha256": "f619b8af577357edb5b5a5e10abf5be6bfacfe403d16b6ce4690d1c0623b469f"
+        },
+        {
+          "path": "trae_accounts.py",
+          "sha256": "ff1120bd064c3d3ec38493b64f462ebe45e2caaae4f205238d98a857d1473593"
+        }
+      ]
+    }
+  ]
+}

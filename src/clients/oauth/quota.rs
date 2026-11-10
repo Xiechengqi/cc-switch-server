@@ -7728,6 +7728,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    include!("quota/gemini_onboarding_tests.rs");
 
     #[derive(Debug, Clone)]
     struct GeminiCodeAssistObservation {

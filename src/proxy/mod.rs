@@ -9,6 +9,7 @@ mod antigravity_compaction;
 pub(crate) mod antigravity_replay;
 mod antigravity_retry;
 pub(crate) mod antigravity_transport;
+mod bedrock;
 mod buddy_schema;
 mod buddy_wire;
 mod cache_injector;
@@ -39,6 +40,7 @@ pub(crate) mod kimi;
 pub(crate) mod kimi_runtime;
 pub(crate) mod kiro;
 mod kiro_prompt_cache;
+mod ollama;
 mod openai_capacity_shed;
 mod openai_chat_compat;
 mod outbound_identity;
@@ -74,6 +76,7 @@ mod transforms;
 mod usage;
 pub(crate) mod value_metering;
 pub(crate) mod web_session;
+pub(crate) mod web_session_runtime;
 
 use serde_json::Value;
 

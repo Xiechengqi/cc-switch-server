@@ -2,6 +2,12 @@
 
 本文描述 cc-switch-server 对 Claude OAuth 的生产边界、运行时约束和验收方式。目标是把一个明确绑定的 Claude OAuth 账号稳定暴露为 Anthropic Messages API，不提供账号池、负载均衡或跨账号故障转移。
 
+## R5 离线协议差分
+
+`assets/contract/r5-claude-oauth.json` 固定 CLIProxyAPI `681ce41b` 的 committed-source 摘要和本仓合成输入。实际转发样例覆盖 native leading/mid-conversation effort、空白 thinking、缓存 eviction/diagnostics、两轮工具别名业务数据不透明性，以及四种兼容路由的 JSON/SSE refusal；复用已有独立 CountTokens beta、限流分类、终态与取消所有权合同。此处只有 `claude.official_oauth` 是正式 Registry Profile，兼容入口覆盖不等于增加 Bundle Surface 或账号权限。
+
+参考实现的 detached drain 只有 64 KiB 字节上限，无 deadline 的上下文可脱离取消，因此未迁入。本仓继续在完整 native message_delta/message_stop 后结束并释放真实上游 owner；不复制 TLS 指纹或改变 CLI 版本、连接池及刷新重试策略。所有真实 operation 仍各自 `live_pending`，样例不能证明厂商接受性或延迟收益。
+
 ## 能力边界
 
 - 对外入口为 Router 暴露的 Share URL 下 `POST /v1/messages` 及对应的 `count_tokens` 路径。

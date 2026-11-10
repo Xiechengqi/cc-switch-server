@@ -21,6 +21,7 @@ use crate::domain::providers::web_session::{
 use crate::state::{ServerState, WebSessionStateError};
 
 use super::provider_ops::ProviderExecution;
+use super::request_timing::{Milestone, TimingResult, TimingSlot, WaitKind};
 use super::router::ProxyRoute;
 use super::ProxyError;
 
@@ -162,12 +163,13 @@ struct ParsedUpstreamCompletion {
     session_id: Option<String>,
 }
 
-pub(crate) async fn execute(
+pub(super) async fn execute(
     state: &ServerState,
     execution: &ProviderExecution,
     route: ProxyRoute,
     body: Bytes,
     value_attempt: Option<&crate::state::ValueAttemptGuard>,
+    timing: &TimingSlot,
 ) -> Result<WebSessionForwardResult, ProxyError> {
     let driver_id = execution.plan.driver_id.as_str();
     let kind = WebSessionKind::for_driver(driver_id)
@@ -187,6 +189,10 @@ pub(crate) async fn execute(
     let selection = resolve_model(execution, kind, &request.requested_model)?;
 
     if route == ProxyRoute::ClaudeCountTokens {
+        if let Some(timing) = timing.get() {
+            timing.mark(Milestone::FirstSemantic);
+            timing.observe_terminal(TimingResult::Complete);
+        }
         return Ok(WebSessionForwardResult {
             downstream_body: Bytes::from(
                 serde_json::to_vec(&json!({"input_tokens": request.input_tokens}))
@@ -247,7 +253,7 @@ pub(crate) async fn execute(
         .header(REFERER, format!("{}/", profile.fixed_origin))
         .header(COOKIE, credential.cookie_header())
         .header(CACHE_CONTROL, HeaderValue::from_static("no-cache"))
-        .body(encoded);
+        .body(timing.retain_bytes(encoded));
     request_builder = match kind {
         WebSessionKind::Grok => request_builder
             .header(ACCEPT, HeaderValue::from_static("*/*"))
@@ -268,11 +274,22 @@ pub(crate) async fn execute(
     if let Some(attempt) = value_attempt {
         attempt.mark_sent();
     }
+    let forward_timing = timing.get();
+    if let Some(timing) = &forward_timing {
+        timing.mark(Milestone::SendStarted);
+    }
+    let headers_wait = forward_timing
+        .as_ref()
+        .map(|timing| timing.wait(WaitKind::Headers));
     let response = request_builder
         .timeout(execution.request_timeout())
         .send()
         .await
         .map_err(|error| network_error("send", error))?;
+    drop(headers_wait);
+    if let Some(timing) = &forward_timing {
+        timing.mark(Milestone::Headers);
+    }
     let status = response.status();
     if let Some(attempt) = value_attempt {
         attempt.mark_upstream_status(status.as_u16());
@@ -323,12 +340,19 @@ pub(crate) async fn execute(
             .stream_idle_timeout()
             .unwrap_or_else(|| execution.request_timeout()),
         execution.request_timeout(),
+        forward_timing.as_ref(),
     )
     .await?;
     let parsed = match kind {
         WebSessionKind::Grok => parse_grok_ndjson(&response_body)?,
         WebSessionKind::Perplexity => parse_perplexity_sse(&response_body)?,
     };
+    if let Some(timing) = &forward_timing {
+        if !parsed.text.is_empty() {
+            timing.mark(Milestone::FirstSemantic);
+        }
+        timing.observe_terminal(TimingResult::Complete);
+    }
 
     state
         .record_web_session_success(&scope, parsed.session_id.as_deref())
@@ -408,6 +432,10 @@ fn scope_for_execution(
 
 fn map_state_error(error: WebSessionStateError) -> ProxyError {
     match error {
+        WebSessionStateError::Capacity => ProxyError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "Web Session runtime capacity is temporarily unavailable".into(),
+        },
         WebSessionStateError::IdentityChanged => ProxyError::conflict(
             "Web Session Provider runtime or credential generation changed during the request",
         ),
@@ -927,6 +955,7 @@ async fn read_response_body_strict(
     first_byte_timeout: Duration,
     idle_timeout: Duration,
     total_timeout: Duration,
+    timing: Option<&super::request_timing::ForwardTiming>,
 ) -> Result<Bytes, ProxyError> {
     if response
         .content_length()
@@ -954,6 +983,7 @@ async fn read_response_body_strict(
         };
         let remaining = deadline.saturating_duration_since(now);
         let wait = phase.min(remaining);
+        let _read_wait = timing.map(|timing| timing.wait(WaitKind::UpstreamRead));
         let chunk = tokio::time::timeout(wait, response.chunk())
             .await
             .map_err(|_| ProxyError {

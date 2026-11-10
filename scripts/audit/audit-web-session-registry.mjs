@@ -145,7 +145,7 @@ function validateImplementationTokens() {
     "Web Session Provider-owned secret is not in the encrypted credential inventory",
   );
   for (const token of [
-    "pub(crate) async fn execute",
+    "pub(super) async fn execute",
     "pub(crate) fn preflight_actual_model",
     "fn build_grok_request",
     "fn build_perplexity_request",

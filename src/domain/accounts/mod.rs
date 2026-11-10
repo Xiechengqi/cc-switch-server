@@ -5,6 +5,7 @@ pub mod checkin;
 pub mod claude_quota;
 pub mod claude_subscription;
 pub mod codex_quota;
+pub mod copilot;
 pub mod cursor_import;
 pub mod grok_subscription;
 pub mod login;

@@ -176,3 +176,12 @@ Router 主调度 UTC 半小时槽，Server 本地 scheduler 兜底：同一 App/
 
 
 WorkBuddy 中国站个人账号可选每日签到由账号控制面持有，默认关闭。账号存储中的 `buddyCheckins` 随 JSON / SQLite 原子持久化；`state/account_checkin.rs` 封装身份/生命周期围栏、状态先查、持久化意图、单账号任务和重试调度，外部签到 HTTP 仅在 `clients/oauth/codebuddy/checkin.rs`。所有 App / Provider / Share 共用账号结果，推理路径和 Router 不执行签到。确认后仅更新实际资源包并复用现有账号 metadata / Router 同步，不更改官方用量、分享额度和推理冷却。具体合同见 [WorkBuddy OAuth](../provider/workbuddy-oauth.md#中国站个人账号每日签到)。
+
+
+### R5 公共计时和驻留所有权
+
+统一 `TimingSlot` 在 Registry 已解析的执行 driver 边界准入全部 28 个 ProviderType；两个隐藏网页 driver 分别使用固定 `grok_web_session` / `perplexity_web_session`，共 30 个有限标签。一次 request 的 Provider/surface 固定，既有恢复各自开始 attempt。首语义排除 role-only、空 delta、keepalive/usage；HTTP 只记 body handoff。DeepSeek completion 的 headers 等待不包含 session 创建与 PoW；网页完整缓冲后才观察语义，未改成 token 流式。没有单请求预算的 driver 只附生命周期 token，实际传输及响应 Bytes 的 clone/slice 延续最后 owner；既有预算回调保留。
+
+DeepSeek session 与 Trae catalog 使用共享不可变 payload，索引、payload 和 64 个独立活动 single-flight 都接进程父账本。DeepSeek 保留 256条/30分钟；Trae 保留128条、32 MiB缓存、8分钟fresh/24小时stale，超本类缓存上限时可返回仍计费的当前结果而不发布。替换、淘汰、失效与缓存析构不提前释放仍被调用方持有的对象；容量错误为503，不能触发登录失效或跨scope恢复。
+
+网页 runtime 在发网前为每个配置scope预留受限 session/auth 槽（最多1024 scope，session id≤512字节）；401/403失效标记不因TTL、容量或降低父限额而消失，仅凭据/配置scope代际变化或删除收回。无生产task写入。旧八类与Kimi/Copilot既有预算不重建；Gemini持久Account投影与Antigravity短期API复制不冒称独立长期缓存。上述为逻辑估算和所有权边界，不是RSS全覆盖或性能收益；合同见 `assets/contract/r5-shared-core.json`，真实operation仍live_pending。

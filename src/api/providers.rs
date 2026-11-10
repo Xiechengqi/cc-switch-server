@@ -2794,6 +2794,16 @@ fn deepseek_provider_test_upstream_error(
 ) -> (ProviderOperationOutcome, Option<u16>, String) {
     use crate::state::DeepSeekUpstreamError;
     let (outcome, status, message) = match error {
+        DeepSeekUpstreamError::RuntimeCapacity => (
+            ProviderOperationOutcome::Upstream,
+            Some(503),
+            "DeepSeek local runtime capacity is exhausted".to_string(),
+        ),
+        DeepSeekUpstreamError::PowCapacity => (
+            ProviderOperationOutcome::Upstream,
+            Some(503),
+            "DeepSeek local proof-of-work capacity is exhausted".to_string(),
+        ),
         DeepSeekUpstreamError::ValueQuota(_) => (
             ProviderOperationOutcome::InvalidConfig,
             None,
@@ -4298,6 +4308,10 @@ async fn fetch_trae_provider_models(
 
 fn trae_runtime_api_error(error: crate::state::TraeRuntimeError) -> ApiError {
     match error {
+        crate::state::TraeRuntimeError::Capacity => ApiError::service_unavailable_code(
+            "trae_runtime_capacity",
+            "Trae runtime capacity is temporarily unavailable",
+        ),
         crate::state::TraeRuntimeError::NotFound => {
             ApiError::not_found("Trae managed Account not found")
         }
@@ -11213,4 +11227,23 @@ mod tests {
             ProviderOperationOutcome::InvalidConfig
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn r5_resource_trae_catalog_capacity_is_service_unavailable_without_login_recovery() {
+    let error = crate::state::TraeRuntimeError::Capacity;
+    assert!(!error.is_authentication_failure());
+    let response = axum::response::IntoResponse::into_response(trae_runtime_api_error(error));
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[cfg(test)]
+#[test]
+fn deepseek_provider_test_runtime_capacity_is_service_unavailable() {
+    let (outcome, status, message) =
+        deepseek_provider_test_upstream_error(crate::state::DeepSeekUpstreamError::RuntimeCapacity);
+    assert_eq!(outcome, ProviderOperationOutcome::Upstream);
+    assert_eq!(status, Some(503));
+    assert_eq!(message, "DeepSeek local runtime capacity is exhausted");
 }

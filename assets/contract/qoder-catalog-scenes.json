@@ -1,0 +1,376 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "source": {
+    "repository": "Qoder/qoder2api-hub",
+    "commit": "5caac09af0eaed301164e2255bceae47af8bfae6",
+    "tree": "16061f45f67521721900cc15ff299d70e8f9678f",
+    "path": "qoder_catalog.py",
+    "symbol": "dialogue_models",
+    "fileSha256": "e2a818e92d1a7747f63e47d39444f3894dd81b5966d8166ee4fe20d5ec152fbe",
+    "symbolSha256": "f68c32b308d287b850208be390a47c65c70aa832fdf0a68b9bde0cea8359042c",
+    "evidence": "read_only_committed_source",
+    "liveState": "live_pending"
+  },
+  "scope": {
+    "providerType": "qoder_cosy",
+    "sites": [
+      "global",
+      "cn"
+    ],
+    "credentialRails": [
+      "global_oauth",
+      "cn_oauth",
+      "pat_job_token"
+    ],
+    "apps": [
+      "claude",
+      "codex",
+      "gemini"
+    ]
+  },
+  "policy": {
+    "chatFirst": true,
+    "appOnlyExecutable": false,
+    "unknownScenesExcluded": true,
+    "staticFallbackGrantsPermission": false,
+    "sameSceneDuplicates": "reject",
+    "liveState": "live_pending",
+    "chatSceneExecutable": true
+  },
+  "cases": [
+    {
+      "name": "chat_deny_has_priority",
+      "input": {
+        "chat": [
+          {
+            "key": "shared",
+            "enable": false,
+            "source": "chat-fixture"
+          }
+        ],
+        "app": [
+          {
+            "key": "shared",
+            "enable": true,
+            "source": "app-fixture"
+          },
+          {
+            "key": "app-only",
+            "enable": true,
+            "source": "app-fixture",
+            "is_vl": true
+          }
+        ],
+        "quest": [
+          {
+            "key": "quest-only",
+            "enable": true
+          }
+        ],
+        "inline": [
+          {
+            "key": "inline-only",
+            "enable": true
+          }
+        ]
+      },
+      "enabledModels": [],
+      "selectedConfigs": {
+        "shared": {
+          "key": "shared",
+          "enable": false,
+          "source": "chat-fixture"
+        },
+        "app-only": {
+          "key": "app-only",
+          "enable": true,
+          "source": "app-fixture",
+          "is_vl": true
+        }
+      },
+      "catalogEntries": [
+        {
+          "modelKey": "shared",
+          "scene": "chat",
+          "enabled": false,
+          "executable": false,
+          "selected": true,
+          "source": "chat-fixture"
+        },
+        {
+          "modelKey": "shared",
+          "scene": "app",
+          "enabled": true,
+          "executable": false,
+          "selected": false,
+          "source": "app-fixture"
+        },
+        {
+          "modelKey": "app-only",
+          "scene": "app",
+          "enabled": true,
+          "executable": false,
+          "selected": true,
+          "source": "app-fixture"
+        }
+      ]
+    },
+    {
+      "name": "chat_permission_is_not_replaced_by_app",
+      "input": {
+        "chat": [
+          {
+            "key": "shared",
+            "enable": true,
+            "source": "chat-fixture"
+          }
+        ],
+        "app": [
+          {
+            "key": "shared",
+            "enable": false,
+            "source": "app-fixture"
+          },
+          {
+            "key": "app-only",
+            "enable": true,
+            "source": "app-fixture",
+            "is_vl": true
+          }
+        ]
+      },
+      "enabledModels": [
+        "shared"
+      ],
+      "selectedConfigs": {
+        "shared": {
+          "key": "shared",
+          "enable": true,
+          "source": "chat-fixture"
+        },
+        "app-only": {
+          "key": "app-only",
+          "enable": true,
+          "source": "app-fixture",
+          "is_vl": true
+        }
+      },
+      "catalogEntries": [
+        {
+          "modelKey": "shared",
+          "scene": "chat",
+          "enabled": true,
+          "executable": true,
+          "selected": true,
+          "source": "chat-fixture"
+        },
+        {
+          "modelKey": "shared",
+          "scene": "app",
+          "enabled": false,
+          "executable": false,
+          "selected": false,
+          "source": "app-fixture"
+        },
+        {
+          "modelKey": "app-only",
+          "scene": "app",
+          "enabled": true,
+          "executable": false,
+          "selected": true,
+          "source": "app-fixture"
+        }
+      ]
+    },
+    {
+      "name": "missing_chat_is_discovery_only",
+      "input": {
+        "app": [
+          {
+            "key": "app-only",
+            "enable": true,
+            "source": "app-fixture",
+            "is_vl": true
+          }
+        ]
+      },
+      "enabledModels": [],
+      "selectedConfigs": {
+        "app-only": {
+          "key": "app-only",
+          "enable": true,
+          "source": "app-fixture",
+          "is_vl": true
+        }
+      },
+      "catalogEntries": [
+        {
+          "modelKey": "app-only",
+          "scene": "app",
+          "enabled": true,
+          "executable": false,
+          "selected": true,
+          "source": "app-fixture"
+        }
+      ]
+    },
+    {
+      "name": "empty_chat_with_app_is_discovery_only",
+      "input": {
+        "chat": [],
+        "app": [
+          {
+            "key": "app-only",
+            "enable": true,
+            "source": "app-fixture",
+            "is_vl": true
+          }
+        ]
+      },
+      "enabledModels": [],
+      "selectedConfigs": {
+        "app-only": {
+          "key": "app-only",
+          "enable": true,
+          "source": "app-fixture",
+          "is_vl": true
+        }
+      },
+      "catalogEntries": [
+        {
+          "modelKey": "app-only",
+          "scene": "app",
+          "enabled": true,
+          "executable": false,
+          "selected": true,
+          "source": "app-fixture"
+        }
+      ]
+    },
+    {
+      "name": "authoritative_empty",
+      "input": {
+        "chat": [],
+        "app": []
+      },
+      "enabledModels": [],
+      "selectedConfigs": {},
+      "catalogEntries": []
+    },
+    {
+      "name": "unknown_scenes_do_not_grant_permission",
+      "input": {
+        "quest": [
+          {
+            "key": "app-only",
+            "enable": true,
+            "source": "app-fixture",
+            "is_vl": true
+          }
+        ],
+        "assistant": [
+          {
+            "key": "app-only",
+            "enable": true,
+            "source": "app-fixture",
+            "is_vl": true
+          }
+        ],
+        "byok": [
+          {
+            "key": "app-only",
+            "enable": true,
+            "source": "app-fixture",
+            "is_vl": true
+          }
+        ]
+      },
+      "error": true
+    },
+    {
+      "name": "malformed_app_array",
+      "input": {
+        "chat": [],
+        "app": {}
+      },
+      "error": true
+    },
+    {
+      "name": "malformed_app_entry",
+      "input": {
+        "chat": [],
+        "app": [
+          null
+        ]
+      },
+      "error": true
+    },
+    {
+      "name": "invalid_app_enable",
+      "input": {
+        "chat": [],
+        "app": [
+          {
+            "key": "app-only",
+            "enable": "true"
+          }
+        ]
+      },
+      "error": true
+    },
+    {
+      "name": "duplicate_keys_within_chat",
+      "input": {
+        "chat": [
+          {
+            "key": "shared",
+            "enable": true,
+            "source": "chat-fixture"
+          },
+          {
+            "key": "shared",
+            "enable": false,
+            "source": "chat-fixture"
+          }
+        ]
+      },
+      "error": true
+    },
+    {
+      "name": "duplicate_keys_within_app",
+      "input": {
+        "app": [
+          {
+            "key": "app-only",
+            "enable": true,
+            "source": "app-fixture",
+            "is_vl": true
+          },
+          {
+            "key": "app-only",
+            "enable": true,
+            "source": "app-fixture",
+            "is_vl": true
+          }
+        ]
+      },
+      "error": true
+    },
+    {
+      "name": "explicit_invalid_chat_not_hidden_by_app",
+      "input": {
+        "chat": null,
+        "app": [
+          {
+            "key": "app-only",
+            "enable": true,
+            "source": "app-fixture",
+            "is_vl": true
+          }
+        ]
+      },
+      "error": true
+    }
+  ]
+}

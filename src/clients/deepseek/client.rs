@@ -1,4 +1,4 @@
-use super::pow::{solve_and_build_header, DeepSeekPowChallenge};
+use super::pow::{solve_and_build_header, DeepSeekPowChallenge, PowCapacityError};
 use futures_util::StreamExt;
 use reqwest::{header::HeaderMap, Client, Response};
 use serde_json::Value;
@@ -13,6 +13,8 @@ const MAX_CONTROL_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum DeepSeekClientError {
+    #[error("DeepSeek local proof-of-work capacity is exhausted")]
+    PowCapacity,
     #[error("DeepSeek {operation} network error: {message}")]
     Network {
         operation: &'static str,
@@ -35,7 +37,7 @@ impl DeepSeekClientError {
     pub fn status_code(&self) -> Option<u16> {
         match self {
             Self::Upstream { status_code, .. } => Some(*status_code),
-            Self::Network { .. } | Self::Protocol { .. } => None,
+            Self::PowCapacity | Self::Network { .. } | Self::Protocol { .. } => None,
         }
     }
 
@@ -45,6 +47,7 @@ impl DeepSeekClientError {
 
     pub fn operation(&self) -> &'static str {
         match self {
+            Self::PowCapacity => "create_pow",
             Self::Network { operation, .. }
             | Self::Upstream { operation, .. }
             | Self::Protocol { operation, .. } => operation,
@@ -166,12 +169,16 @@ impl DeepSeekWebClient {
                     message: error.to_string(),
                 }
             })?;
-        solve_and_build_header(&challenge)
-            .await
-            .map_err(|error| DeepSeekClientError::Protocol {
-                operation: "create_pow",
-                message: error.to_string(),
-            })
+        solve_and_build_header(&challenge).await.map_err(|error| {
+            if error.is::<PowCapacityError>() {
+                DeepSeekClientError::PowCapacity
+            } else {
+                DeepSeekClientError::Protocol {
+                    operation: "create_pow",
+                    message: error.to_string(),
+                }
+            }
+        })
     }
 
     pub(crate) async fn completion(
@@ -180,14 +187,31 @@ impl DeepSeekWebClient {
         pow_header: &str,
         request: DeepSeekCompletionRequest<'_>,
     ) -> Result<Response, DeepSeekClientError> {
+        self.completion_observed(token, pow_header, request, |body| body, || {})
+            .await
+    }
+
+    pub(crate) async fn completion_observed(
+        &self,
+        token: &str,
+        pow_header: &str,
+        request: DeepSeekCompletionRequest<'_>,
+        observe_body: impl FnOnce(bytes::Bytes) -> bytes::Bytes,
+        observe_headers: impl FnOnce(),
+    ) -> Result<Response, DeepSeekClientError> {
         let payload = completion_payload(&request);
+        let encoded =
+            serde_json::to_vec(&payload).map_err(|error| DeepSeekClientError::Protocol {
+                operation: "completion",
+                message: error.to_string(),
+            })?;
         let response = self
             .http
             .post(format!("{}/api/v0/chat/completion", self.api_base))
             .headers(deepseek_base_headers())
             .bearer_auth(token)
             .header("x-ds-pow-response", pow_header)
-            .json(&payload)
+            .body(observe_body(bytes::Bytes::from(encoded)))
             .timeout(COMPLETION_HEADER_TIMEOUT)
             .send()
             .await
@@ -195,6 +219,7 @@ impl DeepSeekWebClient {
                 operation: "completion",
                 message: error.to_string(),
             })?;
+        observe_headers();
         if response
             .content_length()
             .is_some_and(|length| length > 64 * 1024 * 1024)
@@ -393,6 +418,14 @@ fn model_type(model: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pow_capacity_error_is_local_and_never_authentication_or_upstream_status() {
+        let error = super::DeepSeekClientError::PowCapacity;
+        assert_eq!(error.status_code(), None);
+        assert!(!error.is_authentication_failure());
+        assert_eq!(error.operation(), "create_pow");
+    }
     use super::*;
     use crate::clients::deepseek::pow::{deepseek_hash_v1, DeepSeekPowChallenge};
     use axum::routing::post;

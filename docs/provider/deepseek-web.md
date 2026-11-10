@@ -45,3 +45,15 @@ Provider test dry-run 只做本地检查：固定 origin、reviewed model、bear
 - 日志、API、错误和持久化文件不泄露 bearer、session id、PoW signature 或 prompt。
 
 真实凭据未提供前保持 `fixture_verified` / `live_pending`，不得标记 live verified。
+
+
+## R5 DS-01 PoW 取消与 CPU 工作准入（2026-11-10）
+
+`assets/contract/r5-deepseek.json` 冻结 OmniRoute 的 committed Web/session/PoW/stream 形状及十组本仓合同。本仓只支持 Claude 的固定 chat.deepseek.com、显式导入 Web bearer；过期需重导入，不自动借密码、Cookie、API key 或其他账号。工具仍是 nonce-bound 文本模拟，不标成 native。
+
+资源复核发现原 blocking PoW 在调用方取消后继续搜索，且没有独立并发准入。两个反例先以原搜索循环分别证明取消/已过期本地 deadline 仍返回42。现每进程最多两个 worker，最多等待100ms准入，本地工作deadline至多10秒且受challenge既有expiry/skew窗口约束；取消在worker开始、每64次hash及生成header前检查。真实blocking closure一直持permit到退出，取消await不会早释许可或排入更多CPU任务。它是协作检查，不是OS抢占或硬实时上限。
+
+容量拒绝为明确本地503，不执行completion、不触发刷新/需重登录/冷却或换身份；已有Provider test的coarse outcome沿用upstream并附503及固定local-capacity说明。既有session generation、单次同账号重建、401终态、strict terminal/thinking/search与nonce工具注入拒绝均保留。长期session/index父预算另归CORE-02，真实PoW/token/model接受性继续live_pending，实际验证见增强文档§22.16。
+
+
+R5 CORE-02：session/cache index 与最多64个活动 distinct session-flight 接进程父预算，session快照共享不可变payload；256条/30分钟边界保留。失效、替换或淘汰后，仍被当前转发持有的session延续计费至最后引用；父预算/flight容量拒绝返回503，不写needsRelogin、不触发额外修复或账号切换。PoW的既有真实worker准入、取消及到期规则保持。计时的completion headers不包含session创建与PoW准备。公共本仓合同见 `assets/contract/r5-shared-core.json`；真实接受性仍live_pending。

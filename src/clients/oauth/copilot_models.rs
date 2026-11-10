@@ -1,10 +1,13 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::infra::resident_memory::{ResidentMemoryBudget, ResidentMemoryReservation};
 use reqwest::StatusCode;
 use serde_json::Value;
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::RwLock;
+
+mod resident;
 
 use super::copilot_device::{
     COPILOT_API_VERSION, COPILOT_EDITOR_VERSION, COPILOT_PLUGIN_VERSION, COPILOT_USER_AGENT,
@@ -45,7 +48,7 @@ pub const PUBLIC_STATIC_MODEL_IDS: &[&str] = &[
     "oswe-vscode-prime",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CopilotModelCatalogKey {
     pub account_id: String,
     pub auth_identity_generation: u64,
@@ -72,131 +75,51 @@ pub struct CopilotModelDescriptor {
     pub supports_reasoning: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CopilotModelCatalog {
+#[derive(Debug)]
+pub struct CopilotModelCatalogData {
     pub models: Vec<String>,
     pub descriptors: Vec<CopilotModelDescriptor>,
+    pub api_origin: Option<String>,
+    pub github_domain: Option<String>,
+    _memory: Option<ResidentMemoryReservation>,
+    _payload_memory: Option<ResidentMemoryReservation>,
+}
+
+impl PartialEq for CopilotModelCatalogData {
+    fn eq(&self, other: &Self) -> bool {
+        self.models == other.models
+            && self.descriptors == other.descriptors
+            && self.api_origin == other.api_origin
+            && self.github_domain == other.github_domain
+    }
+}
+impl Eq for CopilotModelCatalogData {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopilotModelCatalog {
+    data: Arc<CopilotModelCatalogData>,
     pub source: &'static str,
     pub stale: bool,
     pub fetched_at_ms: Option<i64>,
-    pub api_origin: Option<String>,
-    pub github_domain: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct CachedCopilotModelCatalog {
-    descriptors: Vec<CopilotModelDescriptor>,
-    fetched_at_ms: i64,
+impl std::ops::Deref for CopilotModelCatalog {
+    type Target = CopilotModelCatalogData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CopilotModelCatalogCache {
-    catalogs: RwLock<HashMap<CopilotModelCatalogKey, CachedCopilotModelCatalog>>,
-    flights: Mutex<HashMap<CopilotModelCatalogKey, Arc<Mutex<()>>>>,
-}
-
-impl CopilotModelCatalogCache {
-    pub async fn fresh(
-        &self,
-        key: &CopilotModelCatalogKey,
-        now_ms: i64,
-    ) -> Option<CopilotModelCatalog> {
-        self.catalogs
-            .read()
-            .await
-            .get(key)
-            .filter(|catalog| now_ms.saturating_sub(catalog.fetched_at_ms) < MODEL_CACHE_TTL_MS)
-            .map(|catalog| cached_catalog(key, catalog, false))
-    }
-
-    pub async fn stale(
-        &self,
-        key: &CopilotModelCatalogKey,
-        now_ms: i64,
-    ) -> Option<CopilotModelCatalog> {
-        self.catalogs
-            .read()
-            .await
-            .get(key)
-            .filter(|catalog| {
-                now_ms.saturating_sub(catalog.fetched_at_ms) < STALE_MODEL_CACHE_TTL_MS
-            })
-            .map(|catalog| cached_catalog(key, catalog, true))
-    }
-
-    pub async fn insert(
-        &self,
-        key: CopilotModelCatalogKey,
-        descriptors: Vec<CopilotModelDescriptor>,
-        fetched_at_ms: i64,
-    ) -> CopilotModelCatalog {
-        let api_origin = key.api_origin.clone();
-        let github_domain = key.github_domain.clone();
-        let cached = CachedCopilotModelCatalog {
-            descriptors: descriptors.clone(),
-            fetched_at_ms,
-        };
-        let mut catalogs = self.catalogs.write().await;
-        catalogs.insert(key, cached);
-        while catalogs.len() > MAX_MODEL_CACHE_ENTRIES {
-            let Some(oldest) = catalogs
-                .iter()
-                .min_by_key(|(_, catalog)| catalog.fetched_at_ms)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            catalogs.remove(&oldest);
-        }
-        CopilotModelCatalog {
-            models: descriptors
-                .iter()
-                .map(|descriptor| descriptor.model_id.clone())
-                .collect(),
-            descriptors,
-            source: "copilot_models_api",
-            stale: false,
-            fetched_at_ms: Some(fetched_at_ms),
-            api_origin: Some(api_origin),
-            github_domain: Some(github_domain),
-        }
-    }
-
-    pub async fn lock(&self, key: &CopilotModelCatalogKey) -> OwnedMutexGuard<()> {
-        let flight = {
-            let mut flights = self.flights.lock().await;
-            flights.retain(|current, flight| current == key || Arc::strong_count(flight) > 1);
-            flights
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        flight.lock_owned().await
-    }
-}
-
-fn cached_catalog(
-    key: &CopilotModelCatalogKey,
-    cached: &CachedCopilotModelCatalog,
-    stale: bool,
-) -> CopilotModelCatalog {
-    CopilotModelCatalog {
-        models: cached
-            .descriptors
-            .iter()
-            .map(|descriptor| descriptor.model_id.clone())
-            .collect(),
-        descriptors: cached.descriptors.clone(),
-        source: "copilot_account_cache",
-        stale,
-        fetched_at_ms: Some(cached.fetched_at_ms),
-        api_origin: Some(key.api_origin.clone()),
-        github_domain: Some(key.github_domain.clone()),
-    }
+    catalogs: RwLock<BTreeMap<CopilotModelCatalogKey, CopilotModelCatalog>>,
+    flights: crate::infra::resident_flights::ResidentFlights<CopilotModelCatalogKey>,
+    parent: ResidentMemoryBudget,
 }
 
 #[derive(Debug, Clone)]
 pub struct CopilotModelFetchError {
+    pub capacity_rejected: bool,
     pub status: Option<StatusCode>,
     pub message: String,
 }
@@ -210,12 +133,34 @@ impl std::fmt::Display for CopilotModelFetchError {
 impl std::error::Error for CopilotModelFetchError {}
 
 impl CopilotModelFetchError {
+    fn capacity() -> Self {
+        crate::metrics::record_resident_retention_refused("copilot_catalog_fetch");
+        Self {
+            capacity_rejected: true,
+            status: Some(StatusCode::SERVICE_UNAVAILABLE),
+            message: "Copilot model discovery capacity is exhausted".into(),
+        }
+    }
     pub fn is_transient(&self) -> bool {
-        self.status.is_none_or(|status| {
-            status == StatusCode::REQUEST_TIMEOUT
-                || status == StatusCode::TOO_MANY_REQUESTS
-                || status.is_server_error()
-        })
+        !self.capacity_rejected
+            && self.status.is_none_or(|status| {
+                status == StatusCode::REQUEST_TIMEOUT
+                    || status == StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+            })
+    }
+}
+
+#[derive(Debug)]
+pub struct FetchedCopilotModels {
+    descriptors: Vec<CopilotModelDescriptor>,
+    _memory: Option<ResidentMemoryReservation>,
+}
+
+impl std::ops::Deref for FetchedCopilotModels {
+    type Target = [CopilotModelDescriptor];
+    fn deref(&self) -> &Self::Target {
+        &self.descriptors
     }
 }
 
@@ -224,7 +169,29 @@ pub async fn fetch_copilot_models(
     url: &str,
     copilot_token: &str,
     timeout: Duration,
-) -> Result<Vec<CopilotModelDescriptor>, CopilotModelFetchError> {
+) -> Result<FetchedCopilotModels, CopilotModelFetchError> {
+    fetch_copilot_models_with_parent(
+        http,
+        url,
+        copilot_token,
+        timeout,
+        crate::infra::resident_memory::process_resident_memory(),
+    )
+    .await
+}
+
+async fn fetch_copilot_models_with_parent(
+    http: &reqwest::Client,
+    url: &str,
+    copilot_token: &str,
+    timeout: Duration,
+    parent: ResidentMemoryBudget,
+) -> Result<FetchedCopilotModels, CopilotModelFetchError> {
+    let memory = crate::infra::resident_flights::CatalogFetchMemory::new(
+        parent,
+        MAX_MODEL_RESPONSE_BODY_BYTES,
+    )
+    .ok_or_else(CopilotModelFetchError::capacity)?;
     let mut response = http
         .get(url)
         .bearer_auth(copilot_token)
@@ -242,6 +209,7 @@ pub async fn fetch_copilot_models(
         .send()
         .await
         .map_err(|error| CopilotModelFetchError {
+            capacity_rejected: false,
             status: None,
             message: format!("Copilot model request failed: {error}"),
         })?;
@@ -252,17 +220,23 @@ pub async fn fetch_copilot_models(
     )
     .await
     .map_err(|error| CopilotModelFetchError {
+        capacity_rejected: false,
         status: Some(status),
         message: format!("Copilot model response could not be read: {error}"),
     })?;
     if !status.is_success() {
         return Err(CopilotModelFetchError {
+            capacity_rejected: false,
             status: Some(status),
             message: format!("Copilot model request returned HTTP {status}"),
         });
     }
+    let _parsing = memory
+        .parsing(body.len())
+        .ok_or_else(CopilotModelFetchError::capacity)?;
     let payload =
         serde_json::from_slice::<Value>(&body).map_err(|error| CopilotModelFetchError {
+            capacity_rejected: false,
             status: Some(status),
             message: format!("Copilot model response is not valid JSON: {error}"),
         })?;
@@ -270,11 +244,22 @@ pub async fn fetch_copilot_models(
         && !payload.get("models").is_some_and(Value::is_array)
     {
         return Err(CopilotModelFetchError {
+            capacity_rejected: false,
             status: Some(status),
             message: "Copilot model response does not contain a data/models array".to_string(),
         });
     }
-    Ok(parse_copilot_models(&payload))
+    let descriptors = parse_copilot_models(&payload);
+    let retained = memory
+        .payload(
+            resident::descriptors_bytes(&descriptors)
+                .saturating_add(std::mem::size_of::<FetchedCopilotModels>()),
+        )
+        .ok_or_else(CopilotModelFetchError::capacity)?;
+    Ok(FetchedCopilotModels {
+        descriptors,
+        _memory: Some(retained),
+    })
 }
 
 pub fn parse_copilot_models(payload: &Value) -> Vec<CopilotModelDescriptor> {
@@ -282,14 +267,47 @@ pub fn parse_copilot_models(payload: &Value) -> Vec<CopilotModelDescriptor> {
         .get("data")
         .and_then(Value::as_array)
         .or_else(|| payload.get("models").and_then(Value::as_array));
-    let mut models = items
-        .into_iter()
-        .flatten()
-        .filter_map(parse_copilot_model_descriptor)
-        .collect::<Vec<_>>();
-    models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
-    models.dedup_by(|left, right| left.model_id == right.model_id);
-    models
+    // Duplicate rows are not independent permissions. A denied or conflicting
+    // row must never be hidden by sorting/filtering an enabled row first.
+    let mut models: BTreeMap<String, Option<CopilotModelDescriptor>> = BTreeMap::new();
+    for item in items.into_iter().flatten() {
+        let Some(id) = model_identifier(item) else {
+            continue;
+        };
+        let descriptor = parse_copilot_model_descriptor(item);
+        models
+            .entry(id)
+            .and_modify(|previous| {
+                if let (Some(current), Some(candidate)) = (previous.as_ref(), descriptor.as_ref()) {
+                    if copilot_legacy_descriptor(candidate) {
+                        return;
+                    }
+                    if copilot_legacy_descriptor(current) {
+                        *previous = descriptor.clone();
+                        return;
+                    }
+                }
+                if previous.as_ref() != descriptor.as_ref() {
+                    *previous = None;
+                }
+            })
+            .or_insert(descriptor);
+    }
+    models.into_values().flatten().collect()
+}
+
+// A metadata-free duplicate adds no endpoint/policy permission. Preserve an
+// explicit descriptor over it, but never hide a denied or conflicting row.
+fn copilot_legacy_descriptor(descriptor: &CopilotModelDescriptor) -> bool {
+    descriptor.supported_endpoints.is_empty()
+        && descriptor.policy_state.is_none()
+        && descriptor.model_picker_enabled.is_none()
+        && descriptor.model_type.is_none()
+        && descriptor.supports_tools.is_none()
+        && descriptor.supports_vision.is_none()
+        && descriptor.supports_reasoning.is_none()
+        && descriptor.max_context_window_tokens.is_none()
+        && descriptor.max_output_tokens.is_none()
 }
 
 fn parse_copilot_model_descriptor(item: &Value) -> Option<CopilotModelDescriptor> {
@@ -322,18 +340,23 @@ fn parse_copilot_model_descriptor(item: &Value) -> Option<CopilotModelDescriptor
     {
         return None;
     }
-    let supported_endpoints = string_array(
-        item.get("supported_endpoints")
-            .or_else(|| capabilities.and_then(|value| value.get("supported_endpoints"))),
-    );
-    if !supported_endpoints.is_empty()
-        && !supported_endpoints.iter().any(|endpoint| {
-            endpoint.contains("/chat/completions")
-                || endpoint.contains("/responses")
-                || endpoint.contains("/v1/messages")
-        })
-    {
-        return None;
+    let endpoint_metadata = item
+        .get("supported_endpoints")
+        .or_else(|| capabilities.and_then(|value| value.get("supported_endpoints")));
+    let supported_endpoints = string_array(endpoint_metadata);
+    if let Some(metadata) = endpoint_metadata {
+        // Only an omitted field is the reviewed legacy Chat contract. An
+        // explicit empty/invalid declaration cannot grant a protocol instead.
+        if !metadata.is_array()
+            || supported_endpoints.is_empty()
+            || crate::domain::accounts::copilot::CopilotEndpoint::select(
+                &supported_endpoints,
+                crate::domain::accounts::copilot::CopilotEndpoint::Chat,
+            )
+            .is_err()
+        {
+            return None;
+        }
     }
     if model_type.is_none() && supported_endpoints.is_empty() {
         let normalized = model_id.to_ascii_lowercase();
@@ -476,16 +499,20 @@ pub fn public_static_catalog() -> CopilotModelCatalog {
         })
         .collect::<Vec<_>>();
     CopilotModelCatalog {
-        models: descriptors
-            .iter()
-            .map(|descriptor| descriptor.model_id.clone())
-            .collect(),
-        descriptors,
+        data: Arc::new(CopilotModelCatalogData {
+            models: descriptors
+                .iter()
+                .map(|descriptor| descriptor.model_id.clone())
+                .collect(),
+            descriptors,
+            api_origin: None,
+            github_domain: Some("github.com".to_string()),
+            _memory: None,
+            _payload_memory: None,
+        }),
         source: "copilot_public_static_compatibility",
         stale: true,
         fetched_at_ms: None,
-        api_origin: None,
-        github_domain: Some("github.com".to_string()),
     }
 }
 
@@ -559,6 +586,62 @@ mod tests {
         assert_eq!(model.supports_tools, Some(true));
         assert_eq!(model.supports_vision, Some(false));
         assert_eq!(model.supports_reasoning, Some(true));
+    }
+
+    #[test]
+    fn copilot_catalog_explicit_empty_or_malformed_endpoints_never_enable_legacy_chat() {
+        for endpoints in [
+            json!([]),
+            Value::Null,
+            json!("/responses"),
+            json!([""]),
+            json!([false]),
+            json!(["/unreviewed"]),
+        ] {
+            let rows = vec![
+                json!({"id":"legacy"}),
+                json!({"id":"explicit","supported_endpoints":endpoints}),
+                json!({"id":"nested","capabilities":{"supported_endpoints":endpoints}}),
+                json!({"id":"duplicate","supported_endpoints":["/responses"]}),
+                json!({"id":"duplicate","supported_endpoints":endpoints}),
+            ];
+            for items in [rows.clone(), rows.into_iter().rev().collect()] {
+                let parsed = parse_copilot_models(&json!({"data":items}));
+                assert_eq!(
+                    parsed
+                        .iter()
+                        .map(|row| row.model_id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["legacy"],
+                    "an explicit unsupported endpoint declaration became legacy Chat: {endpoints}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copilot_catalog_does_not_union_conflicting_or_denied_duplicate_permissions() {
+        for reversed in [false, true] {
+            let mut items = vec![
+                json!({"id":"denied","supported_endpoints":["/responses"]}),
+                json!({"id":"denied","policy":{"state":"disabled"},"supported_endpoints":["/responses"]}),
+                json!({"id":"conflict","supported_endpoints":["/responses"]}),
+                json!({"id":"conflict","supported_endpoints":["/v1/messages"]}),
+                json!({"id":"unsafe","supported_endpoints":["https://untrusted.example/responses"]}),
+                json!({"id":"valid","supported_endpoints":["/responses"]}),
+            ];
+            if reversed {
+                items.reverse();
+            }
+            let parsed = parse_copilot_models(&json!({"data":items}));
+            assert_eq!(
+                parsed
+                    .iter()
+                    .map(|d| d.model_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["valid"]
+            );
+        }
     }
 
     #[tokio::test]
@@ -675,6 +758,7 @@ mod tests {
             Some(StatusCode::BAD_GATEWAY),
         ] {
             assert!(CopilotModelFetchError {
+                capacity_rejected: false,
                 status,
                 message: "transient".to_string()
             }
@@ -687,6 +771,7 @@ mod tests {
             StatusCode::OK,
         ] {
             assert!(!CopilotModelFetchError {
+                capacity_rejected: false,
                 status: Some(status),
                 message: "terminal".to_string()
             }
@@ -711,7 +796,8 @@ mod tests {
                 parse_copilot_models(&json!({"data": [{"id": "model-a"}]})),
                 1_000,
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(cache.fresh(&key, 1_001).await.unwrap().models, ["model-a"]);
 
         for changed in [
@@ -744,4 +830,10 @@ mod tests {
             assert!(cache.stale(&changed, 1_001).await.is_none());
         }
     }
+}
+
+#[cfg(test)]
+mod r5_resident_regression_tests {
+    use super::*;
+    include!("copilot_models/r5_resident_tests.rs");
 }

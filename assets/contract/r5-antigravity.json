@@ -1,0 +1,244 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "antigravity_agy",
+  "liveState": "live_pending",
+  "references": [
+    {
+      "repository": "CLIProxyAPI",
+      "commit": "681ce41b6e44c45b15b79378b003909d6ba29e68",
+      "tree": "00d0ecf4594b47495d82d1efd429c17551ab6d51",
+      "files": [
+        {
+          "path": "internal/runtime/executor/antigravity_executor_request.go",
+          "sha256": "e38f4b212ef3c8e9dacb95b8bb65b1e2a4441c22a7c6ee03506f630039741793"
+        },
+        {
+          "path": "internal/runtime/executor/antigravity_executor_stream.go",
+          "sha256": "f2883d5f1dec4e644b396c499ecb43a77bfdbb3ec20d6e4a3fddcd38bce1ba55"
+        },
+        {
+          "path": "internal/runtime/executor/antigravity_executor_execute.go",
+          "sha256": "20452298038e137f34c7ca4ccd0fb967b33e10981b7af0099eb500f91f019a3f"
+        },
+        {
+          "path": "internal/runtime/executor/antigravity_executor_credits.go",
+          "sha256": "94717d5b7d210846541e604454728be13837f84cd9ae4a4f0a6b0804bee51ecd"
+        },
+        {
+          "path": "internal/runtime/executor/antigravity_executor_terminal_disconnect_test.go",
+          "sha256": "a34f66d4863d3337991ee4bdfa7ce4681da361a7eaba6fd3e99c8900341a1a37"
+        }
+      ]
+    },
+    {
+      "repository": "Antigravity/Antigravity-Manager",
+      "commit": "b601f5e7375343343922ccab5e50653bc3450c3b",
+      "tree": "9211a067165c376775c98ecf3d522b5562380ffa",
+      "files": [
+        {
+          "path": "src-tauri/src/proxy/pipeline/policy.rs",
+          "sha256": "500ecab7f64b95de26119c6cbcebc17c59e4aca6dc4ae2f44d1c00b5cd1a4f1b"
+        },
+        {
+          "path": "src-tauri/src/proxy/pipeline/inbound.rs",
+          "sha256": "5d8dcb5dd39a26f1f0b3588ba411f2d1a89955181be443ea77f1c846f8ecb62c"
+        },
+        {
+          "path": "src-tauri/src/proxy/pipeline/auto_heal.rs",
+          "sha256": "f56ca4fbb461e017e4577145e6466508e09ec271fd48652f37cba616ed0a2950"
+        }
+      ]
+    }
+  ],
+  "reference": {
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false
+  },
+  "scope": {
+    "providerTypes": [
+      "antigravity_oauth",
+      "agy_oauth"
+    ],
+    "profiles": [
+      "claude.antigravity_oauth",
+      "claude.antigravity_cli",
+      "gemini.antigravity_oauth",
+      "gemini.antigravity_cli"
+    ],
+    "apps": [
+      "claude",
+      "gemini"
+    ],
+    "product": "Antigravity / Agy Code Assist",
+    "sites": [
+      "https://cloudcode-pa.googleapis.com"
+    ],
+    "credentialRails": [
+      "Antigravity OAuth",
+      "Agy OAuth"
+    ],
+    "identityVersion": "captured antigravity/hub version + UA + opaque generation; fallback 2.2.1, environment override retained",
+    "fencing": [
+      "Provider revision/fingerprint",
+      "Account incarnation",
+      "auth/token refresh generation",
+      "Bearer fingerprint",
+      "project and endpoint",
+      "client identity generation",
+      "caller/share/session/model for replay"
+    ]
+  },
+  "localPolicy": {
+    "pipeline": "keep existing provider facade and shared protocol bridges; no speculative rewrite",
+    "grounding": "late citations precede terminal; preserve scalar offsets and native Gemini metadata",
+    "usage": "native prompt/cache/candidates/thought/total counts remain authoritative; never replace with estimates",
+    "terminal": "Gemini terminal candidate or blocked prompt is required; bare EOF and DONE do not manufacture success; committed cancellation never replays",
+    "refresh": "late old token/client generation cannot publish signature replay or model/capability observations",
+    "catalog": "authoritative empty catalog revokes; stale only same full identity on transient failure; 24h and 128 entries retained",
+    "replay": "strict caller/share/session/provider/account/model/endpoint scope; exact signed call IDs, names, arguments, history and terminal; existing owner budgets retained",
+    "paidCredits": "disabled unless separately explicitly selected with official acceptance evidence; unknown balance never auto-enables billing or retry",
+    "transport": {
+      "poolEnabledByDefault": false,
+      "idleTimeoutMs": 30000,
+      "maxIdlePerHost": 2,
+      "performanceClaim": false
+    },
+    "rejected": [
+      "prompt sanitization",
+      "broad model/signature substring auto-heal",
+      "continued generation and output stitching",
+      "cross-account/rail fallback",
+      "unknown balance optimistic paid credits",
+      "EOF synthetic success"
+    ],
+    "resources": "existing per-request and process resident owners, bounds and optional-retention refusal are retained; no new resident inference cache"
+  },
+  "groundingFrames": [
+    {
+      "response": {
+        "responseId": "r5-grounded",
+        "modelVersion": "gemini-3.5-flash-medium",
+        "candidates": [
+          {
+            "index": 0,
+            "content": {
+              "role": "model",
+              "parts": [
+                {
+                  "text": "A中🙂éZ"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "response": {
+        "candidates": [
+          {
+            "index": 0,
+            "finishReason": "STOP",
+            "groundingMetadata": {
+              "webSearchQueries": [
+                "r5 sources"
+              ],
+              "groundingChunks": [
+                {
+                  "web": {
+                    "uri": "https://example.test/r5-grounding",
+                    "title": "R5"
+                  }
+                }
+              ],
+              "groundingSupports": [
+                {
+                  "segment": {
+                    "partIndex": 0,
+                    "startIndex": 1,
+                    "endIndex": 11
+                  },
+                  "groundingChunkIndices": [
+                    0
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "usageMetadata": {
+          "promptTokenCount": 7,
+          "cachedContentTokenCount": 2,
+          "candidatesTokenCount": 3,
+          "thoughtsTokenCount": 1,
+          "totalTokenCount": 11
+        }
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "late_grounding_native_usage",
+      "routes": "both rails x both Apps x stream/nonstream",
+      "test": "antigravity_r5_both_rails_and_apps_preserve_late_grounding_and_official_cache_usage",
+      "expected": {
+        "inputRaw": 7,
+        "inputUncached": 5,
+        "cacheRead": 2,
+        "outputIncludingThought": 4,
+        "totalNative": 11
+      }
+    },
+    {
+      "id": "missing_terminal",
+      "test": "antigravity_r5_both_rails_and_apps_reject_eof_or_done_without_gemini_terminal",
+      "expected": "failed, one upstream request, no replay"
+    },
+    {
+      "id": "late_refresh_generation",
+      "test": "antigravity_r5_refresh_generation_change_prevents_late_signed_replay_publication",
+      "expected": "no old-generation signed cache publication",
+      "control": "unchanged generation must publish signed replay on both rails and both Apps"
+    },
+    {
+      "id": "no_textual_auto_heal",
+      "test": "antigravity_r5_textual_model_or_signature_error_does_not_rewrite_or_replay",
+      "expected": "exact prompt/model, one send, no paid credits"
+    },
+    {
+      "id": "signed_parallel_tool_loop",
+      "test": "antigravity_r4_two_turn_final_wire_preserves_preceding_signature",
+      "expected": "both rails and both Apps retain exact matching signatures and tool choice NONE"
+    },
+    {
+      "id": "catalog_empty_stale_generation",
+      "test": "antigravity_r4_catalog_snapshot_stale_and_empty_are_exactly_scoped",
+      "expected": "no cross-rail/token/client inheritance"
+    },
+    {
+      "id": "client_generation_publication",
+      "test": "antigravity_r4_publication_fences_client_changes_and_persisted_observations",
+      "expected": "A-B-A never resurrects old generation"
+    },
+    {
+      "id": "bounded_replay_owners",
+      "test": "antigravity_r4_review_request_copy_is_admitted_and_outlives_cache_entry",
+      "expected": "last accounted request owner controls release"
+    },
+    {
+      "id": "cancel_after_commit",
+      "test": "antigravity_core03_committed_cancellation_and_error_do_not_replay",
+      "expected": "owner released, no replay"
+    },
+    {
+      "id": "pool_opt_in",
+      "test": "defaults_to_short_connections_and_bounds_pool_settings",
+      "expected": {
+        "enabled": false,
+        "idleTimeoutMs": 30000,
+        "maxIdlePerHost": 2
+      }
+    }
+  ]
+}

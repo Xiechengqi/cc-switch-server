@@ -65,6 +65,10 @@ impl UpstreamTerminalDetector {
         self.timing = timing;
     }
 
+    pub(super) fn timing(&self) -> Option<super::request_timing::ForwardTiming> {
+        self.timing.clone()
+    }
+
     pub(super) fn max_event_bytes(&self) -> usize {
         self.max_event_bytes
     }
@@ -101,6 +105,13 @@ impl UpstreamTerminalDetector {
                 else {
                     continue;
                 };
+                if let Some(timing) = &self.timing {
+                    timing.observe_responses_value(
+                        &value,
+                        declared_event.as_deref(),
+                        &super::response_semantics::classify_value(&value),
+                    );
+                }
                 if let Some(terminal) = declared_event
                     .as_deref()
                     .and_then(|event| declared_event_terminal(self.format, event))
@@ -240,6 +251,7 @@ fn payload_terminal(
         match format {
             UpstreamFormat::AnthropicMessages => timing.observe_anthropic_value(&value),
             UpstreamFormat::GeminiNative => timing.observe_gemini_value(&value),
+            UpstreamFormat::OpenAiChat => timing.observe_chat_value(&value),
             _ => {}
         }
     }

@@ -1,0 +1,276 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "claude_oauth",
+  "liveState": "live_pending",
+  "references": [
+    {
+      "repository": "CLIProxyAPI",
+      "commit": "681ce41b6e44c45b15b79378b003909d6ba29e68",
+      "tree": "00d0ecf4594b47495d82d1efd429c17551ab6d51",
+      "files": [
+        {
+          "path": "internal/runtime/executor/claude_executor_request.go",
+          "sha256": "480af9d6af852811f76140f6dcf00a95736463e936bc04364487ff73caf6d1ad"
+        },
+        {
+          "path": "internal/runtime/executor/claude_executor_stream.go",
+          "sha256": "45462da506dcb1a7d2b45e98c3b6fa3f39ef7fd58d1be5768dc49ac559ba0138"
+        },
+        {
+          "path": "internal/runtime/executor/claude_executor_stream_terminal_test.go",
+          "sha256": "541acb20954fcaf86e090a03dd99b4be44554ee0eca706e1da330815df052b44"
+        },
+        {
+          "path": "internal/runtime/executor/claude_effort_directive_test.go",
+          "sha256": "979dcae30d23b71bfc540ac92f56a33c50535cc97df989bc866fe4a8cd1ff7e5"
+        },
+        {
+          "path": "internal/runtime/executor/claude_executor_tool_alias_scope_test.go",
+          "sha256": "2ad0aa3d5eb86eb5706ab0cccb5946e238ce42aaea59a2981e11782eb8590e91"
+        },
+        {
+          "path": "internal/auth/claude/utls_transport.go",
+          "sha256": "08758da706e0ba597a14b1fbafc2f307834d62028a4716cac1690d88fee78f0e"
+        },
+        {
+          "path": "internal/runtime/executor/helps/detachable_context.go",
+          "sha256": "9fb9fcb77d7ad6752bf0378ef4386e1c5cc614ee6c93c44186af306ced5ae139"
+        }
+      ]
+    }
+  ],
+  "reference": {
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false
+  },
+  "scope": {
+    "providerType": "claude_oauth",
+    "profiles": [
+      "claude.official_oauth"
+    ],
+    "compatibilityApps": [
+      "claude",
+      "codex",
+      "gemini"
+    ],
+    "routes": [
+      "ClaudeMessages",
+      "ClaudeCountTokens",
+      "CodexResponses",
+      "CodexChatCompletions",
+      "Gemini"
+    ],
+    "product": "Anthropic Claude Code OAuth",
+    "site": "https://api.anthropic.com",
+    "credentialRail": "one explicitly bound managed Claude OAuth Account",
+    "identityVersion": "src/domain/claude_cli.rs remains authoritative; captured client identity is test input only"
+  },
+  "localPolicy": {
+    "effort": "preserve caller-owned leading and mid-conversation effort directives; hoist only leading system text",
+    "reasoning": "native whitespace-only thinking and its caller signature are not trimmed or turned into visible text",
+    "cache": "Messages shape-gates eviction and diagnostics; CountTokens keeps its independent beta contract; native uses audited client betas",
+    "tools": "deterministic account/session scoped aliases rewrite protocol name slots only; business input and tool result remain opaque",
+    "refusal": "native refusal is retained; bridges preserve content_filter/SAFETY or incomplete status without replay or model substitution",
+    "terminal": "native message_delta stop_reason plus message_stop can finish before EOF; message_stop alone is not success; cancel releases the actual upstream owner",
+    "drain": {
+      "adopted": false,
+      "referenceByteLimit": 65536,
+      "referenceUniversalTimeOrCancellationBound": false,
+      "reason": "detached context without parent deadline can outlive cancellation; retain immediate upstream owner release"
+    },
+    "refresh": "retain existing durable receipt/journal and same-account uncertainty fencing; no extra retry or credential rail fallback",
+    "rateLimit": "retain fail-closed structured scope classification; unqualified text is not a new account permission",
+    "performanceClaim": false,
+    "tlsFingerprintChange": false
+  },
+  "nativeRequest": {
+    "model": "claude-sonnet-5",
+    "max_tokens": 64,
+    "output_config": {
+      "effort": "medium"
+    },
+    "metadata": {
+      "user_id": "user_r5_account__session_r5-session"
+    },
+    "messages": [
+      {
+        "role": "system",
+        "content": [
+          {
+            "type": "text",
+            "text": "Keep style."
+          }
+        ],
+        "output_config": {
+          "effort": "low"
+        }
+      },
+      {
+        "role": "user",
+        "content": "Earlier question"
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": " \t\n ",
+            "signature": "r5-opaque-signature"
+          },
+          {
+            "type": "text",
+            "text": "Earlier answer"
+          }
+        ]
+      },
+      {
+        "role": "system",
+        "content": [],
+        "output_config": {
+          "effort": "low"
+        }
+      },
+      {
+        "role": "user",
+        "content": "Continue"
+      }
+    ]
+  },
+  "nativeResponse": {
+    "id": "msg_r5",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-5",
+    "content": [
+      {
+        "type": "thinking",
+        "thinking": " \t\n ",
+        "signature": "r5-opaque-signature"
+      },
+      {
+        "type": "text",
+        "text": "ok"
+      }
+    ],
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 11,
+      "output_tokens": 3,
+      "cache_read_input_tokens": 7
+    }
+  },
+  "cacheRequest": {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 64,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Check cache.",
+            "cache_control": {
+              "type": "ephemeral",
+              "evict_on_complete": true
+            }
+          }
+        ]
+      }
+    ],
+    "diagnostics": {}
+  },
+  "cacheExpectedBetas": [
+    "prompt-caching-evict-2026-05-12",
+    "cache-diagnosis-2026-04-07"
+  ],
+  "toolRequest": {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 64,
+    "metadata": {
+      "user_id": "user_r5_account__session_r5-tool-session"
+    },
+    "tools": [
+      {
+        "name": "custom.lookup",
+        "input_schema": {
+          "type": "object"
+        }
+      }
+    ],
+    "tool_choice": {
+      "type": "tool",
+      "name": "custom.lookup"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "Look up a."
+      }
+    ]
+  },
+  "refusalResponse": {
+    "id": "msg_refusal_r5",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-sonnet-4-6",
+    "content": [
+      {
+        "type": "text",
+        "text": "Cannot comply."
+      }
+    ],
+    "stop_reason": "refusal",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 11,
+      "output_tokens": 3
+    }
+  },
+  "cases": [
+    {
+      "id": "native-leading-effort",
+      "test": "claude_r5_native_effort_and_whitespace_reasoning_survive_json_and_sse"
+    },
+    {
+      "id": "native-mid-conversation-effort",
+      "test": "claude_r5_native_effort_and_whitespace_reasoning_survive_json_and_sse"
+    },
+    {
+      "id": "native-whitespace-reasoning",
+      "test": "claude_r5_native_effort_and_whitespace_reasoning_survive_json_and_sse"
+    },
+    {
+      "id": "cache-eviction-diagnostics",
+      "test": "claude_r5_cache_betas_and_two_turn_alias_keep_business_payload_opaque"
+    },
+    {
+      "id": "two-turn-tool-alias",
+      "test": "claude_r5_cache_betas_and_two_turn_alias_keep_business_payload_opaque"
+    },
+    {
+      "id": "refusal-four-routes",
+      "test": "claude_r5_refusal_keeps_terminal_semantics_on_all_compatibility_routes"
+    },
+    {
+      "id": "terminal-before-eof",
+      "test": "claude_message_stop_completes_before_upstream_eof_or_late_disconnect"
+    },
+    {
+      "id": "missing-terminal-and-cancel",
+      "tests": [
+        "claude_message_stop_without_message_delta_is_not_success",
+        "claude_core03_timing_committed_sse_cancel_and_provider_error_never_replay"
+      ]
+    },
+    {
+      "id": "rate-limit-scope",
+      "test": "claude_rate_limit_scope_decision_table_is_fail_closed"
+    },
+    {
+      "id": "independent-count-tokens",
+      "test": "beta_policy_matches_the_wire_profile_asset"
+    }
+  ]
+}

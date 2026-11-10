@@ -33,6 +33,7 @@ pub(super) struct StreamEventTransformer {
     responses_tool_context: transforms::ResponsesToolContext,
     bridge: Option<StreamBridgeState>,
     chat_compat: Option<super::openai_chat_compat::OpenAiChatStreamCanonicalizer>,
+    ollama_terminal: Option<super::ollama::ChatStreamTerminal>,
     unwrap_v1internal: bool,
     gemini_terminal: Option<GeminiStreamTerminalState>,
 }
@@ -106,7 +107,9 @@ impl StreamEventTransformer {
                 // CodeBuddy emits finish_reason before its separate usage tail.
                 // Hold the Anthropic terminal until that tail (or [DONE]) so
                 // cache metering is not committed as zero.
-                let state = if stored.provider_type.is_buddy_oauth() {
+                let state = if stored.provider_type.is_buddy_oauth()
+                    || stored.provider_type == ProviderType::OllamaCloud
+                {
                     ChatAnthropicState::deferred_terminal()
                 } else {
                     ChatAnthropicState::default()
@@ -166,8 +169,20 @@ impl StreamEventTransformer {
                 "passthrough"
             };
         let chat_compat = (downstream == UpstreamFormat::OpenAiChat).then(|| {
-            super::openai_chat_compat::OpenAiChatStreamCanonicalizer::new(chat_compat_path)
+            let canonicalizer =
+                super::openai_chat_compat::OpenAiChatStreamCanonicalizer::new(chat_compat_path);
+            if stored.provider_type == ProviderType::OllamaCloud
+                && upstream == Some(UpstreamFormat::OpenAiChat)
+            {
+                canonicalizer.require_terminal()
+            } else {
+                canonicalizer
+            }
         });
+        let ollama_terminal = (stored.provider_type == ProviderType::OllamaCloud
+            && upstream == Some(UpstreamFormat::OpenAiChat)
+            && downstream != UpstreamFormat::OpenAiChat)
+            .then(super::ollama::ChatStreamTerminal::default);
         Self {
             upstream,
             downstream,
@@ -175,6 +190,7 @@ impl StreamEventTransformer {
             responses_tool_context,
             bridge,
             chat_compat,
+            ollama_terminal,
             unwrap_v1internal,
             gemini_terminal,
         }
@@ -210,6 +226,9 @@ impl StreamEventTransformer {
             Bytes::new()
         } else {
             let mut output = self.drain_complete_events(true)?.to_vec();
+            if let Some(terminal) = self.ollama_terminal.as_ref() {
+                terminal.finish()?;
+            }
             if let Some(terminal) = self.gemini_terminal.as_ref() {
                 terminal.validate()?;
             }
@@ -284,6 +303,9 @@ impl StreamEventTransformer {
             return Ok(String::new());
         };
         if payload == "[DONE]" {
+            if let Some(terminal) = self.ollama_terminal.as_mut() {
+                terminal.complete()?;
+            }
             if let Some(terminal) = self.gemini_terminal.as_ref() {
                 terminal.validate()?;
             }
@@ -302,6 +324,9 @@ impl StreamEventTransformer {
             crate::metrics::record_stream_transform_protocol_error("invalid_json");
             ProxyError::bad_gateway(format!("upstream SSE data is not valid JSON: {error}"))
         })?;
+        if let Some(terminal) = self.ollama_terminal.as_mut() {
+            terminal.observe(&value)?;
+        }
         if self.unwrap_v1internal {
             if let Some(error) = super::adapters::google_embedded_error(&value) {
                 crate::metrics::record_stream_transform_protocol_error("embedded_google_error");
@@ -6451,6 +6476,7 @@ mod tests {
                 ResponsesAnthropicState::default(),
             )),
             chat_compat: None,
+            ollama_terminal: None,
             unwrap_v1internal: false,
             gemini_terminal: None,
         }
@@ -8630,6 +8656,7 @@ mod tests {
                 GrokResponsesToolsState::new(context),
             )),
             chat_compat: None,
+            ollama_terminal: None,
             unwrap_v1internal: false,
             gemini_terminal: None,
         };

@@ -23,6 +23,10 @@ pub(in crate::api) struct OpenAiModelsResponse {
     pub(in crate::api) stale: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::api) fetched_at_ms: Option<i64>,
+    /// Qoder scene observations, including disabled/discovery-only rows.
+    /// The standard data array remains the executable model catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) catalog_entries: Option<Vec<crate::proxy::qoder_runtime::QoderCatalogEntry>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -3013,7 +3013,23 @@ async fn non_stream_proxy_preserves_upstream_error_status_body_and_usage() {
 #[tokio::test]
 async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
     let seen = Arc::new(AtomicUsize::new(0));
+    let model_requests = Arc::new(AtomicUsize::new(0));
+    let model_requests_for_route = model_requests.clone();
     let upstream = Router::new()
+        .route(
+            "/models",
+            get(move |headers: HeaderMap| {
+                let model_requests = model_requests_for_route.clone();
+                async move {
+                    assert_eq!(
+                        headers.get("authorization").and_then(|value| value.to_str().ok()),
+                        Some("Bearer cached-copilot-token")
+                    );
+                    model_requests.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"data":[{"id":"gpt-5","supported_endpoints":["/chat/completions"]}]}))
+                }
+            }),
+        )
         .route(
             "/chat/completions",
             post(
@@ -3107,6 +3123,7 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
     install_kiro_fixed_endpoint_test_client(&state, proxy_addr).await;
 
     let response = app
+        .clone()
         .oneshot(
             provider_share_request(
                 Request::builder()
@@ -3131,15 +3148,55 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
         .unwrap();
 
     let status = response.status();
-    let body_text = body_text(response).await;
-    assert_eq!(status, StatusCode::OK, "{body_text:?}");
-    let body: Value = serde_json::from_str(&body_text)
-        .unwrap_or_else(|error| panic!("Copilot response is not JSON: {error}: {body_text:?}"));
+    let response_text = body_text(response).await;
+    assert_eq!(status, StatusCode::OK, "{response_text:?}");
+    let body: Value = serde_json::from_str(&response_text)
+        .unwrap_or_else(|error| panic!("Copilot response is not JSON: {error}: {response_text:?}"));
     assert_eq!(
         body["choices"][0]["message"]["content"].as_str(),
         Some("ok")
     );
     assert_eq!(seen.load(Ordering::SeqCst), 1);
+    assert_eq!(model_requests.load(Ordering::SeqCst), 1);
+    let denied = app
+        .oneshot(
+            provider_share_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model":"not-in-this-accounts-catalog",
+                            "messages":[{"role":"user","content":"hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+                AppKind::Codex,
+                "copilot-managed",
+                "copilot-managed-denied-model",
+            )
+            .await,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        denied.status(),
+        StatusCode::BAD_REQUEST,
+        "{}",
+        body_text(denied).await
+    );
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        1,
+        "an unauthorized model reached inference"
+    );
+    assert_eq!(
+        model_requests.load(Ordering::SeqCst),
+        1,
+        "same-scope fresh catalog was not reused"
+    );
     upstream_server.abort();
     proxy_server.abort();
 }

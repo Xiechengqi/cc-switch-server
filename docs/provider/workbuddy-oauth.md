@@ -150,3 +150,10 @@ Claude Code 身份句。CN 同账号对照证实保留该 billing 元数据仍�
 推理档位选择与字段编码分离，继续使用实时目录默认档位及现有顶层 `reasoning_effort`。新版本、字段分支及模型仍需独立协议/真实回执，不凭外部实现自动启用。外部提交及暂不启用项见 `PROTOCOL_EVIDENCE.md`。
 
 Responses 工具桥接支持 namespace 内混合 function/custom：custom 使用字符串 input 参数封装，历史、tool_choice 与流式/非流式回包保留类型、名称和 namespace。非法子类型和身份碰撞仍拒绝；此桥接不提供上游原生 grammar 约束保证。2026-11-06 修复的本地验证及真实验收边界见 `PROTOCOL_EVIDENCE.md` 的 namespace 内 custom 工具条目。
+
+
+## R5 BD-01 产品、站点与平台证据（2026-11-10）
+
+`assets/contract/r5-buddy.json` 冻结推荐 Hub/cli2api/workbuddy-switch 的十份 committed source 与十组本仓既有回归。CodeBuddy 双站 platform=CLI；WorkBuddy CN=workbuddy、Intl=workbuddy-ai。两产品推理继续使用受审 CLI 2.142.0，refresh source=plugin；参考 Hub CN=workbuddy 或可切换 Desktop/VSCode/CLI 不构成本仓必须改身份或借权的证据。真实原生登录与 CLI 推理联合接受性按产品×站点独立 live_pending。
+
+本轮无新增生产 wire 缺口。复用精确目录默认 reasoning、namespaced tools/图片、多轮、单账号轮换 journal、计费 paid/free、官方用量连续扫描及取消/预算回归。保留严格 finish_reason、唯一 DONE、EOF 与截断工具拒绝；不采纳 Hub 默认 stop 聚合、WAF/系统提示清洗、跨身份重试、uTLS 变更或原生媒体新操作。实际验证见增强文档 §22.14。

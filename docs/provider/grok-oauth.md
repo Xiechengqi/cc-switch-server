@@ -305,3 +305,10 @@ Grok R4媒体快照的提交后错误对账采用临时plain store/value读取�
 CORE-03统一时间观察已接入Grok HTTP、每回合原生WS/HTTP回退及图片/视频独立入口，当前验证状态见计划§20.10.4。HTTP从转发入口计时，媒体从请求预算建立后计时，WS从response.create数据帧计时；均不包含此前API收包和鉴权。Provider/surface/phase/result标签有限且静态，不使用账号、会话、任意path或模型文本。
 
 ping/private control、空delta、图片connected/heartbeat和纯progress不记为首内容；完整Responses终态中的有效内容、图片结果及有效视频提交task id可单独观察。视频status响应结束仅表示本次查询完成。统一计时不改变既有first_token_ms、usage、成功、健康、deadline或恢复策略；图片带内错误的计时failed不重写原HTTP/JSON决策。HTTP body handoff不等于socket写成功；WS仅把本地sink的成功完成记为writer完成，语义终态、取消及最后已核算owner释放分别记录。新观察不放宽三项operation的live_pending或remote compaction设计门禁。
+
+
+## R5 GR-01 differential evidence (2026-11-10)
+
+`assets/contract/r5-grok.json` freezes grok2api CLI/media and sub2api idle committed sources with ten local contract groups. The shared lifecycle-only first-semantic deadline regression now explicitly includes Grok as well as Codex. A fragmented loopback case preserves long reasoning and duplicate text exactly while the downstream delays body polling; it checks a single submission and last-owner release, not socket-write completion or deployment throughput. Existing media, terminal, cancellation, generation and capacity contracts are reused. No new production wire defect was established.
+
+The reference sub2api idle helper treats missing upstream data as idle and permits replay/failover after writing. That policy is not adopted: Server retains its existing semantic deadlines, recovery budgets and fixed identity. CLI OAuth and Web SSO remain separate. Media create/poll/cancel and remote compaction require independent receipts; chat success does not grant those operations. All real operations remain live_pending. Actual validation is recorded in enhancement plan §22.13.

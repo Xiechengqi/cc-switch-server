@@ -4,7 +4,7 @@ mod endpoint;
 mod image;
 mod model;
 mod tool_bridge;
-mod wire;
+pub(crate) mod wire;
 
 use crate::domain::accounts::store::Account;
 use crate::domain::providers::amazon_q::AMAZON_Q_RUNTIME_REGIONS;
@@ -536,16 +536,51 @@ pub(crate) fn prepare_kiro_request_with_context_and_memory(
     context: &KiroCallContext,
     request_memory: Option<&RequestMemoryBudget>,
 ) -> Result<KiroPreparedRequest, ProxyError> {
+    let mut body = body.clone();
+    image::prepare_anthropic_images_with_memory(&mut body, request_memory)?;
+    prepare_kiro_request_from_processed_images(account, body, context)
+}
+
+pub(crate) fn has_image_input(body: &Value) -> bool {
+    image::has_images(body)
+}
+
+pub(crate) async fn prepare_kiro_request_bounded(
+    account: &Account,
+    body: &Value,
+    context: &KiroCallContext,
+    request_memory: Option<&RequestMemoryBudget>,
+    prepared_memory: Option<RequestMemoryReservation>,
+    timeout: Duration,
+) -> Result<(KiroPreparedRequest, Option<RequestMemoryReservation>), ProxyError> {
+    if !has_image_input(body) {
+        return prepare_kiro_request_with_context_and_memory(
+            account,
+            body,
+            context,
+            request_memory,
+        )
+        .map(|prepared| (prepared, prepared_memory));
+    }
+    let (body, prepared_memory) =
+        image::prepare_bounded(body, request_memory, prepared_memory, timeout).await?;
+    let prepared = prepare_kiro_request_from_processed_images(account, body, context)?;
+    Ok((prepared, prepared_memory))
+}
+
+fn prepare_kiro_request_from_processed_images(
+    account: &Account,
+    mut body: Value,
+    context: &KiroCallContext,
+) -> Result<KiroPreparedRequest, ProxyError> {
     let account_data = KiroAccountData::from_account(account)?;
     let access_token = account_data.access_token(account)?;
-    let mut body = body.clone();
     if let Some(session_id) = context.session_id.as_deref() {
         if !body.get("metadata").is_some_and(Value::is_object) {
             body["metadata"] = json!({});
         }
         body["metadata"]["session_id"] = json!(session_id);
     }
-    image::prepare_anthropic_images_with_memory(&mut body, request_memory)?;
     let tool_mode = if context.claude_code_tools {
         ToolCompatibilityMode::ClaudeCode
     } else {

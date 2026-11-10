@@ -1,0 +1,185 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "cursor",
+  "liveState": "live_pending",
+  "references": [
+    {
+      "repository": "OmniRoute",
+      "commit": "443d66996d69d7ecf887fd61158404a3cca1b192",
+      "tree": "8d1c312f61d115767c9478416cb039750eaf113a",
+      "files": [
+        {
+          "path": "open-sse/executors/cursor.ts",
+          "sha256": "76d8b4c5b148d52a34b49932bdf819f098323b59d37c2e79fb65470ff28ff546"
+        },
+        {
+          "path": "open-sse/executors/cursor/agentEndpoint.ts",
+          "sha256": "5ff6c5ec33db4a65524b9d92937d40793d138d896d151210b20f0ec31dade6b1"
+        },
+        {
+          "path": "open-sse/executors/cursor/builtinToolBridge.ts",
+          "sha256": "c7dfcf1783496051fc1ed234297a22057753a9e3356fc0c9fceffef353a4ffea"
+        },
+        {
+          "path": "open-sse/executors/cursor/composer.ts",
+          "sha256": "8f93b79ab4a678493211d1b3ec485eafa87ac9a31271c33a7c247d57ba976a85"
+        },
+        {
+          "path": "open-sse/executors/cursor/cursorErrors.ts",
+          "sha256": "d6b52c6c7ef8419c2875e7b4cb95a85af179f449e861dd606ef314bc63e87ae3"
+        },
+        {
+          "path": "open-sse/executors/cursor/prompt.ts",
+          "sha256": "b59ea158268a3f491553254308f99cd6f9641253988ac42b8d9bdb02a4d3864b"
+        },
+        {
+          "path": "open-sse/services/cursorSessionManager.ts",
+          "sha256": "f9e8809841680e0baec8db64ecaed5ced995e8b84922cc65ccab88e6b2a3d862"
+        }
+      ]
+    }
+  ],
+  "reference": {
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false,
+    "wireDelta": "reviewed_no_new_wire_gap"
+  },
+  "scope": {
+    "providerTypes": [
+      "cursor_oauth",
+      "cursor_apikey"
+    ],
+    "profiles": [
+      "claude.cursor_oauth",
+      "claude.cursor_api_key",
+      "codex.cursor_oauth",
+      "codex.cursor_api_key",
+      "gemini.cursor_oauth",
+      "gemini.cursor_api_key"
+    ],
+    "apps": [
+      "claude",
+      "codex",
+      "gemini"
+    ],
+    "product": "Cursor AgentService",
+    "credentialRails": [
+      "one explicitly bound managed OAuth Account",
+      "one exact Provider-owned API key"
+    ],
+    "endpoint": "validated exact-scope AgentService discovery; never another identity"
+  },
+  "localPolicy": {
+    "nativeWireChanged": false,
+    "structuredTools": "only declared Exec/MCP metadata can authorize a resumable tool; never execute remote builtin",
+    "markerOnly": {
+      "status": 501,
+      "guessExecutableCallFromText": false
+    },
+    "constraints": {
+      "maxTokens": "prompt_best_effort",
+      "stop": "prompt_best_effort",
+      "json": "prompt_best_effort",
+      "hostedTools": "explicitly_unsupported",
+      "background": "explicitly_unsupported"
+    },
+    "replay": "no generic transport/5xx replay without same-rail idempotency evidence",
+    "owner": "running/parked h2 and reservations stay with actual last owner; TTL/capacity/cancel close both h2 halves",
+    "fencing": "App/Provider/runtime/credential generation/rail/principal/credential digest/machine; late results cannot borrow another identity",
+    "usage": {
+      "usageEstimated": true,
+      "cacheUsageObserved": false,
+      "cacheRead": "unknown",
+      "cacheWrite": "unknown",
+      "tokenDelta": "partial output signal does not prove full official billing usage",
+      "sourceAnchors": [
+        "src/proxy/cursor/agent_driver.rs::forward_agentservice",
+        "src/proxy/cursor/agent_driver.rs::cursor_delta_events",
+        "src/proxy/cursor/event_emitter.rs::AgentSseWriter::event"
+      ],
+      "testLimit": "emitter tests cover protocol usage output; estimated/cache flags are separately reviewed source contracts, not new vendor receipts"
+    },
+    "performanceClaim": false
+  },
+  "cases": [
+    {
+      "id": "dual-rail-formats",
+      "tests": [
+        "cursor_core03_both_rails_all_formats_stream_and_nonstream"
+      ]
+    },
+    {
+      "id": "structured-tools-and-explicit-choice",
+      "tests": [
+        "explicit_named_tool_choice_cannot_silently_become_auto",
+        "valid_explicit_tool_choice_remains_constrained",
+        "every_ingress_tool_schema_round_trips_through_final_run_request_wire"
+      ]
+    },
+    {
+      "id": "marker-only-fails-closed",
+      "tests": [
+        "marker_only_tool_rejection_does_not_echo_upstream_name",
+        "three_promise_only_attempts_exhaust_but_a_real_tool_commits"
+      ]
+    },
+    {
+      "id": "image-preparation",
+      "tests": [
+        "explicit_invalid_image_inputs_cannot_be_silently_dropped",
+        "valid_explicit_image_inputs_remain_in_plan",
+        "oversized_valid_png_is_prepared_under_the_cursor_wire_limit",
+        "malformed_or_decode_bomb_images_fail_before_cursor_wire_encoding",
+        "image_decode_working_set_obeys_the_request_budget"
+      ]
+    },
+    {
+      "id": "cancel-and-output-deadline",
+      "tests": [
+        "cursor_r4_loopback_cancel_and_first_output_timeout_close_both_h2_halves",
+        "cursor_r4_review_downstream_drop_records_cancelled_usage_and_closes_real_session"
+      ]
+    },
+    {
+      "id": "parked-and-resumed-owner",
+      "tests": [
+        "cursor_core03_parked_turn_and_resumed_turn_keep_distinct_owners",
+        "cursor_r4_loopback_parked_expiry_and_capacity_eviction_close_h2_on_both_rails"
+      ]
+    },
+    {
+      "id": "generation-and-late-result",
+      "tests": [
+        "cursor_r4_loopback_late_tool_result_cannot_acquire_another_identity",
+        "cursor_oauth_session_scope_separates_same_generation_credentials_and_machine",
+        "cursor_api_key_session_scope_separates_same_generation_keys"
+      ]
+    },
+    {
+      "id": "cold-resume-id-fences",
+      "tests": [
+        "cold_resume_rejects_reused_claim_from_another_parked_session",
+        "concurrent_cold_continuation_never_opens_a_duplicate_run",
+        "cursor_client_tool_ids_remain_exact_and_unique_for_parked_continuation",
+        "cursor_surface_tool_calls_do_not_overwrite_duplicate_upstream_ids"
+      ]
+    },
+    {
+      "id": "terminal-and-recovery-budget",
+      "tests": [
+        "cursor_business_completion_policy_is_rail_specific",
+        "cursor_auth_and_semantic_recovery_share_one_total_budget",
+        "cursor_stream_closes_failed_session_before_publishing_error_event",
+        "cursor_core03_in_band_failure_stays_failed_after_http_200"
+      ]
+    },
+    {
+      "id": "usage-and-timing",
+      "tests": [
+        "gemini_json_response_preserves_text_and_usage",
+        "cursor_core03_control_frames_then_committed_cancellation_close_h2"
+      ]
+    }
+  ]
+}

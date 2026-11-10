@@ -971,3 +971,10 @@ CodeBuddy/WorkBuddy 共用 SSE 解码器按本次实际生成请求的工具 sch
 2026-11-10 远程同账号 Messages/Chat 流式均观察到 Bash `{}`，非流式观察到完整 command；证明空参数可来自上游，但不证明必现或已定位上游内部原因。没有执行返回的命令。修复提供明确协议错误及数据边界保护，不保证上游每次生成有效参数。真实 Claude CLI 验收、CodeBuddy/国际站验证及部署均需单独记录。
 
 本次最终独立快照验证：Rust 全套 4360 passed / 3 ignored，含 8 项参数/关联/内存底层测试与双产品 Claude 流式/非流式 Bash HTTP 回环矩阵；Node 审计 2135 passed。格式（含 include! 文件）、Provider 覆盖和 UI 矩阵检查通过。cargo check 通过；本地 smoke 在 Cargo 启动锁超时后改用已构建候选二进制并保留原断言通过。离线 readiness failures=0，真实输入与部署未验证，状态仍 blocked_inputs。无远程部署或真实 CLI 执行验收。
+
+
+## R5 BD-01 产品、站点与平台证据（2026-11-10）
+
+`assets/contract/r5-buddy.json` 冻结推荐 Hub/cli2api/workbuddy-switch 的十份 committed source 与十组本仓既有回归。CodeBuddy 双站 platform=CLI；WorkBuddy CN=workbuddy、Intl=workbuddy-ai。两产品推理继续使用受审 CLI 2.142.0，refresh source=plugin；参考 Hub CN=workbuddy 或可切换 Desktop/VSCode/CLI 不构成本仓必须改身份或借权的证据。真实原生登录与 CLI 推理联合接受性按产品×站点独立 live_pending。
+
+本轮无新增生产 wire 缺口。复用精确目录默认 reasoning、namespaced tools/图片、多轮、单账号轮换 journal、计费 paid/free、官方用量连续扫描及取消/预算回归。保留严格 finish_reason、唯一 DONE、EOF 与截断工具拒绝；不采纳 Hub 默认 stop 聚合、WAF/系统提示清洗、跨身份重试、uTLS 变更或原生媒体新操作。实际验证见增强文档 §22.14。

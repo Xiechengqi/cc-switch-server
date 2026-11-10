@@ -185,7 +185,7 @@ impl ProviderAdapter for GenericForwardingAdapter {
         body: Bytes,
         stored: &StoredProvider,
     ) -> Result<AdapterRequest, ProxyError> {
-        self.transform_request_inner(body, stored, None, None)
+        self.transform_request_inner(body, stored, None, None, None)
     }
 
     fn transform_response(
@@ -259,6 +259,7 @@ impl GenericForwardingAdapter {
         stored: &StoredProvider,
         route: Option<ProxyRoute>,
         copilot_metadata: Option<&CopilotRequestMetadata>,
+        prepared_copilot: Option<CopilotPreparedRequest>,
     ) -> Result<AdapterRequest, ProxyError> {
         let responses_tool_context = transforms::responses_tool_context_from_bytes(&body);
         let custom_tool_names = responses_tool_context.custom_tool_names();
@@ -270,26 +271,17 @@ impl GenericForwardingAdapter {
         let body = maybe_inject_downstream_prompt_cache(body, stored, route, &cache_config)?;
         let (body, model, upstream_headers) = if stored.provider_type == ProviderType::GitHubCopilot
         {
-            let (body, mut model) = apply_request_preprocessors(body, stored, route);
-            let (mut body, upstream_headers, model_source) =
-                maybe_apply_copilot_preflight(body, stored, copilot_metadata)?;
-            if policy_from_settings(&stored.provider.settings_config).is_some() {
-                let requested_model = model.requested_model.clone();
-                let (routed_body, mut routed_model) =
-                    apply_request_preprocessors(body, stored, route);
-                routed_model.requested_model = requested_model;
-                body = routed_body;
-                model = routed_model;
-            } else if let Some(source) = model_source {
-                if let Some(actual_model) = model_from_body(&body) {
-                    model.actual_model = Some(actual_model.clone());
-                    model.actual_model_source = Some(source.to_string());
+            let prepared = match prepared_copilot {
+                Some(mut prepared) => {
+                    prepared.body = body;
+                    prepared
                 }
-            }
+                None => prepare_copilot_request(body, stored, route, copilot_metadata)?,
+            };
             (
-                transform_body_for_upstream(body, stored, route)?,
-                model,
-                upstream_headers,
+                transform_body_for_upstream(prepared.body, stored, route)?,
+                prepared.model,
+                prepared.upstream_headers,
             )
         } else {
             let (body, model) = apply_request_preprocessors(body, stored, route);
@@ -330,7 +322,7 @@ impl GenericForwardingAdapter {
     ) -> Result<AdapterRequest, ProxyError> {
         let body =
             maybe_inject_gemini_cross_protocol_route_model(body, stored, route, gemini_path)?;
-        let mut request = self.transform_request_inner(body, stored, Some(route), None)?;
+        let mut request = self.transform_request_inner(body, stored, Some(route), None, None)?;
         self.finish_route_request(&mut request, stored, route, gemini_path)?;
         Ok(request)
     }
@@ -346,7 +338,38 @@ impl GenericForwardingAdapter {
         let body =
             maybe_inject_gemini_cross_protocol_route_model(body, stored, route, gemini_path)?;
         let mut request =
-            self.transform_request_inner(body, stored, Some(route), Some(copilot_metadata))?;
+            self.transform_request_inner(body, stored, Some(route), Some(copilot_metadata), None)?;
+        self.finish_route_request(&mut request, stored, route, gemini_path)?;
+        Ok(request)
+    }
+
+    pub(super) fn prepare_copilot_request_for_route(
+        &self,
+        body: Bytes,
+        stored: &StoredProvider,
+        route: ProxyRoute,
+        gemini_path: Option<&str>,
+        metadata: &CopilotRequestMetadata,
+    ) -> Result<CopilotPreparedRequest, ProxyError> {
+        let body =
+            maybe_inject_gemini_cross_protocol_route_model(body, stored, route, gemini_path)?;
+        prepare_copilot_request(body, stored, Some(route), Some(metadata))
+    }
+
+    pub(super) fn transform_prepared_copilot_for_route(
+        &self,
+        prepared: CopilotPreparedRequest,
+        stored: &StoredProvider,
+        route: ProxyRoute,
+        gemini_path: Option<&str>,
+    ) -> Result<AdapterRequest, ProxyError> {
+        let mut request = self.transform_request_inner(
+            prepared.body.clone(),
+            stored,
+            Some(route),
+            None,
+            Some(prepared),
+        )?;
         self.finish_route_request(&mut request, stored, route, gemini_path)?;
         Ok(request)
     }
@@ -421,6 +444,16 @@ impl GenericForwardingAdapter {
         route: ProxyRoute,
         request: &AdapterRequest,
     ) -> Result<Bytes, ProxyError> {
+        if super::bedrock::is_profile(stored) {
+            return super::bedrock::converse_json(
+                &body,
+                request
+                    .actual_model
+                    .as_deref()
+                    .or(request.model.as_deref())
+                    .unwrap_or("bedrock"),
+            );
+        }
         transform_response_for_downstream(body, stored, route, &request.responses_tool_context)
     }
 
@@ -477,7 +510,12 @@ pub(super) fn resolve_runtime_endpoint_for_request(
             plan.driver_id
         ))
     })?;
-    let path = if plan.driver_id.as_str() == "oauth.kimi_code" {
+    let path = if plan.profile_id.as_str() == "claude.deepseek_api" {
+        format!(
+            "/anthropic{}",
+            upstream_path(upstream_format, route, gemini_path, request)
+        )
+    } else if plan.driver_id.as_str() == "oauth.kimi_code" {
         kimi_upstream_path(upstream_format, route)
     } else if plan.driver_id.as_str() == "special.copilot"
         && upstream_format == UpstreamFormat::OpenAiChat
@@ -1189,6 +1227,12 @@ fn transform_body_for_upstream(
             "request body must be valid json for transform: {error}"
         ))
     })?;
+    let ollama_chat = stored.provider_type == ProviderType::OllamaCloud
+        && upstream_format == UpstreamFormat::OpenAiChat;
+    if ollama_chat {
+        super::ollama::normalize_source(&mut input, stored.app)
+            .map_err(|error| ProxyError::bad_request(error.to_string()))?;
+    }
     let trae_controls = if stored.provider_type.is_trae() {
         Some(
             super::trae::TraeSourceControls::from_request(stored.app, &input)
@@ -1329,6 +1373,11 @@ fn transform_body_for_upstream(
     }
     .map_err(|error| ProxyError::bad_request(format!("request transform failed: {error}")))?;
 
+    if ollama_chat {
+        super::ollama::normalize_chat(&mut output)
+            .map_err(|error| ProxyError::bad_request(error.to_string()))?;
+    }
+
     if let Some(controls) = qoder_controls {
         for (field, value) in controls {
             output[field] = value;
@@ -1381,6 +1430,9 @@ fn transform_response_for_downstream(
     route: ProxyRoute,
     responses_tool_context: &transforms::ResponsesToolContext,
 ) -> Result<Bytes, ProxyError> {
+    if super::bedrock::is_profile(stored) {
+        return super::bedrock::converse_json(&body, "bedrock");
+    }
     let downstream_format = downstream_format_for_route(route);
     let Some(upstream_format) = upstream_format_for_route(stored, Some(route), &[]) else {
         return if downstream_format == UpstreamFormat::OpenAiChat {
@@ -3083,6 +3135,33 @@ fn bedrock_sigv4_signed_request_parts(
 }
 
 fn bedrock_converse_body_from_anthropic(input: &Value) -> Result<Value, ProxyError> {
+    // Thinking history is opaque model state; malformed state is not dropped.
+    if let Some(messages) = input.get("messages").and_then(Value::as_array) {
+        for block in messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_array))
+            .flatten()
+        {
+            match block.get("type").and_then(Value::as_str) {
+                Some("thinking")
+                    if block.get("thinking").and_then(Value::as_str).is_none()
+                        || block.get("signature").and_then(Value::as_str).is_none() =>
+                {
+                    return Err(ProxyError::bad_request(
+                        "Bedrock thinking history requires text and signature",
+                    ))
+                }
+                Some("redacted_thinking")
+                    if block.get("data").and_then(Value::as_str).is_none() =>
+                {
+                    return Err(ProxyError::bad_request(
+                        "Bedrock redacted thinking history requires opaque data",
+                    ))
+                }
+                _ => {}
+            }
+        }
+    }
     let messages = input
         .get("messages")
         .and_then(Value::as_array)
@@ -3114,7 +3193,61 @@ fn bedrock_converse_body_from_anthropic(input: &Value) -> Result<Value, ProxyErr
     if let Some(tool_config) = bedrock_tool_config_from_anthropic(input)? {
         output.insert("toolConfig".to_string(), tool_config);
     }
-
+    let mut additional = match input.get("additionalModelRequestFields") {
+        Some(value) => value.as_object().cloned().ok_or_else(|| {
+            ProxyError::bad_request("Bedrock additionalModelRequestFields must be an object")
+        })?,
+        None => serde_json::Map::new(),
+    };
+    for key in ["thinking", "top_k"] {
+        if let Some(value) = input.get(key) {
+            if additional
+                .get(key)
+                .is_some_and(|existing| existing != value)
+            {
+                return Err(ProxyError::bad_request(
+                    "conflicting Bedrock model request fields",
+                ));
+            }
+            additional.insert(key.to_string(), value.clone());
+        }
+    }
+    if !additional.is_empty() {
+        output.insert(
+            "additionalModelRequestFields".to_string(),
+            Value::Object(additional),
+        );
+    }
+    let mut paths = match input.get("additionalModelResponseFieldPaths") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .filter(|paths| paths.len() <= 8)
+            .ok_or_else(|| ProxyError::bad_request("invalid Bedrock response field paths"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| value.starts_with('/') && value.len() <= 1024)
+                    .map(str::to_string)
+                    .ok_or_else(|| ProxyError::bad_request("invalid Bedrock response field path"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    if input
+        .get("stop_sequences")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+        && !paths.iter().any(|path| path == "/stop_sequence")
+    {
+        paths.push("/stop_sequence".to_string());
+    }
+    if !paths.is_empty() {
+        output.insert(
+            "additionalModelResponseFieldPaths".to_string(),
+            json!(paths),
+        );
+    }
     Ok(Value::Object(output))
 }
 
@@ -3265,6 +3398,15 @@ fn bedrock_content_block_from_anthropic(block: &Value) -> Option<Value> {
                     "source": { "bytes": data }
                 }
             }))
+        }
+        Some("thinking") => {
+            let text = block.get("thinking").and_then(Value::as_str)?;
+            let signature = block.get("signature").and_then(Value::as_str)?;
+            Some(json!({"reasoningContent":{"reasoningText":{"text":text,"signature":signature}}}))
+        }
+        Some("redacted_thinking") => {
+            let data = block.get("data").and_then(Value::as_str)?;
+            Some(json!({"reasoningContent":{"redactedContent":data}}))
         }
         Some("tool_use") => {
             let id = block.get("id").and_then(Value::as_str)?;
@@ -4033,6 +4175,50 @@ pub(super) fn apply_provider_model_routing(
     apply_request_preprocessors(body, stored, Some(route))
 }
 
+pub(super) struct CopilotPreparedRequest {
+    body: Bytes,
+    model: ModelSelection,
+    upstream_headers: Vec<(&'static str, String)>,
+}
+
+impl CopilotPreparedRequest {
+    pub(super) fn model(&self) -> Result<&str, ProxyError> {
+        self.model
+            .actual_model
+            .as_deref()
+            .or(self.model.requested_model.as_deref())
+            .ok_or_else(|| ProxyError::bad_request("Copilot inference requires an explicit model"))
+    }
+}
+
+fn prepare_copilot_request(
+    body: Bytes,
+    stored: &StoredProvider,
+    route: Option<ProxyRoute>,
+    copilot_metadata: Option<&CopilotRequestMetadata>,
+) -> Result<CopilotPreparedRequest, ProxyError> {
+    let (body, mut model) = apply_request_preprocessors(body, stored, route);
+    let (mut body, upstream_headers, model_source) =
+        maybe_apply_copilot_preflight(body, stored, copilot_metadata)?;
+    if policy_from_settings(&stored.provider.settings_config).is_some() {
+        let requested_model = model.requested_model.clone();
+        let (routed_body, mut routed_model) = apply_request_preprocessors(body, stored, route);
+        routed_model.requested_model = requested_model;
+        body = routed_body;
+        model = routed_model;
+    } else if let Some(source) = model_source {
+        if let Some(actual_model) = model_from_body(&body) {
+            model.actual_model = Some(actual_model.clone());
+            model.actual_model_source = Some(source.to_string());
+        }
+    }
+    Ok(CopilotPreparedRequest {
+        body,
+        model,
+        upstream_headers,
+    })
+}
+
 fn maybe_apply_copilot_preflight(
     body: Bytes,
     stored: &StoredProvider,
@@ -4055,6 +4241,8 @@ fn maybe_apply_copilot_preflight(
             model_source = Some("copilot_model_normalization");
         }
     }
+
+    super::copilot_optimizer::validate_tool_results(&value).map_err(ProxyError::bad_request)?;
 
     let config = CopilotOptimizerConfig::from_settings(&stored.provider.settings_config);
     let default_metadata;
@@ -5308,6 +5496,51 @@ mod tests {
             .iter()
             .any(|(name, _)| *name == "x-interaction-id"));
         assert!(request.stream_requested);
+    }
+
+    #[test]
+    fn copilot_preflight_preserves_passthrough_model_for_beta_user_request() {
+        let stored = stored_provider(
+            AppKind::Claude,
+            ProviderType::GitHubCopilot,
+            json!({
+                "copilotModels":["claude-sonnet-4.6"]
+            }),
+        );
+        let input = Bytes::from_static(br#"{"model":"claude-sonnet-4.8","messages":[{"role":"user","content":"Explain this code"}]}"#);
+        let (output, _, source) = maybe_apply_copilot_preflight(
+            input.clone(),
+            &stored,
+            Some(&CopilotRequestMetadata {
+                has_anthropic_beta: true,
+                session_id: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output).unwrap(),
+            serde_json::from_slice::<Value>(&input).unwrap()
+        );
+        assert_eq!(source, None);
+    }
+
+    #[test]
+    fn copilot_preflight_rejects_orphan_results_instead_of_rewriting_them() {
+        let stored = stored_provider(AppKind::Claude, ProviderType::GitHubCopilot, json!({}));
+        for input in [
+            json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"missing","content":"sensitive result"}]}]}),
+            json!({"messages":[{"role":"assistant","content":"hello"},{"role":"user","content":[{"type":"tool_result","tool_use_id":"missing","content":"sensitive result"}]}]}),
+        ] {
+            let result = maybe_apply_copilot_preflight(
+                Bytes::from(serde_json::to_vec(&input).unwrap()),
+                &stored,
+                None,
+            );
+            assert!(
+                result.is_err(),
+                "orphan tool output was accepted or rewritten"
+            );
+        }
     }
 
     #[test]
@@ -9170,6 +9403,28 @@ mod tests {
     }
 
     #[test]
+    fn non_ollama_r5_requests_keep_their_own_effort_contract() {
+        let stored = stored_provider(
+            AppKind::Codex,
+            ProviderType::Nvidia,
+            json!({"env":{"OPENAI_BASE_URL":"https://api.example","OPENAI_API_KEY":"fixture"}}),
+        );
+        for effort in [json!("ultra"), json!("extreme"), json!(42), Value::Null] {
+            let body = json!({"model":"fixture","input":"hello","reasoning":{"effort":effort}});
+            let request = adapter_for(AppKind::Codex, ProviderType::Nvidia)
+                .transform_request_for_route(
+                    Bytes::from(body.to_string()),
+                    &stored,
+                    ProxyRoute::CodexResponses,
+                    None,
+                )
+                .unwrap();
+            let output: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(output["reasoning_effort"], effort);
+        }
+    }
+
+    #[test]
     fn codex_responses_to_non_ollama_openai_chat_preserves_xhigh_reasoning_effort() {
         let stored = stored_provider(
             AppKind::Codex,
@@ -10459,4 +10714,5 @@ mod tests {
 
         assert_eq!(response, body);
     }
+    include!("adapters/bedrock_r5_tests.rs");
 }

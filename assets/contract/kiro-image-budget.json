@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "liveState": "live_pending",
+  "reference": {
+    "repository": "Kiro/kiro.rs",
+    "commit": "7255d98280df1abd504cbeefc89575ae2aadd0ff",
+    "tree": "7bc8a0df7a3735bc4b968fe1ad9ff7ace2d7009f",
+    "path": "src/image_resize.rs",
+    "fileSha256": "48bdb16531621bdd5745e9f9fb712a5be1e74deeed8bfea095bebd454cd7517a",
+    "evidence": "read_only_committed_source",
+    "officialVendorLimitProven": false,
+    "referenceMayReturnOversizeAtFloor": true
+  },
+  "scope": {
+    "providerTypes": ["kiro_oauth", "amazon_q_oauth"],
+    "apps": ["claude", "codex"],
+    "binding": "one exact product/account/region/credential rail; no endpoint or identity fallback",
+    "requestShape": "existing user images[].source.bytes base64 field",
+    "identityVersion": "existing independent Kiro IDE/CLI and Amazon Q CLI contracts",
+    "realReceipt": false,
+    "terminal": "existing strict EventStream CRC, unique terminal and EOF"
+  },
+  "localAnchorMigration": {
+    "extension": "CORE-N2-KIRO",
+    "historicalPath": "src/proxy/providers/kiro/mod.rs",
+    "historicalAnchor": "prepare_kiro_request_with_context_and_memory",
+    "currentEvidence": [
+      {
+        "path": "src/proxy/providers/kiro/mod.rs",
+        "anchors": ["driver::prepare_kiro_request_bounded", "prepared_memory"]
+      },
+      {
+        "path": "src/proxy/kiro.rs",
+        "anchors": ["pub(crate) async fn prepare_kiro_request_bounded", "prepare_kiro_request_with_context_and_memory", "image::prepare_bounded"]
+      },
+      {
+        "path": "src/proxy/kiro/image.rs",
+        "anchors": ["async fn run_bounded", "let _permit = permit", "Ok((body, memory))"]
+      }
+    ]
+  },
+  "localPolicy": {
+    "maxWireBase64CharactersPerImage": 400000,
+    "unit": "ASCII base64 characters in the final wire field, including padding",
+    "limitAuthority": "local conservative budget, not a proven official vendor limit",
+    "maxImages": 20,
+    "maxDecodedInputBytesPerImage": 8388608,
+    "maxTotalOutputBytes": 20971520,
+    "maxDecodePixelsPerImage": 67108864,
+    "maxDecodeLongSide": 16384,
+    "maxStaticLongSide": 1568,
+    "minimumLongSide": 256,
+    "jpegQualities": [85, 65, 45, 35],
+    "maxEncodeAttemptsPerImage": 24,
+    "maxEncodeAttemptsPerRequest": 64,
+    "maxPixelWorkPerRequest": 268435456,
+    "maxConcurrentBlockingJobs": 2,
+    "waitQueue": "none; admission rejection is a local capacity error",
+    "cancel": "cooperative checkpoints; permit and memory stay with the worker until actual completion",
+    "gif": "preserve original animation and bytes when within field budget; reject oversize without flattening",
+    "orientation": "apply embedded EXIF orientation before static image re-encoding",
+    "oversizeAfterConvergence": "explicit local rejection; never emit an oversized field",
+    "decodeFailure": "reject; never passthrough a failed static conversion"
+  },
+  "cases": [
+    "compressed bytes below 400000 but base64 above 400000",
+    "high entropy PNG/JPEG within and beyond the static dimension cap",
+    "EXIF rotation and extreme aspect ratio",
+    "valid animated GIF roundtrip and oversized GIF rejection",
+    "twenty unique images and total pixel/encoding work rejection",
+    "bounded blocking admission, cancellation and memory ownership",
+    "both independent products across Claude Messages, Chat and Responses"
+  ]
+}

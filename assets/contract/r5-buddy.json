@@ -1,0 +1,213 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "buddy",
+  "liveState": "live_pending",
+  "reference": {
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false,
+    "negative": "Hub aggregate_stream starts finish=stop and can synthesize success on normal truncated EOF; alternate Desktop/VSCode/CLI header builders do not establish all platform entitlements"
+  },
+  "scope": {
+    "providerTypes": [
+      "codebuddy_oauth",
+      "workbuddy_oauth"
+    ],
+    "profiles": [
+      "claude.codebuddy_oauth",
+      "claude.workbuddy_oauth",
+      "codex.codebuddy_oauth",
+      "codex.workbuddy_oauth",
+      "gemini.codebuddy_oauth",
+      "gemini.workbuddy_oauth"
+    ],
+    "matrix": [
+      {
+        "product": "codebuddy",
+        "site": "cn",
+        "loginPlatform": "CLI",
+        "generationIdentity": "audited CLI 2.142.0",
+        "refreshSource": "plugin"
+      },
+      {
+        "product": "codebuddy",
+        "site": "intl",
+        "loginPlatform": "CLI",
+        "generationIdentity": "audited CLI 2.142.0",
+        "refreshSource": "plugin"
+      },
+      {
+        "product": "workbuddy",
+        "site": "cn",
+        "loginPlatform": "workbuddy",
+        "generationIdentity": "audited CLI 2.142.0",
+        "refreshSource": "plugin"
+      },
+      {
+        "product": "workbuddy",
+        "site": "intl",
+        "loginPlatform": "workbuddy-ai",
+        "generationIdentity": "audited CLI 2.142.0",
+        "refreshSource": "plugin"
+      }
+    ],
+    "credentialRail": "one explicitly bound personal managed Account and exact product/site/platform; native login and CLI generation acceptance require joint real evidence"
+  },
+  "localPolicy": {
+    "productionWireChanged": false,
+    "identitySwitchOnFailure": false,
+    "tlsProfileChanged": false,
+    "nativeMediaGenerationEnabled": false,
+    "reasoning": "retain existing Registry buddy_upstream_default_v1 and exact current catalog default; no menu-order guesses or permission fallback",
+    "catalog": "only same product/site/generation/current channel evidence; empty/revoked is authoritative and not replaced by reference fallback catalog",
+    "terminal": "one valid finish_reason then exactly one DONE and EOF; partial tool/late failure cannot become success",
+    "billing": "paid/free summary and official scan already exist; retain explicit scan truncation/completeness, no duplicated feature claim",
+    "semanticCleaning": "do not migrate reference WAF text cleaning, prompt replacement, guessed text tools, or tool truncation swallowing",
+    "performanceClaim": false
+  },
+  "cases": [
+    {
+      "id": "product-site-platform",
+      "tests": [
+        "workbuddy_identity_is_product_and_site_scoped",
+        "workbuddy_native_login_uses_site_platform_and_private_cookie_lifecycle",
+        "codebuddy_workbuddy_imports_require_product_and_site_and_drop_untrusted_fields"
+      ]
+    },
+    {
+      "id": "refresh-identity-and-rotation",
+      "tests": [
+        "refresh_sends_complete_identity_and_journals_rotated_token_before_validation",
+        "refresh_accepts_same_site_brand_domain_rotation",
+        "refresh_rejects_cross_site_domain_rotation",
+        "only_session_dead_invalid_grant_marks_refresh_as_relogin"
+      ]
+    },
+    {
+      "id": "catalog-scope",
+      "tests": [
+        "buddy_catalog_uses_only_the_active_channel_for_each_product_and_site",
+        "codebuddy_catalog_refetches_for_same_generation_credential_and_profile_changes",
+        "cache_fences_site_and_both_generations_and_bounds_stale"
+      ]
+    },
+    {
+      "id": "reasoning-policy",
+      "tests": [
+        "buddy_default_resolution_preserves_max_and_xhigh_and_never_uses_menu_order",
+        "buddy_catalog_rejects_invalid_and_contradictory_defaults",
+        "buddy_auto_preserves_tools_and_uses_catalog_reasoning_defaults"
+      ]
+    },
+    {
+      "id": "native-tools",
+      "tests": [
+        "payload_closes_namespace_tool_rounds_across_claude_chat_and_responses",
+        "buddy_split_parallel_calls_preserve_results_in_both_orders",
+        "buddy_split_calls_never_merge_reasoning_text_or_duplicate_ids"
+      ]
+    },
+    {
+      "id": "images",
+      "tests": [
+        "buddy_fixed_text_models_reject_images_without_silent_substitution_or_refresh",
+        "buddy_tool_result_images_survive_native_round_trips",
+        "buddy_image_capabilities_are_strict_and_scoped_to_reviewed_cli_models"
+      ]
+    },
+    {
+      "id": "strict-terminal",
+      "tests": [
+        "decoder_requires_one_done_and_rejects_post_terminal_data",
+        "valid_tool_is_not_released_after_truncated_or_duplicate_terminal",
+        "codebuddy_core03_headers_and_committed_cancel_or_truncation_keep_last_owner_and_no_replay"
+      ]
+    },
+    {
+      "id": "quota-and-auth-errors",
+      "tests": [
+        "codebuddy_workbuddy_modern_billing_empty_fallback_and_transient_classification",
+        "modern_billing_auth_failure_is_not_hidden_by_a_successful_sibling",
+        "buddy_usage_projection_is_product_site_scoped_and_never_copies_private_details"
+      ]
+    },
+    {
+      "id": "official-usage-completeness",
+      "tests": [
+        "codebuddy_official_usage_sweeps_past_truncated_total_and_deduplicates_boundary",
+        "official_usage_deduplicates_and_never_projects_prompt_fields"
+      ]
+    },
+    {
+      "id": "cancel-budget-and-recovery",
+      "tests": [
+        "codebuddy_both_sites_keep_one_request_budget_across_401_recovery",
+        "codebuddy_memory_exhaustion_never_replays_or_refreshes_on_either_site",
+        "codebuddy_core03_both_sites_original_401_recovery_has_independent_attempts"
+      ]
+    }
+  ],
+  "references": [
+    {
+      "repository": "CodeBuddy/workbuddy2api-hub",
+      "commit": "018d52bdddd71344665f2da1218bbefce8a9dfd5",
+      "tree": "a4bce82dba200d5c54e3546b6b8fdb046386dc9f",
+      "files": [
+        {
+          "path": "wb_identity.py",
+          "sha256": "9f667b98aede558ad9e5c4b6030136bda0ca60be623f8303357374c919f5e5df"
+        },
+        {
+          "path": "wb_accounts.py",
+          "sha256": "5403dfaef15a9ee356b1c2e0ae3cbe7bee426960260e8df3e00b1bf29c4e3138"
+        },
+        {
+          "path": "wb_proxy.py",
+          "sha256": "155d99d94f47f3d7d7aeb8116593ab30f65ab7fd5a800c954b137f751c4f154a"
+        },
+        {
+          "path": "wb_catalog.py",
+          "sha256": "87dd019ae7d2eb30b58db5d16d11d52da91764a0dd7138dac2907c2fa646acbd"
+        }
+      ]
+    },
+    {
+      "repository": "cli2api",
+      "commit": "36474d589a04f663127679ebb30d614690518907",
+      "tree": "16c6962af16e7f21130db0b4240a1242f3ee794a",
+      "files": [
+        {
+          "path": "internal/providers/workbuddy/headers.go",
+          "sha256": "13c9a213d92e1b336d2a87f85fbd9f12a81521cd1e3e38010528a6ea3f34f4dc"
+        },
+        {
+          "path": "internal/providers/workbuddy/client.go",
+          "sha256": "a5896ad5f25cfc498236d10fb242dc6a7ec34c26fa02af1db52b7528c1facd35"
+        },
+        {
+          "path": "internal/providers/workbuddy/sse.go",
+          "sha256": "39ab1fd31ea78b9c4f6f0455a85b33b7b75f81f9869c0993885d0d50c4f578a3"
+        }
+      ]
+    },
+    {
+      "repository": "CodeBuddy/workbuddy-switch",
+      "commit": "22b318c1f44b335c2222e444abcc2d0f74e160f7",
+      "tree": "aaca14e3f9e01e9495b9f7ae0e40d185fb93dbcf",
+      "files": [
+        {
+          "path": "crates/wb-switch-core/src/modules/variant.rs",
+          "sha256": "1697a0a80ed3cac877fb2e683418ebefa0f7114017799d02daaec7162d952ec3"
+        },
+        {
+          "path": "crates/wb-switch-core/src/modules/refresh.rs",
+          "sha256": "51ff9cc5da2b1b3d8f38c16a8bcd0b976125188520ff848b5ad34e89ea6fc502"
+        },
+        {
+          "path": "crates/wb-switch-core/src/modules/official_usage.rs",
+          "sha256": "40e4d45f138310d95821b6f3336699fbb6a0d7f2d528b9d169b0a6def2aed902"
+        }
+      ]
+    }
+  ]
+}

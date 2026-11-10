@@ -344,12 +344,50 @@ pub(crate) async fn prepare_bound_request(
         })
         .transpose()
         .map_err(|error| error.into_proxy_error())?;
-    let mut prepared = driver::prepare_kiro_request_with_context_and_memory(
+    let (mut prepared, prepared_memory) = driver::prepare_kiro_request_bounded(
         &account,
         request_body,
         &call_context,
         request_memory,
-    )?;
+        prepared_memory,
+        execution.request_timeout(),
+    )
+    .await?;
+    // Image work may outlive a control-plane change. Recheck the exact product,
+    // credential and persistent account incarnation before using its result.
+    if driver::has_image_input(request_body) {
+        let live_accounts = state.accounts_snapshot().await;
+        let current_account =
+            live_accounts.find_for_provider(product.provider_type, Some(account_id));
+        if live_accounts.kiro_prompt_cache_owner_id(account_id) != Some(cache_owner_id)
+            || !current_account.is_some_and(|current| {
+                current.auth_identity_generation == account.auth_identity_generation
+                    && current.token_refresh_generation == account.token_refresh_generation
+                    && driver::KiroAccountData::from_account(current)
+                        .ok()
+                        .and_then(|data| driver::prompt_cache_request_identity(current, &data).ok())
+                        .as_ref()
+                        == Some(&cache_request_identity)
+            })
+        {
+            return Err(ProxyError::conflict(
+                "Kiro image preparation account binding changed",
+            ));
+        }
+        let current_providers = state.providers.read().await;
+        if !current_providers
+            .runtime_plan(stored.app, &stored.provider.id)
+            .is_some_and(|plan| {
+                plan.provider_revision == execution.plan.provider_revision
+                    && plan.runtime_fingerprint == execution.plan.runtime_fingerprint
+            })
+        {
+            return Err(ProxyError::conflict(
+                "Kiro image preparation Provider binding changed",
+            ));
+        }
+        drop(current_providers);
+    }
     if let Some(base_url) = api_base_override(stored) {
         prepared.url = url_with_base_override(&base_url, &prepared.url)?;
     }

@@ -31,6 +31,7 @@ pub(crate) struct EventStreamDecoder {
     buffer: BytesMut,
     max_buffer_length: usize,
     max_frame_length: usize,
+    max_header_length: usize,
     recovery: RecoveryPolicy,
     errors: usize,
     skipped: usize,
@@ -48,11 +49,25 @@ impl EventStreamDecoder {
         Self::with_policy(RecoveryPolicy::STRICT)
     }
 
+    pub(crate) fn bounded(
+        max_frame_length: usize,
+        max_buffer_length: usize,
+        max_header_length: usize,
+    ) -> Self {
+        let mut decoder = Self::strict();
+        decoder.max_frame_length = max_frame_length;
+        decoder.max_buffer_length = max_buffer_length;
+        decoder.max_header_length = max_header_length;
+        decoder
+    }
+
     pub(crate) fn with_policy(recovery: RecoveryPolicy) -> Self {
         Self {
             buffer: BytesMut::with_capacity(8192),
             max_buffer_length: DEFAULT_MAX_BUFFER_LENGTH,
             max_frame_length: DEFAULT_MAX_FRAME_LENGTH,
+            // Retain the existing Kiro framing policy; other callers choose their own cap.
+            max_header_length: usize::MAX,
             recovery,
             errors: 0,
             skipped: 0,
@@ -103,7 +118,7 @@ impl EventStreamDecoder {
     fn drain(&mut self) -> Result<Vec<Frame>, WireError> {
         let mut frames = Vec::new();
         loop {
-            match parse_frame(&self.buffer, self.max_frame_length) {
+            match parse_frame(&self.buffer, self.max_frame_length, self.max_header_length) {
                 Ok(ParseOutcome::Incomplete) => return Ok(frames),
                 Ok(ParseOutcome::Complete { frame, consumed }) => {
                     self.buffer.advance(consumed);

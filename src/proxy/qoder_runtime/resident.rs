@@ -2,6 +2,7 @@
 //! Opaque HTTP/crypto allocations and control-plane parsing remain separate.
 use super::*;
 use crate::infra::resident_memory::process_resident_memory;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// The owner lives inside the Arc target so even a caller retaining only the
@@ -69,9 +70,33 @@ pub(super) struct ResidentSessionEntry {
 pub(super) struct QoderResidentCatalog {
     pub(super) value: FetchedQoderModelCatalog,
     pub(super) _memory: Option<ResidentMemoryReservation>,
+    pub(super) epoch: Option<CatalogEpoch>,
 }
 
-pub(super) type RuntimeFlights = BTreeMap<QoderRuntimeScope, Arc<Mutex<ResidentMemoryReservation>>>;
+#[derive(Debug)]
+pub(super) struct RuntimeFlight {
+    lock: Arc<Mutex<ResidentMemoryReservation>>,
+    catalog_generation: AtomicU64,
+}
+
+#[derive(Debug)]
+pub(super) struct CatalogEpoch {
+    flight: Arc<RuntimeFlight>,
+    generation: u64,
+}
+
+impl CatalogEpoch {
+    pub(super) fn is_current(&self) -> bool {
+        self.flight.catalog_generation.load(Ordering::Acquire) == self.generation
+    }
+}
+
+pub(super) type RuntimeFlights = BTreeMap<QoderRuntimeScope, Arc<RuntimeFlight>>;
+
+fn retain_active_flights(flights: &mut RuntimeFlights) {
+    flights
+        .retain(|_, flight| Arc::strong_count(flight) > 1 || Arc::strong_count(&flight.lock) > 1);
+}
 
 fn node_bytes<K, V>(dynamic: usize) -> usize {
     (std::mem::size_of::<(K, V)>() + std::mem::size_of::<usize>() * 2)
@@ -165,7 +190,10 @@ impl QoderRuntimeCache {
     ) -> Option<QoderModelCatalog> {
         let mut catalogs = self.catalogs.write().await;
         catalogs.retain(|_, catalog| catalog.is_fresh(now_ms));
-        catalogs.get(scope).cloned()
+        let catalog = catalogs.get(scope).cloned();
+        drop(catalogs);
+        retain_active_flights(&mut *self.catalog_flights.lock().await);
+        catalog
     }
 
     pub async fn insert_catalog(
@@ -174,15 +202,27 @@ impl QoderRuntimeCache {
         fetched: FetchedQoderModelCatalog,
         fetched_at_ms: i64,
     ) -> QoderModelCatalog {
+        // Production fetches have already admitted this bounded flight before
+        // allocating the response. Retaining its small owner also fences a
+        // snapshot whose optional catalog cache reservation is refused.
+        let flight = self.catalog_flight(&scope).await;
+        let mut catalogs = self.catalogs.write().await;
+        let epoch = flight.map(|flight| CatalogEpoch {
+            generation: flight
+                .catalog_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1),
+            flight,
+        });
         let mut catalog = QoderModelCatalog {
             data: Arc::new(QoderResidentCatalog {
                 value: fetched,
                 _memory: None,
+                epoch,
             }),
             fetched_at_ms,
             expires_at_ms: fetched_at_ms.saturating_add(QODER_MODEL_CATALOG_TTL_MS),
         };
-        let mut catalogs = self.catalogs.write().await;
         catalogs.remove(&scope);
         catalogs.retain(|_, catalog| catalog.is_fresh(fetched_at_ms));
         let dynamic = catalog
@@ -224,7 +264,13 @@ impl QoderRuntimeCache {
     }
 
     pub async fn invalidate_catalog(&self, scope: &QoderRuntimeScope) {
-        self.catalogs.write().await.remove(scope);
+        let mut catalogs = self.catalogs.write().await;
+        let mut flights = self.catalog_flights.lock().await;
+        if let Some(flight) = flights.get(scope) {
+            flight.catalog_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        catalogs.remove(scope);
+        retain_active_flights(&mut flights);
     }
 
     pub async fn invalidate_scope(&self, scope: &QoderRuntimeScope) {
@@ -247,7 +293,27 @@ impl QoderRuntimeCache {
         &self,
         scope: &QoderRuntimeScope,
     ) -> Option<OwnedMutexGuard<ResidentMemoryReservation>> {
-        self.flight_lock(&self.catalog_flights, scope).await
+        let flight = self.catalog_flight(scope).await?;
+        Some(flight.lock.clone().lock_owned().await)
+    }
+
+    async fn catalog_flight(&self, scope: &QoderRuntimeScope) -> Option<Arc<RuntimeFlight>> {
+        if let Some(flight) = self.flight_state(&self.catalog_flights, scope).await {
+            return Some(flight);
+        }
+        // Idle retained catalogs must not consume every flight slot forever.
+        // A borrowed snapshot keeps its epoch; only a cache's sole payload
+        // reference is optional and eligible for eviction here.
+        {
+            let mut catalogs = self.catalogs.write().await;
+            let oldest = catalogs
+                .iter()
+                .filter(|(_, catalog)| Arc::strong_count(&catalog.data) == 1)
+                .min_by_key(|(key, catalog)| (catalog.fetched_at_ms, *key))
+                .map(|(key, _)| key.clone())?;
+            catalogs.remove(&oldest);
+        }
+        self.flight_state(&self.catalog_flights, scope).await
     }
 
     async fn flight_lock(
@@ -255,28 +321,43 @@ impl QoderRuntimeCache {
         flights: &Mutex<RuntimeFlights>,
         scope: &QoderRuntimeScope,
     ) -> Option<OwnedMutexGuard<ResidentMemoryReservation>> {
+        let flight = self.flight_state(flights, scope).await?;
+        Some(flight.lock.clone().lock_owned().await)
+    }
+
+    async fn flight_state(
+        &self,
+        flights: &Mutex<RuntimeFlights>,
+        scope: &QoderRuntimeScope,
+    ) -> Option<Arc<RuntimeFlight>> {
         let flight = {
             let mut flights = flights.lock().await;
-            flights.retain(|key, flight| key == scope || Arc::strong_count(flight) > 1);
+            flights.retain(|key, flight| {
+                key == scope || Arc::strong_count(flight) > 1 || Arc::strong_count(&flight.lock) > 1
+            });
             if let Some(flight) = flights.get(scope) {
                 flight.clone()
             } else {
                 if flights.len() >= MAX_RUNTIME_ENTRIES {
                     return None;
                 }
-                let bytes = node_bytes::<QoderRuntimeScope, Arc<Mutex<ResidentMemoryReservation>>>(
+                let bytes = node_bytes::<QoderRuntimeScope, Arc<RuntimeFlight>>(
                     scope.0.capacity().saturating_add(
                         std::mem::size_of::<Mutex<ResidentMemoryReservation>>()
-                            + std::mem::size_of::<usize>() * 2,
+                            + std::mem::size_of::<RuntimeFlight>()
+                            + std::mem::size_of::<usize>() * 4,
                     ),
                 );
                 let memory = self.parent.reserve(bytes)?;
-                let flight = Arc::new(Mutex::new(memory));
+                let flight = Arc::new(RuntimeFlight {
+                    lock: Arc::new(Mutex::new(memory)),
+                    catalog_generation: AtomicU64::new(0),
+                });
                 flights.insert(scope.clone(), flight.clone());
                 flight
             }
         };
-        Some(flight.lock_owned().await)
+        Some(flight)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -429,6 +510,7 @@ mod tests {
             enabled_models: vec![model.into()],
             raw_configs: BTreeMap::from([(model.into(), json!({"key":model}))]),
             capabilities: BTreeMap::new(),
+            catalog_entries: Vec::new(),
         }
     }
 
@@ -533,6 +615,7 @@ mod tests {
                     enabled_models: Vec::new(),
                     raw_configs: BTreeMap::new(),
                     capabilities: BTreeMap::new(),
+                    catalog_entries: Vec::new(),
                 },
                 2,
             )
@@ -540,6 +623,64 @@ mod tests {
         assert!(empty.enabled_models.is_empty());
         assert!(empty.data._memory.is_none());
         assert!(cache.catalog(&scope(0), 3).await.is_none());
+        // The uncached current result still owns its small authorization epoch.
+        assert!(empty.is_current(3));
+        assert!(parent.snapshot().used_bytes > 0);
+        drop(empty);
+        cache.invalidate_catalog(&scope(0)).await;
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn qoder_catalog_epochs_isolate_scopes_and_survive_cancelled_waiters() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = Arc::new(QoderRuntimeCache::with_parent(parent.clone()));
+        let first = cache.insert_catalog(scope(0), fetched("auto"), 1).await;
+        let other = cache.insert_catalog(scope(1), fetched("auto"), 1).await;
+        let guard = cache.catalog_lock(&scope(0)).await.unwrap();
+        let waiting_cache = cache.clone();
+        let waiting = tokio::spawn(async move { waiting_cache.catalog_lock(&scope(0)).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        drop(guard);
+        drop(
+            cache
+                .insert_catalog(scope(1), fetched("replacement"), 2)
+                .await,
+        );
+        assert!(first.is_current(2));
+        assert!(!other.is_current(2));
+        cache.invalidate_catalog(&scope(0)).await;
+        assert!(!first.is_current(2));
+        drop(cache);
+        assert!(parent.snapshot().used_bytes > 0);
+        drop(first);
+        drop(other);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn qoder_catalog_flight_capacity_evicts_only_unborrowed_payloads() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = QoderRuntimeCache::with_parent(parent.clone());
+        let held = cache.insert_catalog(scope(0), fetched("auto"), 1).await;
+        for index in 1..MAX_RUNTIME_ENTRIES {
+            drop(cache.insert_catalog(scope(index), fetched("auto"), 1).await);
+        }
+        let new = cache
+            .insert_catalog(scope(MAX_RUNTIME_ENTRIES), fetched("new"), 2)
+            .await;
+        assert!(new.is_current(2));
+        assert!(held.is_current(2));
+        assert!(cache.catalog(&scope(0), 2).await.is_some());
+        assert!(cache.catalog(&scope(1), 2).await.is_none());
+        assert_eq!(cache.catalogs.read().await.len(), MAX_RUNTIME_ENTRIES);
+        drop(cache);
+        drop(new);
+        assert!(parent.snapshot().used_bytes > 0);
+        drop(held);
         assert_eq!(parent.snapshot().used_bytes, 0);
     }
 

@@ -244,6 +244,15 @@ impl PreparedQoderRuntime {
 }
 
 impl QoderModelCatalog {
+    pub(crate) fn is_current(&self, now_ms: i64) -> bool {
+        self.is_fresh(now_ms)
+            && self
+                .data
+                .epoch
+                .as_ref()
+                .is_some_and(|epoch| epoch.is_current())
+    }
+
     pub fn exact_config(&self, model_key: &str) -> Option<&Value> {
         self.raw_configs.get(model_key.trim())
     }
@@ -336,6 +345,18 @@ impl QoderModelCatalog {
         enabled_models
             .saturating_add(raw_configs)
             .saturating_add(capabilities)
+            .saturating_add(
+                self.catalog_entries.iter().fold(
+                    self.catalog_entries
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<QoderCatalogEntry>()),
+                    |bytes, entry| {
+                        bytes
+                            .saturating_add(entry.model_key.capacity())
+                            .saturating_add(entry.source.as_ref().map_or(0, String::capacity))
+                    },
+                ),
+            )
     }
 }
 
@@ -344,6 +365,28 @@ pub struct FetchedQoderModelCatalog {
     pub enabled_models: Vec<String>,
     pub raw_configs: BTreeMap<String, Value>,
     pub capabilities: BTreeMap<String, QoderModelCapability>,
+    pub catalog_entries: Vec<QoderCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QoderCatalogScene {
+    Chat,
+    App,
+}
+
+/// Discovery observations are deliberately separate from inference permission.
+/// An enabled app row is not evidence for the reviewed COSY chat operation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QoderCatalogEntry {
+    pub model_key: String,
+    pub scene: QoderCatalogScene,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub enabled: bool,
+    pub selected: bool,
+    pub executable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -526,11 +569,27 @@ pub fn parse_qoder_model_catalog(
     value: &Value,
     site: QoderSite,
 ) -> Result<FetchedQoderModelCatalog, String> {
-    let entries = value
-        .get("chat")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Qoder model catalog must contain a chat array".to_string())?;
-    if entries.len() > MAX_MODEL_CATALOG_ENTRIES {
+    let mut scenes = Vec::with_capacity(2);
+    for (name, scene) in [
+        ("chat", QoderCatalogScene::Chat),
+        ("app", QoderCatalogScene::App),
+    ] {
+        if let Some(entries) = value.get(name) {
+            let entries = entries
+                .as_array()
+                .ok_or_else(|| format!("Qoder model catalog {name} must be an array"))?;
+            scenes.push((scene, entries));
+        }
+    }
+    if scenes.is_empty() {
+        return Err("Qoder model catalog must contain a chat or app array".to_string());
+    }
+    if scenes
+        .iter()
+        .map(|(_, entries)| entries.len())
+        .sum::<usize>()
+        > MAX_MODEL_CATALOG_ENTRIES
+    {
         return Err(format!(
             "Qoder model catalog exceeds {MAX_MODEL_CATALOG_ENTRIES} entries"
         ));
@@ -539,42 +598,67 @@ pub fn parse_qoder_model_catalog(
     let mut raw_configs = BTreeMap::new();
     let mut enabled_models = Vec::new();
     let mut capabilities = BTreeMap::new();
-    for (index, entry) in entries.iter().enumerate() {
-        let object = entry
-            .as_object()
-            .ok_or_else(|| format!("Qoder model catalog entry {index} must be an object"))?;
-        let raw_key = object
-            .get("key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("Qoder model catalog entry {index} is missing a key"))?;
-        let key = raw_key.trim();
-        if key.is_empty() || key != raw_key {
-            return Err(format!(
-                "Qoder model catalog entry {index} has an invalid key"
-            ));
-        }
-        if key.len() > MAX_MODEL_KEY_BYTES {
-            return Err("Qoder model key exceeds the size limit".to_string());
-        }
-        if raw_configs.contains_key(key) {
-            return Err(format!(
-                "Qoder model catalog contains duplicate key {key:?}"
-            ));
-        }
-        raw_configs.insert(key.to_string(), entry.clone());
-        let enabled = match object.get("enable") {
-            None => true,
-            Some(Value::Bool(enabled)) => *enabled,
-            Some(_) => {
+    let mut catalog_entries = Vec::new();
+    for (scene, entries) in scenes {
+        let mut seen = BTreeSet::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let object = entry
+                .as_object()
+                .ok_or_else(|| format!("Qoder model catalog entry {index} must be an object"))?;
+            let raw_key = object
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("Qoder model catalog entry {index} is missing a key"))?;
+            let key = raw_key.trim();
+            if key.is_empty() || key != raw_key {
                 return Err(format!(
-                    "Qoder model catalog enable flag for {key:?} must be boolean"
-                ))
+                    "Qoder model catalog entry {index} has an invalid key"
+                ));
             }
-        };
-        parameters::validate_catalog(object)?;
-        if enabled {
-            enabled_models.push(key.to_string());
-            capabilities.insert(key.to_string(), qoder_model_capability(site, key, object));
+            if key.len() > MAX_MODEL_KEY_BYTES {
+                return Err("Qoder model key exceeds the size limit".to_string());
+            }
+            if !seen.insert(key) {
+                return Err(format!(
+                    "Qoder model catalog {scene:?} contains duplicate key {key:?}"
+                ));
+            }
+            let enabled = match object.get("enable") {
+                None => true,
+                Some(Value::Bool(enabled)) => *enabled,
+                Some(_) => {
+                    return Err(format!(
+                        "Qoder model catalog enable flag for {key:?} must be boolean"
+                    ))
+                }
+            };
+            // App metadata is an opaque discovery observation. Only chat config
+            // participates in the reviewed parameter and generation contracts.
+            if scene == QoderCatalogScene::Chat {
+                parameters::validate_catalog(object)?;
+            }
+            let selected = !raw_configs.contains_key(key);
+            let executable = selected && scene == QoderCatalogScene::Chat && enabled;
+            catalog_entries.push(QoderCatalogEntry {
+                model_key: key.to_string(),
+                scene,
+                source: object
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                enabled,
+                selected,
+                executable,
+            });
+            // Processing chat first preserves its entire configuration and deny;
+            // app cannot replace that authority, even when it advertises enable.
+            if selected {
+                raw_configs.insert(key.to_string(), entry.clone());
+            }
+            if executable {
+                enabled_models.push(key.to_string());
+                capabilities.insert(key.to_string(), qoder_model_capability(site, key, object));
+            }
         }
     }
     enabled_models.sort();
@@ -583,6 +667,7 @@ pub fn parse_qoder_model_catalog(
         enabled_models,
         raw_configs,
         capabilities,
+        catalog_entries,
     })
 }
 
@@ -1988,6 +2073,7 @@ mod tests {
                     enabled_models: vec!["auto".to_string()],
                     raw_configs: BTreeMap::new(),
                     capabilities: BTreeMap::new(),
+                    catalog_entries: Vec::new(),
                 },
                 1_000,
             )
@@ -2010,6 +2096,7 @@ mod tests {
                     enabled_models: Vec::new(),
                     raw_configs: BTreeMap::new(),
                     capabilities: BTreeMap::new(),
+                    catalog_entries: Vec::new(),
                 },
                 1_000,
             )
@@ -2017,6 +2104,60 @@ mod tests {
         let catalog = cache.catalog(&scope, 1_001).await.unwrap();
         assert!(catalog.enabled_models.is_empty());
         assert!(catalog.raw_configs.is_empty());
+    }
+
+    #[test]
+    fn qoder_catalog_scenes_preserve_source_and_never_grant_unverified_app_models() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../assets/contract/qoder-catalog-scenes.json"
+        ))
+        .unwrap();
+        for site in [QoderSite::Global, QoderSite::Cn] {
+            for case in fixture["cases"].as_array().unwrap() {
+                let parsed = parse_qoder_model_catalog(&case["input"], site);
+                if case["error"] == true {
+                    assert!(
+                        parsed.is_err(),
+                        "{site:?}/{} accepted a malformed scene",
+                        case["name"]
+                    );
+                    continue;
+                }
+                let parsed =
+                    parsed.unwrap_or_else(|error| panic!("{site:?}/{}: {error}", case["name"]));
+                assert_eq!(
+                    serde_json::to_value(&parsed.raw_configs).unwrap(),
+                    case["selectedConfigs"],
+                    "{site:?}/{} lost scene selection or app discovery",
+                    case["name"]
+                );
+                assert_eq!(
+                    serde_json::to_value(&parsed.enabled_models).unwrap(),
+                    case["enabledModels"],
+                    "{site:?}/{} expanded inference permission",
+                    case["name"]
+                );
+                assert_eq!(
+                    serde_json::to_value(&parsed.catalog_entries).unwrap(),
+                    case["catalogEntries"],
+                    "{site:?}/{} lost original scene/enable/source observation",
+                    case["name"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qoder_catalog_scenes_share_one_entry_budget() {
+        let chat = (0..129)
+            .map(|i| json!({"key":format!("chat-{i}")}))
+            .collect::<Vec<_>>();
+        let app = (0..128)
+            .map(|i| json!({"key":format!("app-{i}")}))
+            .collect::<Vec<_>>();
+        assert!(
+            parse_qoder_model_catalog(&json!({"chat":chat,"app":app}), QoderSite::Global).is_err()
+        );
     }
 
     #[test]
@@ -2045,7 +2186,8 @@ mod tests {
             FetchedQoderModelCatalog {
                 enabled_models: Vec::new(),
                 raw_configs: BTreeMap::new(),
-                capabilities: BTreeMap::new()
+                capabilities: BTreeMap::new(),
+                catalog_entries: Vec::new()
             }
         );
         assert!(parse_qoder_model_catalog(&json!({"models": []}), QoderSite::Global).is_err());
@@ -2459,6 +2601,7 @@ mod tests {
             data: Arc::new(QoderResidentCatalog {
                 value: global,
                 _memory: None,
+                epoch: None,
             }),
             fetched_at_ms: 1,
             expires_at_ms: 2,
@@ -2497,6 +2640,7 @@ mod tests {
                     data: Arc::new(QoderResidentCatalog {
                         value: fetched,
                         _memory: None,
+                        epoch: None,
                     }),
                     fetched_at_ms: 1,
                     expires_at_ms: 2,
@@ -2523,6 +2667,7 @@ mod tests {
             data: Arc::new(QoderResidentCatalog {
                 value: fetched,
                 _memory: None,
+                epoch: None,
             }),
             fetched_at_ms: 1,
             expires_at_ms: 2,
@@ -2911,6 +3056,7 @@ mod tests {
             data: Arc::new(QoderResidentCatalog {
                 value: fetched,
                 _memory: None,
+                epoch: None,
             }),
             fetched_at_ms: 1,
             expires_at_ms: 2,

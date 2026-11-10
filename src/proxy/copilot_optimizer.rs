@@ -24,13 +24,13 @@ impl Default for CopilotOptimizerConfig {
         Self {
             enabled: true,
             request_classification: true,
-            tool_result_merging: true,
+            tool_result_merging: false,
             compact_detection: true,
             deterministic_request_id: true,
             subagent_detection: true,
-            warmup_downgrade: true,
+            warmup_downgrade: false,
             warmup_model: "gpt-5-mini".to_string(),
-            strip_thinking: true,
+            strip_thinking: false,
         }
     }
 }
@@ -126,7 +126,6 @@ pub(super) fn optimize_request(
         config.subagent_detection,
     );
     let mut model_source = None;
-    *body = sanitize_orphan_tool_results(std::mem::take(body));
     if config.tool_result_merging {
         *body = merge_tool_results(std::mem::take(body));
     }
@@ -233,67 +232,46 @@ pub(super) fn classify_request(
     }
 }
 
-pub(super) fn sanitize_orphan_tool_results(mut body: Value) -> Value {
-    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
-        return body;
+/// Validate Anthropic tool linkage without changing or flattening history.
+/// Pending results may be split over adjacent user messages, but a new
+/// assistant turn establishes a new set. Chat/Responses linkage belongs to
+/// their protocol validators and must not be guessed from text here.
+pub(super) fn validate_tool_results(body: &Value) -> Result<(), &'static str> {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return Ok(());
     };
-    if messages.len() < 2 {
-        return body;
-    }
-
-    for i in 1..messages.len() {
-        if messages[i].get("role").and_then(Value::as_str) != Some("user") {
-            continue;
-        }
-        let prev_tool_use_ids: HashSet<String> =
-            if messages[i - 1].get("role").and_then(Value::as_str) == Some("assistant") {
-                messages[i - 1]
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter(|block| {
-                                block.get("type").and_then(Value::as_str) == Some("tool_use")
-                            })
-                            .filter_map(|block| {
-                                block.get("id").and_then(Value::as_str).map(String::from)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                HashSet::new()
-            };
-        let Some(content) = messages[i].get_mut("content").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for block in content {
-            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
-                continue;
+    let mut pending = HashSet::new();
+    for message in messages {
+        let role = message.get("role").and_then(Value::as_str);
+        let blocks = message.get("content").and_then(Value::as_array);
+        if role == Some("assistant") {
+            pending.clear();
+            if let Some(blocks) = blocks {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                        if let Some(id) = block.get("id").and_then(Value::as_str) {
+                            pending.insert(id);
+                        }
+                    }
+                }
             }
-            let tool_use_id = block
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if tool_use_id.is_empty() || !prev_tool_use_ids.contains(tool_use_id) {
-                let content_text = match block.get("content") {
-                    Some(Value::String(text)) => text.clone(),
-                    Some(Value::Array(blocks)) => blocks
-                        .iter()
-                        .filter_map(|item| item.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    _ => String::new(),
-                };
-                *block = serde_json::json!({
-                    "type": "text",
-                    "text": format!("[Tool result for {}]: {}", tool_use_id, content_text)
-                });
+        } else if role == Some("user") {
+            if let Some(blocks) = blocks {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                        let id = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if id.is_empty() || !pending.remove(id) {
+                            return Err("Copilot tool_result must match one pending tool_use; orphan or duplicate tool output is not rewritten");
+                        }
+                    }
+                }
             }
         }
     }
-    body
+    Ok(())
 }
 
 pub(super) fn merge_tool_results(mut body: Value) -> Value {
@@ -724,7 +702,10 @@ mod tests {
         });
         let result = optimize_request(
             &mut body,
-            &CopilotOptimizerConfig::default(),
+            &CopilotOptimizerConfig {
+                strip_thinking: true,
+                ..Default::default()
+            },
             &CopilotRequestMetadata::default(),
         );
         assert!(result
@@ -744,8 +725,90 @@ mod tests {
             has_anthropic_beta: true,
             session_id: None,
         };
-        let result = optimize_request(&mut body, &CopilotOptimizerConfig::default(), &metadata);
+        let result = optimize_request(
+            &mut body,
+            &CopilotOptimizerConfig {
+                warmup_downgrade: true,
+                ..Default::default()
+            },
+            &metadata,
+        );
         assert_eq!(body["model"], "gpt-5-mini");
         assert_eq!(result.model_source, Some("copilot_warmup"));
+    }
+
+    #[test]
+    fn default_optimizer_preserves_user_model_thinking_and_parallel_results() {
+        let original = json!({
+            "model": "claude-sonnet-4.6-1m",
+            "messages": [
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"signed thought","signature":"opaque"},
+                    {"type":"tool_use","id":"a","name":"Read","input":{}},
+                    {"type":"tool_use","id":"b","name":"Read","input":{}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"b","content":"second"},
+                    {"type":"text","text":"user instruction"},
+                    {"type":"tool_result","tool_use_id":"a","content":"first"}
+                ]}
+            ]
+        });
+        for settings in [
+            json!({}),
+            json!({"copilotOptimizer":true}),
+            json!({"copilotOptimizer":{"enabled":true}}),
+        ] {
+            let mut body = original.clone();
+            let config = CopilotOptimizerConfig::from_settings(&settings);
+            let result = optimize_request(
+                &mut body,
+                &config,
+                &CopilotRequestMetadata {
+                    has_anthropic_beta: true,
+                    session_id: None,
+                },
+            );
+            assert_eq!(
+                body, original,
+                "default/header-only optimizer changed semantics: {settings}"
+            );
+            assert_eq!(result.model_source, None);
+            assert!(result
+                .headers
+                .iter()
+                .any(|(name, _)| *name == "editor-version"));
+        }
+    }
+
+    #[test]
+    fn beta_without_tools_is_not_permission_to_change_user_model() {
+        let original = json!({"model":"claude-sonnet-4.6-1m","messages":[
+            {"role":"user","content":"Explain this code"}
+        ]});
+        let mut body = original.clone();
+        let result = optimize_request(
+            &mut body,
+            &CopilotOptimizerConfig::default(),
+            &CopilotRequestMetadata {
+                has_anthropic_beta: true,
+                session_id: None,
+            },
+        );
+        assert_eq!(body, original);
+        assert_eq!(result.model_source, None);
+    }
+    #[test]
+    fn copilot_tool_validation_preserves_split_parallel_results_and_rejects_duplicates() {
+        let mut body = json!({"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Read","input":{}},{"type":"tool_use","id":"b","name":"Read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"b","content":"second"}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"first"}]}
+        ]});
+        assert!(validate_tool_results(&body).is_ok());
+        body["messages"][2]["content"][0]["tool_use_id"] = json!("b");
+        assert!(validate_tool_results(&body).is_err());
+        body["messages"][2]["content"][0]["tool_use_id"] = json!("");
+        assert!(validate_tool_results(&body).is_err());
     }
 }

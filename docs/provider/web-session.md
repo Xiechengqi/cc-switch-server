@@ -99,3 +99,15 @@ node scripts/audit/audit-web-session-registry.mjs --check --check-sources
 本地测试覆盖 Claude/Codex 流式与非流式响应、任意 transport 分块、固定 method/path/origin/Cookie、客户端头隔离、Set-Cookie 丢弃、严格终态失败、非终态 partial frame 后客户端取消仍为零重试/无 fallback、401/403 零重试、credential generation 轮换、runtime 漂移、Share 计费以及 tools/images/count_tokens 零上游。
 
 升为 visible/stable 或把 `live_pending` 改为真实通过仍需要 Grok 与 Perplexity 各自的真实订阅脱敏 receipt、撤销/过期 Cookie 行为、当前 model entitlement 和上游漂移复验；缺任一项都不得升级成熟度。
+
+
+## R5 WS-01 复核与 Cookie 验证修复（2026-11-10）
+
+`assets/contract/r5-web-sessions.json` 另行冻结 OmniRoute `443d66996d69d7ecf887fd61158404a3cca1b192` 的六份 committed source；旧双源 baseline 与其 observation 保留。四个 hidden/experimental Profile 的加密槽、Cookie family/分片上限、固定 origin、完整 scope、网页专属终态和显式重导入已按既有本仓回环复核。
+
+新增反例 `xx密钥=synthetic-value` 在实际 domain 源码旧实现上触发第 7 字节 UTF-8 切片 panic；安全前缀检查后，两种网页协议的非法名称均返回验证错误，合法 ASCII Cookie header 行为保持。参考 Bearer/JSON/裸值自动规范化、自动 clearance 刷新重试、Set-Cookie 轮换、文本模拟工具及跨 connection 会话恢复均不采纳。
+
+上游完整缓冲后才生成下游流，当前纯文本、无工具/图片/原生续接，usage 是本地估算；本轮没有启用逐 token 输出或新增模型接受性声明。真实四个 Profile 仍逐 scope live_pending，验证见增强文档 §22.18。
+
+
+R5 公共切片：Grok/Perplexity Web分别用两个固定计时标签，完整严格缓冲之后观察语义/终态；本地count_tokens不伪造send/headers或socket写成功。生产runtime在发送前为每个当前配置scope预留session/auth槽（总数最多1024，session id≤512字节），与进程父预算相连。401/403失效标记没有TTL/容量淘汰；降低父限额后已准入scope仍可写入失效标记，必须显式凭据/配置scope代际变化或删除才释放。容量拒绝为503且发生在发网前。通用task类型没有生产写入口，未新增任务或续接能力。公共合同见 `assets/contract/r5-shared-core.json`；四scope继续live_pending。

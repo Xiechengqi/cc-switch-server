@@ -2121,71 +2121,84 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_response_body_failure_does_not_try_fallback_endpoint() {
-        let broken_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let broken_address = broken_listener.local_addr().unwrap();
-        let broken_server = tokio::spawn(async move {
-            let (mut stream, _) = broken_listener.accept().await.unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).await.unwrap();
-            let body = r#"{"access_token":"rotated-access","refresh_token":"rotated-refresh""#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:X}\r\n{body}\r\nZZ\r\n",
-                body.len()
+        for provider_type in [ProviderType::ClaudeOAuth, ProviderType::CodexOAuth] {
+            let broken_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let broken_address = broken_listener.local_addr().unwrap();
+            let broken_server = tokio::spawn(async move {
+                let (mut stream, _) = broken_listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await.unwrap();
+                let body = r#"{"access_token":"rotated-access","refresh_token":"rotated-refresh""#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:X}\r\n{body}\r\nZZ\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+
+            let fallback_listener =
+                tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .unwrap();
+            let fallback_address = fallback_listener.local_addr().unwrap();
+            let fallback_requests = Arc::new(AtomicUsize::new(0));
+            let fallback_requests_for_route = Arc::clone(&fallback_requests);
+            let fallback = Router::new().route(
+                "/fallback",
+                post(move || {
+                    let requests = Arc::clone(&fallback_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "access_token": "must-not-be-used",
+                            "refresh_token": "must-not-be-used",
+                            "expires_in": 3600
+                        }))
+                    }
+                }),
             );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.shutdown().await.unwrap();
-        });
+            let fallback_server =
+                tokio::spawn(
+                    async move { axum::serve(fallback_listener, fallback).await.unwrap() },
+                );
 
-        let fallback_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            let mut account = account(
+                provider_type,
+                Some("expired"),
+                Some("body-failure-refresh-token"),
+                Some(1),
+            );
+            account.id = format!("body-failure-no-fallback-{}", provider_type.as_str());
+            let first = format!("http://{broken_address}/token");
+            let second = format!("http://{fallback_address}/fallback");
+            let urls = [first.as_str(), second.as_str()];
+            let error = execute_native_account_refresh_with_token_urls(
+                &reqwest::Client::new(),
+                &account,
+                3_000_000,
+                60_000,
+                Some(&urls),
+            )
             .await
-            .unwrap();
-        let fallback_address = fallback_listener.local_addr().unwrap();
-        let fallback_requests = Arc::new(AtomicUsize::new(0));
-        let fallback_requests_for_route = Arc::clone(&fallback_requests);
-        let fallback = Router::new().route(
-            "/fallback",
-            post(move || {
-                let requests = Arc::clone(&fallback_requests_for_route);
-                async move {
-                    requests.fetch_add(1, Ordering::SeqCst);
-                    Json(serde_json::json!({
-                        "access_token": "must-not-be-used",
-                        "refresh_token": "must-not-be-used",
-                        "expires_in": 3600
-                    }))
-                }
-            }),
-        );
-        let fallback_server =
-            tokio::spawn(async move { axum::serve(fallback_listener, fallback).await.unwrap() });
+            .unwrap_err();
 
-        let mut account = account(
-            ProviderType::ClaudeOAuth,
-            Some("expired"),
-            Some("body-failure-refresh-token"),
-            Some(1),
-        );
-        account.id = "body-failure-no-fallback".to_string();
-        let first = format!("http://{broken_address}/token");
-        let second = format!("http://{fallback_address}/fallback");
-        let urls = [first.as_str(), second.as_str()];
-        let error = execute_native_account_refresh_with_token_urls(
-            &reqwest::Client::new(),
-            &account,
-            3_000_000,
-            60_000,
-            Some(&urls),
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error.kind, OAuthErrorKind::Network);
-        assert!(!error.endpoint_fallback_safe);
-        assert_eq!(fallback_requests.load(Ordering::SeqCst), 0);
-        broken_server.await.unwrap();
-        fallback_server.abort();
+            assert_eq!(error.kind, OAuthErrorKind::Network);
+            assert!(!error.endpoint_fallback_safe);
+            assert!(
+                error.outcome_unknown,
+                "partial rotation cannot be retried: {provider_type:?}"
+            );
+            assert!(
+                error.immediate_relogin,
+                "uncertain credentials must be fenced: {provider_type:?}"
+            );
+            assert_eq!(fallback_requests.load(Ordering::SeqCst), 0);
+            broken_server.await.unwrap();
+            fallback_server.abort();
+        }
     }
 
     #[tokio::test]

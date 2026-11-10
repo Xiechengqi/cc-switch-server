@@ -21,9 +21,9 @@
 | Alibaba Coding Plan | Global/Singapore | Anthropic Messages | OpenAI Chat | unavailable |
 | MiniMax | China | Anthropic Messages | OpenAI Responses | MiniMax plan API |
 | MiniMax | Global | Anthropic Messages | OpenAI Responses | MiniMax plan API |
-| Volcengine Coding Plan | China/Beijing | Anthropic Messages | OpenAI Chat | Volcengine plan API |
-| Xiaomi MiMo Token Plan | China | Anthropic Messages | OpenAI Chat | unavailable |
-| Xiaomi MiMo Token Plan | Singapore | Anthropic Messages | OpenAI Chat | unavailable |
+| Volcengine Coding Plan | China/Beijing | Anthropic Messages | OpenAI Responses | Volcengine plan API |
+| Xiaomi MiMo Token Plan | China | Anthropic Messages | OpenAI Responses | unavailable |
+| Xiaomi MiMo Token Plan | Singapore | Anthropic Messages | OpenAI Responses | unavailable |
 
 同名模型不能跨 Family、region 或 Surface 外推。manifest 只从每个 Profile 明示的模型读取 context window 与 text/image modality；没有独立字段时 tools 固定为 `not_inferred_without_explicit_model_evidence`。例如 GLM-5.3 只在有 OpenAI Coding rail evidence 的 Zhipu Codex Profiles 发布，不自动进入 Claude 或 Qoder rail。
 
@@ -48,8 +48,27 @@ Ollama Cloud 不是 Account pool，也不是上述 20 个 `codingPlan` Profile�
 
 本地 fixture 已覆盖 exact method/path/header、optional schema drift、0..1 ratio、model/body bounds、redirect、错误脱敏、partial/stale、认证清理、Bundle single-flight、删除和 generation rotation。可选 `cargo test ollama_cloud_live_account_usage_from_env -- --ignored` 需要真实 `OLLAMA_API_KEY`；缺少 Key 或未执行推理、目录、usage 与错误验收时仍为 `live_pending`。
 
+### R5 effort 兼容边界
+
+Claude Messages、Codex Responses 与 Chat 的 Ollama Cloud 桥接统一处理显式 effort：`ultra` / `xhigh` → `max`、`minimal` → `low`、`none` / `off` / `disabled` → `none`；`low` / `medium` / `high` / `max` 保留。大小写与首尾空白可规范化，缺省或空字符串不注入 effort。未知值、类型错误及相互冲突的控制在发往上游前返回 400，显式关闭不能被当成缺省。
+
+这些 alias 只表达请求转换，不证明 Cloud 的每个模型支持 max。官方本地 runner 的 Harmony 降档依赖模型配置与模板，本仓不凭 `gpt-oss` 字符串降低 effort，也不更换模型；上游拒绝时按既有错误合同返回，不降档重发。官方工具、length 终态与 token/cache usage 保留。三条 Cloud 入站均要求非空字符串 `finish_reason` 后的 `[DONE]`，缺失或非法终态、重复 `[DONE]` 和同批终态后数据均按失败结束；Claude 终态等到 `[DONE]` 才发布，保留其前的官方 usage。取消按既有状态码合同记录 client_cancelled 并释放上游 owner，不重放。冻结来源和合成差分见 `assets/contract/r5-ollama-cloud.json`，真实 Cloud 接受性仍 `live_pending`。
+
 ## 真实验收
 
 每个 region × Surface 至少需要一份独立脱敏 receipt，包含 Profile id、region、model、固定 origin/path 摘要、non-stream/stream、terminal、usage/quota state、HTTP/outcome 和 credential generation 是否稳定；不能保存 Key、raw body 或用户内容。
 
 验收还必须覆盖错误 Key、429、5xx、坏/超大/截断 stream、Provider revision 与 credential rotation，并断言另一个 region、Surface、Provider 和任何 Account 的请求数为零。quota 为 `unavailable` 的 Profile 只验收诚实状态，不得临时抓 Cookie 或借用 PAYG/控制台余额。真实输入未齐备前，manifest 与报告必须继续标记 `fixture_verified` / `live_pending`。
+
+
+## R5 ST-01 静态 Profile 矩阵与 Bedrock 响应边界
+
+`assets/contract/r5-static-profiles.json` 固定 26 个 Profile：Bedrock AK/SK 与 Bearer 各一、Nvidia/DeepSeek API 各两个 App，以及 20 个 codingPlan。审计将其与真实 Registry 的 app、origin/template、密钥槽、modelPolicy、driver、Bundle scope 和完整 codingPlan 合同交叉核对，并读取 Rust 的固定 origin 常量。旧 codingPlan 来源基线仍保留原提交，不冒称已对 R5 最新外仓重新全面审计。
+
+两个实际 adapter 反例证明原 typed Bedrock 将 Converse JSON 原样交给 Claude，且未拒绝缺失终态/非法 usage。现将 Converse JSON 与 AWS EventStream 转为 Claude 形状，保留工具、thinking/signature、redacted thinking 与已观察 cache counters；请求中的 opaque thinking 历史及显式 thinking/top_k 保留，不替模型决定支持性。SigV4 的 date/region/service 与最终唯一 headers 保持既有合同；Bearer 与 AK/SK 独立配置，不互借、不 refresh。Claude DeepSeek API 修正为固定 `https://api.deepseek.com/anthropic/v1/messages`，Codex 保持 `/v1/chat/completions`；两者都不借 Web bearer。
+
+合法 `model_context_window_exceeded` 原样保留；显式 stop sequences 请求对应额外响应字段，已观察 `stop_sequence` 原样返回，未观察的不猜。malformed model/tool 终态明确失败。
+
+Bedrock streaming 校验 prelude/message CRC、帧/工具/状态顺序，必须取得 messageStop、合法 metadata usage 及完整 EOF 后才发布成功。异常不补成功，不跳损坏帧；未知内容或不完整工具参数明确失败。message_start 的零 usage 是流式占位，最终 metadata 才是已观察计数；缺失 cache 字段不编零。单帧 1 MiB、header 4 KiB、最多 128 block、单工具流参数 1 MiB，framing/header map/JSON 分配前保守预留工作集，解析/索引/输出受请求与父预算约束；帧上限不保证较小请求预算一定准入。取消释放实际 decoder/upstream owner，normalized Bytes 的预算随最后 clone/slice 释放。
+
+本仓路径/转换/错误/资源验证与共享桥接测试不证明任何地区、模型、凭据 rail 已获厂商接受。26 个 Profile 各自真实权限、工具/媒体/usage/配额回执仍 live_pending；现有 MetadataOnly Account 不复制 Provider 私钥作为第二份推理权威。实际验证将在增强文档 §22.17 记录。

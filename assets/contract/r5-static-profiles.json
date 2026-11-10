@@ -1,0 +1,3021 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "static_profiles",
+  "liveState": "live_pending",
+  "reference": {
+    "use": "read_only_committed_source_and_public_schema_only_never_external_test_or_runtime_dependencies",
+    "realReceipt": false,
+    "codingPlanBaseline": {
+      "file": "assets/contract/coding-plan-source-baseline.json",
+      "sha256": "8bf2f22ed2bfb3fe8c37bc698bc8282396174859ac91615f2403611834ad59c0",
+      "review": "existing historical pins retained; no claim of a fresh full R5 source comparison",
+      "commits": {
+        "omniroute": "b342c1a361f2f72293b6ce853024c4198cd3f0ff",
+        "9router": "90b52e06ffd666b7929554211474d01588f6b1f8"
+      }
+    },
+    "publicSchemas": [
+      {
+        "url": "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html",
+        "sha256": "0f1d5d90695d74bc88c7331fd2c64e5e3251f2bf6861da87b4047ff0b354a536",
+        "bytes": 83177,
+        "use": "schema_evidence_only_no_live_provider_receipt"
+      },
+      {
+        "url": "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html",
+        "sha256": "666c8a39d78a68d89493c683339fd2cc269ace8fcbd18162edc6e9667eb2d91b",
+        "bytes": 84457,
+        "use": "schema_evidence_only_no_live_provider_receipt"
+      },
+      {
+        "url": "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_TokenUsage.html",
+        "sha256": "99c8db6357c883d5b41bb3ec3bf24e18ae5a481bf441af55f432b5276340b1b8",
+        "bytes": 15308,
+        "use": "schema_evidence_only_no_live_provider_receipt"
+      },
+      {
+        "url": "https://smithy.io/2.0/aws/amazon-eventstream.html",
+        "sha256": "b8b8e8bb0de471c95f9d7a6a98ee5904b1149219588509dfe4b0ce24c186d077",
+        "bytes": 73063,
+        "use": "schema_evidence_only_no_live_provider_receipt"
+      }
+    ],
+    "rejectedReferencePolicy": "Converse exceptions or raw EOF must not synthesize finish/[DONE]; do not copy tool-history pruning or infer OAuth rights"
+  },
+  "scope": {
+    "apps": [
+      "claude",
+      "codex"
+    ],
+    "profiles": 26,
+    "codingPlans": 20,
+    "credentialRail": "one explicitly configured Provider-owned static credential generation; metadata-only Accounts never supply or duplicate inference secrets",
+    "liveReceiptScope": "each product/region/App/credential rail is independent; shared bridge tests are not vendor acceptance"
+  },
+  "localPolicy": {
+    "crossScopeFallback": false,
+    "fakeRefresh": false,
+    "productionWireChanged": true,
+    "deepseekApiClaudePath": "/anthropic/v1/messages",
+    "deepseekApiCodexPath": "/v1/chat/completions",
+    "bedrock": {
+      "request": "Converse with model path and final SigV4 or explicit Bearer rail; signed/redacted thinking history preserved",
+      "streamTerminal": "messageStop plus valid metadata usage plus complete EOF; no success before all three",
+      "exceptions": "fixed status and sanitized text; never skipped or converted to success",
+      "maxFrameBytes": 1048576,
+      "maxStreamBlocks": 128,
+      "maxStreamToolArgumentBytes": 1048576,
+      "memory": "request and process parent charged before framing/header-map/JSON growth with conservative working-set admission; decoder/source follow cancellation, normalized Bytes follow last clone/slice; per-frame caps do not guarantee a smaller request budget admits every frame; complete accumulated tool JSON has a separate pre-parse reservation; terminal success encoding is admitted before moving observed fields, including JSON escaping and Vec growth",
+      "initialUsage": "message_start zero is a streaming placeholder; final metadata supplies observed counters; missing cache fields stay unknown",
+      "terminalReasons": "preserve model_context_window_exceeded and observed stop_sequence; malformed_model_output/tool_use fail closed",
+      "maxHeaderBytes": 4096,
+      "httpErrorBodies": "fixed sanitized payload on the ordinary error path and shared HTTP 429 early return; retain rate-limit observations before redaction and never carry upstream Content-Encoding"
+    },
+    "quota": "existing exact-scope adapters or honest unavailable; no console Cookie or PAYG borrowing",
+    "performanceClaim": false
+  },
+  "cases": [
+    {
+      "id": "26-runtime-plans-exact-scopes",
+      "tests": [
+        "static_r5_all_26_profiles_compile_exact_rails_models_auth_and_routes"
+      ]
+    },
+    {
+      "id": "provider-owned-static-secrets",
+      "tests": [
+        "metadata_account_does_not_supply_static_provider_auth",
+        "static_auth_reads_only_declared_runtime_slots",
+        "static_auth_rejects_conflicting_runtime_slots"
+      ]
+    },
+    {
+      "id": "bedrock-final-sigv4",
+      "tests": [
+        "typed_bedrock_final_sigv4_headers_are_unique",
+        "typed_bedrock_pipeline_converts_and_signs_only_at_protocol_boundary",
+        "bedrock_sigv4_plan_normalizes_region_scope_and_redaction_without_native_enablement"
+      ]
+    },
+    {
+      "id": "bedrock-converse-json",
+      "tests": [
+        "bedrock_r5_converse_json_is_a_claude_message_on_both_static_rails",
+        "bedrock_r5_converse_json_requires_an_official_terminal_and_valid_usage",
+        "bedrock_r5_json_preserves_reasoning_tools_and_observed_cache_counters",
+        "bedrock_r5_legal_context_limit_and_observed_stop_sequence_are_not_forged_or_lost"
+      ]
+    },
+    {
+      "id": "bedrock-opaque-history",
+      "tests": [
+        "bedrock_r5_request_keeps_opaque_thinking_history_and_explicit_model_fields"
+      ]
+    },
+    {
+      "id": "bedrock-eventstream-boundaries",
+      "tests": [
+        "bedrock_r5_stream_handles_every_byte_boundary_and_delays_success_until_eof",
+        "bedrock_r5_stream_preserves_signed_thinking_and_fragmented_tool_arguments",
+        "bedrock_r5_bearer_actual_forwarder_normalizes_json_and_fragmented_eventstream"
+      ]
+    },
+    {
+      "id": "bedrock-fail-closed",
+      "tests": [
+        "bedrock_r5_stream_rejects_crc_truncation_missing_terminal_and_post_terminal_data",
+        "bedrock_r5_stream_exception_is_sanitized_and_never_a_success_terminal",
+        "bedrock_r5_stream_rejects_bad_tools_indices_usage_and_unknown_content",
+        "bedrock_r5_http_errors_and_corrupt_stream_never_replay_or_leak_provider_payload"
+      ]
+    },
+    {
+      "id": "bedrock-actual-memory-owners",
+      "tests": [
+        "bedrock_r5_normalized_output_and_decoder_charge_their_actual_last_owners",
+        "bedrock_r5_cancellation_releases_pending_frame_and_source_without_replay",
+        "bedrock_r5_memory_refusal_precedes_upstream_poll",
+        "bedrock_r5_completed_tool_json_parse_is_admitted_before_allocating_the_object",
+        "bedrock_r5_terminal_encoding_is_admitted_before_moving_observed_fields"
+      ]
+    },
+    {
+      "id": "coding-plan-quota-and-region",
+      "tests": [
+        "contract_rejects_cross_app_routes_and_auxiliary_inference_slots",
+        "coding_plan_quota_credentials_do_not_satisfy_the_inference_slot",
+        "quota_cache_is_exact_across_revision_generation_and_runtime",
+        "coding_plan_quota_reports_mimo_as_contract_unavailable_without_network"
+      ]
+    },
+    {
+      "id": "nvidia-deepseek-shared-protocol-boundary",
+      "tests": [
+        "claude_nvidia_contract_uses_openai_chat_transform",
+        "codex_responses_to_non_ollama_openai_chat_preserves_xhigh_reasoning_effort",
+        "gemini_cross_protocol_to_openai_preserves_content_tools_usage_and_terminal"
+      ]
+    }
+  ],
+  "profiles": [
+    {
+      "profileId": "claude.aws_bedrock_aksk",
+      "app": "claude",
+      "providerType": "aws_bedrock",
+      "endpointPolicy": "template",
+      "originTemplate": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "aws.bedrock_sigv4"
+      },
+      "credentialPolicy": {
+        "mode": "aws",
+        "slots": [
+          "access_key_id",
+          "secret_access_key",
+          "session_token"
+        ]
+      },
+      "modelPolicy": "single",
+      "allowedModelPolicies": [
+        "single",
+        "passthrough"
+      ],
+      "defaultUpstreamModel": "global.anthropic.claude-opus-4-8",
+      "codingPlan": null
+    },
+    {
+      "profileId": "claude.aws_bedrock_api_key",
+      "app": "claude",
+      "providerType": "aws_bedrock",
+      "endpointPolicy": "template",
+      "originTemplate": "https://bedrock-runtime.${AWS_REGION}.amazonaws.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.bedrock_bearer"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "api_key"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "single",
+      "allowedModelPolicies": [
+        "single",
+        "passthrough"
+      ],
+      "defaultUpstreamModel": "global.anthropic.claude-opus-4-8",
+      "codingPlan": null
+    },
+    {
+      "profileId": "claude.bailian_coding_plan_cn",
+      "app": "claude",
+      "providerType": "claude",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://coding.dashscope.aliyuncs.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.anthropic_messages"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "api_key"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://coding.dashscope.aliyuncs.com",
+          "protocol": "anthropic_messages",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "api_key"
+        },
+        "routes": [
+          {
+            "route": "claude_messages",
+            "path": "/apps/anthropic/v1/messages"
+          },
+          {
+            "route": "claude_count_tokens",
+            "path": "/apps/anthropic/v1/messages/count_tokens"
+          }
+        ],
+        "models": [
+          {
+            "id": "qwen3.8-max-preview",
+            "displayName": "Qwen3.8 Max Preview",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "qwen3.7-max",
+            "displayName": "Qwen3.7 Max",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "qwen3.7-plus",
+            "displayName": "Qwen3.7 Plus",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "qwen3.6-flash",
+            "displayName": "Qwen3.6 Flash",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-5.2",
+            "displayName": "GLM-5.2",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "deepseek-v4-pro",
+            "displayName": "DeepSeek V4 Pro",
+            "contextWindow": 163840,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "qwen3-coder-plus",
+            "displayName": "Qwen3 Coder Plus",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "unavailable",
+          "credentialSlots": [],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_excludes_cached",
+        "stream": {
+          "format": "anthropic_sse",
+          "terminalEvent": "message_stop",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "anthropic",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute Bailian regional Anthropic contract",
+          "capturedAt": "2026-08-23T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "claude.bailian_coding_plan_global",
+      "app": "claude",
+      "providerType": "claude",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://coding-intl.dashscope.aliyuncs.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.anthropic_messages"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "api_key"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://coding-intl.dashscope.aliyuncs.com",
+          "protocol": "anthropic_messages",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "api_key"
+        },
+        "routes": [
+          {
+            "route": "claude_messages",
+            "path": "/apps/anthropic/v1/messages"
+          },
+          {
+            "route": "claude_count_tokens",
+            "path": "/apps/anthropic/v1/messages/count_tokens"
+          }
+        ],
+        "models": [
+          {
+            "id": "qwen3.8-max-preview",
+            "displayName": "Qwen3.8 Max Preview",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "qwen3.7-max",
+            "displayName": "Qwen3.7 Max",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "qwen3.7-plus",
+            "displayName": "Qwen3.7 Plus",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "qwen3.6-flash",
+            "displayName": "Qwen3.6 Flash",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-5.2",
+            "displayName": "GLM-5.2",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "deepseek-v4-pro",
+            "displayName": "DeepSeek V4 Pro",
+            "contextWindow": 163840,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "qwen3-coder-plus",
+            "displayName": "Qwen3 Coder Plus",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "unavailable",
+          "credentialSlots": [],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_excludes_cached",
+        "stream": {
+          "format": "anthropic_sse",
+          "terminalEvent": "message_stop",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "anthropic",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute Bailian regional Anthropic contract",
+          "capturedAt": "2026-08-23T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "claude.deepseek_api",
+      "app": "claude",
+      "providerType": "deepseek_api",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://api.deepseek.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.anthropic_messages"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "api_key"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "single",
+      "allowedModelPolicies": [
+        "single",
+        "passthrough"
+      ],
+      "defaultUpstreamModel": "deepseek-v4-flash",
+      "codingPlan": null
+    },
+    {
+      "profileId": "claude.kimi_coding_api_key",
+      "app": "claude",
+      "providerType": "claude",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://api.kimi.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.anthropic_messages"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "api_key"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://api.kimi.com",
+          "protocol": "anthropic_messages",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "api_key"
+        },
+        "routes": [
+          {
+            "route": "claude_messages",
+            "path": "/coding/v1/messages"
+          },
+          {
+            "route": "claude_count_tokens",
+            "path": "/coding/v1/messages/count_tokens"
+          }
+        ],
+        "models": [
+          {
+            "id": "kimi-for-coding",
+            "displayName": "Kimi For Coding",
+            "contextWindow": 262144,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "kimi",
+          "endpoint": "https://api.kimi.com/coding/v1/usages",
+          "credentialSlots": [
+            {
+              "role": "inference_credential",
+              "slot": "/settingsConfig/apiKey"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_excludes_cached",
+        "stream": {
+          "format": "anthropic_sse",
+          "terminalEvent": "message_stop",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "anthropic",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute Kimi Coding API-key rail and usage contract",
+          "capturedAt": "2026-08-13T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "claude.minimax_cn",
+      "app": "claude",
+      "providerType": "claude",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://api.minimaxi.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.anthropic_messages"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 2,
+        "inference": {
+          "fixedOrigin": "https://api.minimaxi.com",
+          "protocol": "anthropic_messages",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "claude_messages",
+            "path": "/anthropic/v1/messages"
+          },
+          {
+            "route": "claude_count_tokens",
+            "path": "/anthropic/v1/messages/count_tokens"
+          }
+        ],
+        "models": [
+          {
+            "id": "MiniMax-M3",
+            "displayName": "MiniMax-M3",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.7",
+            "displayName": "MiniMax-M2.7",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.7-highspeed",
+            "displayName": "MiniMax-M2.7 Highspeed",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.5",
+            "displayName": "MiniMax-M2.5",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.5-highspeed",
+            "displayName": "MiniMax-M2.5 Highspeed",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "minimax",
+          "endpoint": "https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains",
+          "credentialSlots": [
+            {
+              "role": "inference_credential",
+              "slot": "/settingsConfig/apiKey"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_excludes_cached",
+        "stream": {
+          "format": "anthropic_sse",
+          "terminalEvent": "message_stop",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "anthropic",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute MiniMax registry and quota contracts",
+          "capturedAt": "2026-08-14T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "claude.minimax_global",
+      "app": "claude",
+      "providerType": "claude",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://api.minimax.io",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.anthropic_messages"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 2,
+        "inference": {
+          "fixedOrigin": "https://api.minimax.io",
+          "protocol": "anthropic_messages",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "claude_messages",
+            "path": "/anthropic/v1/messages"
+          },
+          {
+            "route": "claude_count_tokens",
+            "path": "/anthropic/v1/messages/count_tokens"
+          }
+        ],
+        "models": [
+          {
+            "id": "MiniMax-M3",
+            "displayName": "MiniMax-M3",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.7",
+            "displayName": "MiniMax-M2.7",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.7-highspeed",
+            "displayName": "MiniMax-M2.7 Highspeed",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.5",
+            "displayName": "MiniMax-M2.5",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.5-highspeed",
+            "displayName": "MiniMax-M2.5 Highspeed",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "minimax",
+          "endpoint": "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
+          "credentialSlots": [
+            {
+              "role": "inference_credential",
+              "slot": "/settingsConfig/apiKey"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_excludes_cached",
+        "stream": {
+          "format": "anthropic_sse",
+          "terminalEvent": "message_stop",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "anthropic",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute MiniMax registry and quota contracts",
+          "capturedAt": "2026-08-14T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "claude.nvidia",
+      "app": "claude",
+      "providerType": "nvidia",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://integrate.api.nvidia.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_chat"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "api_key"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "single",
+      "allowedModelPolicies": [
+        "single",
+        "passthrough"
+      ],
+      "defaultUpstreamModel": "moonshotai/kimi-k2.5",
+      "codingPlan": null
+    },
+    {
+      "profileId": "claude.volcengine_coding_plan",
+      "app": "claude",
+      "providerType": "claude",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://ark.cn-beijing.volces.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.anthropic_messages"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey",
+          "/settingsConfig/env/VOLC_ACCESS_KEY_ID",
+          "/settingsConfig/env/VOLC_SECRET_ACCESS_KEY"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://ark.cn-beijing.volces.com",
+          "protocol": "anthropic_messages",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "claude_messages",
+            "path": "/api/coding/v1/messages"
+          },
+          {
+            "route": "claude_count_tokens",
+            "path": "/api/coding/v1/messages/count_tokens"
+          }
+        ],
+        "models": [
+          {
+            "id": "ark-code-latest",
+            "displayName": "Ark Code Latest",
+            "contextWindow": 256000,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "volcengine",
+          "endpoint": "https://open.volcengineapi.com/",
+          "credentialSlots": [
+            {
+              "role": "access_key_id",
+              "slot": "/settingsConfig/env/VOLC_ACCESS_KEY_ID"
+            },
+            {
+              "role": "secret_access_key",
+              "slot": "/settingsConfig/env/VOLC_SECRET_ACCESS_KEY"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_excludes_cached",
+        "stream": {
+          "format": "anthropic_sse",
+          "terminalEvent": "message_stop",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "anthropic",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute Volcengine fixed Coding Plan endpoint and quota contract",
+          "capturedAt": "2026-08-13T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "claude.xiaomi_mimo_token_plan",
+      "app": "claude",
+      "providerType": "claude",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://token-plan-cn.xiaomimimo.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.anthropic_messages"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://token-plan-cn.xiaomimimo.com",
+          "protocol": "anthropic_messages",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "claude_messages",
+            "path": "/anthropic/v1/messages"
+          },
+          {
+            "route": "claude_count_tokens",
+            "path": "/anthropic/v1/messages/count_tokens"
+          }
+        ],
+        "models": [
+          {
+            "id": "mimo-v2.5-pro",
+            "displayName": "MiMo V2.5 Pro",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "mimo-v2.5",
+            "displayName": "MiMo V2.5",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "unavailable",
+          "credentialSlots": [],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_excludes_cached",
+        "stream": {
+          "format": "anthropic_sse",
+          "terminalEvent": "message_stop",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "anthropic",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute Xiaomi Token Plan endpoint and quota limitation review",
+          "capturedAt": "2026-08-14T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "claude.xiaomi_mimo_token_plan_sgp",
+      "app": "claude",
+      "providerType": "claude",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://token-plan-sgp.xiaomimimo.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.anthropic_messages"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "api_key"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://token-plan-sgp.xiaomimimo.com",
+          "protocol": "anthropic_messages",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "api_key"
+        },
+        "routes": [
+          {
+            "route": "claude_messages",
+            "path": "/anthropic/v1/messages"
+          },
+          {
+            "route": "claude_count_tokens",
+            "path": "/anthropic/v1/messages/count_tokens"
+          }
+        ],
+        "models": [
+          {
+            "id": "mimo-v2.5-pro",
+            "displayName": "MiMo V2.5 Pro",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "mimo-v2.5",
+            "displayName": "MiMo V2.5",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "unavailable",
+          "credentialSlots": [],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_excludes_cached",
+        "stream": {
+          "format": "anthropic_sse",
+          "terminalEvent": "message_stop",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "anthropic",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute Singapore Token Plan fixed endpoint and quota limitation review",
+          "capturedAt": "2026-08-14T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "claude.zhipu_glm_cn",
+      "app": "claude",
+      "providerType": "claude",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://open.bigmodel.cn",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.anthropic_messages"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "api_key"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 2,
+        "inference": {
+          "fixedOrigin": "https://open.bigmodel.cn",
+          "protocol": "anthropic_messages",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "api_key"
+        },
+        "routes": [
+          {
+            "route": "claude_messages",
+            "path": "/api/anthropic/v1/messages"
+          },
+          {
+            "route": "claude_count_tokens",
+            "path": "/api/anthropic/v1/messages/count_tokens"
+          }
+        ],
+        "models": [
+          {
+            "id": "glm-5.2",
+            "displayName": "GLM-5.2",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5.1",
+            "displayName": "GLM-5.1",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5",
+            "displayName": "GLM-5",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5-turbo",
+            "displayName": "GLM-5 Turbo",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.7-flash",
+            "displayName": "GLM-4.7 Flash",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.7",
+            "displayName": "GLM-4.7",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.6v",
+            "displayName": "GLM-4.6V",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-4.6",
+            "displayName": "GLM-4.6",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.5v",
+            "displayName": "GLM-4.5V",
+            "contextWindow": 16000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-4.5",
+            "displayName": "GLM-4.5",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.5-air",
+            "displayName": "GLM-4.5 Air",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "zhipu",
+          "endpoint": "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+          "credentialSlots": [
+            {
+              "role": "inference_credential",
+              "slot": "/settingsConfig/apiKey"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_excludes_cached",
+        "stream": {
+          "format": "anthropic_sse",
+          "terminalEvent": "message_stop",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "anthropic",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute GLM registry and usage contracts",
+          "capturedAt": "2026-08-14T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "claude.zhipu_glm_global",
+      "app": "claude",
+      "providerType": "claude",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://api.z.ai",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.anthropic_messages"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "api_key"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 2,
+        "inference": {
+          "fixedOrigin": "https://api.z.ai",
+          "protocol": "anthropic_messages",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "api_key"
+        },
+        "routes": [
+          {
+            "route": "claude_messages",
+            "path": "/api/anthropic/v1/messages"
+          },
+          {
+            "route": "claude_count_tokens",
+            "path": "/api/anthropic/v1/messages/count_tokens"
+          }
+        ],
+        "models": [
+          {
+            "id": "glm-5.2",
+            "displayName": "GLM-5.2",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5.1",
+            "displayName": "GLM-5.1",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5",
+            "displayName": "GLM-5",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5-turbo",
+            "displayName": "GLM-5 Turbo",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.7-flash",
+            "displayName": "GLM-4.7 Flash",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.7",
+            "displayName": "GLM-4.7",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.6v",
+            "displayName": "GLM-4.6V",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-4.6",
+            "displayName": "GLM-4.6",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.5v",
+            "displayName": "GLM-4.5V",
+            "contextWindow": 16000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-4.5",
+            "displayName": "GLM-4.5",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.5-air",
+            "displayName": "GLM-4.5 Air",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "zhipu",
+          "endpoint": "https://api.z.ai/api/monitor/usage/quota/limit",
+          "credentialSlots": [
+            {
+              "role": "inference_credential",
+              "slot": "/settingsConfig/apiKey"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_excludes_cached",
+        "stream": {
+          "format": "anthropic_sse",
+          "terminalEvent": "message_stop",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "anthropic",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute GLM registry and usage contracts",
+          "capturedAt": "2026-08-14T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "codex.bailian_coding_plan_cn",
+      "app": "codex",
+      "providerType": "codex",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://coding.dashscope.aliyuncs.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_chat"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://coding.dashscope.aliyuncs.com",
+          "protocol": "open_ai_chat",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "codex_chat_completions",
+            "path": "/v1/chat/completions"
+          },
+          {
+            "route": "codex_responses",
+            "path": "/v1/chat/completions"
+          }
+        ],
+        "models": [
+          {
+            "id": "qwen3.5-plus",
+            "displayName": "Qwen3.5 Plus",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "kimi-k2.5",
+            "displayName": "Kimi K2.5",
+            "contextWindow": 164000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-5",
+            "displayName": "GLM-5",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.5",
+            "displayName": "MiniMax-M2.5",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "qwen3-max-2026-01-23",
+            "displayName": "Qwen3 Max",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "qwen3-coder-next",
+            "displayName": "Qwen3 Coder Next",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "qwen3-coder-plus",
+            "displayName": "Qwen3 Coder Plus",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.7",
+            "displayName": "GLM-4.7",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "unavailable",
+          "credentialSlots": [],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_includes_cached",
+        "stream": {
+          "format": "open_ai_chat_sse",
+          "terminalEvent": "[DONE]",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "open_ai",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "9router Alibaba Coding Chat catalog",
+          "capturedAt": "2026-08-23T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "codex.bailian_coding_plan_global",
+      "app": "codex",
+      "providerType": "codex",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://coding-intl.dashscope.aliyuncs.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_chat"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://coding-intl.dashscope.aliyuncs.com",
+          "protocol": "open_ai_chat",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "codex_chat_completions",
+            "path": "/v1/chat/completions"
+          },
+          {
+            "route": "codex_responses",
+            "path": "/v1/chat/completions"
+          }
+        ],
+        "models": [
+          {
+            "id": "qwen3.5-plus",
+            "displayName": "Qwen3.5 Plus",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "kimi-k2.5",
+            "displayName": "Kimi K2.5",
+            "contextWindow": 164000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-5",
+            "displayName": "GLM-5",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.5",
+            "displayName": "MiniMax-M2.5",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "qwen3-coder-next",
+            "displayName": "Qwen3 Coder Next",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "qwen3-coder-plus",
+            "displayName": "Qwen3 Coder Plus",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.7",
+            "displayName": "GLM-4.7",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "unavailable",
+          "credentialSlots": [],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_includes_cached",
+        "stream": {
+          "format": "open_ai_chat_sse",
+          "terminalEvent": "[DONE]",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "open_ai",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "9router Alibaba Coding Chat catalog and OmniRoute regional endpoint review",
+          "capturedAt": "2026-08-23T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "codex.deepseek_api",
+      "app": "codex",
+      "providerType": "deepseek_api",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://api.deepseek.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_chat"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "api_key"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "single",
+      "allowedModelPolicies": [
+        "single",
+        "passthrough"
+      ],
+      "defaultUpstreamModel": "deepseek-v4-flash",
+      "codingPlan": null
+    },
+    {
+      "profileId": "codex.kimi_coding_api_key",
+      "app": "codex",
+      "providerType": "codex",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://api.kimi.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_chat"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://api.kimi.com",
+          "protocol": "open_ai_chat",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "codex_chat_completions",
+            "path": "/coding/v1/chat/completions"
+          },
+          {
+            "route": "codex_responses",
+            "path": "/coding/v1/chat/completions"
+          }
+        ],
+        "models": [
+          {
+            "id": "kimi-for-coding",
+            "displayName": "Kimi For Coding",
+            "contextWindow": 262144,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "kimi",
+          "endpoint": "https://api.kimi.com/coding/v1/usages",
+          "credentialSlots": [
+            {
+              "role": "inference_credential",
+              "slot": "/settingsConfig/apiKey"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_includes_cached",
+        "stream": {
+          "format": "open_ai_chat_sse",
+          "terminalEvent": "[DONE]",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "open_ai",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute Kimi Coding API-key rail and usage contract",
+          "capturedAt": "2026-08-13T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "codex.minimax_cn",
+      "app": "codex",
+      "providerType": "codex",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://api.minimaxi.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_responses"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 2,
+        "inference": {
+          "fixedOrigin": "https://api.minimaxi.com",
+          "protocol": "open_ai_responses",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "codex_responses",
+            "path": "/v1/responses"
+          }
+        ],
+        "models": [
+          {
+            "id": "MiniMax-M3",
+            "displayName": "MiniMax-M3",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.7",
+            "displayName": "MiniMax-M2.7",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.7-highspeed",
+            "displayName": "MiniMax-M2.7 Highspeed",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.5",
+            "displayName": "MiniMax-M2.5",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.5-highspeed",
+            "displayName": "MiniMax-M2.5 Highspeed",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "minimax",
+          "endpoint": "https://api.minimaxi.com/v1/api/openplatform/coding_plan/remains",
+          "credentialSlots": [
+            {
+              "role": "inference_credential",
+              "slot": "/settingsConfig/apiKey"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_includes_cached",
+        "stream": {
+          "format": "open_ai_responses_sse",
+          "terminalEvent": "response.completed",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "open_ai",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute MiniMax registry and quota contracts",
+          "capturedAt": "2026-08-14T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "codex.minimax_global",
+      "app": "codex",
+      "providerType": "codex",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://api.minimax.io",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_responses"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 2,
+        "inference": {
+          "fixedOrigin": "https://api.minimax.io",
+          "protocol": "open_ai_responses",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "codex_responses",
+            "path": "/v1/responses"
+          }
+        ],
+        "models": [
+          {
+            "id": "MiniMax-M3",
+            "displayName": "MiniMax-M3",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.7",
+            "displayName": "MiniMax-M2.7",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.7-highspeed",
+            "displayName": "MiniMax-M2.7 Highspeed",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.5",
+            "displayName": "MiniMax-M2.5",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "MiniMax-M2.5-highspeed",
+            "displayName": "MiniMax-M2.5 Highspeed",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "minimax",
+          "endpoint": "https://api.minimax.io/v1/api/openplatform/coding_plan/remains",
+          "credentialSlots": [
+            {
+              "role": "inference_credential",
+              "slot": "/settingsConfig/apiKey"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_includes_cached",
+        "stream": {
+          "format": "open_ai_responses_sse",
+          "terminalEvent": "response.completed",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "open_ai",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute MiniMax registry and quota contracts",
+          "capturedAt": "2026-08-14T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "codex.nvidia",
+      "app": "codex",
+      "providerType": "nvidia",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://integrate.api.nvidia.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_chat"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "api_key"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "single",
+      "allowedModelPolicies": [
+        "single",
+        "passthrough"
+      ],
+      "defaultUpstreamModel": "moonshotai/kimi-k2.5",
+      "codingPlan": null
+    },
+    {
+      "profileId": "codex.volcengine_coding_plan",
+      "app": "codex",
+      "providerType": "codex",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://ark.cn-beijing.volces.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_responses"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey",
+          "/settingsConfig/env/VOLC_ACCESS_KEY_ID",
+          "/settingsConfig/env/VOLC_SECRET_ACCESS_KEY"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://ark.cn-beijing.volces.com",
+          "protocol": "open_ai_responses",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "codex_responses",
+            "path": "/api/coding/v3/responses"
+          }
+        ],
+        "models": [
+          {
+            "id": "ark-code-latest",
+            "displayName": "Ark Code Latest",
+            "contextWindow": 256000,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "volcengine",
+          "endpoint": "https://open.volcengineapi.com/",
+          "credentialSlots": [
+            {
+              "role": "access_key_id",
+              "slot": "/settingsConfig/env/VOLC_ACCESS_KEY_ID"
+            },
+            {
+              "role": "secret_access_key",
+              "slot": "/settingsConfig/env/VOLC_SECRET_ACCESS_KEY"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_includes_cached",
+        "stream": {
+          "format": "open_ai_responses_sse",
+          "terminalEvent": "response.completed",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "open_ai",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute Volcengine fixed Coding Plan endpoint and quota contract",
+          "capturedAt": "2026-08-13T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "codex.xiaomi_mimo_token_plan",
+      "app": "codex",
+      "providerType": "codex",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://token-plan-cn.xiaomimimo.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_responses"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://token-plan-cn.xiaomimimo.com",
+          "protocol": "open_ai_responses",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "codex_responses",
+            "path": "/v1/responses"
+          }
+        ],
+        "models": [
+          {
+            "id": "mimo-v2.5-pro",
+            "displayName": "MiMo V2.5 Pro",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "mimo-v2.5",
+            "displayName": "MiMo V2.5",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "unavailable",
+          "credentialSlots": [],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_includes_cached",
+        "stream": {
+          "format": "open_ai_responses_sse",
+          "terminalEvent": "response.completed",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "open_ai",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute Xiaomi Token Plan endpoint and quota limitation review",
+          "capturedAt": "2026-08-14T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "codex.xiaomi_mimo_token_plan_sgp",
+      "app": "codex",
+      "providerType": "codex",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://token-plan-sgp.xiaomimimo.com",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_responses"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 1,
+        "inference": {
+          "fixedOrigin": "https://token-plan-sgp.xiaomimimo.com",
+          "protocol": "open_ai_responses",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "codex_responses",
+            "path": "/v1/responses"
+          }
+        ],
+        "models": [
+          {
+            "id": "mimo-v2.5-pro",
+            "displayName": "MiMo V2.5 Pro",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "mimo-v2.5",
+            "displayName": "MiMo V2.5",
+            "contextWindow": 1048576,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "unavailable",
+          "credentialSlots": [],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_includes_cached",
+        "stream": {
+          "format": "open_ai_responses_sse",
+          "terminalEvent": "response.completed",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "open_ai",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute Singapore Token Plan fixed endpoint and quota limitation review",
+          "capturedAt": "2026-08-14T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "codex.zhipu_glm_cn",
+      "app": "codex",
+      "providerType": "codex",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://open.bigmodel.cn",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_chat"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 2,
+        "inference": {
+          "fixedOrigin": "https://open.bigmodel.cn",
+          "protocol": "open_ai_chat",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "codex_chat_completions",
+            "path": "/api/coding/paas/v4/chat/completions"
+          },
+          {
+            "route": "codex_responses",
+            "path": "/api/coding/paas/v4/chat/completions"
+          }
+        ],
+        "models": [
+          {
+            "id": "glm-5.3",
+            "displayName": "GLM-5.3",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5.2",
+            "displayName": "GLM-5.2",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5.1",
+            "displayName": "GLM-5.1",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5",
+            "displayName": "GLM-5",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5-turbo",
+            "displayName": "GLM-5 Turbo",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.7-flash",
+            "displayName": "GLM-4.7 Flash",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.7",
+            "displayName": "GLM-4.7",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.6v",
+            "displayName": "GLM-4.6V",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-4.6",
+            "displayName": "GLM-4.6",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.5v",
+            "displayName": "GLM-4.5V",
+            "contextWindow": 16000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-4.5",
+            "displayName": "GLM-4.5",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.5-air",
+            "displayName": "GLM-4.5 Air",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "zhipu",
+          "endpoint": "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+          "credentialSlots": [
+            {
+              "role": "inference_credential",
+              "slot": "/settingsConfig/apiKey"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_includes_cached",
+        "stream": {
+          "format": "open_ai_chat_sse",
+          "terminalEvent": "[DONE]",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "open_ai",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute GLM registry and usage contracts plus 9router GLM-5.3 endpoint evidence",
+          "capturedAt": "2026-08-23T00:00:00Z"
+        }
+      }
+    },
+    {
+      "profileId": "codex.zhipu_glm_global",
+      "app": "codex",
+      "providerType": "codex",
+      "endpointPolicy": "fixed",
+      "originTemplate": "https://api.z.ai",
+      "driverBinding": {
+        "kind": "fixed",
+        "driverId": "http.openai_chat"
+      },
+      "credentialPolicy": {
+        "mode": "static_secret",
+        "slots": [
+          "/settingsConfig/apiKey"
+        ],
+        "authScheme": "bearer"
+      },
+      "modelPolicy": "passthrough",
+      "allowedModelPolicies": [
+        "passthrough"
+      ],
+      "defaultUpstreamModel": null,
+      "codingPlan": {
+        "contractRevision": 2,
+        "inference": {
+          "fixedOrigin": "https://api.z.ai",
+          "protocol": "open_ai_chat",
+          "credentialSlot": "/settingsConfig/apiKey",
+          "authScheme": "bearer"
+        },
+        "routes": [
+          {
+            "route": "codex_chat_completions",
+            "path": "/api/coding/paas/v4/chat/completions"
+          },
+          {
+            "route": "codex_responses",
+            "path": "/api/coding/paas/v4/chat/completions"
+          }
+        ],
+        "models": [
+          {
+            "id": "glm-5.3",
+            "displayName": "GLM-5.3",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5.2",
+            "displayName": "GLM-5.2",
+            "contextWindow": 1000000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5.1",
+            "displayName": "GLM-5.1",
+            "contextWindow": 204800,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5",
+            "displayName": "GLM-5",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-5-turbo",
+            "displayName": "GLM-5 Turbo",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.7-flash",
+            "displayName": "GLM-4.7 Flash",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.7",
+            "displayName": "GLM-4.7",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.6v",
+            "displayName": "GLM-4.6V",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-4.6",
+            "displayName": "GLM-4.6",
+            "contextWindow": 200000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.5v",
+            "displayName": "GLM-4.5V",
+            "contextWindow": 16000,
+            "inputModalities": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "glm-4.5",
+            "displayName": "GLM-4.5",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text"
+            ]
+          },
+          {
+            "id": "glm-4.5-air",
+            "displayName": "GLM-4.5 Air",
+            "contextWindow": 128000,
+            "inputModalities": [
+              "text"
+            ]
+          }
+        ],
+        "quota": {
+          "adapter": "zhipu",
+          "endpoint": "https://api.z.ai/api/monitor/usage/quota/limit",
+          "credentialSlots": [
+            {
+              "role": "inference_credential",
+              "slot": "/settingsConfig/apiKey"
+            }
+          ],
+          "cacheTtlMs": 60000,
+          "staleTtlMs": 900000
+        },
+        "cacheTokens": "input_includes_cached",
+        "stream": {
+          "format": "open_ai_chat_sse",
+          "terminalEvent": "[DONE]",
+          "errorBeforeTerminalIsFatal": true
+        },
+        "error": {
+          "envelope": "open_ai",
+          "retrySameCredentialOnceOn401": false,
+          "retryAfterCommit": false
+        },
+        "pricing": {
+          "evidence": "flat_rate_subscription_no_usd",
+          "source": "OmniRoute GLM registry and usage contracts plus 9router GLM-5.3 endpoint evidence",
+          "capturedAt": "2026-08-23T00:00:00Z"
+        }
+      }
+    }
+  ],
+  "drivers": [
+    {
+      "driverId": "aws.bedrock_sigv4",
+      "driverContractRevision": 2,
+      "upstreamProtocol": "bedrock",
+      "acceptedAuthSchemes": [
+        "aws_sig_v4"
+      ],
+      "operations": {
+        "forward": "supported",
+        "test": "supported",
+        "discovery": "unsupported",
+        "connectivity": "supported"
+      },
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "images": true
+      },
+      "outboundIdentityPolicy": {
+        "kind": "omit"
+      },
+      "optionSchemaId": "aws.bedrock_sigv4.v1"
+    },
+    {
+      "driverId": "http.anthropic_messages",
+      "driverContractRevision": 2,
+      "upstreamProtocol": "anthropic_messages",
+      "acceptedAuthSchemes": [
+        "api_key",
+        "bearer",
+        "custom_header"
+      ],
+      "operations": {
+        "forward": "supported",
+        "test": "supported",
+        "discovery": "supported",
+        "connectivity": "supported"
+      },
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "images": true
+      },
+      "outboundIdentityPolicy": {
+        "kind": "server_identity"
+      },
+      "optionSchemaId": "http.anthropic.v1"
+    },
+    {
+      "driverId": "http.bedrock_bearer",
+      "driverContractRevision": 2,
+      "upstreamProtocol": "bedrock",
+      "acceptedAuthSchemes": [
+        "bearer"
+      ],
+      "operations": {
+        "forward": "supported",
+        "test": "supported",
+        "discovery": "unsupported",
+        "connectivity": "supported"
+      },
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "images": true
+      },
+      "outboundIdentityPolicy": {
+        "kind": "omit"
+      },
+      "optionSchemaId": "http.bedrock_bearer.v1"
+    },
+    {
+      "driverId": "http.openai_chat",
+      "driverContractRevision": 2,
+      "upstreamProtocol": "open_ai_chat",
+      "acceptedAuthSchemes": [
+        "api_key",
+        "bearer",
+        "custom_header"
+      ],
+      "operations": {
+        "forward": "supported",
+        "test": "supported",
+        "discovery": "supported",
+        "connectivity": "supported"
+      },
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "images": true
+      },
+      "outboundIdentityPolicy": {
+        "kind": "server_identity"
+      },
+      "optionSchemaId": "http.openai_chat.v1"
+    },
+    {
+      "driverId": "http.openai_responses",
+      "driverContractRevision": 2,
+      "upstreamProtocol": "open_ai_responses",
+      "acceptedAuthSchemes": [
+        "api_key",
+        "bearer",
+        "custom_header"
+      ],
+      "operations": {
+        "forward": "supported",
+        "test": "supported",
+        "discovery": "supported",
+        "connectivity": "supported"
+      },
+      "capabilities": {
+        "stream": true,
+        "tools": true,
+        "images": true
+      },
+      "outboundIdentityPolicy": {
+        "kind": "server_identity"
+      },
+      "optionSchemaId": "http.openai_responses.v1"
+    }
+  ],
+  "families": [
+    {
+      "familyId": "family.aws_bedrock_aksk",
+      "label": "AWS Bedrock AK/SK",
+      "credentialProfileId": "claude.aws_bedrock_aksk",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.aws_bedrock_aksk",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.aws_bedrock_api_key",
+      "label": "AWS Bedrock API Key",
+      "credentialProfileId": "claude.aws_bedrock_api_key",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.aws_bedrock_api_key",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.bailian_coding_plan_cn",
+      "label": "Bailian",
+      "credentialProfileId": "claude.bailian_coding_plan_cn",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.bailian_coding_plan_cn",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.bailian_coding_plan_cn",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.bailian_coding_plan_global",
+      "label": "Bailian",
+      "credentialProfileId": "claude.bailian_coding_plan_global",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.bailian_coding_plan_global",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.bailian_coding_plan_global",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.deepseek_api",
+      "label": "DeepSeek API",
+      "credentialProfileId": "codex.deepseek_api",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "surface",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.deepseek_api",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.deepseek_api",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.kimi_coding_api_key",
+      "label": "Kimi API Key",
+      "credentialProfileId": "claude.kimi_coding_api_key",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.kimi_coding_api_key",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.kimi_coding_api_key",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.minimax_cn",
+      "label": "MiniMax (China)",
+      "credentialProfileId": "claude.minimax_cn",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.minimax_cn",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.minimax_cn",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.minimax_global",
+      "label": "MiniMax (Global)",
+      "credentialProfileId": "claude.minimax_global",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.minimax_global",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.minimax_global",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.nvidia",
+      "label": "NVIDIA",
+      "credentialProfileId": "codex.nvidia",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.nvidia",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.nvidia",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.volcengine_coding_plan",
+      "label": "Volcengine",
+      "credentialProfileId": "claude.volcengine_coding_plan",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.volcengine_coding_plan",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.volcengine_coding_plan",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.xiaomi_mimo_token_plan",
+      "label": "Xiaomi MiMo (China)",
+      "credentialProfileId": "claude.xiaomi_mimo_token_plan",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.xiaomi_mimo_token_plan",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.xiaomi_mimo_token_plan",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.xiaomi_mimo_token_plan_sgp",
+      "label": "Xiaomi MiMo (Singapore)",
+      "credentialProfileId": "claude.xiaomi_mimo_token_plan_sgp",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.xiaomi_mimo_token_plan_sgp",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.xiaomi_mimo_token_plan_sgp",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.zhipu_glm_cn",
+      "label": "Zhipu (China)",
+      "credentialProfileId": "claude.zhipu_glm_cn",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.zhipu_glm_cn",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.zhipu_glm_cn",
+          "defaultEnabled": true
+        }
+      ]
+    },
+    {
+      "familyId": "family.zhipu_glm_global",
+      "label": "Zhipu (Global)",
+      "credentialProfileId": "claude.zhipu_glm_global",
+      "endpointScope": "bundle",
+      "headersScope": "bundle",
+      "driverOptionsScope": "bundle",
+      "credentialSourceScope": "bundle",
+      "surfaces": [
+        {
+          "app": "claude",
+          "profileId": "claude.zhipu_glm_global",
+          "defaultEnabled": true
+        },
+        {
+          "app": "codex",
+          "profileId": "codex.zhipu_glm_global",
+          "defaultEnabled": true
+        }
+      ]
+    }
+  ],
+  "references": [
+    {
+      "repository": "OmniRoute",
+      "commit": "443d66996d69d7ecf887fd61158404a3cca1b192",
+      "tree": "8d1c312f61d115767c9478416cb039750eaf113a",
+      "files": [
+        {
+          "path": "open-sse/executors/bedrock.ts",
+          "sha256": "f88cb8365861f27b9e0509e9d3b4c77a1139b94bb6e9b52cc7d07c67f5aef7fd"
+        },
+        {
+          "path": "open-sse/config/bedrock.ts",
+          "sha256": "723b9aa6b691938ef8d83b4713d64760fda5fc19dec6342f1ad23f8f8117ece0"
+        },
+        {
+          "path": "open-sse/utils/awsSigV4.ts",
+          "sha256": "ccd336d388eb1d891dba00e252a239ad85781ff46de2667ecd072742781fc889"
+        }
+      ]
+    },
+    {
+      "repository": "OmniRoute",
+      "commit": "443d66996d69d7ecf887fd61158404a3cca1b192",
+      "tree": "8d1c312f61d115767c9478416cb039750eaf113a",
+      "files": [
+        {
+          "path": "open-sse/config/providers/registry/deepseek/index.ts",
+          "sha256": "5fbbde6048170e7a478813859437bd94361772397b62a547e2db942fb8c655be"
+        }
+      ]
+    }
+  ]
+}

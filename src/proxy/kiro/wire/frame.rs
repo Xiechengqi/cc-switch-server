@@ -12,6 +12,15 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
+    /// Protocol-neutral AWS EventStream metadata, without Kiro event parsing.
+    pub(crate) fn string_header(&self, name: &str) -> Option<&str> {
+        self.headers.string(name)
+    }
+
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         self.headers
             .retained_bytes()
@@ -27,6 +36,7 @@ pub(super) enum ParseOutcome {
 pub(super) fn parse_frame(
     buffer: &[u8],
     max_frame_length: usize,
+    max_header_length: usize,
 ) -> Result<ParseOutcome, WireError> {
     if buffer.len() < PRELUDE_LENGTH {
         return Ok(ParseOutcome::Incomplete);
@@ -46,6 +56,12 @@ pub(super) fn parse_frame(
         return Err(WireError::InvalidFrameLayout {
             total_length,
             headers_length,
+        });
+    }
+    if headers_length > max_header_length {
+        return Err(WireError::FrameTooLarge {
+            size: headers_length,
+            max: max_header_length,
         });
     }
     let expected_prelude_crc = u32::from_be_bytes(buffer[8..12].try_into().expect("fixed slice"));

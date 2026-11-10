@@ -11,6 +11,8 @@ use crate::domain::providers::runtime::{ProviderRuntimePlan, RuntimeAuthRef, Run
 use super::adapters::AdapterRequest;
 use super::ProxyError;
 
+mod tool_schema;
+
 pub const KIMI_MODEL_ALIASES: &[&str] = &[
     "kimi",
     "kimi-code",
@@ -147,7 +149,10 @@ fn normalize_request(body: &Bytes, model: &str, app: AppKind) -> Result<Bytes, P
     object.insert("model".to_string(), Value::String(model.to_string()));
     match app {
         AppKind::Claude => normalize_anthropic_request(object, model)?,
-        AppKind::Codex | AppKind::Gemini => normalize_chat_request(object, model)?,
+        AppKind::Codex | AppKind::Gemini => {
+            normalize_chat_request(object, model)?;
+            tool_schema::normalize_chat_tools(object)?;
+        }
     }
     serde_json::to_vec(&value)
         .map(Bytes::from)
@@ -474,7 +479,7 @@ mod tests {
     };
     use crate::domain::providers::runtime::{RuntimeConfigurationState, RuntimeTransportPolicy};
 
-    fn plan_for(app: AppKind, policy: RuntimeModelPolicy) -> ProviderRuntimePlan {
+    pub(super) fn plan_for(app: AppKind, policy: RuntimeModelPolicy) -> ProviderRuntimePlan {
         ProviderRuntimePlan {
             provider_key: ProviderKey::new(app, "kimi").unwrap(),
             provider_revision: 1,
@@ -724,4 +729,10 @@ mod tests {
             json!([{"type":"caller_edit"}])
         );
     }
+}
+
+#[cfg(test)]
+mod r5_schema_regression_tests {
+    use super::*;
+    include!("kimi/r5_schema_tests.rs");
 }

@@ -1092,7 +1092,7 @@ pub struct ServerStateInner {
     pub(crate) codebuddy_runtime: crate::proxy::codebuddy_runtime::CodeBuddyRuntimeCache,
     pub(crate) trae_runtime: crate::proxy::trae_runtime::TraeRuntimeCache,
     pub(crate) deepseek_runtime: crate::proxy::deepseek_runtime::DeepSeekRuntimeCache,
-    web_session_runtime: RwLock<crate::domain::providers::web_session::WebSessionRuntimeStore>,
+    web_session_runtime: RwLock<crate::proxy::web_session_runtime::WebSessionRuntime>,
     web_session_http_client: RwLock<reqwest::Client>,
     cursor_api_key_verifier: Arc<dyn crate::clients::oauth::cursor::CursorApiKeyVerifier>,
     managed_account_refreshes: ManagedAccountRefreshCoordinator,
@@ -1239,6 +1239,8 @@ pub(crate) struct GrokReasoningCapabilityScope<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum WebSessionStateError {
+    #[error("Web Session runtime capacity is temporarily unavailable")]
+    Capacity,
     #[error("Web Session Provider identity changed")]
     IdentityChanged,
     #[error("Web Session authentication requires explicit Cookie re-import")]
@@ -1895,6 +1897,7 @@ impl CodeBuddyRuntimeError {
 
 #[derive(Debug)]
 pub(crate) enum TraeRuntimeError {
+    Capacity,
     NotFound,
     IdentityChanged,
     CredentialPersistenceDegraded,
@@ -1927,6 +1930,8 @@ impl From<CopilotUpstreamAuthError> for CopilotModelCatalogError {
 
 #[derive(Debug)]
 pub enum DeepSeekUpstreamError {
+    RuntimeCapacity,
+    PowCapacity,
     ValueQuota(anyhow::Error),
     NotFound,
     IdentityChanged,
@@ -1952,6 +1957,7 @@ fn deepseek_client_runtime_error(
 ) -> DeepSeekUpstreamError {
     use crate::clients::deepseek::client::DeepSeekClientError;
     match error {
+        DeepSeekClientError::PowCapacity => DeepSeekUpstreamError::PowCapacity,
         DeepSeekClientError::Network { operation, message } => {
             DeepSeekUpstreamError::Network { operation, message }
         }
@@ -1978,6 +1984,28 @@ pub struct CopilotUpstreamAuth {
     pub expires_at_ms: Option<i64>,
     pub account_token_refresh_generation: u64,
     pub token_generation: u64,
+}
+
+/// Immutable inference capability bound to the exact authenticated catalog scope.
+/// Private fields prevent callers from constructing or changing this binding.
+pub(crate) struct CopilotInferencePlan {
+    pub auth: CopilotUpstreamAuth,
+    pub endpoint: crate::domain::accounts::copilot::CopilotEndpoint,
+    pub auth_recovered_during_discovery: bool,
+    key: crate::clients::oauth::copilot_models::CopilotModelCatalogKey,
+    catalog_valid_until_ms: i64,
+    catalog: crate::clients::oauth::copilot_models::CopilotModelCatalog,
+    descriptor_index: usize,
+}
+
+impl CopilotInferencePlan {
+    fn descriptor(&self) -> &crate::clients::oauth::copilot_models::CopilotModelDescriptor {
+        &self.catalog.descriptors[self.descriptor_index]
+    }
+
+    pub(crate) fn model(&self) -> &str {
+        &self.descriptor().model_id
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7357,7 +7385,7 @@ impl ServerStateInner {
             trae_runtime: crate::proxy::trae_runtime::TraeRuntimeCache::default(),
             deepseek_runtime: crate::proxy::deepseek_runtime::DeepSeekRuntimeCache::default(),
             web_session_runtime: RwLock::new(
-                crate::domain::providers::web_session::WebSessionRuntimeStore::default(),
+                crate::proxy::web_session_runtime::WebSessionRuntime::default(),
             ),
             web_session_http_client: RwLock::new(
                 build_web_session_http_client().context("build Web Session HTTP client")?,
@@ -8648,6 +8676,9 @@ impl ServerStateInner {
         if runtime.requires_explicit_reimport(scope) {
             return Err(WebSessionStateError::ExplicitReimportRequired);
         }
+        if !runtime.admit(scope) {
+            return Err(WebSessionStateError::Capacity);
+        }
         Ok(())
     }
 
@@ -8662,10 +8693,14 @@ impl ServerStateInner {
         if !web_session_scope_matches_store(&providers, scope) {
             return Err(WebSessionStateError::IdentityChanged);
         }
-        self.web_session_runtime
+        if !self
+            .web_session_runtime
             .write()
             .await
-            .invalidate_authentication(scope);
+            .invalidate_authentication(scope)
+        {
+            return Err(WebSessionStateError::Capacity);
+        }
         Ok(())
     }
 
@@ -8699,6 +8734,9 @@ impl ServerStateInner {
         runtime.retain_current(scope);
         if runtime.requires_explicit_reimport(scope) {
             return Err(WebSessionStateError::ExplicitReimportRequired);
+        }
+        if !runtime.admit(scope) {
+            return Err(WebSessionStateError::Capacity);
         }
         if let Some(session_id) = session_id {
             runtime
@@ -16653,6 +16691,26 @@ impl ServerStateInner {
         #[cfg(test)] models_url_override: Option<&str>,
     ) -> Result<crate::clients::oauth::copilot_models::CopilotModelCatalog, CopilotModelCatalogError>
     {
+        self.copilot_model_catalog_with_auth_budget(
+            account_id,
+            expected_auth_identity_generation,
+            timeout,
+            true,
+            #[cfg(test)]
+            models_url_override,
+        )
+        .await
+    }
+
+    async fn copilot_model_catalog_with_auth_budget(
+        self: &Arc<Self>,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+        timeout: Duration,
+        allow_auth_refresh: bool,
+        #[cfg(test)] models_url_override: Option<&str>,
+    ) -> Result<crate::clients::oauth::copilot_models::CopilotModelCatalog, CopilotModelCatalogError>
+    {
         use crate::clients::oauth::copilot_models::CopilotModelCatalogKey;
 
         let account = self
@@ -16687,7 +16745,14 @@ impl ServerStateInner {
             self.ensure_copilot_model_catalog_key_current(&key).await?;
             return Ok(catalog);
         }
-        let mut _catalog_guard = self.copilot_model_catalogs.lock(&key).await;
+        let mut _catalog_guard = self
+            .copilot_model_catalogs
+            .lock(&key)
+            .await
+            .ok_or_else(|| CopilotModelCatalogError::Discovery {
+                status_code: 503,
+                message: "Copilot model discovery capacity is exhausted".into(),
+            })?;
         let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
         if let Some(catalog) = self.copilot_model_catalogs.fresh(&key, now_ms).await {
             self.ensure_copilot_model_catalog_key_current(&key).await?;
@@ -16709,9 +16774,10 @@ impl ServerStateInner {
             timeout,
         )
         .await;
-        if fetched
-            .as_ref()
-            .is_err_and(|error| error.status == Some(reqwest::StatusCode::UNAUTHORIZED))
+        if allow_auth_refresh
+            && fetched
+                .as_ref()
+                .is_err_and(|error| error.status == Some(reqwest::StatusCode::UNAUTHORIZED))
         {
             let refreshed = self
                 .refresh_copilot_upstream_auth_now(
@@ -16731,7 +16797,14 @@ impl ServerStateInner {
             key.api_origin = api_origin.clone();
             key.account_token_refresh_generation = refreshed.account_token_refresh_generation;
             key.copilot_token_generation = refreshed.token_generation;
-            _catalog_guard = self.copilot_model_catalogs.lock(&key).await;
+            _catalog_guard = self
+                .copilot_model_catalogs
+                .lock(&key)
+                .await
+                .ok_or_else(|| CopilotModelCatalogError::Discovery {
+                    status_code: 503,
+                    message: "Copilot model discovery capacity is exhausted".into(),
+                })?;
             let refreshed_now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
             if let Some(catalog) = self
                 .copilot_model_catalogs
@@ -16767,8 +16840,12 @@ impl ServerStateInner {
                 let has_entitlement = !descriptors.is_empty();
                 let catalog = self
                     .copilot_model_catalogs
-                    .insert(key, descriptors, fetched_at_ms)
-                    .await;
+                    .insert_fetched(key, descriptors, fetched_at_ms)
+                    .await
+                    .ok_or_else(|| CopilotModelCatalogError::Discovery {
+                        status_code: 503,
+                        message: "Copilot model catalog capacity is exhausted".into(),
+                    })?;
                 if let Err(error) = self
                     .record_copilot_capability_observation_if_current(
                         account_id,
@@ -16803,6 +16880,10 @@ impl ServerStateInner {
             }
             Err(error) => {
                 tracing::warn!(account_id, error = %error, "GitHub Copilot model discovery failed");
+                if error.capacity_rejected {
+                    self.copilot_model_catalogs.invalidate(&key).await;
+                    return Err(copilot_model_fetch_error(error));
+                }
                 if error.is_transient() {
                     if let Some(catalog) = self.copilot_model_catalogs.stale(&key, now_ms).await {
                         return Ok(catalog);
@@ -16811,6 +16892,136 @@ impl ServerStateInner {
                 Err(copilot_model_fetch_error(error))
             }
         }
+    }
+
+    // The test-only model URL adds one parameter to the production scope.
+    #[cfg_attr(test, allow(clippy::too_many_arguments))]
+    pub(crate) async fn prepare_copilot_inference_plan(
+        self: &Arc<Self>,
+        account_id: &str,
+        expected_generation: u64,
+        model: &str,
+        preferred: crate::domain::accounts::copilot::CopilotEndpoint,
+        timeout: Duration,
+        allow_auth_refresh: bool,
+        #[cfg(test)] models_url_override: Option<&str>,
+    ) -> Result<CopilotInferencePlan, CopilotModelCatalogError> {
+        use crate::clients::oauth::copilot_models::{CopilotModelCatalogKey, MODEL_CACHE_TTL_MS};
+        let initial_auth = self
+            .prepare_copilot_upstream_auth(account_id, expected_generation)
+            .await?;
+        self.copilot_model_catalog_with_auth_budget(
+            account_id,
+            expected_generation,
+            timeout,
+            allow_auth_refresh,
+            #[cfg(test)]
+            models_url_override,
+        )
+        .await?;
+        let auth = self
+            .prepare_copilot_upstream_auth(account_id, expected_generation)
+            .await?;
+        let account = self
+            .accounts_snapshot_if_credentials_persisted()
+            .await
+            .ok_or(CopilotUpstreamAuthError::CredentialPersistenceDegraded)?
+            .find_for_provider(ProviderType::GitHubCopilot, Some(account_id))
+            .cloned()
+            .ok_or(CopilotUpstreamAuthError::NotFound)?;
+        ensure_copilot_identity_generation(&account, expected_generation)?;
+        let domain = copilot_account_domain(&account)?;
+        let key = CopilotModelCatalogKey {
+            account_id: account_id.to_string(),
+            auth_identity_generation: expected_generation,
+            account_token_refresh_generation: auth.account_token_refresh_generation,
+            copilot_token_generation: auth.token_generation,
+            github_domain: domain,
+            api_origin: auth.api_endpoint.clone(),
+        };
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        let catalog = self
+            .copilot_model_catalogs
+            .fresh(&key, now_ms)
+            .await
+            .ok_or_else(|| CopilotModelCatalogError::Discovery {
+                status_code: 409,
+                message:
+                    "Copilot inference requires a fresh catalog for the current token and origin"
+                        .into(),
+            })?;
+        let descriptor_index = catalog
+            .descriptors
+            .iter()
+            .position(|descriptor| descriptor.model_id == model)
+            .ok_or_else(|| CopilotModelCatalogError::Discovery {
+                status_code: 400,
+                message: "requested Copilot model is absent or denied in the authenticated catalog"
+                    .into(),
+            })?;
+        let endpoint = crate::domain::accounts::copilot::CopilotEndpoint::select(
+            &catalog.descriptors[descriptor_index].supported_endpoints,
+            preferred,
+        )
+        .map_err(|message| CopilotModelCatalogError::Discovery {
+            status_code: 400,
+            message: message.into(),
+        })?;
+        let auth_recovered_during_discovery =
+            initial_auth.token_generation != auth.token_generation;
+        let plan = CopilotInferencePlan {
+            auth,
+            endpoint,
+            auth_recovered_during_discovery,
+            key,
+            descriptor_index,
+            catalog_valid_until_ms: catalog
+                .fetched_at_ms
+                .unwrap_or(0)
+                .saturating_add(MODEL_CACHE_TTL_MS),
+            catalog,
+        };
+        self.ensure_copilot_inference_plan_current(&plan).await?;
+        Ok(plan)
+    }
+
+    pub(crate) async fn ensure_copilot_inference_plan_current(
+        &self,
+        plan: &CopilotInferencePlan,
+    ) -> Result<(), CopilotModelCatalogError> {
+        let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+        if now_ms >= plan.catalog_valid_until_ms {
+            return Err(CopilotModelCatalogError::Discovery {
+                status_code: 409,
+                message: "Copilot inference catalog expired before send".into(),
+            });
+        }
+        self.ensure_copilot_model_catalog_key_current(&plan.key)
+            .await?;
+        let catalog = self.copilot_model_catalogs.fresh(&plan.key, now_ms).await;
+        if !catalog.is_some_and(|catalog| {
+            catalog
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor == plan.descriptor())
+        }) {
+            return Err(CopilotModelCatalogError::Discovery {
+                status_code: 409,
+                message: "Copilot model capability changed or was revoked before send".into(),
+            });
+        }
+        let auth = self.copilot_upstream_auth.read().await;
+        if !auth.get(&plan.key.account_id).is_some_and(|cached| {
+            cached.is_valid(now_ms)
+                && cached.token_generation == plan.auth.token_generation
+                && cached.token == plan.auth.token
+        }) {
+            return Err(CopilotModelCatalogError::Discovery {
+                status_code: 409,
+                message: "Copilot inference token changed or expired before send".into(),
+            });
+        }
+        Ok(())
     }
 
     async fn ensure_copilot_model_catalog_key_current(
@@ -17010,7 +17221,12 @@ impl ServerStateInner {
         if let Some(catalog) = self.kimi_model_catalogs.fresh(&scope, now_ms).await {
             return catalog;
         }
-        let mut catalog_guard = self.kimi_model_catalogs.lock(&scope).await;
+        let Some(mut catalog_guard) = self.kimi_model_catalogs.lock(&scope).await else {
+            crate::metrics::record_resident_retention_refused("kimi_catalog_flight");
+            let mut catalog = unavailable_catalog();
+            catalog.source = "kimi_models_capacity_rejected";
+            return catalog;
+        };
         now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
         if let Some(catalog) = self.kimi_model_catalogs.fresh(&scope, now_ms).await {
             return catalog;
@@ -17087,7 +17303,13 @@ impl ServerStateInner {
                 expected_auth_identity_generation,
                 account.token_refresh_generation,
             );
-            catalog_guard = self.kimi_model_catalogs.lock(&scope).await;
+            let Some(refreshed_guard) = self.kimi_model_catalogs.lock(&scope).await else {
+                crate::metrics::record_resident_retention_refused("kimi_catalog_flight");
+                let mut catalog = unavailable_catalog();
+                catalog.source = "kimi_models_capacity_rejected";
+                return catalog;
+            };
+            catalog_guard = refreshed_guard;
             now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
             if let Some(catalog) = self.kimi_model_catalogs.fresh(&scope, now_ms).await {
                 return catalog;
@@ -17122,7 +17344,7 @@ impl ServerStateInner {
                 let has_entitlement = fetched_catalog.upstream_non_empty;
                 let catalog = self
                     .kimi_model_catalogs
-                    .insert(scope, fetched_catalog.models, observed_at_ms)
+                    .insert_fetched(scope, fetched_catalog, observed_at_ms)
                     .await;
                 drop(catalog_guard);
                 if let Err(error) = self
@@ -17139,6 +17361,12 @@ impl ServerStateInner {
             }
             Err(error) => {
                 tracing::warn!(account_id, error = %error, "Kimi model discovery failed");
+                if error.capacity_rejected {
+                    self.kimi_model_catalogs.invalidate(&scope).await;
+                    let mut catalog = unavailable_catalog();
+                    catalog.source = "kimi_models_capacity_rejected";
+                    return catalog;
+                }
                 if error.retryable() {
                     self.kimi_model_catalogs
                         .stale(&scope, now_ms)
@@ -18457,10 +18685,15 @@ impl ServerStateInner {
                     now_ms,
                 )
                 .await
+                .map_err(|_| TraeRuntimeError::Capacity)?
         } else if let Some(catalog) = self.trae_runtime.catalog(&scope, now_ms).await {
             catalog
         } else {
-            let _catalog_guard = self.trae_runtime.catalog_lock(&scope).await;
+            let _catalog_guard = self
+                .trae_runtime
+                .catalog_lock(&scope)
+                .await
+                .ok_or(TraeRuntimeError::Capacity)?;
             now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
             if let Some(catalog) = self.trae_runtime.catalog(&scope, now_ms).await {
                 catalog
@@ -18514,6 +18747,7 @@ impl ServerStateInner {
                         self.trae_runtime
                             .insert_catalog(scope.clone(), parsed, now_ms)
                             .await
+                            .map_err(|_| TraeRuntimeError::Capacity)?
                     }
                     Err(error) => {
                         let auth_failure = error.is_authentication_failure();
@@ -18862,6 +19096,9 @@ impl ServerStateInner {
             thinking_enabled,
             search_enabled,
             None,
+            |body| body,
+            || {},
+            || {},
         )
         .await
     }
@@ -18883,6 +19120,9 @@ impl ServerStateInner {
         thinking_enabled: bool,
         search_enabled: bool,
         mut metering: Option<&mut ValueGenerationAdmission<'_>>,
+        observe_completion: impl Fn(bytes::Bytes) -> bytes::Bytes + Send + Sync,
+        observe_headers: impl Fn() + Send + Sync,
+        observe_session_repair: impl Fn() + Send + Sync,
     ) -> Result<reqwest::Response, DeepSeekUpstreamError> {
         use crate::clients::deepseek::client::DeepSeekCompletionRequest;
         use crate::proxy::deepseek_runtime::{DeepSeekCachedSession, DeepSeekRuntimeScope};
@@ -18963,7 +19203,11 @@ impl ServerStateInner {
             if let Some(session) = self.deepseek_runtime.session(&scope, now_ms).await {
                 (session, true)
             } else {
-                let _session_guard = self.deepseek_runtime.session_lock(&scope).await;
+                let _session_guard = self
+                    .deepseek_runtime
+                    .session_lock(&scope)
+                    .await
+                    .ok_or(DeepSeekUpstreamError::RuntimeCapacity)?;
                 let now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
                 if let Some(session) = self.deepseek_runtime.session(&scope, now_ms).await {
                     (session, true)
@@ -18993,9 +19237,11 @@ impl ServerStateInner {
                                 message,
                             }
                         })?;
-                    self.deepseek_runtime
-                        .insert_session(scope.clone(), session.clone())
-                        .await;
+                    let session = self
+                        .deepseek_runtime
+                        .insert_session(scope.clone(), session)
+                        .await
+                        .map_err(|_| DeepSeekUpstreamError::RuntimeCapacity)?;
                     (session, false)
                 }
             };
@@ -19031,7 +19277,7 @@ impl ServerStateInner {
                 }
             }
             let response = client
-                .completion(
+                .completion_observed(
                     &token,
                     &pow_header,
                     DeepSeekCompletionRequest {
@@ -19041,6 +19287,8 @@ impl ServerStateInner {
                         thinking_enabled,
                         search_enabled,
                     },
+                    &observe_completion,
+                    &observe_headers,
                 )
                 .await
                 .map_err(deepseek_client_runtime_error)?;
@@ -19066,10 +19314,15 @@ impl ServerStateInner {
             if reused && !rebuilt && matches!(status, 400 | 404 | 409) {
                 // A rejected cached session is recoverable before any downstream bytes exist.
                 // Authentication/rate-limit/server failures never enter this path.
+                observe_session_repair();
                 rebuilt = true;
                 reused = false;
                 self.deepseek_runtime.invalidate_session(&scope).await;
-                let _session_guard = self.deepseek_runtime.session_lock(&scope).await;
+                let _session_guard = self
+                    .deepseek_runtime
+                    .session_lock(&scope)
+                    .await
+                    .ok_or(DeepSeekUpstreamError::RuntimeCapacity)?;
                 let session_id = client
                     .create_session(&token)
                     .await
@@ -19095,9 +19348,11 @@ impl ServerStateInner {
                         message,
                     }
                 })?;
-                self.deepseek_runtime
-                    .insert_session(scope.clone(), session.clone())
-                    .await;
+                session = self
+                    .deepseek_runtime
+                    .insert_session(scope.clone(), session)
+                    .await
+                    .map_err(|_| DeepSeekUpstreamError::RuntimeCapacity)?;
                 continue;
             }
             if matches!(status, 400 | 401 | 403 | 404 | 409) {
@@ -23894,6 +24149,7 @@ mod tests {
     }
 
     include!("state/buddy_catalog_tests.rs");
+    include!("state/copilot_inference_tests.rs");
     include!("state/share_value_quota/tariff_state_tests.rs");
     include!("state/share_value_quota/initialization_tests.rs");
     use std::fs;
@@ -35387,61 +35643,92 @@ mod tests {
 
     #[tokio::test]
     async fn native_refresh_journal_recovers_rotated_credentials_after_restart_boundary() {
-        let state = test_state();
-        let expected = state
-            .mutate_accounts_immediate(|accounts| {
-                accounts.upsert(refresh_test_account_input(
-                    "journal-recovery-account",
-                    ProviderType::GeminiCli,
-                    Some("journal@example.com"),
-                    "journal-old-access",
-                    "journal-old-refresh",
-                    1,
-                ))
-            })
-            .await
-            .unwrap();
-        let path = write_native_refresh_recovery_journal(
-            &state.config_dir,
-            &expected,
-            &AccountRefreshUpdate {
-                access_token: Some("journal-new-access".to_string()),
-                refresh_token: Some("journal-new-refresh".to_string()),
-                expires_at: Some(i64::MAX / 2),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let journal_on_disk = std::fs::read_to_string(&path).unwrap();
-        assert!(!journal_on_disk.contains("journal-new-access"));
-        assert!(!journal_on_disk.contains("journal-new-refresh"));
+        for provider_type in [ProviderType::GeminiCli, ProviderType::CodexOAuth] {
+            for superseded in [false, true] {
+                let state = test_state();
+                let expected = state
+                    .mutate_accounts_immediate(|accounts| {
+                        accounts.upsert(refresh_test_account_input(
+                            "journal-recovery-account",
+                            provider_type,
+                            Some("journal@example.com"),
+                            "journal-old-access",
+                            "journal-old-refresh",
+                            1,
+                        ))
+                    })
+                    .await
+                    .unwrap();
+                let path = write_native_refresh_recovery_journal(
+                    &state.config_dir,
+                    &expected,
+                    &AccountRefreshUpdate {
+                        access_token: Some("journal-new-access".to_string()),
+                        refresh_token: Some("journal-new-refresh".to_string()),
+                        expires_at: Some(i64::MAX / 2),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let journal_on_disk = std::fs::read_to_string(&path).unwrap();
+                assert!(!journal_on_disk.contains("journal-new-access"));
+                assert!(!journal_on_disk.contains("journal-new-refresh"));
 
-        let mut restarted_accounts = AccountStore::load_or_default(&state.config_dir).unwrap();
-        remove_superseded_native_refresh_journals(&state.config_dir, &restarted_accounts).unwrap();
-        assert!(path.exists());
-        recover_pending_native_refresh_journals(&state.config_dir, &mut restarted_accounts)
-            .unwrap();
-        let recovered = restarted_accounts
-            .find_for_provider(ProviderType::GeminiCli, Some("journal-recovery-account"))
-            .unwrap();
-        assert_eq!(
-            recovered.access_token.as_deref(),
-            Some("journal-new-access")
-        );
-        assert_eq!(
-            recovered.refresh_token.as_deref(),
-            Some("journal-new-refresh")
-        );
-        assert!(!path.exists());
-        let persisted = AccountStore::load_or_default(&state.config_dir).unwrap();
-        assert_eq!(
-            persisted
-                .find_for_provider(ProviderType::GeminiCli, Some("journal-recovery-account"),)
-                .unwrap()
-                .refresh_token
-                .as_deref(),
-            Some("journal-new-refresh")
-        );
+                let mut restarted_accounts =
+                    AccountStore::load_or_default(&state.config_dir).unwrap();
+                let (expected_access, expected_refresh, expected_generation) = if superseded {
+                    let replacement = restarted_accounts.upsert(refresh_test_account_input(
+                        "journal-recovery-account",
+                        provider_type,
+                        Some("journal@example.com"),
+                        "journal-reauthorized-access",
+                        "journal-reauthorized-refresh",
+                        i64::MAX / 2,
+                    ));
+                    assert_ne!(
+                        replacement.token_refresh_generation,
+                        expected.token_refresh_generation
+                    );
+                    restarted_accounts.save(&state.config_dir).unwrap();
+                    (
+                        "journal-reauthorized-access",
+                        "journal-reauthorized-refresh",
+                        replacement.auth_identity_generation,
+                    )
+                } else {
+                    remove_superseded_native_refresh_journals(
+                        &state.config_dir,
+                        &restarted_accounts,
+                    )
+                    .unwrap();
+                    assert!(path.exists());
+                    (
+                        "journal-new-access",
+                        "journal-new-refresh",
+                        expected.auth_identity_generation,
+                    )
+                };
+                recover_pending_native_refresh_journals(&state.config_dir, &mut restarted_accounts)
+                    .unwrap();
+                let recovered = restarted_accounts
+                    .find_for_provider(provider_type, Some("journal-recovery-account"))
+                    .unwrap();
+                assert_eq!(recovered.access_token.as_deref(), Some(expected_access));
+                assert_eq!(recovered.refresh_token.as_deref(), Some(expected_refresh));
+                assert_eq!(recovered.provider_type, provider_type);
+                assert_eq!(recovered.auth_identity_generation, expected_generation);
+                assert!(!path.exists());
+                let persisted = AccountStore::load_or_default(&state.config_dir).unwrap();
+                assert_eq!(
+                    persisted
+                        .find_for_provider(provider_type, Some("journal-recovery-account"),)
+                        .unwrap()
+                        .refresh_token
+                        .as_deref(),
+                    Some(expected_refresh)
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,181 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "ollama_cloud",
+  "liveState": "live_pending",
+  "reference": {
+    "repository": "Ollama/ollama",
+    "commit": "b68b112bd8868d6278250d7d4bdfafa5cbf035c8",
+    "tree": "326eb686db2fee0bdb87ccdc47378a1276181381",
+    "files": [
+      {
+        "path": "openai/openai.go",
+        "sha256": "425c68495c50a6f5020466d01e1f588ac8ebcf112e223b2fba29ca99aec72b3b",
+        "observation": "thinkFromReasoningEffort accepts ultra/xhigh to max, minimal to low, none disables, unknown rejects; official completion carries usage and finish reason"
+      },
+      {
+        "path": "openai/openai_test.go",
+        "sha256": "a8b081f4d2fb08cd02d3c63506b45c2df7bb7eae8106cffcbf47b1f1339692d3",
+        "observation": "synthetic effort cases, not Cloud acceptance"
+      },
+      {
+        "path": "server/routes.go",
+        "sha256": "650d29738473bdf31aa122e71943d1bec5f45cfdd2bbc383ea88f70927eb7dfd",
+        "observation": "local runner downgrades max only after actual model config/template enables Harmony; model-name guessing is not a Cloud capability proof"
+      }
+    ],
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false
+  },
+  "scope": {
+    "providerType": "ollama_cloud",
+    "profiles": [
+      "claude.ollama_cloud",
+      "codex.ollama_cloud"
+    ],
+    "inboundRoutes": [
+      "ClaudeMessages",
+      "CodexResponses",
+      "CodexChatCompletions"
+    ],
+    "product": "Ollama Cloud",
+    "site": "https://ollama.com",
+    "credentialRail": "Provider-owned API key, no managed inference Account or OAuth refresh",
+    "identityVersion": "no CLI impersonation",
+    "fencing": [
+      "Provider revision",
+      "credential source",
+      "credential generation",
+      "App and exact binding"
+    ]
+  },
+  "localPolicy": {
+    "effort": {
+      "case": "trimmed ASCII lowercase",
+      "mapping": {
+        "ultra": "max",
+        "xhigh": "max",
+        "max": "max",
+        "high": "high",
+        "medium": "medium",
+        "low": "low",
+        "minimal": "low",
+        "none": "none",
+        "off": "none",
+        "disabled": "none"
+      },
+      "absentOrEmpty": "model default, no injected effort",
+      "invalid": "explicit local 400 before send; no silent removal",
+      "types": "present controls require strings; malformed containers rejected",
+      "source": "Claude output_config.effort/thinking.effort and disabled thinking; Codex nested reasoning.effort/top-level reasoning_effort; conflicting controls rejected",
+      "output": "canonical Chat reasoning_effort; retained nested reasoning must carry the same effort"
+    },
+    "modelCapabilities": "normalization is not entitlement or max support; keep exact configured model and preserve upstream unsupported response; no gpt-oss brand-based max-to-high clamp or model substitution",
+    "response": "preserve official tool_calls/length terminal and token/cache usage; never replace native counts with estimates; truncate/cancel cannot synthesize success",
+    "resources": "existing bounded display-only account/usage cache and state-owned mutation retained; no new retained inference object",
+    "retry": "no cross-binding/rail fallback or policy change",
+    "streamTerminal": "Ollama Cloud requires a nonempty string finish_reason followed by [DONE] on all three routes; missing/invalid finish, missing or duplicate [DONE] and same-batch data after [DONE] fail. Claude terminal waits for usage and [DONE]. Cancellation retains the established HTTP/log status contract and must record client_cancelled and drop owners without replay."
+  },
+  "cases": [
+    {
+      "id": "effort_aliases",
+      "inputToCanonical": {
+        "ultra": "max",
+        "xhigh": "max",
+        "max": "max",
+        "high": "high",
+        "medium": "medium",
+        "low": "low",
+        "minimal": "low",
+        "none": "none",
+        "off": "none",
+        "disabled": "none"
+      }
+    },
+    {
+      "id": "unknown_effort",
+      "value": "extreme",
+      "expectedHttp": 400,
+      "expectedSends": 0
+    },
+    {
+      "id": "invalid_types",
+      "values": [
+        null,
+        true,
+        12,
+        {},
+        []
+      ],
+      "expectedHttp": 400,
+      "expectedSends": 0
+    },
+    {
+      "id": "empty_default",
+      "value": "  ",
+      "expected": "no effort"
+    },
+    {
+      "id": "control_conflict",
+      "nested": "low",
+      "top": "high",
+      "expectedHttp": 400
+    },
+    {
+      "id": "canonical_equivalence",
+      "nested": "xhigh",
+      "top": "ultra",
+      "expected": "max"
+    },
+    {
+      "id": "claude_disabled",
+      "thinking": {
+        "type": "disabled"
+      },
+      "expected": "none"
+    },
+    {
+      "id": "exact_model_preserved",
+      "model": "gpt-oss:20b",
+      "requested": "ultra",
+      "sent": "max",
+      "noLocalClamp": "high"
+    },
+    {
+      "id": "upstream_model_unsupported",
+      "expectedHttp": 400,
+      "expectedSends": 1,
+      "noRetry": true
+    },
+    {
+      "id": "tool_terminal_usage",
+      "finish_reason": "tool_calls",
+      "usage": {
+        "prompt_tokens": 7,
+        "completion_tokens": 3,
+        "total_tokens": 10,
+        "prompt_tokens_details": {
+          "cached_tokens": 2
+        }
+      }
+    },
+    {
+      "id": "length_terminal",
+      "finish_reason": "length",
+      "expectedClaude": "max_tokens",
+      "expectedResponses": "incomplete"
+    },
+    {
+      "id": "truncated_stream",
+      "expected": "failure, no completed terminal"
+    },
+    {
+      "id": "client_cancel",
+      "expected": "cancelled owner release; no replay"
+    },
+    {
+      "id": "non_ollama_passthrough",
+      "expected": "unrelated Providers keep their own effort contract"
+    }
+  ]
+}

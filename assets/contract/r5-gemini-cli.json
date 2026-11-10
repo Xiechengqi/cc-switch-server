@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "providerClass": "gemini_cli",
+  "kind": "synthetic_server_contract",
+  "liveState": "live_pending",
+  "reference": {
+    "repository": "CLIProxyAPI",
+    "commit": "681ce41b6e44c45b15b79378b003909d6ba29e68",
+    "tree": "00d0ecf4594b47495d82d1efd429c17551ab6d51",
+    "files": [
+      {
+        "path": "internal/auth/antigravity/auth.go",
+        "sha256": "b9f28f566ed12c73ddfa398f741028e0c01e44526c1c5c103f9250f300e884c5",
+        "product": "antigravity",
+        "observation": "FetchProjectID may invoke OnboardUser with an Antigravity tier and identity; this does not establish Gemini CLI permission"
+      },
+      {
+        "path": "internal/runtime/executor/gemini_executor.go",
+        "sha256": "91c8f98d298f71e15e2b2393640a1ad6775c386653be12698f0dbcc86c25cbda",
+        "product": "gemini_api_key",
+        "observation": "API-key Gemini executor is not the Code Assist subscription OAuth rail"
+      }
+    ],
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false
+  },
+  "scope": {
+    "providerType": "gemini_cli",
+    "driver": "oauth.gemini_code_assist",
+    "profiles": ["claude.google_oauth", "gemini.google_oauth"],
+    "credentialRail": "one exact configured Gemini OAuth client and Account generation",
+    "identityVersion": "GeminiCLI/0.31.0; google-genai-sdk/1.41.0 gl-node/v22.19.0",
+    "metadata": {"ideType": "GEMINI_CLI", "pluginType": "GEMINI"},
+    "oauthClientIdAuthority": "Account raw.clientId or CC_SWITCH_SERVER_GEMINI_CLIENT_ID; no built-in client ID",
+    "scopes": [
+      "https://www.googleapis.com/auth/cloud-platform",
+      "https://www.googleapis.com/auth/userinfo.email",
+      "https://www.googleapis.com/auth/userinfo.profile"
+    ],
+    "noCrossProductEntitlement": true
+  },
+  "localPolicy": {
+    "loadCodeAssist": "read existing project and current/paid tier metadata",
+    "existingProject": "reuse exact bound project; never guess or create one",
+    "allowedTiers": "observations do not authorize tier selection or onboarding",
+    "operationHint": "does not authorize creation, polling or retry as another client",
+    "onboardingEnabled": false,
+    "onboardingGate": "research_gated_missing_exact_client_tier_operation_and_consent_evidence",
+    "missingProject": "local inference unavailable; bounded existing discovery cooldown, no automatic onboarding",
+    "countTokens": "existing AI Studio countTokens route remains independent of Code Assist project discovery",
+    "futureEnablement": "administrator action plus exact client/scope and official tier/consent/poll evidence; bounded cancellation and generation-CAS persistence required",
+    "terminal": "existing native Gemini finish/error and strict stream/aggregate contract",
+    "resources": "existing request/callback timeout, coalesced discovery and cooldown; no operation poll owner introduced"
+  },
+  "cases": [
+    {"id": "empty", "response": {}, "project": null, "tier": null},
+    {"id": "eligible_free_is_not_provisioned", "response": {"allowedTiers": [{"id": "synthetic-free", "isDefault": true}]}, "project": null, "tier": null},
+    {"id": "eligible_paid_is_not_selected", "response": {"allowedTiers": [{"id": "synthetic-paid", "isDefault": true}], "currentTier": {"id": "synthetic-current"}}, "project": null, "tier": "synthetic-current"},
+    {"id": "operation_hint_is_not_polled", "response": {"name": "operations/synthetic", "done": false}, "project": null, "tier": null},
+    {"id": "bound_project_is_preserved", "response": {"allowedTiers": [{"id": "synthetic-paid", "isDefault": true}]}, "boundProject": "synthetic-bound-project", "project": "synthetic-bound-project", "tier": null},
+    {"id": "existing_project_is_loaded", "response": {"cloudaicompanionProject": {"id": "synthetic-loaded-project"}, "currentTier": {"id": "synthetic-existing-tier"}}, "project": "synthetic-loaded-project", "tier": "synthetic-existing-tier"}
+  ]
+}

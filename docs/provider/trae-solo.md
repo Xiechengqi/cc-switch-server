@@ -151,3 +151,13 @@ SOLO 和 raw 共用以下语义：
 最终 `src/tests/assets/web-src/src/web-dist` 与 Cargo/build 输入共 839 文件的路径及内容 SHA-256 快照在验证期间保持一致，摘要为 `c81544cd2eeafc5d3e67b677e078871dd6f974c25bbd8e9d1c8340d5c039c6dc`。整体 review 未发现本次范围内尚未修复的本地阻断项。
 
 真实账号的官网授权、设备注册与 token 续期仍为 `live_pending`；本地 mock/HTTP 回环和静态官网合同不等同线上闭环。上述验收完成时尚未提交、推送或部署。
+
+
+## R5 TR-01 三通道证据复核（2026-11-10）
+
+`assets/contract/r5-trae.json` 冻结 Hub `5ed619f314f75e3016392370d1b766467a5e92c1` 的三份 committed source、九个 Profile 和十组既有本仓回归。SOLO、CN raw、Intl raw 保持独立账号、端点、设备与代次。已有四入口实时流式/非流式、两轮工具、reasoning/cache usage、raw 图片与 SOLO 明确拒绝、严格 done+EOF 及取消/预算合同，不向参考缓冲输出或 EOF 补 stop 退化。
+
+官网 callback/PKCE、一次性 state、固定兑换端点、签发 client 与设备 key 归属已经实现并有负例；本轮没有重做登录或放宽 legacy token 路径。raw 文本工具仍默认关闭的显式 opt-in，Intl 不借 CN 目录或权限。此次未确认新生产 wire 缺口；统一计时归 CORE-01 独立切片。三 rail 的真实注册/登录/刷新/权限/模型与多轮接受性仍分别 live_pending，验证范围见增强文档 §22.15。
+
+
+R5 公共切片：三rail在各自实际发送、headers与既有解码器产出的canonical Chat事件处观察统一计时，queue/progress不能成为首语义，恢复只观察已有同绑定分支。catalog为共享不可变payload，父预算跟随最后快照；本类最多128条/32MiB缓存、64个活动distinct catalog-flight，8分钟fresh/24小时stale保留。超本类可选缓存上限的当前结果可继续使用且仍接父预算，但不发布入cache；父预算/flight拒绝单独为503，不触发鉴权恢复或needsRelogin。见 `assets/contract/r5-shared-core.json`，没有新增真实接受性或性能成绩。

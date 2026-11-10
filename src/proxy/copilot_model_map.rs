@@ -42,12 +42,9 @@ pub(super) fn normalize_or_resolve_model(client_id: &str, settings: &Value) -> O
     {
         return normalized.filter(|model| model != client_id);
     }
-    let fallback = family_fallback(target, &models)?;
-    if fallback.eq_ignore_ascii_case(client_id) {
-        None
-    } else {
-        Some(fallback)
-    }
+    // A configured catalog is an exact alias target set, never permission to
+    // choose another version or context window from the same model family.
+    None
 }
 
 fn configured_models(settings: &Value) -> Vec<String> {
@@ -125,53 +122,6 @@ fn dashes_to_dot_in_last_version(id: &str) -> Option<String> {
     Some(format!("{head}.{last_segment}"))
 }
 
-fn detect_family(id: &str) -> Option<&'static str> {
-    let lower = id.to_ascii_lowercase();
-    if lower.contains("haiku") {
-        Some("haiku")
-    } else if lower.contains("sonnet") {
-        Some("sonnet")
-    } else if lower.contains("opus") {
-        Some("opus")
-    } else {
-        None
-    }
-}
-
-fn extract_major_minor(id: &str) -> Option<(u32, u32)> {
-    let lower = id.to_ascii_lowercase();
-    let family = detect_family(&lower)?;
-    let after = &lower[lower.find(family)? + family.len()..];
-    let after = after.strip_prefix('-')?;
-    let segment = after.split(['-', '[', ' ']).next()?;
-    let mut parts = segment.split('.');
-    let major: u32 = parts.next()?.parse().ok()?;
-    let minor: u32 = parts.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor))
-}
-
-fn family_fallback(target: &str, models: &[String]) -> Option<String> {
-    let family = detect_family(target)?;
-    let want_1m = target.ends_with("-1m");
-    let pick_best = |require_1m: bool| -> Option<String> {
-        models
-            .iter()
-            .filter(|model| {
-                let lower = model.to_ascii_lowercase();
-                lower.contains(family) && lower.ends_with("-1m") == require_1m
-            })
-            .filter_map(|model| extract_major_minor(model).map(|version| (model, version)))
-            .max_by_key(|(_, version)| *version)
-            .map(|(model, _)| model.clone())
-    };
-
-    if want_1m {
-        pick_best(true).or_else(|| pick_best(false))
-    } else {
-        pick_best(false)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,7 +167,20 @@ mod tests {
         );
         assert_eq!(
             normalize_or_resolve_model("claude-sonnet-4.8", &settings),
-            Some("claude-sonnet-4.6".to_string())
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_version_or_context_window_never_selects_another_model() {
+        let settings = json!({"copilotModels":["claude-sonnet-4.6","claude-sonnet-4.7-1m"]});
+        assert_eq!(
+            normalize_or_resolve_model("claude-sonnet-4.8", &settings),
+            None
+        );
+        assert_eq!(
+            normalize_or_resolve_model("claude-sonnet-4-6[1m]", &settings),
+            None
         );
     }
 }

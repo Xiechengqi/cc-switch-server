@@ -1,0 +1,147 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "deepseek_account",
+  "liveState": "live_pending",
+  "reference": {
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false,
+    "scope": "Web session/PoW/thinking/search shape only; reference refresh/password or tool guessing does not grant Server support"
+  },
+  "scope": {
+    "providerType": "deepseek_account",
+    "profiles": [
+      "claude.deepseek_account"
+    ],
+    "apps": [
+      "claude"
+    ],
+    "origin": "https://chat.deepseek.com",
+    "credentialRail": "one exact explicitly bound imported Web bearer Account; token expiry requires explicit reimport",
+    "excluded": [
+      "API key",
+      "password login",
+      "Cookie",
+      "automatic refresh",
+      "Codex/Gemini app expansion",
+      "native tool claim"
+    ]
+  },
+  "localPolicy": {
+    "productionWireChanged": false,
+    "localWorkerPolicyChanged": true,
+    "pow": {
+      "algorithm": "DeepSeekHashV1",
+      "defaultDifficulty": 144000,
+      "maxDifficulty": 1000000,
+      "maxConcurrentWorkers": 2,
+      "admissionWaitMs": 100,
+      "maxLocalWorkMs": 10000,
+      "controlIntervalHashes": 64,
+      "deadline": "monotonic local duration also capped by normalized challenge expiry plus existing 30s skew",
+      "cancel": "dropping async owner sets flag; worker checks before work/every 64 hashes/before header",
+      "permit": "blocking closure owns permit until actual exit, including queued or cancelled work",
+      "guarantee": "cooperative checks, not OS preemption or a hard real-time upper bound",
+      "capacity": "typed local error maps to fixed 503; no completion, auth recovery, cooldown or identity switching"
+    },
+    "toolMode": "nonce-bound allowlisted text simulation with complete object arguments; not native tools",
+    "session": "30min/256 exact scopes; same-account single rebuild only for reused session precommit 400/404/409",
+    "replay": "401/403/429/5xx, fresh-session failure, second failure and committed output remain terminal",
+    "resourceFollowup": "long-lived session/index ownership reviewed separately in CORE-02",
+    "performanceClaim": false
+  },
+  "cases": [
+    {
+      "id": "bearer-only-fixed-profile",
+      "tests": [
+        "deepseek_account_manager_accepts_only_the_imported_bearer_rail",
+        "deepseek_provider_test_dry_run_validates_fixed_bearer_binding_without_network"
+      ]
+    },
+    {
+      "id": "pow-reviewed-shape",
+      "tests": [
+        "pow_accepts_exact_current_completion_challenge",
+        "pow_rejects_expiry_target_algorithm_and_difficulty_drift"
+      ]
+    },
+    {
+      "id": "pow-cancel-and-deadline",
+      "tests": [
+        "pow_cancelled_search_must_not_return_a_valid_answer",
+        "pow_expired_local_work_deadline_must_not_return_a_valid_answer"
+      ]
+    },
+    {
+      "id": "pow-actual-worker-admission-owner",
+      "tests": [
+        "pow_capacity_is_bounded_before_cpu_work_and_closed_admission_is_local",
+        "pow_request_drop_cancels_work_but_keeps_the_real_worker_permit"
+      ]
+    },
+    {
+      "id": "local-capacity-not-auth",
+      "tests": [
+        "pow_capacity_error_is_local_and_never_authentication_or_upstream_status",
+        "deepseek_upstream_errors_map_to_proxy_status_codes"
+      ]
+    },
+    {
+      "id": "nonce-bound-simulated-tools",
+      "tests": [
+        "prompt_replays_tool_results_and_binds_tool_nonce",
+        "canonical_tool_reply_requires_nonce_allowlist_and_object_arguments"
+      ]
+    },
+    {
+      "id": "strict-terminal-thinking-search",
+      "tests": [
+        "strict_stream_preserves_thinking_content_and_search_citations",
+        "strict_stream_rejects_malformed_truncated_duplicate_and_post_terminal_data",
+        "claude_stream_closes_thinking_before_text_and_never_terminates_truncation"
+      ]
+    },
+    {
+      "id": "session-generation-and-discovery",
+      "tests": [
+        "session_cache_fences_provider_account_generation_share_and_ttl",
+        "session_cache_invalidation_is_exact_scope_only",
+        "deepseek_reviewed_discovery_requires_the_exact_account_generation"
+      ]
+    },
+    {
+      "id": "same-account-rebuild-once",
+      "tests": [
+        "deepseek_cached_session_rebuilds_once_on_same_account_before_commit",
+        "deepseek_provider_network_test_executes_native_chain_on_bound_account"
+      ]
+    },
+    {
+      "id": "expired-bearer-no-other-rail",
+      "tests": [
+        "deepseek_cached_session_401_is_terminal_without_rebuild_or_other_account"
+      ]
+    }
+  ],
+  "references": [
+    {
+      "repository": "OmniRoute",
+      "commit": "443d66996d69d7ecf887fd61158404a3cca1b192",
+      "tree": "8d1c312f61d115767c9478416cb039750eaf113a",
+      "files": [
+        {
+          "path": "open-sse/executors/deepseek-web.ts",
+          "sha256": "8557a3911b4525b81399e799c09769fb0327eefe5307128d5469a4327fa911a0"
+        },
+        {
+          "path": "open-sse/executors/deepseek-web/stream-format.ts",
+          "sha256": "38395066bc460617a07605ddb7f0fc8ab91b49e476855f0ba55448dcefab25c8"
+        },
+        {
+          "path": "open-sse/lib/deepseek-pow.ts",
+          "sha256": "fd81e8c7308a916244b47d5b25c793281e85f5798f5dcf68bfcdebba0ad6ba4d"
+        }
+      ]
+    }
+  ]
+}

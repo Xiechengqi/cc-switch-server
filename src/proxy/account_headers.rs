@@ -90,7 +90,8 @@ pub(super) fn account_header_override_blocked(name: &str, provider_type: Provide
     if provider_type == ProviderType::GitHubCopilot
         && matches!(
             normalized.as_str(),
-            "editor-version"
+            "anthropic-version"
+                | "editor-version"
                 | "editor-plugin-version"
                 | "copilot-integration-id"
                 | "x-github-api-version"
@@ -143,6 +144,7 @@ mod tests {
     #[test]
     fn copilot_account_headers_cannot_override_protocol_identity() {
         for name in [
+            "anthropic-version",
             "editor-version",
             "editor-plugin-version",
             "copilot-integration-id",

@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { auditKiroImageBudget, loadKiroImageBudget } from "./audit-kiro-image-budget.mjs";
 
 const repoRoot = path.resolve(new URL("../..", import.meta.url).pathname);
 const contractPath = path.join(repoRoot, "assets/contract/kiro-reference-delta.json");
@@ -647,6 +648,26 @@ assert(
 const evidenceExtensions = new Map(
   (contract.evidenceExtensions ?? []).map((entry) => [entry.id, entry]),
 );
+// Preserve the frozen extension and validate the replacement call chain
+// explicitly when a production facade moves to asynchronous image preparation.
+const imageBudget = loadKiroImageBudget();
+auditKiroImageBudget(imageBudget);
+const anchorMigration = imageBudget.localAnchorMigration;
+assert(
+  anchorMigration?.extension === "CORE-N2-KIRO" &&
+    anchorMigration.historicalPath === "src/proxy/providers/kiro/mod.rs" &&
+    anchorMigration.historicalAnchor === "prepare_kiro_request_with_context_and_memory" &&
+    anchorMigration.currentEvidence?.length === 3,
+  "Kiro bounded image call-chain migration is incomplete",
+);
+for (const evidence of anchorMigration.currentEvidence) {
+  safeRelative(evidence.path, "Kiro image migration path");
+  const source = fs.readFileSync(path.join(repoRoot, evidence.path), "utf8");
+  assert(evidence.anchors?.length > 0, "Kiro image migration needs source anchors");
+  for (const anchor of evidence.anchors) {
+    assert(source.includes(anchor), `Kiro image migration is missing ${anchor}`);
+  }
+}
 assert(
   evidenceExtensions.size === 3 &&
     evidenceExtensions.has("CORE-N1") &&
@@ -670,6 +691,11 @@ for (const [id, expectedCount] of [
     assert(fs.existsSync(localPath), `${id} local path is unavailable: ${evidence.path}`);
     const source = fs.readFileSync(localPath, "utf8");
     for (const anchor of evidence.anchors ?? []) {
+      if (
+        id === anchorMigration.extension &&
+        evidence.path === anchorMigration.historicalPath &&
+        anchor === anchorMigration.historicalAnchor
+      ) continue;
       assert(source.includes(anchor), `${id} is missing local anchor ${anchor}`);
     }
   }

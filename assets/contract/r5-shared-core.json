@@ -1,0 +1,1079 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerClass": "shared_core",
+  "liveState": "live_pending",
+  "reference": {
+    "use": "local_Server_Registry_and_actual_owner_review_only_no_new_vendor_protocol_adoption",
+    "realReceipt": false,
+    "historicalEvidence": "All earlier R5 provider fixtures and committed reference pins remain separate and unchanged"
+  },
+  "scope": {
+    "registry": {
+      "profiles": [
+        {
+          "profileId": "claude.amazon_q_oauth",
+          "app": "claude",
+          "providerType": "amazon_q_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.amazon_q"
+          },
+          "timingLabel": "amazon_q_oauth"
+        },
+        {
+          "profileId": "claude.anthropic_api_key",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "claude"
+        },
+        {
+          "profileId": "claude.antigravity_cli",
+          "app": "claude",
+          "providerType": "agy_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.agy"
+          },
+          "timingLabel": "agy_oauth"
+        },
+        {
+          "profileId": "claude.antigravity_oauth",
+          "app": "claude",
+          "providerType": "antigravity_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.antigravity"
+          },
+          "timingLabel": "antigravity_oauth"
+        },
+        {
+          "profileId": "claude.aws_bedrock_aksk",
+          "app": "claude",
+          "providerType": "aws_bedrock",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "aws.bedrock_sigv4"
+          },
+          "timingLabel": "aws_bedrock"
+        },
+        {
+          "profileId": "claude.aws_bedrock_api_key",
+          "app": "claude",
+          "providerType": "aws_bedrock",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.bedrock_bearer"
+          },
+          "timingLabel": "aws_bedrock"
+        },
+        {
+          "profileId": "claude.bailian_coding_plan_cn",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "claude"
+        },
+        {
+          "profileId": "claude.bailian_coding_plan_global",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "claude"
+        },
+        {
+          "profileId": "claude.codebuddy_oauth",
+          "app": "claude",
+          "providerType": "codebuddy_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.codebuddy_oauth"
+          },
+          "timingLabel": "codebuddy_oauth"
+        },
+        {
+          "profileId": "claude.cursor_api_key",
+          "app": "claude",
+          "providerType": "cursor_apikey",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.cursor"
+          },
+          "timingLabel": "cursor_apikey"
+        },
+        {
+          "profileId": "claude.cursor_oauth",
+          "app": "claude",
+          "providerType": "cursor_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.cursor"
+          },
+          "timingLabel": "cursor_oauth"
+        },
+        {
+          "profileId": "claude.deepseek_account",
+          "app": "claude",
+          "providerType": "deepseek_account",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.deepseek_account"
+          },
+          "timingLabel": "deepseek_account"
+        },
+        {
+          "profileId": "claude.deepseek_api",
+          "app": "claude",
+          "providerType": "deepseek_api",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "deepseek_api"
+        },
+        {
+          "profileId": "claude.github_copilot",
+          "app": "claude",
+          "providerType": "github_copilot",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.copilot"
+          },
+          "timingLabel": "github_copilot"
+        },
+        {
+          "profileId": "claude.google_oauth",
+          "app": "claude",
+          "providerType": "gemini_cli",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "oauth.gemini_code_assist"
+          },
+          "timingLabel": "gemini_cli"
+        },
+        {
+          "profileId": "claude.grok_oauth",
+          "app": "claude",
+          "providerType": "grok_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "oauth.grok_responses"
+          },
+          "timingLabel": "grok_oauth"
+        },
+        {
+          "profileId": "claude.grok_web_session",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.grok_web_session"
+          },
+          "timingLabel": "grok_web_session"
+        },
+        {
+          "profileId": "claude.kimi_code",
+          "app": "claude",
+          "providerType": "kimi_code",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "oauth.kimi_code"
+          },
+          "timingLabel": "kimi_code"
+        },
+        {
+          "profileId": "claude.kimi_coding_api_key",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "claude"
+        },
+        {
+          "profileId": "claude.kiro_oauth",
+          "app": "claude",
+          "providerType": "kiro_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.kiro"
+          },
+          "timingLabel": "kiro_oauth"
+        },
+        {
+          "profileId": "claude.minimax_cn",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "claude"
+        },
+        {
+          "profileId": "claude.minimax_global",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "claude"
+        },
+        {
+          "profileId": "claude.nvidia",
+          "app": "claude",
+          "providerType": "nvidia",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_chat"
+          },
+          "timingLabel": "nvidia"
+        },
+        {
+          "profileId": "claude.official_oauth",
+          "app": "claude",
+          "providerType": "claude_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "oauth.claude_messages"
+          },
+          "timingLabel": "claude_oauth"
+        },
+        {
+          "profileId": "claude.ollama_cloud",
+          "app": "claude",
+          "providerType": "ollama_cloud",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_chat"
+          },
+          "timingLabel": "ollama_cloud"
+        },
+        {
+          "profileId": "claude.openai_oauth",
+          "app": "claude",
+          "providerType": "codex_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "oauth.openai_codex"
+          },
+          "timingLabel": "codex_oauth"
+        },
+        {
+          "profileId": "claude.openrouter",
+          "app": "claude",
+          "providerType": "openrouter",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "openrouter"
+        },
+        {
+          "profileId": "claude.perplexity_web_session",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.perplexity_web_session"
+          },
+          "timingLabel": "perplexity_web_session"
+        },
+        {
+          "profileId": "claude.qoder_cosy",
+          "app": "claude",
+          "providerType": "qoder_cosy",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.qoder_cosy"
+          },
+          "timingLabel": "qoder_cosy"
+        },
+        {
+          "profileId": "claude.trae_raw_chat",
+          "app": "claude",
+          "providerType": "trae_raw_chat",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.trae_raw_chat"
+          },
+          "timingLabel": "trae_raw_chat"
+        },
+        {
+          "profileId": "claude.trae_raw_chat_intl",
+          "app": "claude",
+          "providerType": "trae_raw_chat_intl",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.trae_raw_chat_intl"
+          },
+          "timingLabel": "trae_raw_chat_intl"
+        },
+        {
+          "profileId": "claude.trae_solo",
+          "app": "claude",
+          "providerType": "trae_solo",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.trae_solo"
+          },
+          "timingLabel": "trae_solo"
+        },
+        {
+          "profileId": "claude.volcengine_coding_plan",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "claude"
+        },
+        {
+          "profileId": "claude.workbuddy_oauth",
+          "app": "claude",
+          "providerType": "workbuddy_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.workbuddy_oauth"
+          },
+          "timingLabel": "workbuddy_oauth"
+        },
+        {
+          "profileId": "claude.xiaomi_mimo_token_plan",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "claude"
+        },
+        {
+          "profileId": "claude.xiaomi_mimo_token_plan_sgp",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "claude"
+        },
+        {
+          "profileId": "claude.zhipu_glm_cn",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "claude"
+        },
+        {
+          "profileId": "claude.zhipu_glm_global",
+          "app": "claude",
+          "providerType": "claude",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.anthropic_messages"
+          },
+          "timingLabel": "claude"
+        },
+        {
+          "profileId": "codex.amazon_q_oauth",
+          "app": "codex",
+          "providerType": "amazon_q_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.amazon_q"
+          },
+          "timingLabel": "amazon_q_oauth"
+        },
+        {
+          "profileId": "codex.bailian_coding_plan_cn",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_chat"
+          },
+          "timingLabel": "codex"
+        },
+        {
+          "profileId": "codex.bailian_coding_plan_global",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_chat"
+          },
+          "timingLabel": "codex"
+        },
+        {
+          "profileId": "codex.codebuddy_oauth",
+          "app": "codex",
+          "providerType": "codebuddy_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.codebuddy_oauth"
+          },
+          "timingLabel": "codebuddy_oauth"
+        },
+        {
+          "profileId": "codex.cursor_api_key",
+          "app": "codex",
+          "providerType": "cursor_apikey",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.cursor"
+          },
+          "timingLabel": "cursor_apikey"
+        },
+        {
+          "profileId": "codex.cursor_oauth",
+          "app": "codex",
+          "providerType": "cursor_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.cursor"
+          },
+          "timingLabel": "cursor_oauth"
+        },
+        {
+          "profileId": "codex.deepseek_api",
+          "app": "codex",
+          "providerType": "deepseek_api",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_chat"
+          },
+          "timingLabel": "deepseek_api"
+        },
+        {
+          "profileId": "codex.github_copilot",
+          "app": "codex",
+          "providerType": "github_copilot",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.copilot"
+          },
+          "timingLabel": "github_copilot"
+        },
+        {
+          "profileId": "codex.grok_oauth",
+          "app": "codex",
+          "providerType": "grok_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "oauth.grok_responses"
+          },
+          "timingLabel": "grok_oauth"
+        },
+        {
+          "profileId": "codex.grok_web_session",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.grok_web_session"
+          },
+          "timingLabel": "grok_web_session"
+        },
+        {
+          "profileId": "codex.kimi_code",
+          "app": "codex",
+          "providerType": "kimi_code",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "oauth.kimi_code"
+          },
+          "timingLabel": "kimi_code"
+        },
+        {
+          "profileId": "codex.kimi_coding_api_key",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_chat"
+          },
+          "timingLabel": "codex"
+        },
+        {
+          "profileId": "codex.kiro_oauth",
+          "app": "codex",
+          "providerType": "kiro_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.kiro"
+          },
+          "timingLabel": "kiro_oauth"
+        },
+        {
+          "profileId": "codex.minimax_cn",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_responses"
+          },
+          "timingLabel": "codex"
+        },
+        {
+          "profileId": "codex.minimax_global",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_responses"
+          },
+          "timingLabel": "codex"
+        },
+        {
+          "profileId": "codex.nvidia",
+          "app": "codex",
+          "providerType": "nvidia",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_chat"
+          },
+          "timingLabel": "nvidia"
+        },
+        {
+          "profileId": "codex.ollama_cloud",
+          "app": "codex",
+          "providerType": "ollama_cloud",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_chat"
+          },
+          "timingLabel": "ollama_cloud"
+        },
+        {
+          "profileId": "codex.openai_api_key",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_responses"
+          },
+          "timingLabel": "codex"
+        },
+        {
+          "profileId": "codex.openai_oauth",
+          "app": "codex",
+          "providerType": "codex_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "oauth.openai_codex"
+          },
+          "timingLabel": "codex_oauth"
+        },
+        {
+          "profileId": "codex.openrouter",
+          "app": "codex",
+          "providerType": "openrouter",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_responses"
+          },
+          "timingLabel": "openrouter"
+        },
+        {
+          "profileId": "codex.perplexity_web_session",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.perplexity_web_session"
+          },
+          "timingLabel": "perplexity_web_session"
+        },
+        {
+          "profileId": "codex.qoder_cosy",
+          "app": "codex",
+          "providerType": "qoder_cosy",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.qoder_cosy"
+          },
+          "timingLabel": "qoder_cosy"
+        },
+        {
+          "profileId": "codex.trae_raw_chat",
+          "app": "codex",
+          "providerType": "trae_raw_chat",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.trae_raw_chat"
+          },
+          "timingLabel": "trae_raw_chat"
+        },
+        {
+          "profileId": "codex.trae_raw_chat_intl",
+          "app": "codex",
+          "providerType": "trae_raw_chat_intl",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.trae_raw_chat_intl"
+          },
+          "timingLabel": "trae_raw_chat_intl"
+        },
+        {
+          "profileId": "codex.trae_solo",
+          "app": "codex",
+          "providerType": "trae_solo",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.trae_solo"
+          },
+          "timingLabel": "trae_solo"
+        },
+        {
+          "profileId": "codex.volcengine_coding_plan",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_responses"
+          },
+          "timingLabel": "codex"
+        },
+        {
+          "profileId": "codex.workbuddy_oauth",
+          "app": "codex",
+          "providerType": "workbuddy_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.workbuddy_oauth"
+          },
+          "timingLabel": "workbuddy_oauth"
+        },
+        {
+          "profileId": "codex.xiaomi_mimo_token_plan",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_responses"
+          },
+          "timingLabel": "codex"
+        },
+        {
+          "profileId": "codex.xiaomi_mimo_token_plan_sgp",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_responses"
+          },
+          "timingLabel": "codex"
+        },
+        {
+          "profileId": "codex.zhipu_glm_cn",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_chat"
+          },
+          "timingLabel": "codex"
+        },
+        {
+          "profileId": "codex.zhipu_glm_global",
+          "app": "codex",
+          "providerType": "codex",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_chat"
+          },
+          "timingLabel": "codex"
+        },
+        {
+          "profileId": "gemini.antigravity_cli",
+          "app": "gemini",
+          "providerType": "agy_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.agy"
+          },
+          "timingLabel": "agy_oauth"
+        },
+        {
+          "profileId": "gemini.antigravity_oauth",
+          "app": "gemini",
+          "providerType": "antigravity_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.antigravity"
+          },
+          "timingLabel": "antigravity_oauth"
+        },
+        {
+          "profileId": "gemini.codebuddy_oauth",
+          "app": "gemini",
+          "providerType": "codebuddy_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.codebuddy_oauth"
+          },
+          "timingLabel": "codebuddy_oauth"
+        },
+        {
+          "profileId": "gemini.cursor_api_key",
+          "app": "gemini",
+          "providerType": "cursor_apikey",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.cursor"
+          },
+          "timingLabel": "cursor_apikey"
+        },
+        {
+          "profileId": "gemini.cursor_oauth",
+          "app": "gemini",
+          "providerType": "cursor_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.cursor"
+          },
+          "timingLabel": "cursor_oauth"
+        },
+        {
+          "profileId": "gemini.github_copilot",
+          "app": "gemini",
+          "providerType": "github_copilot",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.copilot"
+          },
+          "timingLabel": "github_copilot"
+        },
+        {
+          "profileId": "gemini.google_api_key",
+          "app": "gemini",
+          "providerType": "gemini",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.gemini_native"
+          },
+          "timingLabel": "gemini"
+        },
+        {
+          "profileId": "gemini.google_oauth",
+          "app": "gemini",
+          "providerType": "gemini_cli",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "oauth.gemini_code_assist"
+          },
+          "timingLabel": "gemini_cli"
+        },
+        {
+          "profileId": "gemini.grok_oauth",
+          "app": "gemini",
+          "providerType": "grok_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "oauth.grok_responses"
+          },
+          "timingLabel": "grok_oauth"
+        },
+        {
+          "profileId": "gemini.kimi_code",
+          "app": "gemini",
+          "providerType": "kimi_code",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "oauth.kimi_code"
+          },
+          "timingLabel": "kimi_code"
+        },
+        {
+          "profileId": "gemini.openrouter",
+          "app": "gemini",
+          "providerType": "openrouter",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "http.openai_chat"
+          },
+          "timingLabel": "openrouter"
+        },
+        {
+          "profileId": "gemini.qoder_cosy",
+          "app": "gemini",
+          "providerType": "qoder_cosy",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.qoder_cosy"
+          },
+          "timingLabel": "qoder_cosy"
+        },
+        {
+          "profileId": "gemini.trae_raw_chat",
+          "app": "gemini",
+          "providerType": "trae_raw_chat",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.trae_raw_chat"
+          },
+          "timingLabel": "trae_raw_chat"
+        },
+        {
+          "profileId": "gemini.trae_raw_chat_intl",
+          "app": "gemini",
+          "providerType": "trae_raw_chat_intl",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.trae_raw_chat_intl"
+          },
+          "timingLabel": "trae_raw_chat_intl"
+        },
+        {
+          "profileId": "gemini.trae_solo",
+          "app": "gemini",
+          "providerType": "trae_solo",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.trae_solo"
+          },
+          "timingLabel": "trae_solo"
+        },
+        {
+          "profileId": "gemini.workbuddy_oauth",
+          "app": "gemini",
+          "providerType": "workbuddy_oauth",
+          "driverBinding": {
+            "kind": "fixed",
+            "driverId": "special.workbuddy_oauth"
+          },
+          "timingLabel": "workbuddy_oauth"
+        }
+      ],
+      "customRecipes": [
+        {
+          "recipeId": "claude.anthropic_bearer_relay",
+          "profileId": "claude.custom_http",
+          "providerType": "claude_auth",
+          "binding": {
+            "upstreamProtocol": "anthropic_messages",
+            "authScheme": "bearer"
+          },
+          "timingLabel": "claude_auth"
+        }
+      ],
+      "providerTypes": [
+        "agy_oauth",
+        "amazon_q_oauth",
+        "antigravity_oauth",
+        "aws_bedrock",
+        "claude",
+        "claude_auth",
+        "claude_oauth",
+        "codebuddy_oauth",
+        "codex",
+        "codex_oauth",
+        "cursor_apikey",
+        "cursor_oauth",
+        "deepseek_account",
+        "deepseek_api",
+        "gemini",
+        "gemini_cli",
+        "github_copilot",
+        "grok_oauth",
+        "kimi_code",
+        "kiro_oauth",
+        "nvidia",
+        "ollama_cloud",
+        "openrouter",
+        "qoder_cosy",
+        "trae_raw_chat",
+        "trae_raw_chat_intl",
+        "trae_solo",
+        "workbuddy_oauth"
+      ],
+      "labels": [
+        "agy_oauth",
+        "amazon_q_oauth",
+        "antigravity_oauth",
+        "aws_bedrock",
+        "claude",
+        "claude_auth",
+        "claude_oauth",
+        "codebuddy_oauth",
+        "codex",
+        "codex_oauth",
+        "cursor_apikey",
+        "cursor_oauth",
+        "deepseek_account",
+        "deepseek_api",
+        "gemini",
+        "gemini_cli",
+        "github_copilot",
+        "grok_oauth",
+        "grok_web_session",
+        "kimi_code",
+        "kiro_oauth",
+        "nvidia",
+        "ollama_cloud",
+        "openrouter",
+        "perplexity_web_session",
+        "qoder_cosy",
+        "trae_raw_chat",
+        "trae_raw_chat_intl",
+        "trae_solo",
+        "workbuddy_oauth"
+      ]
+    },
+    "resources": {
+      "deepseek": {
+        "MAX_SESSION_SCOPES": 256,
+        "MAX_ACTIVE_SESSION_FLIGHTS": 64,
+        "DEEPSEEK_SESSION_TTL_MS": 1800000
+      },
+      "trae": {
+        "MAX_RUNTIME_ENTRIES": 128,
+        "MAX_ACTIVE_CATALOG_FLIGHTS": 64,
+        "MAX_RUNTIME_BYTES": 33554432,
+        "TRAE_MODEL_CATALOG_TTL_MS": 480000,
+        "MAX_STALE_CATALOG_AGE_MS": 86400000
+      },
+      "web": {
+        "MAX_WEB_SCOPES": 1024,
+        "MAX_SESSION_ID_BYTES": 512
+      }
+    }
+  },
+  "localPolicy": {
+    "implementationCommit": null,
+    "timing": "one immutable request provider/surface, separate attempts, admission/send/headers/first_semantic/body_handoff/terminal/last_owner; bounded static labels only",
+    "httpHandoffIsSocketWrite": false,
+    "controlsAreContent": false,
+    "memoryTrackingWithoutBudget": "lifetime token only; no new request admission for previously unbudgeted drivers",
+    "buffers": "web first_semantic observed after complete strict upstream parse; no low-latency claim",
+    "deepseekHeaders": "completion send/header callback excludes session creation, PoW and generation preparation",
+    "deepseekSession": "shared immutable payload; 256 sessions with 30min TTL; separate 64 active flights; process parent retained through last accepted snapshot",
+    "traeCatalog": "shared immutable catalog, original 8min fresh/24h stale rules; 128 entries/32MiB retention, 64 active flights; optional oversized retention may serve one charged live result without publication",
+    "webScope": "reserve bounded session/auth slot before send; capacity is 503 before network; no TTL/capacity eviction of authentication invalidation; explicit scope generation/config deletion releases",
+    "capacityIsAccountInvalidation": false,
+    "ownerReview": {
+      "oldEightProviderBudgets": "preserved, not rebuilt",
+      "kimiCopilot": "R5 existing parent and flight ownership preserved",
+      "geminiQuota": "persisted Account projection, no separate resident runtime catalog",
+      "antigravityPublicCatalog": "short-lived copied API/state projection, not a retained shared runtime owner; existing charged internal cache unchanged",
+      "webTasks": "no production task insertion; no new job or continuation support"
+    },
+    "policyUnchanged": [
+      "no cross Account/Provider/product/site/credential rail fallback",
+      "same existing recovery eligibility/count, deadlines, cooldown and usage",
+      "no EOF-success synthesis or credential reimport bypass"
+    ],
+    "limits": "logical reserved allocation estimates, not allocator/TLS/parser/SQLite/RSS coverage or measured performance"
+  },
+  "cases": [
+    {
+      "id": "static_labels_and_control",
+      "input": "synthetic local scope and loopback protocol fixtures; no vendor request",
+      "expected": "observation-only timing or bounded process ownership; exact identity and protocol policy preserved",
+      "tests": [
+        "r5_timing_all_registry_types_and_experimental_drivers_have_static_labels",
+        "r5_timing_chat_role_and_responses_keepalive_are_not_first_semantic_content",
+        "r5_timing_unbudgeted_owner_waits_for_transport_and_response_slices",
+        "r5_timing_unbudgeted_cancellation_precedes_last_payload_release"
+      ]
+    },
+    {
+      "id": "real_http_driver_timing",
+      "input": "synthetic local scope and loopback protocol fixtures; no vendor request",
+      "expected": "observation-only timing or bounded process ownership; exact identity and protocol policy preserved",
+      "tests": [
+        "r5_timing_static_provider_types_observe_all_four_protocols_in_real_forwarding",
+        "r5_timing_kimi_and_gemini_cli_cover_all_declared_app_surfaces",
+        "r5_timing_trae_three_rails_cover_four_routes_without_counting_queue_frames",
+        "r5_timing_deepseek_completion_observes_json_and_sse_with_existing_pow_and_scope",
+        "r5_timing_kimi_real_header_cancellation_and_http_failure_release_owners",
+        "r5_timing_gemini_cli_native_count_tokens_is_semantic_without_discovery",
+        "r5_timing_copilot_native_chat_endpoint_covers_four_downstream_routes",
+        "r5_timing_web_local_count_has_semantic_delivery_and_no_upstream_send"
+      ]
+    },
+    {
+      "id": "deepseek_last_owner_and_flights",
+      "input": "synthetic local scope and loopback protocol fixtures; no vendor request",
+      "expected": "observation-only timing or bounded process ownership; exact identity and protocol policy preserved",
+      "tests": [
+        "r5_resource_deepseek_last_owner_survives_invalidation_replacement_and_expiry",
+        "r5_resource_deepseek_refused_replacement_revokes_old_index_without_relabeling_auth",
+        "r5_resource_deepseek_cache_eviction_preserves_snapshot_charge",
+        "r5_resource_deepseek_distinct_flights_waiter_cancel_and_guard_drop_are_bounded"
+      ]
+    },
+    {
+      "id": "trae_last_owner_and_flights",
+      "input": "synthetic local scope and loopback protocol fixtures; no vendor request",
+      "expected": "observation-only timing or bounded process ownership; exact identity and protocol policy preserved",
+      "tests": [
+        "r5_resource_trae_snapshots_stale_expiry_and_drop_share_exact_owner",
+        "r5_resource_trae_empty_and_refused_replacements_never_reuse_old_entitlement",
+        "r5_resource_trae_optional_oversized_catalog_retention_keeps_live_owner_charged",
+        "r5_resource_trae_invalidation_and_eviction_do_not_release_external_snapshots",
+        "r5_resource_trae_distinct_flights_and_waiter_cancellation_preserve_parent"
+      ]
+    },
+    {
+      "id": "web_scope_auth_capacity",
+      "input": "synthetic local scope and loopback protocol fixtures; no vendor request",
+      "expected": "observation-only timing or bounded process ownership; exact identity and protocol policy preserved",
+      "tests": [
+        "r5_resource_web_scope_reserves_auth_marker_before_send_and_survives_lowered_limit",
+        "r5_resource_web_rebind_and_delete_release_only_the_matching_scope",
+        "r5_resource_web_scope_capacity_never_evicts_an_authentication_invalidation"
+      ]
+    },
+    {
+      "id": "runtime_capacity_is_not_authentication",
+      "input": "synthetic local scope and loopback protocol fixtures; no vendor request",
+      "expected": "observation-only timing or bounded process ownership; exact identity and protocol policy preserved",
+      "tests": [
+        "r5_resource_runtime_capacity_is_503_and_never_authentication_recovery"
+      ]
+    },
+    {
+      "id": "catalog_api_capacity_is_not_authentication",
+      "input": "synthetic local scope and loopback protocol fixtures; no vendor request",
+      "expected": "observation-only timing or bounded process ownership; exact identity and protocol policy preserved",
+      "tests": [
+        "r5_resource_trae_catalog_capacity_is_service_unavailable_without_login_recovery"
+      ]
+    },
+    {
+      "id": "native_special_and_existing_regressions",
+      "input": "real loopback HTTP JSON/SSE/EventStream for all declared routes",
+      "expected": "static Provider labels, valid semantic terminal, no fabricated socket completion, final payload release",
+      "tests": [
+        "web_session_drivers_forward_claude_and_codex_text_lifecycles_with_fixed_rails",
+        "bedrock_r5_bearer_actual_forwarder_normalizes_json_and_fragmented_eventstream",
+        "copilot_native_endpoints_bridge_all_declared_downstream_routes_and_tool_lifecycles",
+        "ollama_r5_tool_and_length_terminals_preserve_official_usage_on_all_routes",
+        "claude_core03_timing_real_json_and_sse_cover_all_declared_surfaces",
+        "antigravity_core03_both_rails_cover_declared_surfaces_and_zero_count",
+        "kiro_core03_both_products_three_surfaces_stream_and_buffered_and_local_count",
+        "trae_all_channels_four_protocols_stream_and_nonstream_two_tool_roundtrips",
+        "deepseek_cached_session_rebuilds_once_on_same_account_before_commit"
+      ]
+    }
+  ],
+  "references": []
+}

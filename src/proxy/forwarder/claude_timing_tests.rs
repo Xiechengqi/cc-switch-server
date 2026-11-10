@@ -402,7 +402,7 @@ fn claude_core03_timing_excludes_empty_control_and_retains_incomplete_hint() {
         .is_none());
     assert!(TimingSlot::default()
         .begin_for_provider(ProviderType::Claude, "anthropic_messages", Instant::now())
-        .is_none());
+        .is_some());
 }
 
 #[test]

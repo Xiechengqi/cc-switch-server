@@ -27,6 +27,14 @@ CN 的 catalog、quota、auth-status 与 generation 都必须发送非空规范�
 
 COSY model list 是当前绑定账号的权威 entitlement。成功空目录保持为空，不与 Provider 配置、静态 alias 或其他账号目录合并。目录条目必须是 object，包含非空且无首尾空白的原样 key；`enable` 若存在必须是 boolean。坏结构、超限响应、缺失字段和身份 scope 漂移均失败关闭。未知厂商 key 保持大小写原样，只有已审 alias 的匹配不区分 ASCII 大小写。
 
+R5 场景目录同时识别 `chat` 与 `app` 数组，至少存在一个；显式 null/坏数组不作为缺省忽略。同场景重复 key 拒绝，两场景合计最多 256 条。chat 原始配置及 deny 优先于同 key app，不 union 权限；quest、inline、assistant、BYOK 不参与发现或推理。只有 enabled chat 能进入标准 `data` 和实际生成白名单。app-only 即便 `enable:true` 或声明图片能力，仍为 discovery-only，不能借 alias、配置或另一站点/rail 变成可执行模型。
+
+Qoder 的 `/v1/models` 另提供顶层可选 `catalogEntries`：每条包含原始 `modelKey`、`scene`、可选字符串 `source`、`enabled`、`selected` 与 `executable`。同 key 的 chat/app 观察均保留，`selected` 指向 chat 优先的配置；这不是第二份推理白名单。不公开 raw config 或身份/签名材料。chat 参数按既有合同校验，app 配置只作为未授权的发现观察，不据其字段猜能力。元数据随原 catalog Arc owner 计入进程驻留预算。
+
+本项源码证据为 `qoder2api-hub@5caac09af0eaed301164e2255bceae47af8bfae6` 的 `qoder_catalog.py::dialogue_models`；本仓 synthetic `assets/contract/qoder-catalog-scenes.json` 将来源与更严格的本地权限策略分开记录。该参考只证明场景选择，不证明 app-only 对 Global OAuth、Global PAT 或 CN OAuth 的 COSY 调用权限；三 rail 继续 `live_pending`。原官方 CLI oracle 与其历史验证计数不改写。
+
+目录沿用一小时 TTL，并在准备后的请求检查目录代次：同 scope 替换、显式失效和过期均使旧快照不可发送或成功发布。代次复用已有有界 single-flight owner，不创建无界索引；完整目录可选缓存留存被拒绝时，当前 fresh 结果仍持有小型代次 owner，能够正常使用并响应后续撤权。owner 计费直到最后引用释放。新 scope 准入必要时仅淘汰未被请求借用的可选目录缓存；不能淘汰正在使用的代次来绕过边界。
+
 Global/CN alias 表集中维护，但只有对应 live-enabled route 才会发布公开 alias。若上游同时给出与 alias 同名的原始 key，该原始条目不能冒充 alias 的 route/capability；未启用 alias route 时公开目录也不发布这个不可请求的 ID。上游出现未知 live route 时保留其 exact id，便于观察新 entitlement，同时不猜测 reasoning、context、图片或其他能力。`/v1/models` 可返回：
 
 - `reasoningEfforts`：按 site × route 的 reviewed matrix，仅发布 `none`/`low`/`high`/`max` 中已证明的组合；

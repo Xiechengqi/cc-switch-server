@@ -1,13 +1,19 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::RwLock;
+
+use crate::infra::resident_flights::{node_bytes, ResidentFlightGuard, ResidentFlights};
+use crate::infra::resident_memory::{
+    process_resident_memory, ResidentMemoryBudget, ResidentMemoryReservation,
+};
 
 const MAX_SESSION_SCOPES: usize = 256;
+const MAX_ACTIVE_SESSION_FLIGHTS: usize = 64;
 pub const DEEPSEEK_SESSION_TTL_MS: i64 = 30 * 60 * 1_000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeepSeekRuntimeScope(String);
 
 impl DeepSeekRuntimeScope {
@@ -64,12 +70,32 @@ impl DeepSeekRuntimeScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeepSeekCachedSession {
+#[derive(Debug, Clone)]
+pub struct DeepSeekCachedSession(Arc<DeepSeekSessionData>);
+
+#[derive(Debug)]
+pub struct DeepSeekSessionData {
     pub session_id: String,
     pub created_at_ms: i64,
     pub expires_at_ms: i64,
+    _memory: Option<ResidentMemoryReservation>,
 }
+
+impl std::ops::Deref for DeepSeekCachedSession {
+    type Target = DeepSeekSessionData;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl PartialEq for DeepSeekCachedSession {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.created_at_ms == other.created_at_ms
+            && self.expires_at_ms == other.expires_at_ms
+    }
+}
+impl Eq for DeepSeekCachedSession {}
 
 impl DeepSeekCachedSession {
     pub fn new(session_id: String, now_ms: i64) -> Result<Self, String> {
@@ -77,11 +103,12 @@ impl DeepSeekCachedSession {
         if session_id.is_empty() || session_id.len() > 512 {
             return Err("DeepSeek session id is empty or exceeds 512 bytes".to_string());
         }
-        Ok(Self {
+        Ok(Self(Arc::new(DeepSeekSessionData {
             session_id,
             created_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(DEEPSEEK_SESSION_TTL_MS),
-        })
+            _memory: None,
+        })))
     }
 
     fn is_fresh(&self, now_ms: i64) -> bool {
@@ -89,38 +116,52 @@ impl DeepSeekCachedSession {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DeepSeekRuntimeCache {
-    sessions: RwLock<HashMap<DeepSeekRuntimeScope, DeepSeekCachedSession>>,
-    session_flights: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    sessions: RwLock<BTreeMap<DeepSeekRuntimeScope, DeepSeekCachedSession>>,
+    session_flights: ResidentFlights<DeepSeekRuntimeScope>,
+    parent: ResidentMemoryBudget,
+}
+
+#[derive(Debug)]
+pub struct DeepSeekSessionCapacity;
+
+impl Default for DeepSeekRuntimeCache {
+    fn default() -> Self {
+        Self::with_parent(process_resident_memory())
+    }
 }
 
 impl DeepSeekRuntimeCache {
+    pub(crate) fn with_parent(parent: ResidentMemoryBudget) -> Self {
+        Self {
+            sessions: RwLock::new(BTreeMap::new()),
+            session_flights: ResidentFlights::new(parent.clone(), MAX_ACTIVE_SESSION_FLIGHTS),
+            parent,
+        }
+    }
+
     pub async fn session(
         &self,
         scope: &DeepSeekRuntimeScope,
         now_ms: i64,
     ) -> Option<DeepSeekCachedSession> {
-        let candidate = self.sessions.read().await.get(scope).cloned();
-        if candidate
-            .as_ref()
-            .is_some_and(|session| session.is_fresh(now_ms))
-        {
-            return candidate;
-        }
-        if candidate.is_some() {
-            self.sessions.write().await.remove(scope);
-        }
-        None
+        let mut sessions = self.sessions.write().await;
+        sessions.retain(|_, session| session.is_fresh(now_ms));
+        sessions.get(scope).cloned()
     }
 
     pub async fn insert_session(
         &self,
         scope: DeepSeekRuntimeScope,
         session: DeepSeekCachedSession,
-    ) {
+    ) -> Result<DeepSeekCachedSession, DeepSeekSessionCapacity> {
         let mut sessions = self.sessions.write().await;
-        if sessions.len() >= MAX_SESSION_SCOPES && !sessions.contains_key(&scope) {
+        // Replacement revokes the old index even when admission is refused;
+        // snapshots already held by callers keep their original charge.
+        sessions.remove(&scope);
+        sessions.retain(|_, previous| previous.is_fresh(session.created_at_ms));
+        if sessions.len() >= MAX_SESSION_SCOPES {
             if let Some(oldest) = sessions
                 .iter()
                 .min_by_key(|(_, session)| session.created_at_ms)
@@ -129,25 +170,41 @@ impl DeepSeekRuntimeCache {
                 sessions.remove(&oldest);
             }
         }
-        sessions.insert(scope, session);
+        let bytes = node_bytes::<DeepSeekRuntimeScope, DeepSeekCachedSession>(
+            scope
+                .0
+                .capacity()
+                .saturating_add(std::mem::size_of::<DeepSeekSessionData>())
+                .saturating_add(std::mem::size_of::<usize>() * 2)
+                .saturating_add(session.session_id.len()),
+        );
+        let Some(memory) = self.parent.reserve(bytes) else {
+            crate::metrics::record_resident_retention_refused("deepseek_session");
+            return Err(DeepSeekSessionCapacity);
+        };
+        let session = DeepSeekCachedSession(Arc::new(DeepSeekSessionData {
+            session_id: session.session_id.as_str().into(),
+            created_at_ms: session.created_at_ms,
+            expires_at_ms: session.expires_at_ms,
+            _memory: Some(memory),
+        }));
+        sessions.insert(scope, session.clone());
+        Ok(session)
     }
 
     pub async fn invalidate_session(&self, scope: &DeepSeekRuntimeScope) {
         self.sessions.write().await.remove(scope);
     }
 
-    pub async fn session_lock(&self, scope: &DeepSeekRuntimeScope) -> OwnedMutexGuard<()> {
-        let key = scope.key().to_string();
-        let flight = {
-            let mut flights = self.session_flights.lock().await;
-            flights.retain(|_, flight| Arc::strong_count(flight) > 1 || flight.try_lock().is_err());
-            Arc::clone(
-                flights
-                    .entry(key)
-                    .or_insert_with(|| Arc::new(Mutex::new(()))),
-            )
-        };
-        flight.lock_owned().await
+    pub(crate) async fn session_lock(
+        &self,
+        scope: &DeepSeekRuntimeScope,
+    ) -> Option<ResidentFlightGuard> {
+        let guard = self.session_flights.lock(scope, scope.0.capacity()).await;
+        if guard.is_none() {
+            crate::metrics::record_resident_retention_refused("deepseek_session_flight");
+        }
+        guard
     }
 }
 
@@ -181,7 +238,8 @@ mod tests {
                 exact.clone(),
                 DeepSeekCachedSession::new("upstream-session-a".to_string(), 1_000).unwrap(),
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(
             cache.session(&exact, 1_001).await.unwrap().session_id,
@@ -216,7 +274,8 @@ mod tests {
                     scope.clone(),
                     DeepSeekCachedSession::new(id.to_string(), 1_000).unwrap(),
                 )
-                .await;
+                .await
+                .unwrap();
         }
         cache.invalidate_session(&first).await;
         assert!(cache.session(&first, 1_001).await.is_none());
@@ -224,5 +283,146 @@ mod tests {
             cache.session(&second, 1_001).await.unwrap().session_id,
             "second"
         );
+    }
+
+    #[tokio::test]
+    async fn r5_resource_deepseek_last_owner_survives_invalidation_replacement_and_expiry() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = DeepSeekRuntimeCache::with_parent(parent.clone());
+        let key = scope("account", 1, "share");
+        let first = cache
+            .insert_session(
+                key.clone(),
+                DeepSeekCachedSession::new("first".into(), 1000).unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = parent.snapshot().used_bytes;
+        let first_view = cache.session(&key, 1001).await.unwrap();
+        assert!(Arc::ptr_eq(&first.0, &first_view.0));
+        assert_eq!(parent.snapshot().used_bytes, bytes);
+        cache.invalidate_session(&key).await;
+        assert_eq!(parent.snapshot().used_bytes, bytes);
+        let second = cache
+            .insert_session(
+                key.clone(),
+                DeepSeekCachedSession::new("second".into(), 1001).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(parent.snapshot().used_bytes > bytes);
+        drop(first);
+        drop(first_view);
+        let second_bytes = parent.snapshot().used_bytes;
+        assert!(second_bytes > 0);
+        assert!(cache
+            .session(&key, 1001 + DEEPSEEK_SESSION_TTL_MS)
+            .await
+            .is_none());
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, second_bytes);
+        drop(second);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn r5_resource_deepseek_refused_replacement_revokes_old_index_without_relabeling_auth() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = DeepSeekRuntimeCache::with_parent(parent.clone());
+        let key = scope("account", 1, "share");
+        let held = cache
+            .insert_session(
+                key.clone(),
+                DeepSeekCachedSession::new("old".into(), 1000).unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = parent.snapshot().used_bytes;
+        parent.configure_limit(Some(bytes));
+        assert!(cache
+            .insert_session(
+                key.clone(),
+                DeepSeekCachedSession::new("new".into(), 1001).unwrap()
+            )
+            .await
+            .is_err());
+        assert!(cache.session(&key, 1002).await.is_none());
+        assert_eq!(held.session_id, "old");
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, bytes);
+        drop(held);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn r5_resource_deepseek_cache_eviction_preserves_snapshot_charge() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = DeepSeekRuntimeCache::with_parent(parent.clone());
+        let first_key = scope("account", 1, "first");
+        let first = cache
+            .insert_session(
+                first_key.clone(),
+                DeepSeekCachedSession::new("first".into(), 1000).unwrap(),
+            )
+            .await
+            .unwrap();
+        let first_bytes = parent.snapshot().used_bytes;
+        for index in 0..MAX_SESSION_SCOPES {
+            cache
+                .insert_session(
+                    scope("account", 1, &format!("share-{index}")),
+                    DeepSeekCachedSession::new(format!("session-{index}"), 1001 + index as i64)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(cache.sessions.read().await.len(), MAX_SESSION_SCOPES);
+        assert!(cache.session(&first_key, 2000).await.is_none());
+        drop(cache);
+        assert_eq!(parent.snapshot().used_bytes, first_bytes);
+        drop(first);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn r5_resource_deepseek_distinct_flights_waiter_cancel_and_guard_drop_are_bounded() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = Arc::new(DeepSeekRuntimeCache::with_parent(parent.clone()));
+        let mut guards = Vec::new();
+        for index in 0..MAX_ACTIVE_SESSION_FLIGHTS {
+            guards.push(
+                cache
+                    .session_lock(&scope("account", 1, &format!("share-{index}")))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(cache
+            .session_lock(&scope("account", 1, "overflow"))
+            .await
+            .is_none());
+        let bytes = parent.snapshot().used_bytes;
+        let waiting_cache = cache.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_cache
+                .session_lock(&scope("account", 1, "share-0"))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        assert!(parent.snapshot().used_bytes > bytes);
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(parent.snapshot().used_bytes, bytes);
+        drop(cache);
+        assert!(parent.snapshot().used_bytes > 0);
+        drop(guards);
+        assert_eq!(parent.snapshot().used_bytes, 0);
+        let zero = DeepSeekRuntimeCache::with_parent(ResidentMemoryBudget::new(Some(0)));
+        assert!(zero
+            .session_lock(&scope("account", 1, "zero"))
+            .await
+            .is_none());
     }
 }

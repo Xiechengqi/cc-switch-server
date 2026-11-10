@@ -107,6 +107,7 @@ struct QoderFixtureState {
     refresh_requests: Arc<AtomicUsize>,
     observations: Arc<Mutex<Vec<QoderRequestObservation>>>,
     catalog_config: Arc<Mutex<Value>>,
+    catalog_payload: Arc<Mutex<Option<Value>>>,
 }
 
 impl QoderFixtureState {
@@ -120,6 +121,7 @@ impl QoderFixtureState {
             refresh_requests: Default::default(),
             observations: Default::default(),
             catalog_config: Arc::new(Mutex::new(model_config())),
+            catalog_payload: Default::default(),
         }
     }
 
@@ -194,7 +196,13 @@ async fn qoder_model_list(
 ) -> Response {
     state.model_requests.fetch_add(1, Ordering::SeqCst);
     record_observation(&state, uri, &headers, None);
-    wrapped_json(json!({"chat": [state.catalog_config.lock().unwrap().clone()]}))
+    let payload = state
+        .catalog_payload
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| json!({"chat": [state.catalog_config.lock().unwrap().clone()]}));
+    wrapped_json(payload)
 }
 
 async fn qoder_pat_exchange(State(state): State<QoderFixtureState>) -> Response {
@@ -1063,6 +1071,210 @@ fn assert_generation_observation(observation: &QoderRequestObservation) {
     assert!(body["parameters"].get("context_length").is_none());
     assert_eq!(body["stream"], true);
     assert_signed_request(observation, QODER_GENERATION_SIGNATURE_PATH);
+}
+
+#[test]
+fn qoder_catalog_scenes_gate_inference_on_every_credential_rail_and_surface() {
+    run_qoder_async_test(async {
+        for rail in [
+            QoderFixtureRail::GlobalOauth,
+            QoderFixtureRail::CnOauth,
+            QoderFixtureRail::Pat,
+        ] {
+            for app in [AppKind::Claude, AppKind::Codex, AppKind::Gemini] {
+                for scene in ["app-only", "chat-denied", "chat-enabled"] {
+                    let name = format!("qoder-scenes-{}-{}-{scene}", rail.label(), app.as_str());
+                    let (address, fixture, server) =
+                        spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
+                    let mut enabled = model_config();
+                    enabled["enable"] = json!(true);
+                    let mut disabled = enabled.clone();
+                    disabled["enable"] = json!(false);
+                    *fixture.catalog_payload.lock().unwrap() = Some(match scene {
+                        "app-only" => json!({"app":[enabled]}),
+                        "chat-denied" => json!({"chat":[disabled],"app":[enabled]}),
+                        _ => json!({"chat":[enabled],"app":[disabled]}),
+                    });
+                    let state = qoder_test_state(&name);
+                    let (provider_id, _) = install_qoder_provider(
+                        &state,
+                        &name,
+                        app,
+                        rail,
+                        &format!("http://{address}"),
+                    )
+                    .await;
+                    let share_id = format!("{name}-share");
+                    install_qoder_share(&state, &share_id, app, &provider_id, "owner@example.com")
+                        .await;
+                    let response = forward_qoder_surface(
+                        state,
+                        app,
+                        provider_id,
+                        &share_id,
+                        "owner@example.com",
+                        "scene-session",
+                        false,
+                    )
+                    .await;
+                    if scene == "chat-enabled" {
+                        let response = response.unwrap();
+                        assert_eq!(response.status(), StatusCode::OK, "{name}");
+                        collect(response).await;
+                    } else {
+                        let error = response.unwrap_err();
+                        assert_eq!(error.status, StatusCode::FORBIDDEN, "{name}: {error:?}");
+                    }
+                    assert_eq!(fixture.count(&fixture.model_requests), 1, "{name}");
+                    assert_eq!(
+                        fixture.count(&fixture.generation_requests),
+                        usize::from(scene == "chat-enabled"),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        fixture.count(&fixture.refresh_requests),
+                        0,
+                        "{name}: permission failure cannot refresh"
+                    );
+                    server.abort();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn qoder_catalog_replacement_revocation_and_expiry_fence_prepared_generation() {
+    run_qoder_async_test(async {
+        for drift in [
+            "replacement",
+            "invalidate",
+            "expiry",
+            "uncached-replacement",
+            "uncached-valid",
+        ] {
+            let (address, fixture, server) = spawn_qoder_upstream(
+                QoderFixtureRail::GlobalOauth,
+                vec![QoderGenerationReply::Success],
+            )
+            .await;
+            let name = format!("qoder-catalog-{drift}");
+            let mut state = qoder_test_state(&name);
+            let parent = crate::infra::resident_memory::ResidentMemoryBudget::new(None);
+            Arc::get_mut(&mut state).unwrap().qoder_runtime =
+                crate::proxy::qoder_runtime::QoderRuntimeCache::with_parent(parent.clone());
+            install_qoder_provider(
+                &state,
+                &name,
+                AppKind::Codex,
+                QoderFixtureRail::GlobalOauth,
+                &format!("http://{address}"),
+            )
+            .await;
+            let execution = {
+                let providers = state.providers.read().await;
+                ProviderExecution::from_store(&providers, providers.providers[0].clone()).unwrap()
+            };
+            let bound = qoder_provider::bound_account_identity(&execution).unwrap();
+            let mut runtime = qoder_provider::prepare_runtime(&state, &execution, &bound)
+                .await
+                .unwrap();
+            let now = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
+            let canonical = qoder_provider::CanonicalRequest {
+                share_id: "fixture-share".into(),
+                user_namespace: "fixture-user".into(),
+                downstream_session_id: "fixture-session".into(),
+                requested_model: MODEL_KEY.into(),
+                body: json!({"model": MODEL_KEY, "messages":[{"role":"user","content":"hello"}]}),
+                declared_history_names: Default::default(),
+            };
+            let prepared =
+                qoder_provider::prepare_generation(&runtime, &canonical, now, None, None).unwrap();
+            if drift.starts_with("uncached") {
+                // A live fetch already owns its small single-flight admission.
+                let guard = state
+                    .qoder_runtime
+                    .catalog_lock(&runtime.scope)
+                    .await
+                    .unwrap();
+                parent.configure_limit(Some(0));
+                let fresh = crate::proxy::qoder_runtime::parse_qoder_model_catalog(
+                    &json!({"chat":[model_config()]}),
+                    QoderSite::Global,
+                )
+                .unwrap();
+                runtime.catalog = state
+                    .qoder_runtime
+                    .insert_catalog(runtime.scope.clone(), fresh, now)
+                    .await;
+                drop(guard);
+                assert!(state
+                    .qoder_runtime
+                    .catalog(&runtime.scope, now)
+                    .await
+                    .is_none());
+            }
+            match drift {
+                "replacement" | "uncached-replacement" => {
+                    let denied = crate::proxy::qoder_runtime::parse_qoder_model_catalog(
+                        &json!({"chat":[],"app":[model_config()]}),
+                        QoderSite::Global,
+                    )
+                    .unwrap();
+                    state
+                        .qoder_runtime
+                        .insert_catalog(runtime.scope.clone(), denied, now)
+                        .await;
+                }
+                "invalidate" => state.qoder_runtime.invalidate_catalog(&runtime.scope).await,
+                "expiry" => {
+                    let fresh = crate::proxy::qoder_runtime::parse_qoder_model_catalog(
+                        &json!({"chat":[model_config()]}),
+                        QoderSite::Global,
+                    )
+                    .unwrap();
+                    runtime.catalog = state
+                        .qoder_runtime
+                        .insert_catalog(
+                            runtime.scope.clone(),
+                            fresh,
+                            now - crate::proxy::qoder_runtime::QODER_MODEL_CATALOG_TTL_MS,
+                        )
+                        .await;
+                }
+                _ => {}
+            }
+            let result = send_qoder_generation(
+                &state,
+                &execution,
+                &runtime,
+                &prepared.payload,
+                &prepared.model_source,
+                None,
+                None,
+                None,
+            )
+            .await;
+            if drift == "uncached-valid" {
+                assert!(
+                    result.is_ok(),
+                    "optional catalog retention must not invalidate a current result"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(QoderForwardAttemptError::Proxy(ref error))
+                    if error.status == StatusCode::CONFLICT),
+                    "{drift} must reject before sending"
+                );
+            }
+            assert_eq!(
+                fixture.count(&fixture.generation_requests),
+                usize::from(drift == "uncached-valid"),
+                "{drift}"
+            );
+            server.abort();
+        }
+    });
 }
 
 #[test]

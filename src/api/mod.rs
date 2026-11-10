@@ -1540,6 +1540,7 @@ async fn proxy_models_for_selection(
             source: catalog.source,
             stale: catalog.stale,
             fetched_at_ms: catalog.fetched_at_ms,
+            catalog_entries: None,
         }));
     }
     let mut data = openai_model_list(&providers.providers, app, provider_id);
@@ -1710,6 +1711,9 @@ async fn proxy_models_for_selection(
     Ok(Json(OpenAiModelsResponse {
         object: "list",
         data,
+        catalog_entries: qoder_catalog
+            .as_ref()
+            .map(|catalog| catalog.entries.clone()),
         source: grok_catalog
             .as_ref()
             .map(|catalog| catalog.source.to_string())
@@ -1841,9 +1845,10 @@ async fn append_trae_models(
     }))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct QoderCatalogUse {
     fetched_at_ms: i64,
+    entries: Vec<crate::proxy::qoder_runtime::QoderCatalogEntry>,
 }
 
 async fn append_qoder_models(
@@ -1926,6 +1931,7 @@ async fn append_qoder_models(
     data.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(Some(QoderCatalogUse {
         fetched_at_ms: runtime.catalog.fetched_at_ms,
+        entries: runtime.catalog.catalog_entries.clone(),
     }))
 }
 
@@ -5676,7 +5682,11 @@ mod grok_catalog_provider_tests {
                             {"key":"mmodel","display_name":"MiniMax","enable":true},
                             {"key":"future-route","display_name":"Future","enable":true},
                             {"key":"qmodel","display_name":"Hidden","enable":false}
-                        ]});
+                        ], "app":[
+                            {"key":"qmodel","enable":true},
+                            {"key":"gmodel","enable":false},
+                            {"key":"Future-App-Route","enable":true}
+                        ], "quest":[{"key":"must-not-discover","enable":true}]});
                         Json(json!({
                             "statusCodeValue": 200,
                             "body": catalog.to_string()
@@ -5759,6 +5769,33 @@ mod grok_catalog_provider_tests {
                 .unwrap();
             assert_eq!(future.reasoning_efforts, None);
             assert_eq!(future.context_window, None);
+            assert!(!response
+                .data
+                .iter()
+                .any(|model| model.id == "Future-App-Route"));
+            let projected = serde_json::to_value(&response).unwrap();
+            let entries = projected["catalogEntries"]
+                .as_array()
+                .expect("Qoder discovery must retain scene observations");
+            assert_eq!(entries.len(), 7);
+            assert!(entries
+                .iter()
+                .any(|entry| entry["modelKey"] == "Future-App-Route"
+                    && entry["scene"] == "app"
+                    && entry["enabled"] == true
+                    && entry["executable"] == false
+                    && entry["selected"] == true));
+            assert!(entries
+                .iter()
+                .filter(|entry| entry["modelKey"] == "qmodel")
+                .all(|entry| entry["executable"] == false));
+            assert!(entries
+                .iter()
+                .filter(|entry| entry["scene"] == "app")
+                .all(|entry| entry["executable"] == false));
+            assert!(!entries
+                .iter()
+                .any(|entry| entry["modelKey"] == "must-not-discover"));
             assert_eq!(observed_users.lock().unwrap().as_slice(), ["bound-user"]);
             server.abort();
         }

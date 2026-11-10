@@ -1,6 +1,12 @@
 # Provider Fixture 目录
 
+R5 Gemini CLI 合同 `assets/contract/r5-gemini-cli.json` 固定六组项目发现样例、精确 client/identity/scope 和首次开通研究门禁。`audit-r5-provider-evidence.mjs` 冻结来源与本地策略，变异审计禁止借 Antigravity/API-key 权限、自动选层或虚假 live；不依赖外仓执行。
+
+R5 Kiro/Amazon Q 图片预算补充合同为 `assets/contract/kiro-image-budget.json`，单独记录推荐源码、最终 base64 字段单位、本地保守限制、动画、编码/像素工作量、blocking 并发和取消 owner 边界。它不把历史 decoded threshold 改写为官方字符限制，不扩展独立产品的凭据或端点权限，真实接受性仍 `live_pending`。
+
 本目录只保留说明文档。Provider 运行时身份以 `assets/contract/provider-registry.json` 为准；产品覆盖要求位于 `assets/contract/server-provider-requirements.json`，兼容窗口内的最小 preset fixture 位于 `assets/contract/provider-legacy-compatibility.json`。这些文件均由本仓库维护，不从外部工作树生成。
+
+R5 Qoder 场景目录夹具为 `assets/contract/qoder-catalog-scenes.json`：12 组 synthetic 输入与独立的本地授权策略，绑定推荐 Hub 的 committed source/digest。chat/app 元数据发现与推理权限分开；app-only 保持 discovery-only。`scripts/audit/audit-qoder-catalog-scenes.mjs` 独立冻结来源、观察和本地策略，mutation 测试拒绝 coherent 漂移、权限扩大及虚假 live 状态。此夹具不修改原 CLI oracle，不依赖外仓执行或证明真实账号接受性。实施与实际验证状态见根增强文档 §22.4。
 
 约束：
 
@@ -33,3 +39,29 @@ Kiro 的机器可读协议合同保存在 `assets/contract/kiro-wire-protocol.js
 Qoder 的机器可读 oracle 保存在 `assets/contract/qoder-cli-oracle.json`。schema v2 以独立固定 digest 记录官方 Global/CN CLI `1.1.32`、`cli2api` 只读 capture projection、三条 credential rail、Device lifecycle、精确 COSY origin/path/profile/header、encoding/signature vector、去随机化完整 server body、payload/catalog 差分、quota、EOF terminal、验证计数与脱敏 receipt schema。`assets/contract/qoder-reference-delta.json` 也是 append-only schema v2：它冻结 `2cc8a01` 中原 v1 文件、全部 11 个历史字段及 `TokenRouter@7faf946` / tree `b205061c` 干净 snapshot，以 11 条不可变 observation 映射 QD-01～03、QD-N1/N2、CORE-N1/N2、LIVE-N1 和 QD-R1～R3。三条 reject 排除账号池/轮换/affinity 与跨边界 fallback、商业控制面，以及外仓运行时依赖、伪 live 和缺唯一 terminal + EOF 的成功语义；默认 audit 只读本仓库与 committed target objects，`node scripts/audit/audit-qoder-reference-delta.mjs --check-sources` 才复核 TokenRouter 冻结对象。对应审计还禁止敏感材料、旧 refresh endpoint、coherent fixture mutation 和未解释漂移；`src/clients/oauth/qoder.rs`、`src/clients/oauth/quota.rs`、`src/proxy/qoder.rs`、`src/proxy/qoder_runtime.rs` 与 `src/proxy/providers/qoder/` 的 Rust 测试直接消费相同 fixture。`CORE-N2-QODER=fixture_verified` 记录三 rail、三 Surface 的 sticky request-memory 边界；real-harness receipt schema v2 额外绑定 target commit/harness、Account 两代际、三个 Provider revision/runtime、Share revision、site/rail/model、三份 fresh catalog 与六个 body hash。loopback 仍只建立 `fixture_verified`，未实际观察的登录/轮换、权威空目录和两段 401 继续写 `not_observed`，不会单独把 rail 提升为 live verified。三条完整真实 receipt 齐备前保持 `live_pending`。
 
 CodeBuddy revision 2 的差分资产为 `assets/contract/codebuddy-reference-delta.json`。append-only schema v2 冻结 `d81056c` 中原文件、target commit/tree、全部 11 个 v1 历史字段及逐字段 digest；新增 `cli2api@624874a` / tree `c2f02a3` committed-object snapshot，明确排除 `proxy.html`、`proxy.md` 两个未跟踪文件，并用 15 条不可变 observation 映射 CB-01～04、CB-N1～N5、CORE-N1/N2、LIVE-N1、CB-R1～R3。三条 reject 排除账号池/轮换/affinity 和跨边界 fallback、运营/商业控制面，以及未经验证的企业/多模态、外仓运行时依赖、伪 live 与弱化 terminal + EOF。CB-N1/2 已修复工具历史与 reasoning-only，CB-N3/5 记录共享 bridge/guard 已覆盖，CB-N4 的 `deepseek-v4.1-flash` 保持 runtime disabled。CORE-N1 facade 位于 `src/proxy/providers/codebuddy/`，只接管 Account binding、canonical/model/catalog/payload 与 generation fence；CORE-N2 以 `CORE-N2-CODEBUDDY=fixture_verified` 固定 Intl/CN、三 Surface 的 sticky request-memory、同账号 401 共预算和 capacity-shed 语义。共享 forwarder 继续拥有 lease、usage、terminal、attempt 和 401 replay 决策。`scripts/smoke/codebuddy-real-receipt.mjs` 将 Intl/CN 拆成两份仓库外 `0600` 私有 receipt，schema v2 scope 绑定三 Surface Provider、Share、Account 两代际、exact model、三份 fresh catalog 与六个 body hash；fixture 永远只能得到 `contract_verified/live_pending`。两站 16 项真实检查仍分别为 `live_pending`。默认 audit 只读本仓库及 committed target objects；`node scripts/audit/audit-codebuddy-reference-delta.mjs --check-sources` 才可选复核外部 Git object，未跟踪文件、外部仓库、构建和运行时相互隔离。
+
+- `assets/contract/r5-kimi-code.json`：R5 Kimi/Copilot owner 预算和 Kimi Chat schema 本地合同；冻结参考 committed objects，不读取外仓作运行/测试依赖，真实接受性 live_pending。
+
+R5 Ollama Cloud：`assets/contract/r5-ollama-cloud.json` 冻结官方 committed source 摘要、Provider-owned key 与三入站 effort/终态/usage 负例；仅为本仓合成合同，Cloud 型号/最大 effort 接受性仍 `live_pending`。
+
+R5 Antigravity / Agy：`assets/contract/r5-antigravity.json` 冻结双 OAuth rail、已登记 Claude/Gemini App、来源摘要、grounding/usage/终态/代次与明确不采纳策略；只作本仓合成合同，live_pending。
+
+R5 Claude OAuth：`assets/contract/r5-claude-oauth.json` 冻结推荐源码摘要、native effort/空白 thinking、缓存 beta、两轮 opaque alias、refusal 与终态所有权边界；只作本仓合成合同，未采用缺少通用时间/取消上限的 detached drain，真实接受性 live_pending。
+
+R5 Codex OAuth：`assets/contract/r5-codex-oauth.json` 冻结双推荐源码、已有 WS/HTTP 负例及 Codex 部分 refresh/journal 恢复样例；不增加 SIWC、跨 workspace/credential 兜底或 create 后重放，本仓合成证据保持 live_pending。
+
+R5 Cursor：`assets/contract/r5-cursor.json` 冻结推荐 committed source、六个实验 Profile 与十组双 rail 工具/图片/生命周期/usage 合同；marker-only 501、prompt best-effort、估算及未知 cache 边界不扩大，真实接受性独立 live_pending。
+
+R5 Grok：`assets/contract/r5-grok.json` 冻结 CLI/媒体和 idle 反例来源，覆盖控制帧、长 reasoning/重复内容/延迟 body demand 与独立媒体代次；不采纳写出后重放，不借 Web SSO，真实 operation 分别 live_pending。
+
+R5 Buddy：`assets/contract/r5-buddy.json` 固定六个Profile与产品×站点×登录平台矩阵、十组既有目录/工具/图片/刷新/额度/严格终态合同；不混拼客户端身份或复制EOF补stop，四组真实接受性分别live_pending。
+
+R5 Trae：`assets/contract/r5-trae.json` 冻结九Profile/三rail、既有官网PKCE/刷新与四入口工具/图片/严格终态/资源负例；不借参考缓冲或EOF补stop降低合同，真实接受性逐rail live_pending，计时另归CORE-01。
+
+R5 DeepSeek：`assets/contract/r5-deepseek.json` 固定Claude/Web bearer与十组PoW/取消/容量/代次/nonce工具合同；2worker/100ms准入/10s协作deadline，permit跟随真实worker，真实接受性live_pending。
+
+R5 静态 Profile：`assets/contract/r5-static-profiles.json` 固定26个Profile及20 codingPlan完整合同，并与真实Registry/runtime交叉核对；Bedrock Converse严格终态/CRC/资源与DeepSeek API Claude路径独立验收，真实接受性live_pending。
+
+R5 Web Session：`assets/contract/r5-web-sessions.json` 独立冻结四个 hidden Profile、Cookie UTF-8 panic 反例、专用加密槽/full scope 与严格终态、取消和显式重导入回环；保持网页缓冲、无工具/原生续接、estimated usage 限制和 live_pending。
+
+`assets/contract/r5-shared-core.json` 冻结当前Registry计时投影、资源常量、真实本地转发及最后owner/容量反例测试锚点。来源为本仓已审查生产代码，未新增厂商wire采纳；旧R5参考证据保留。离线结果不提升live_pending。

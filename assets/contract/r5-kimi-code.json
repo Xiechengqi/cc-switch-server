@@ -1,0 +1,212 @@
+{
+  "schemaVersion": 1,
+  "providerClass": "kimi_code",
+  "kind": "synthetic_server_contract",
+  "liveState": "live_pending",
+  "reference": {
+    "repository": "CLIProxyAPI",
+    "commit": "681ce41b6e44c45b15b79378b003909d6ba29e68",
+    "tree": "00d0ecf4594b47495d82d1efd429c17551ab6d51",
+    "files": [
+      {
+        "path": "internal/runtime/executor/kimi_executor.go",
+        "sha256": "e73410babb71dcd397f631c13a2340d34304ff46ea9da9818201f3ab9566cace",
+        "observation": "Kimi Chat normalizes local refs and aliases; native Claude schema compatibility is not established"
+      },
+      {
+        "path": "internal/runtime/executor/kimi_executor_test.go",
+        "sha256": "7cc9c3b4bfaf58c289910c7d7dd9f2a28ac695c87135e2b704a7ebf8c7a0dbc8",
+        "observation": "Synthetic roundtripper tests contain nested refs, sibling type and highspeed cases; not vendor receipts"
+      },
+      {
+        "path": "internal/util/gemini_schema.go",
+        "sha256": "d38ed98229af74e930c50878eedf354f29a84dda07be4c84b71394be58cc6149",
+        "observation": "Reference expansion has a 256 KiB cap but degrades cycles/overflow to hints; weakening is not adopted"
+      }
+    ],
+    "use": "read_only_committed_source_never_a_test_or_runtime_dependency",
+    "realReceipt": false
+  },
+  "scope": {
+    "providerType": "kimi_code",
+    "driver": "oauth.kimi_code",
+    "profiles": [
+      "claude.kimi_code",
+      "codex.kimi_code",
+      "gemini.kimi_code"
+    ],
+    "product": "Kimi Code",
+    "site": "api.kimi.com",
+    "credentialRail": "one bound Account with account-scoped device identity",
+    "identityVersion": "KimiCLI/1.37.0",
+    "fencing": [
+      "App",
+      "Provider revision/runtime",
+      "Account authIdentityGeneration",
+      "tokenRefreshGeneration",
+      "Share",
+      "user namespace",
+      "session",
+      "model family"
+    ],
+    "copilotResourceScope": "exact Account, both token generations, GitHub domain and validated API origin; no protocol change"
+  },
+  "localPolicy": {
+    "parent": "existing process ResidentMemoryBudget; logical allocation/index estimate, not RSS",
+    "replay": {
+      "maxEntries": 1024,
+      "maxEntryBytes": 8388608,
+      "maxTotalBytes": 67108864,
+      "maxBlocks": 512,
+      "ttlMs": 3600000,
+      "owner": "copied Bytes::from_owner allocation with reservation until final clone/slice drop",
+      "refusal": "optional retention omitted; CAS replacement removes old snapshot; no retry, refresh, relogin or cooldown"
+    },
+    "catalogs": {
+      "kimiMaxEntries": 64,
+      "copilotMaxEntries": 32,
+      "responseMaxBytes": 2097152,
+      "freshTtlMs": 300000,
+      "staleMaxAgeMs": 86400000,
+      "owner": "shared immutable payload owns reservation through last Arc snapshot",
+      "refusal": "authoritative replacement removes old entry including stale; Copilot admission returns local 503, Kimi discovery returns capacity-unavailable",
+      "fetchBodyReservationBytes": 2097152,
+      "parseGrowthMultiplier": 256,
+      "parseFixedBytes": 65536,
+      "fetchOwner": "body and transient parse are admitted before allocation; fetched payload carries its reservation across async identity checks and transfers it to the shared published owner"
+    },
+    "singleflight": "bounded per-cache registrations plus each guard/waiter reservation; cancellation and cache deletion preserve live charges",
+    "streamReplay": "optional bounded accumulator with transient JSON estimate; capacity abandons only replay retention; complete output owns its Bytes reservation",
+    "schema": {
+      "scope": "Kimi Chat tools[].function.parameters and legacy functions[].parameters after generic conversion; Claude native input_schema unchanged",
+      "references": "local literal JSON Pointer only; nested refs and conjunctive siblings preserved",
+      "refusal": "recursive, unresolved, remote or scoped refs rejected locally without typed-hint weakening",
+      "maxInputBytes": 262144,
+      "maxOutputBytes": 262144,
+      "maxNodes": 8192,
+      "maxDepth": 64,
+      "maxRequestSchemaBytes": 1048576,
+      "instanceData": "default/const/enum/examples remain literal"
+    },
+    "models": "existing authenticated catalog intersected with reviewed default/highspeed/K3 aliases; no broad prefix or 1m fallback"
+  },
+  "cases": [
+    {
+      "id": "replay_last_bytes_view",
+      "expect": "charge survives expiry/index deletion until final Bytes slice drops"
+    },
+    {
+      "id": "catalog_last_arc_snapshot",
+      "expect": "Kimi and Copilot charge survives eviction until final shared snapshot drops"
+    },
+    {
+      "id": "replacement_capacity_refused",
+      "expect": "old authorization is removed; external owner keeps its charge; no stale revival"
+    },
+    {
+      "id": "singleflight_waiter_cancel",
+      "expect": "one same-key flight; each waiter charged, cancellation releases only its owner"
+    },
+    {
+      "id": "nested_local_refs",
+      "schema": {
+        "type": "object",
+        "$defs": {
+          "leaf": {
+            "type": "string"
+          },
+          "branch": {
+            "type": "object",
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/leaf",
+                "description": "keep"
+              }
+            }
+          }
+        },
+        "properties": {
+          "branch": {
+            "$ref": "#/$defs/branch"
+          }
+        },
+        "required": [
+          "branch"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "type": "object",
+        "properties": {
+          "branch": {
+            "type": "object",
+            "properties": {
+              "value": {
+                "type": "string",
+                "description": "keep"
+              }
+            }
+          }
+        },
+        "required": [
+          "branch"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "id": "conflicting_ref_siblings",
+      "schema": {
+        "type": "object",
+        "$defs": {
+          "leaf": {
+            "type": "string",
+            "minLength": 3
+          }
+        },
+        "properties": {
+          "value": {
+            "$ref": "#/$defs/leaf",
+            "type": "integer"
+          }
+        }
+      },
+      "expect": "both assertions retained through allOf"
+    },
+    {
+      "id": "cycle",
+      "schema": {
+        "type": "object",
+        "$defs": {
+          "node": {
+            "type": "object",
+            "properties": {
+              "next": {
+                "$ref": "#/$defs/node"
+              }
+            }
+          }
+        },
+        "properties": {
+          "head": {
+            "$ref": "#/$defs/node"
+          }
+        }
+      },
+      "expectStatus": 400
+    },
+    {
+      "id": "expansion_budget",
+      "input": "32 local refs each expanding a 16 KiB description",
+      "expectStatus": 400
+    },
+    {
+      "id": "scope_refresh",
+      "expect": "no replay/catalog reuse across token, identity or runtime generation"
+    },
+    {
+      "id": "highspeed_catalog",
+      "expect": "only authenticated highspeed model authorizes its exact reviewed alias"
+    }
+  ]
+}

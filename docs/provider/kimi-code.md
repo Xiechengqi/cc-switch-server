@@ -54,6 +54,7 @@ Kimi refresh 使用固定 token endpoint、client ID、Kimi CLI User-Agent 和�
 模型采用权威发现 + fail-closed reviewed allowlist：
 
 - `kimi-for-coding`、`kimi`、`kimi-code` 以及登记的 Claude 风格 aliases 映射为 wire model `kimi-for-coding`。
+- `kimi-for-coding-highspeed` 保持独立 wire model，只由当前 authenticated catalog 中的同名模型授权；不与默认档或 K3 互换。
 - `kimi-k3` 和 `k3` 映射为 wire model `k3`。
 - single-model policy 先选择配置模型；passthrough 只允许上述登记 alias。未知模型直接返回 400，不透传到 Kimi。
 - 模型目录按 App、Provider revision/runtime、Account、identity/token generation 隔离并 single-flight 获取。成功空目录是权威结果；只有 network/408/429/5xx 才可读取完全相同作用域内、24 小时硬上限内的 stale cache。认证错误、超限响应、坏 JSON、未知成功结构和“上游非空但全部模型均不在 reviewed allowlist”均失败关闭并清理当前 scope；运行时不存在静态 entitlement fallback。
@@ -68,14 +69,22 @@ Kimi refresh 使用固定 token endpoint、client ID、Kimi CLI User-Agent 和�
 - 仅当本次确实应用 replay 且上游返回 400/422 时 CAS 删除对应旧值，避免一个失败请求清理另一会话或更新后的内容。
 - replay 的 hit、miss、content mismatch、上游拒绝、过期与 CAS 冲突使用固定枚举 metric；不携带 Provider、Account、Share、用户或 session 标签。
 
+## 资源与 Chat schema
+
+Replay 内容、Kimi 与 Copilot 目录快照以及 singleflight 登记、持锁者和等待者接入既有进程 `ResidentMemoryBudget`。默认观测逻辑字节量，配置 `CC_SWITCH_PROCESS_MEMORY_BUDGET_MB` 时执行父级硬门槛；payload 与稀疏索引容量采用保守估计，不是 allocator/RSS 测量。Replay 使用独立复制的 `Bytes::from_owner`，目录使用共享不可变 Arc payload，删除索引或淘汰后仍计费，直到最后一个 Bytes clone/slice 或目录快照释放。singleflight 按每个缓存独立加锁，取消等待不会清除另一个活动 flight 的预约。 目录 HTTP 读取前预约既有 2 MiB 响应上限，解析前以实际编码量 ×256 +64 KiB 作保守临时预约；解析结果携带实际 payload 预约跨异步身份复核并移交缓存，不存在发布前的无预约等待窗口。小于这些本地保守需求的父预算可拒绝发现；默认仍只观测。
+
+Replay 的原有 1024 项、单条 8 MiB、总 64 MiB、512 blocks 与一小时 TTL 保持；Kimi/Copilot 目录分别最多 64/32 项，发现响应各限 2 MiB，fresh 五分钟、stale 最长一天。容量不足可放弃可选 replay 保留，流式累积器也只放弃 replay，不因此改变推理终态、重试、refresh、账号健康或 cooldown。目录的权威替换先撤销旧缓存；新预约失败不能复活旧 fresh/stale 授权。Copilot 必需的目录/flight admission 以本地 503 拒绝；Kimi 管理发现标记 capacity-unavailable。固定标签记录 retention refused，不能计作鉴权失败。
+
+Kimi Chat 的 function parameters（含 legacy functions）在已有四入站桥接之后展开本地 JSON Pointer `$ref`，处理嵌套引用与兄弟断言；冲突断言保持合取，不降级为弱类型提示。default/const/enum/examples 中的 JSON 是实例数据，保留字面量。循环、缺失/远程引用及会改变引用作用域的 `$id`/dynamic/anchor 结构在本地拒绝。每个 schema 输入和输出限 256 KiB，8192 个展开节点、64 层，单请求展开 schema 总量限 1 MiB；这些是本地保守预算。Claude 原生 input_schema 不据 Chat 参考改写。范围、来源和本地负例见 `assets/contract/r5-kimi-code.json`；真实 schema 接受性仍 live_pending。
+
 ## 验收边界
 
-37 项离线 Kimi 测试覆盖 device poll 串行化、slow-down、稳定设备身份、JWT principal、账号 Profile round-trip、header 最终覆盖、三个 App 的精确 endpoint、权威/空/stale/协议漂移模型目录、模型 allowlist、K3 effort、signature-only/placeholder/parallel-tool thinking replay、同账号单次 401 和 Provider/Account/token 代际漂移。真实 Kimi Code 账号仍需分别验证：
+本仓离线 Kimi 回归覆盖 device poll 串行化、slow-down、稳定设备身份、JWT principal、账号 Profile round-trip、header 最终覆盖、三个 App 的精确 endpoint、权威/空/stale/协议漂移模型目录、模型 allowlist、K3 effort、signature-only/placeholder/parallel-tool thinking replay、同账号单次 401 和 Provider/Account/token 代际漂移。真实 Kimi Code 账号仍需分别验证：
 
 - device 登录与 refresh-token 轮换；
 - Claude/Codex/Gemini 三个 Surface 的非流和流式文本；
 - tools、图片、首个 401、第二个 401、429 和中途断流；
-- `kimi-for-coding`、`k3` 与未知模型拒绝；
+- `kimi-for-coding`、`kimi-for-coding-highspeed`、`k3` 与未知模型拒绝；
 - 日志、控制面和持久化文件不泄露 token。
 
 缺少真实账号证据时只能标记 offline/fixture verified，不能标记 live verified。
