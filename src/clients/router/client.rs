@@ -1002,6 +1002,13 @@ impl RouterShareCapabilities {
                 .iter()
                 .any(|c| c == "usdEquivalentQuotaV1")
     }
+    pub fn resource_value_quotas(&self) -> bool {
+        self.share_contract_version >= 11
+            && self
+                .capabilities
+                .iter()
+                .any(|c| c == "resourceValueQuotaV2")
+    }
     pub fn value_pricing_activation(&self) -> bool {
         self.value_quotas()
             && self

@@ -40,7 +40,7 @@ use wal::validate_wal_if_present;
 pub(crate) const DATABASE_FILE_NAME: &str = "server-store.sqlite3";
 pub(crate) const MARKER_FILE_NAME: &str = "server-store-migration.json";
 pub(crate) const ACTIVATION_REQUEST_FILE_NAME: &str = "server-store-activation-request.json";
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

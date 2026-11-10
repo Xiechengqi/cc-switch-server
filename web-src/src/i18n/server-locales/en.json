@@ -1233,9 +1233,9 @@
           "sqlite_authority": "Server SQLite is not authoritative yet. Migrate storage in Settings → General → Data storage.",
           "metering_storage": "Metering storage is unhealthy; inspect and recover Server storage.",
           "acknowledged_tariff": "The Server hasn't acknowledged the current USD tariff yet; this usually follows within about a minute.",
-          "text_surface": "This runtime binding is not verified for text value metering:",
+          "text_surface": "This runtime binding cannot execute the configured operation. Check its Profile, Driver and enabled API:",
           "model_price_coverage": "The execution model needs an active price in Router settings, or its new tariff is awaiting activation.",
-          "model_unresolved": "Select a concrete WorkBuddy model instead of auto/default, and configure its price in Router settings. Opaque routing aliases cannot be priced safely.",
+          "model_unresolved": "Select a concrete execution model or configure an exact pricing mapping. Auto/default aliases need an explicit target.",
           "offline": "Server is unreachable. Reconnect before checking again.",
           "timeout": "The Server did not respond in time. Please retry.",
           "controlAuth": "Your session is not authorized for this check. Sign in again.",
@@ -1248,13 +1248,16 @@
             "metering_storage": "Metering storage needs attention",
             "tariff_published": "Router tariff not generated yet",
             "acknowledged_tariff": "Waiting for the Server to confirm the tariff",
-            "text_surface": "A Provider can't meter USD yet",
-            "model_price_coverage": "Execution model pricing is not ready"
+            "text_surface": "Runtime binding needs configuration",
+            "model_price_coverage": "Execution model pricing is not ready",
+            "resource_metering": "Resource tariff or upgrade required"
           },
           "more": "+{{count}} more",
           "waitingOn": "Clears once this is fixed: {{blocker}}",
           "openStorage": "Open storage settings",
-          "opensNewTab": "(opens in a new tab)"
+          "opensNewTab": "(opens in a new tab)",
+          "resource_metering": "Resource metering is waiting for protocol v11 and an active resource tariff. Upgrade Router and Server, then check price delivery.",
+          "resource_unpriced": "Configure an explicit price for every resource the execution model uses. A missing price is never treated as free."
         },
         "remaining": "Remaining equivalent quota: {{amount}}",
         "exhausted": "Limit reached",
@@ -1312,12 +1315,13 @@
           "ready": "Ready",
           "scheduled_next_window": "Starts at the next full period",
           "metered_from_now": "Metered from now",
-          "unverified_surface": "A runtime binding of this Share isn't verified for USD metering.",
+          "unverified_surface": "Check this Share’s runtime Profile, Driver and enabled API.",
           "pricing_unavailable": "No acknowledged tariff prices this Share's models yet.",
           "storage_unavailable": "Server metering storage is unavailable.",
           "router_upgrade_required": "Upgrade Router and Server to use USD quotas.",
           "blocked_needs_reconcile": "This user's USD usage needs reconciling first (Apply now in the usage column).",
-          "invalid_policy": "This limit or period isn't valid for a USD quota."
+          "invalid_policy": "This limit or period isn't valid for a USD quota.",
+          "resource_upgrade_required": "Upgrade Router and Server and activate the resource tariff."
         },
         "rowReason": "{{email}}: {{reason}}",
         "usageEditUnavailable": "Consumed tokens can't be set for USD-quota users. Use Apply now in their usage column instead.",
@@ -1346,10 +1350,12 @@
         "details": "USD quota details",
         "scheduledLine": "→ {{amount}} from {{date}}",
         "scheduledHint": "A USD-equivalent limit is scheduled. The current policy and its usage stay enforced until then; usage is never converted between units.",
-        "usdDisabledReason": "USD equivalent is unavailable until every USD quota readiness check passes.",
+        "usdDisabledReason": "USD quotas can be selected; resolve the listed configuration checks before applying.",
         "invalidRows": "{{count}} users can't use this USD quota:",
         "malformed": "USD quota data for this user can't be read; it is shown read-only and won't be changed.",
-        "malformedSave": "{{email}} has a USD quota this page can't read. Reload, or remove the user, before saving."
+        "malformedSave": "{{email}} has a USD quota this page can't read. Reload, or remove the user, before saving.",
+        "resources": "Include images, audio, video and paid tools",
+        "resourcesHint": "Requires resource prices and an upgraded Server. Existing text quotas keep their current prices."
       },
       "accountReset": {
         "label": "Account reset cycle",

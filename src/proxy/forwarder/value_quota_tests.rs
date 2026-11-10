@@ -410,3 +410,123 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
         }
     }
 }
+
+#[tokio::test]
+async fn value_quota_deepseek_cached_recovery_admits_each_real_generation() {
+    use crate::domain::usage::value_pricing::{PricingSnapshot, ValueQuota};
+    use crate::repository::server_sqlite::{self, value_quota as ledger};
+    let (address, observations, server) =
+        spawn_deepseek_session_fixture(DeepSeekSessionFixtureMode::RebuildCachedSession).await;
+    let state = forwarder_test_state("value-deepseek-rebuild");
+    let (provider_id, _) = install_deepseek_forwarder_test_provider(
+        &state,
+        "value-deepseek-rebuild",
+        format!("http://{address}"),
+    )
+    .await;
+    let share_id = "value-deepseek-share";
+    install_antigravity_test_share(
+        &state,
+        share_id,
+        AppKind::Claude,
+        ProviderType::DeepSeekAccount,
+        &provider_id,
+    )
+    .await;
+    state
+        .configure_value_quota_router_for_test("value-deepseek-install")
+        .await;
+    server_sqlite::activate_authority(&state.config_dir).unwrap();
+    let config = state.config_snapshot().await;
+    let scope = ledger::Scope {
+        router_url: config.router_api_base().unwrap().into(),
+        installation_id: "value-deepseek-install".into(),
+        share_id: share_id.into(),
+        email: "owner@example.com".into(),
+        entitlement_id: None,
+    };
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/share-value-pricing-v1.json"
+    ))
+    .unwrap();
+    let mut snapshot: PricingSnapshot =
+        serde_json::from_value(fixture["snapshot"].clone()).unwrap();
+    snapshot
+        .exact_aliases
+        .insert("deepseek-v4-pro".into(), "text-model".into());
+    let revision = snapshot.revision().unwrap();
+    ledger::install_snapshot(
+        &state.config_dir,
+        &scope,
+        &revision,
+        &snapshot,
+        current_time_ms() as i64,
+    )
+    .unwrap();
+    ledger::activate_snapshot(&state.config_dir, &scope, &revision).unwrap();
+    state
+        .mutate_shares_immediate(|store| {
+            let share = store
+                .shares
+                .iter_mut()
+                .find(|share| share.id == share_id)
+                .unwrap();
+            let grant = share.user_grants.get_mut("owner@example.com").unwrap();
+            grant.policy.token_period =
+                crate::domain::sharing::router_contract::ShareTokenPeriod::Lifetime;
+            grant.policy.parallel_limit = Some(1);
+            grant.policy.value_quota = Some(ValueQuota {
+                limit_usd_micros: "10000000".into(),
+                tariff_policy_id: "api-equivalent-v1".into(),
+            });
+        })
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let response = forward_for_test_surface(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            provider_id.clone(),
+            None,
+            deepseek_forwarder_headers(share_id, "value-deepseek-session"),
+            deepseek_forwarder_request(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+    }
+    let db = rusqlite::Connection::open(server_sqlite::database_path(&state.config_dir)).unwrap();
+    let counts: (i64, i64) = db
+        .query_row(
+            "SELECT count(*),sum(metering_status='pending') FROM value_quota_attempts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        counts,
+        (3, 0),
+        "two calls plus cached-session replay, all terminal"
+    );
+    let repeated: i64 = db
+        .query_row(
+            "SELECT count(*) FROM value_quota_attempts WHERE attempt_id='2' AND usage_picos<>'0'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        repeated, 1,
+        "the cached-session replay owns a distinct paid attempt"
+    );
+    assert_eq!(
+        observations
+            .completion_requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        3
+    );
+    server.abort();
+}

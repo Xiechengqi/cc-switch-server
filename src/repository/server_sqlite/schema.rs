@@ -95,7 +95,7 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
         hex::encode(Sha256::digest(include_bytes!("value_quota_schema.sql")))
     );
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    anyhow::ensure!((1..=4).contains(&version),
+    anyhow::ensure!((1..=5).contains(&version),
         "unsupported Server SQLite schema {version}; use a matching Server binary/backup (never downgrade)");
     let checksum: String = connection.query_row(
         "SELECT checksum FROM schema_migrations WHERE version=1",
@@ -199,6 +199,35 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
         checksum == termination_checksum,
         "Server SQLite v4 migration checksum mismatch"
     );
+    let resource_checksum = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(include_bytes!("value_resources_schema.sql")))
+    );
+    if version < 5 {
+        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> anyhow::Result<()> {
+            connection.execute_batch(include_str!("value_resources_schema.sql"))?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES(5,'universal_value_resources',0,?1)",
+                [&resource_checksum],
+            )?;
+            connection.execute_batch("PRAGMA user_version=5; COMMIT;")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = connection.execute_batch("ROLLBACK;");
+        }
+        result.context("migrate Server SQLite to v5 resource metering")?;
+    }
+    let checksum: String = connection.query_row(
+        "SELECT checksum FROM schema_migrations WHERE version=5",
+        [],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        checksum == resource_checksum,
+        "Server SQLite v5 migration checksum mismatch"
+    );
     Ok(())
 }
 
@@ -211,6 +240,7 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
         connection.execute_batch("DROP TABLE market_settlement_ack_outbox; DROP TABLE market_settlement_receipts; DROP TABLE market_settlement_requests; DELETE FROM meta WHERE key='market_settlement_since_ms';
+            DROP TABLE value_async_tasks;
             DROP TABLE value_quota_revisions; DROP TABLE value_quota_attempts;
             DROP TABLE value_quota_checkpoints;
             DROP TABLE value_quota_adjustments; DROP TABLE value_quota_gaps; DROP TABLE value_quota_coverage; DROP TABLE value_pricing_snapshots;
@@ -228,14 +258,14 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            super::super::SCHEMA_VERSION
         );
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row
                     .get::<_, i64>(0))
                 .unwrap(),
-            4
+            super::super::SCHEMA_VERSION
         );
         assert_eq!(
             connection

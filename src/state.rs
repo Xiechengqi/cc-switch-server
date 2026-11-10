@@ -182,8 +182,8 @@ pub(crate) use grok_media_resident::GrokMediaMemoryCapacity;
 use grok_media_resident::GrokMediaResidentSnapshot;
 
 pub(crate) use account_reset::QuotaPreviewConflict;
-pub(crate) use share_value_quota::ValueAttemptGuard;
 pub(crate) use share_value_quota::ValueUsageInitializationRequest;
+pub(crate) use share_value_quota::{ValueAttemptGuard, ValueGenerationAdmission};
 
 pub use background::{
     report_installation_upgrade_status, spawn_account_quota_refresh, spawn_audit_log_uploader,
@@ -992,7 +992,7 @@ type CachedRouterShareCapabilities = (
     String,
     String,
     std::time::Instant,
-    (bool, bool, bool, bool, bool, bool, bool),
+    (bool, bool, bool, bool, bool, bool, bool, bool),
 );
 
 #[derive(Clone, Copy)]
@@ -1927,6 +1927,7 @@ impl From<CopilotUpstreamAuthError> for CopilotModelCatalogError {
 
 #[derive(Debug)]
 pub enum DeepSeekUpstreamError {
+    ValueQuota(anyhow::Error),
     NotFound,
     IdentityChanged,
     CredentialPersistenceDegraded,
@@ -13603,12 +13604,29 @@ impl ServerStateInner {
             }
             self.usage.write().await.apply_append(append);
             self.usage_persistence.mark_published();
-            if has_market_receipt {
+            if has_market_receipt
+                || expected_log.operation
+                    == crate::domain::usage::store::InferenceOperation::VideoStatus
+            {
                 // The ledger settled this request's USD attempt in the same
                 // SQLite commit; mirror it into a USD trial budget now. A
                 // crash before this save is repaired by the startup pass.
                 if let Err(error) = self
-                    .sync_market_trial_value(Some(&expected_log.request_id), true)
+                    .sync_market_trial_value(
+                        Some(
+                            if expected_log.operation
+                                == crate::domain::usage::store::InferenceOperation::VideoStatus
+                            {
+                                expected_log
+                                    .parent_request_id
+                                    .as_deref()
+                                    .unwrap_or(&expected_log.request_id)
+                            } else {
+                                &expected_log.request_id
+                            },
+                        ),
+                        true,
+                    )
                     .await
                 {
                     tracing::error!(%error, request_id = %expected_log.request_id,
@@ -18829,6 +18847,43 @@ impl ServerStateInner {
         thinking_enabled: bool,
         search_enabled: bool,
     ) -> Result<reqwest::Response, DeepSeekUpstreamError> {
+        self.start_deepseek_chat_completion_metered(
+            app,
+            provider_id,
+            provider_revision,
+            runtime_fingerprint,
+            account_id,
+            expected_auth_identity_generation,
+            share_id,
+            user_identity,
+            client_session_id,
+            model,
+            prompt,
+            thinking_enabled,
+            search_enabled,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_deepseek_chat_completion_metered(
+        self: &Arc<Self>,
+        app: AppKind,
+        provider_id: &str,
+        provider_revision: u64,
+        runtime_fingerprint: &str,
+        account_id: &str,
+        expected_auth_identity_generation: u64,
+        share_id: &str,
+        user_identity: &str,
+        client_session_id: &str,
+        model: &str,
+        prompt: &str,
+        thinking_enabled: bool,
+        search_enabled: bool,
+        mut metering: Option<&mut ValueGenerationAdmission<'_>>,
+    ) -> Result<reqwest::Response, DeepSeekUpstreamError> {
         use crate::clients::deepseek::client::DeepSeekCompletionRequest;
         use crate::proxy::deepseek_runtime::{DeepSeekCachedSession, DeepSeekRuntimeScope};
 
@@ -18966,6 +19021,15 @@ impl ServerStateInner {
                 self.deepseek_runtime.invalidate_session(&scope).await;
                 return Err(DeepSeekUpstreamError::IdentityChanged);
             }
+            if let Some(meter) = metering.as_deref_mut() {
+                meter
+                    .begin(self)
+                    .await
+                    .map_err(DeepSeekUpstreamError::ValueQuota)?;
+                if let Some(attempt) = meter.attempt.as_ref() {
+                    attempt.mark_sent();
+                }
+            }
             let response = client
                 .completion(
                     &token,
@@ -18996,6 +19060,9 @@ impl ServerStateInner {
                 return Err(DeepSeekUpstreamError::IdentityChanged);
             }
             let status = response.status().as_u16();
+            if let Some(attempt) = metering.as_ref().and_then(|meter| meter.attempt.as_ref()) {
+                attempt.mark_upstream_status(status);
+            }
             if reused && !rebuilt && matches!(status, 400 | 404 | 409) {
                 // A rejected cached session is recoverable before any downstream bytes exist.
                 // Authentication/rate-limit/server failures never enter this path.
@@ -19251,6 +19318,7 @@ impl ServerStateInner {
                         capability.share_termination(),
                         capability.provider_identity(),
                         capability.buddy_quota_presentation(),
+                        capability.resource_value_quotas(),
                     ),
                 )
             });
@@ -21528,6 +21596,7 @@ pub(crate) async fn authoritative_share_descriptor(
         apply_value_descriptor_projection(
             &mut descriptor,
             state.router_supports_value_quotas().await,
+            state.resource_value_router_negotiated().await,
         )?;
         state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
         let share_id = share_id.to_string();
@@ -21598,7 +21667,27 @@ fn apply_account_reset_descriptor_projection(
 fn apply_value_descriptor_projection(
     descriptor: &mut ShareDescriptor,
     supported: bool,
+    resources_supported: bool,
 ) -> anyhow::Result<()> {
+    let has_resources = descriptor.user_grants.values().any(|g| {
+        g.active
+            && g.policy
+                .value_quota
+                .iter()
+                .chain(
+                    g.pending_value_quota
+                        .iter()
+                        .filter_map(|p| p.policy.value_quota.as_ref()),
+                )
+                .any(|q| {
+                    q.tariff_policy_id
+                        == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+                })
+    });
+    anyhow::ensure!(
+        !has_resources || resources_supported,
+        "VALUE_QUOTA_RESOURCE_ROUTER_UPGRADE_REQUIRED"
+    );
     if !supported {
         anyhow::ensure!(
             !descriptor
@@ -21618,7 +21707,7 @@ fn apply_value_descriptor_projection(
             }
         }
         if descriptor.contract_version
-            == crate::domain::sharing::router_contract::VALUE_QUOTA_CONTRACT_VERSION
+            >= crate::domain::sharing::router_contract::VALUE_QUOTA_CONTRACT_VERSION
         {
             descriptor.contract_version = if !descriptor.market_entitlements.is_empty() {
                 9
@@ -22722,6 +22811,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         let account_reset_supported = state.router_supports_account_reset().await;
         let market_trial_supported = state.router_supports_market_trials().await;
         let value_supported = state.router_supports_value_quotas().await;
+        let resources_supported = state.resource_value_router_negotiated().await;
         let provider_identity_supported = state.router_supports_provider_identity().await;
         let buddy_quota_supported = state.router_supports_buddy_quota_presentation().await;
         let termination_archive_since_ms = if state.router_supports_share_termination().await {
@@ -22752,6 +22842,24 @@ fn build_router_share_upsert_ops_with_policy<'a>(
                     })
                 {
                     "VALUE_QUOTA_ROUTER_UPGRADE_REQUIRED"
+                } else if !resources_supported
+                    && share.user_grants.values().any(|g| {
+                        g.active
+                            && g.policy
+                                .value_quota
+                                .iter()
+                                .chain(
+                                    g.pending_value_quota
+                                        .iter()
+                                        .filter_map(|pending| pending.policy.value_quota.as_ref()),
+                                )
+                                .any(|q| {
+                                    q.tariff_policy_id
+                                    == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+                                })
+                    })
+                {
+                    "VALUE_QUOTA_RESOURCE_ROUTER_UPGRADE_REQUIRED"
                 } else {
                     return None;
                 };
@@ -22803,7 +22911,11 @@ fn build_router_share_upsert_ops_with_policy<'a>(
                         crate::domain::sharing::router_contract::MARKET_TRIAL_CONTRACT_VERSION,
                     );
                 }
-                apply_value_descriptor_projection(&mut descriptor, value_supported)?;
+                apply_value_descriptor_projection(
+                    &mut descriptor,
+                    value_supported,
+                    resources_supported,
+                )?;
                 state.apply_ollama_cloud_share_projections(&mut descriptor, share, &providers);
                 Ok((share.id.clone(), descriptor, fingerprint))
             })
@@ -33235,6 +33347,8 @@ mod tests {
         reload.unwrap();
     }
 
+    include!("state/share_value_quota/resource_policy_tests.rs");
+
     #[tokio::test]
     async fn value_quota_readiness_ignores_bound_but_disabled_apps() {
         let state = test_state();
@@ -33594,11 +33708,11 @@ mod tests {
                 &*state.providers.read().await,
                 None,
             );
-        assert!(apply_value_descriptor_projection(&mut projection, false).is_err());
+        assert!(apply_value_descriptor_projection(&mut projection, false, false).is_err());
         for grant in projection.user_grants.values_mut() {
             grant.active = false;
         }
-        apply_value_descriptor_projection(&mut projection, false).unwrap();
+        apply_value_descriptor_projection(&mut projection, false, false).unwrap();
         assert!(projection.user_grants.values().all(|g| !g.active
             && g.value_metering.is_none()
             && g.policy.value_quota.is_none()

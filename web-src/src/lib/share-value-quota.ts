@@ -55,7 +55,7 @@ export function valueUsageLabel(picos: string | null | undefined): string {
 }
 
 export const VALUE_REASON_CODES = ["ready", "scheduled_next_window", "metered_from_now", "unverified_surface", "pricing_unavailable",
-  "storage_unavailable", "router_upgrade_required", "blocked_needs_reconcile", "invalid_policy"] as const;
+  "storage_unavailable", "router_upgrade_required", "blocked_needs_reconcile", "invalid_policy", "resource_upgrade_required"] as const;
 export type ValueReasonCode = (typeof VALUE_REASON_CODES)[number];
 const BLOCKING_CODES = new Set<string>(VALUE_REASON_CODES.slice(3));
 export function valueReasonCode(code: unknown): ValueReasonCode | undefined {
@@ -78,7 +78,7 @@ export type ValueCheck = { code: string; ready: boolean; blockedBy?: string | nu
   providerId?: string; profileId?: string | null; driverId?: string | null; model?: string; scope?: string; reasonCode?: string };
 /** Fix-first order: an earlier check usually unblocks the later ones. Unknown codes go last. */
 export const VALUE_CHECK_ORDER = ["router_protocol", "sqlite_authority", "metering_storage", "tariff_published",
-  "acknowledged_tariff", "text_surface", "model_price_coverage"] as const;
+  "acknowledged_tariff", "resource_metering", "text_surface", "model_price_coverage"] as const;
 const checkRank = (code: string) => {
   const index = (VALUE_CHECK_ORDER as readonly string[]).indexOf(code);
   return index < 0 ? VALUE_CHECK_ORDER.length : index;

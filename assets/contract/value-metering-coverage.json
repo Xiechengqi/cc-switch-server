@@ -1,0 +1,1007 @@
+{
+  "schemaVersion": 1,
+  "authority": "assets/contract/provider-registry.json",
+  "counts": {
+    "families": 39,
+    "profiles": 91,
+    "drivers": 28,
+    "pairs": 99
+  },
+  "pairs": [
+    {
+      "profileId": "claude.official_oauth",
+      "driverId": "oauth.claude_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.anthropic_api_key",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.openai_oauth",
+      "driverId": "oauth.openai_codex",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse",
+        "websocket"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.google_oauth",
+      "driverId": "oauth.gemini_code_assist",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.grok_oauth",
+      "driverId": "oauth.grok_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse",
+        "websocket"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.kimi_code",
+      "driverId": "oauth.kimi_code",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.qoder_cosy",
+      "driverId": "special.qoder_cosy",
+      "strategy": "qoder",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.codebuddy_oauth",
+      "driverId": "special.codebuddy_oauth",
+      "strategy": "buddy",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.workbuddy_oauth",
+      "driverId": "special.workbuddy_oauth",
+      "strategy": "buddy",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.trae_solo",
+      "driverId": "special.trae_solo",
+      "strategy": "trae",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.trae_raw_chat",
+      "driverId": "special.trae_raw_chat",
+      "strategy": "trae",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.trae_raw_chat_intl",
+      "driverId": "special.trae_raw_chat_intl",
+      "strategy": "trae",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.kiro_oauth",
+      "driverId": "special.kiro",
+      "strategy": "kiro",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.amazon_q_oauth",
+      "driverId": "special.amazon_q",
+      "strategy": "kiro",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.grok_web_session",
+      "driverId": "special.grok_web_session",
+      "strategy": "web_session",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.perplexity_web_session",
+      "driverId": "special.perplexity_web_session",
+      "strategy": "web_session",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.ollama_cloud",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.cursor_oauth",
+      "driverId": "special.cursor",
+      "strategy": "cursor",
+      "transports": [
+        "h2",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.cursor_api_key",
+      "driverId": "special.cursor",
+      "strategy": "cursor",
+      "transports": [
+        "h2",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.antigravity_oauth",
+      "driverId": "special.antigravity",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.antigravity_cli",
+      "driverId": "special.agy",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.github_copilot",
+      "driverId": "special.copilot",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.deepseek_account",
+      "driverId": "special.deepseek_account",
+      "strategy": "deepseek",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.aws_bedrock_aksk",
+      "driverId": "aws.bedrock_sigv4",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.aws_bedrock_api_key",
+      "driverId": "http.bedrock_bearer",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.openrouter",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.nvidia",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.deepseek_api",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.openai_oauth",
+      "driverId": "oauth.openai_codex",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse",
+        "websocket"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.openai_api_key",
+      "driverId": "http.openai_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.github_copilot",
+      "driverId": "special.copilot",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.grok_oauth",
+      "driverId": "oauth.grok_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse",
+        "websocket"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.kimi_code",
+      "driverId": "oauth.kimi_code",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.qoder_cosy",
+      "driverId": "special.qoder_cosy",
+      "strategy": "qoder",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.codebuddy_oauth",
+      "driverId": "special.codebuddy_oauth",
+      "strategy": "buddy",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.workbuddy_oauth",
+      "driverId": "special.workbuddy_oauth",
+      "strategy": "buddy",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.trae_solo",
+      "driverId": "special.trae_solo",
+      "strategy": "trae",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.trae_raw_chat",
+      "driverId": "special.trae_raw_chat",
+      "strategy": "trae",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.trae_raw_chat_intl",
+      "driverId": "special.trae_raw_chat_intl",
+      "strategy": "trae",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.kiro_oauth",
+      "driverId": "special.kiro",
+      "strategy": "kiro",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.amazon_q_oauth",
+      "driverId": "special.amazon_q",
+      "strategy": "kiro",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.grok_web_session",
+      "driverId": "special.grok_web_session",
+      "strategy": "web_session",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.perplexity_web_session",
+      "driverId": "special.perplexity_web_session",
+      "strategy": "web_session",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.cursor_api_key",
+      "driverId": "special.cursor",
+      "strategy": "cursor",
+      "transports": [
+        "h2",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.cursor_oauth",
+      "driverId": "special.cursor",
+      "strategy": "cursor",
+      "transports": [
+        "h2",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.ollama_cloud",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.openrouter",
+      "driverId": "http.openai_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.nvidia",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.deepseek_api",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.google_oauth",
+      "driverId": "oauth.gemini_code_assist",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.google_api_key",
+      "driverId": "http.gemini_native",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.antigravity_oauth",
+      "driverId": "special.antigravity",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.antigravity_cli",
+      "driverId": "special.agy",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.github_copilot",
+      "driverId": "special.copilot",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.grok_oauth",
+      "driverId": "oauth.grok_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse",
+        "websocket"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.kimi_code",
+      "driverId": "oauth.kimi_code",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.qoder_cosy",
+      "driverId": "special.qoder_cosy",
+      "strategy": "qoder",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.codebuddy_oauth",
+      "driverId": "special.codebuddy_oauth",
+      "strategy": "buddy",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.workbuddy_oauth",
+      "driverId": "special.workbuddy_oauth",
+      "strategy": "buddy",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.trae_solo",
+      "driverId": "special.trae_solo",
+      "strategy": "trae",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.trae_raw_chat",
+      "driverId": "special.trae_raw_chat",
+      "strategy": "trae",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.trae_raw_chat_intl",
+      "driverId": "special.trae_raw_chat_intl",
+      "strategy": "trae",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.cursor_api_key",
+      "driverId": "special.cursor",
+      "strategy": "cursor",
+      "transports": [
+        "h2",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.cursor_oauth",
+      "driverId": "special.cursor",
+      "strategy": "cursor",
+      "transports": [
+        "h2",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.openrouter",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.kimi_coding_api_key",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.kimi_coding_api_key",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.zhipu_glm_cn",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.zhipu_glm_cn",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.zhipu_glm_global",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.zhipu_glm_global",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.bailian_coding_plan_cn",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.bailian_coding_plan_cn",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.bailian_coding_plan_global",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.bailian_coding_plan_global",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.minimax_cn",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.minimax_cn",
+      "driverId": "http.openai_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.minimax_global",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.minimax_global",
+      "driverId": "http.openai_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.volcengine_coding_plan",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.volcengine_coding_plan",
+      "driverId": "http.openai_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.xiaomi_mimo_token_plan",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.xiaomi_mimo_token_plan",
+      "driverId": "http.openai_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.xiaomi_mimo_token_plan_sgp",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.xiaomi_mimo_token_plan_sgp",
+      "driverId": "http.openai_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.custom_http",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.custom_http",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.custom_http",
+      "driverId": "http.openai_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.custom_http",
+      "driverId": "http.gemini_native",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.custom_http",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.custom_http",
+      "driverId": "http.openai_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.custom_http",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.custom_http",
+      "driverId": "http.gemini_native",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.custom_http",
+      "driverId": "http.openai_chat",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.custom_http",
+      "driverId": "http.openai_responses",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.custom_http",
+      "driverId": "http.anthropic_messages",
+      "strategy": "http",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.legacy_compat",
+      "driverId": "legacy.frozen",
+      "strategy": "resolved_runtime",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.legacy_compat",
+      "driverId": "legacy.frozen",
+      "strategy": "resolved_runtime",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "gemini.legacy_compat",
+      "driverId": "legacy.frozen",
+      "strategy": "resolved_runtime",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    }
+  ]
+}

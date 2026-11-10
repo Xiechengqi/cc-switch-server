@@ -72,6 +72,7 @@ pub(crate) mod trae;
 pub(crate) mod trae_runtime;
 mod transforms;
 mod usage;
+pub(crate) mod value_metering;
 pub(crate) mod web_session;
 
 use serde_json::Value;

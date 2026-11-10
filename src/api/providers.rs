@@ -2794,6 +2794,11 @@ fn deepseek_provider_test_upstream_error(
 ) -> (ProviderOperationOutcome, Option<u16>, String) {
     use crate::state::DeepSeekUpstreamError;
     let (outcome, status, message) = match error {
+        DeepSeekUpstreamError::ValueQuota(_) => (
+            ProviderOperationOutcome::InvalidConfig,
+            None,
+            "USD-equivalent quota admission is unavailable".into(),
+        ),
         DeepSeekUpstreamError::NotFound => (
             ProviderOperationOutcome::InvalidConfig,
             None,

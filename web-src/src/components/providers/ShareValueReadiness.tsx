@@ -45,8 +45,9 @@ export function ShareValueUnitToggle({ value, onChange, usdDisabled, disabled, l
 }) {
   const { t } = useTranslation();
   const reasonId = useId();
-  const usdOff = !!usdDisabled && value !== "usdEquivalent";
-  const describedBy = usdOff ? [reasonId, readinessId].filter(Boolean).join(" ") : undefined;
+  const usdOff = false;
+  const needsSetup = !!usdDisabled;
+  const describedBy = needsSetup ? [reasonId, readinessId].filter(Boolean).join(" ") : undefined;
   const options: Array<{ id: ShareQuotaUnit; label: string; title?: string; off?: boolean }> = [
     { id: "tokens", label: t("share.userLimit.valueQuota.tokens") },
     { id: "usdEquivalent", label: t("share.userLimit.valueQuota.unitUsdShort"), title: t("share.userLimit.valueQuota.usd"), off: usdOff },
@@ -73,7 +74,7 @@ export function ShareValueUnitToggle({ value, onChange, usdDisabled, disabled, l
       </button>;
     })}
   </div>
-  {usdOff ? <span id={reasonId} className="sr-only">{t("share.userLimit.valueQuota.usdDisabledReason")}</span> : null}
+  {needsSetup ? <span id={reasonId} className="sr-only">{t("share.userLimit.valueQuota.usdDisabledReason")}</span> : null}
   </>;
 }
 
@@ -261,4 +262,12 @@ export function ShareValueScheduledLine({ limitMicros, effectiveFromMs }: { limi
     <span className="font-mono">{t(q + "scheduledLine", { amount: valueLimitLabel(limitMicros), date: formatValueTime(effectiveFromMs, i18n.language, "short") })}</span>
     <ShareValueInfo label={t(q + "details")}><p>{t(q + "scheduledHint")}</p></ShareValueInfo>
   </div>;
+}
+
+export function ShareValueResourceToggle({value,onChange,disabled}: {value:boolean;onChange:(value:boolean)=>void;disabled?:boolean}) {
+  const {t}=useTranslation();
+  return <label className="flex items-start gap-2 text-xs text-muted-foreground">
+    <input type="checkbox" className="mt-0.5" checked={value} disabled={disabled} onChange={event=>onChange(event.target.checked)} />
+    <span>{t("share.userLimit.valueQuota.resources")}<span className="mt-1 block">{t("share.userLimit.valueQuota.resourcesHint")}</span></span>
+  </label>;
 }

@@ -53,6 +53,7 @@ fn installed_model_price_becomes_usable_at_boundary_without_a_heartbeat() {
         Some(old.clone())
     );
     let admission = Admission {
+        resource_plan: None,
         enforce: true,
         scope: &scope,
         window: &window,
@@ -107,6 +108,7 @@ fn tariff_activation_keeps_admitted_attempts_frozen_and_replays_idempotent() {
     let (mut conn, scope, window, quota, old, new) = prepared_price_update();
     let tx = conn.transaction().unwrap();
     let admission = Admission {
+        resource_plan: None,
         enforce: true,
         scope: &scope,
         window: &window,

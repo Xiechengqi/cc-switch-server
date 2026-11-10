@@ -276,7 +276,7 @@ async fn restored_router_ack_and_withdrawn_pending_tariff_converge_without_rewri
                 let count = ack_count.clone();
                 async move {
                     count.fetch_add(1, AtomicOrdering::SeqCst);
-                    assert_eq!(body["storageSchema"], 3);
+                    assert_eq!(body["storageSchema"], 5);
                     Json(json!({"ok":true,"revision":body["revision"]}))
                 }
             }),

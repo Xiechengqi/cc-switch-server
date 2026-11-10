@@ -144,14 +144,19 @@ pub(crate) fn model_coverage(
         Some(revision) => {
             cached_snapshot(&tx, &scope.router_url, &scope.installation_id, revision)?
                 .model(model)
-                .is_ok_and(|price| price.supports_tier(tier))
+                .is_ok_and(|price| {
+                    price.supports_tier(tier)
+                        || (price.rates.is_empty() && !price.resources.is_empty())
+                })
         }
         None => false,
     };
     let pending_covers = match pending.as_ref() {
         Some(p) => cached_snapshot(&tx, &scope.router_url, &scope.installation_id, &p.revision)?
             .model(model)
-            .is_ok_and(|price| price.supports_tier(tier)),
+            .is_ok_and(|price| {
+                price.supports_tier(tier) || (price.rates.is_empty() && !price.resources.is_empty())
+            }),
         None => false,
     };
     let result = TariffCoverage {
@@ -184,7 +189,12 @@ pub(super) fn price_rejection(
     let pending_covers = pending.as_ref().is_some_and(|p| {
         cached_snapshot(conn, &scope.router_url, &scope.installation_id, &p.revision)
             .ok()
-            .is_some_and(|s| s.model(model).is_ok_and(|price| price.supports_tier(tier)))
+            .is_some_and(|s| {
+                s.model(model).is_ok_and(|price| {
+                    price.supports_tier(tier)
+                        || (price.rates.is_empty() && !price.resources.is_empty())
+                })
+            })
     });
     PriceRejection {
         reason_code: if pending_covers {

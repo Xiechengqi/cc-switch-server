@@ -216,6 +216,8 @@ struct CursorAttemptContext {
     rail: String,
     request_memory: Option<RequestMemoryBudget>,
     timing: Option<TimingSlot>,
+    value_series: Arc<tokio::sync::Mutex<crate::proxy::value_metering::ValueAttemptSeries>>,
+    value_request_body: Option<Arc<Value>>,
 }
 
 impl CursorAttemptContext {
@@ -244,6 +246,8 @@ impl CursorAttemptContext {
             rail,
             request_memory,
             timing: None,
+            value_series: Arc::default(),
+            value_request_body: None,
         })
     }
 
@@ -778,6 +782,15 @@ async fn drive_semantic_attempts(
                 return Err(error);
             }
         };
+        let observed_usage = match &outcome {
+            DriveOutcome::Completed { usage, .. } | DriveOutcome::Parked { usage, .. } => *usage,
+        };
+        attempt_context
+            .value_series
+            .lock()
+            .await
+            .observe(observed_usage, true)
+            .await?;
         let Some(choice) = semantic_tool_choice.as_ref() else {
             reservation_guard.disarm();
             return Ok(SemanticDriveSuccess {
@@ -1060,6 +1073,16 @@ struct CursorApiKeyExchangeResponse {
 pub async fn forward_agentservice(
     options: AgentServiceForwardOptions,
 ) -> Result<Response, ProxyError> {
+    let value_series: Arc<tokio::sync::Mutex<crate::proxy::value_metering::ValueAttemptSeries>> =
+        Arc::default();
+    let result = forward_agentservice_metered(options, value_series.clone()).await;
+    result.map(|response| crate::proxy::value_metering::series_response(response, value_series))
+}
+
+async fn forward_agentservice_metered(
+    options: AgentServiceForwardOptions,
+    value_series: Arc<tokio::sync::Mutex<crate::proxy::value_metering::ValueAttemptSeries>>,
+) -> Result<Response, ProxyError> {
     let AgentServiceForwardOptions {
         state,
         route,
@@ -1319,6 +1342,8 @@ pub async fn forward_agentservice(
     )
     .await?;
     attempt_context.timing = Some(timing);
+    attempt_context.value_series = value_series.clone();
+    attempt_context.value_request_body = Some(Arc::new(body_value.clone()));
     let session_open_context = CursorSessionOpenContext {
         state: &state,
         stored: &stored,
@@ -1389,6 +1414,7 @@ pub async fn forward_agentservice(
         local_task_state: local_task_state.clone(),
     });
 
+    request_context.attempt_count = Some(value_series.lock().await.number);
     let model = usage_model_metadata(&adapter_request);
     let semantic_tool_choice = semantic_tool_constraint_for_plan(&plan);
     if adapter_request.stream_requested && semantic_tool_choice.is_none() {
@@ -1505,6 +1531,7 @@ pub async fn forward_agentservice(
             .transpose()?
             .unwrap_or(compacted);
     }
+    request_context.attempt_count = Some(value_series.lock().await.number);
     let status_code = StatusCode::OK.as_u16();
     log_usage(
         &state,
@@ -2332,6 +2359,7 @@ async fn stream_semantic_response(
         session_entry: None,
         parked_handoff: false,
     };
+    let value_series = attempt_context.value_series.clone();
     let stream = stream! {
         let _request_state_memory = request_state_memory;
         let mut interrupted_guard = interrupted_guard;
@@ -2468,6 +2496,11 @@ async fn stream_semantic_response(
         // A constrained attempt is intentionally buffered until it commits a
         // real tool call. Recording the flush instant as TTFT would make the
         // generation window effectively zero and produce meaningless TPS.
+        let generation = value_series.lock().await.number;
+        let _ = state.update_usage_log(&request_id, |log| {
+            log.attempt_count = generation;
+            log.usage_revision = log.usage_revision.saturating_add(1);
+        }).await;
         update_stream_usage(
             &state,
             &stored,
@@ -3459,6 +3492,7 @@ async fn acquire_or_open_session(
                 return Err(error.into_proxy_error());
             }
         }
+        begin_cursor_value_generation(context, attempt_context).await?;
         if let Err(error) = resume_tool_results(&entry, &context.plan.tool_results).await {
             context
                 .state
@@ -3485,7 +3519,7 @@ async fn acquire_or_open_session(
         .await?;
         ensure_cursor_session_scope_current(context, &active_session_key).await?;
         let access_token = credential.access_token().to_string();
-        match open_agent_stream(context, &credential, &active_session_key).await {
+        match open_agent_stream(context, &credential, &active_session_key, attempt_context).await {
             Ok(entry) => {
                 if let Err(error) =
                     ensure_cursor_session_scope_current(context, &active_session_key).await
@@ -3517,6 +3551,12 @@ async fn acquire_or_open_session(
                 match action {
                     CursorAgentServiceAuthAction::UseResponse => return Err(error),
                     CursorAgentServiceAuthAction::RefreshAndReplaySameBinding => {
+                        attempt_context
+                            .value_series
+                            .lock()
+                            .await
+                            .auth_rejected()
+                            .await;
                         let wait = attempt_context
                             .timing
                             .as_ref()
@@ -3604,6 +3644,12 @@ async fn acquire_ready_session(
                 return Ok(opened);
             }
             CursorAgentServiceAuthAction::RefreshAndReplaySameBinding => {
+                attempt_context
+                    .value_series
+                    .lock()
+                    .await
+                    .auth_rejected()
+                    .await;
                 let wait = attempt_context
                     .timing
                     .as_ref()
@@ -4583,10 +4629,39 @@ impl ResolvedCursorSession {
     }
 }
 
+async fn begin_cursor_value_generation(
+    context: &CursorSessionOpenContext<'_>,
+    attempt_context: &mut CursorAttemptContext,
+) -> Result<(), ProxyError> {
+    // Preserve original tool and media declarations for resource admission.
+    // Replace only the execution model and the text actually sent by this generation.
+    let mut body = attempt_context
+        .value_request_body
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    body["model"] = json!(context.plan.model_id);
+    body["input"] = json!(context.plan.user_text);
+    body["system"] = json!(context.plan.system_prompt);
+    let payload = serde_json::to_vec(&body).map_err(ProxyError::bad_gateway)?;
+    let mut meter = attempt_context.value_series.lock().await;
+    meter
+        .begin(
+            context.state,
+            context.request_context,
+            &context.plan.model_id,
+            &payload,
+        )
+        .await?;
+    meter.sent();
+    Ok(())
+}
+
 async fn open_agent_stream(
     context: &CursorSessionOpenContext<'_>,
     credential: &CursorCredential,
     session_key: &CursorSessionKey,
+    attempt_context: &mut CursorAttemptContext,
 ) -> Result<Arc<tokio::sync::Mutex<CursorSession>>, ProxyError> {
     let state = context.state;
     let stored = context.stored;
@@ -4696,6 +4771,7 @@ async fn open_agent_stream(
                 .map_err(|error| error.into_proxy_error())?;
         }
     }
+    begin_cursor_value_generation(context, attempt_context).await?;
     let stream = match CursorH2Stream::open(
         &endpoint,
         cursor_agentservice_headers(

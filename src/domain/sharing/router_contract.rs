@@ -38,6 +38,7 @@ pub const SHARE_CONTRACT_VERSION: u16 = 7;
 pub const ACCOUNT_RESET_CONTRACT_VERSION: u16 = 8;
 pub const MARKET_TRIAL_CONTRACT_VERSION: u16 = 9;
 pub const VALUE_QUOTA_CONTRACT_VERSION: u16 = 10;
+pub const RESOURCE_VALUE_QUOTA_CONTRACT_VERSION: u16 = 11;
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -1360,7 +1361,24 @@ pub fn descriptor_for_share_with_accounts_and_usage(
     }
     ShareDescriptor {
         termination_archive_since_ms: None,
-        contract_version: if user_grants
+        contract_version: if user_grants.values().any(|grant| {
+            grant
+                .policy
+                .value_quota
+                .iter()
+                .chain(
+                    grant
+                        .pending_value_quota
+                        .iter()
+                        .filter_map(|pending| pending.policy.value_quota.as_ref()),
+                )
+                .any(|quota| {
+                    quota.tariff_policy_id
+                        == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+                })
+        }) {
+            RESOURCE_VALUE_QUOTA_CONTRACT_VERSION
+        } else if user_grants
             .values()
             .any(|g| g.value_metering.is_some() || g.policy.value_quota.is_some())
         {

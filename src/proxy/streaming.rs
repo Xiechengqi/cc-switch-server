@@ -58,6 +58,7 @@ pub struct StreamUsageAccumulator {
     usage_estimated: bool,
     response_model: ResponseModelEvidence,
     streamed_text_bytes: u64,
+    resources: crate::domain::usage::value_pricing::ResourceUsageObserver,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +69,7 @@ pub struct StreamUsageResult {
     pub response_model: ResponseModelEvidence,
     /// UTF-8 bytes of generated text deltas (text, thinking, tool arguments).
     pub streamed_text_bytes: u64,
+    pub resources: Option<crate::domain::usage::value_pricing::ResourceUsage>,
 }
 
 #[derive(Debug)]
@@ -495,6 +497,7 @@ impl StreamUsageAccumulator {
             usage_estimated: false,
             response_model: ResponseModelEvidence::default(),
             streamed_text_bytes: 0,
+            resources: Default::default(),
         }
     }
 
@@ -512,6 +515,7 @@ impl StreamUsageAccumulator {
 
     pub fn retained_bytes(&self) -> usize {
         self.decoder.retained_bytes()
+            + self.resources.retained_bytes()
             + self
                 .response_model
                 .model
@@ -541,6 +545,7 @@ impl StreamUsageAccumulator {
             usage_estimated: self.usage_estimated,
             response_model: self.response_model.clone(),
             streamed_text_bytes: self.streamed_text_bytes,
+            resources: self.resources.usage(),
         }
     }
 
@@ -548,6 +553,7 @@ impl StreamUsageAccumulator {
     /// Keep local parse failures sticky, but do not add text or cumulative
     /// counters a second time when both representations saw the same frame.
     pub fn replace_observation(&mut self, observed: StreamUsageResult) {
+        self.resources.replace_usage(observed.resources);
         self.usage = observed.usage;
         self.response_model = observed.response_model;
         self.streamed_text_bytes = observed.streamed_text_bytes;
@@ -559,6 +565,7 @@ impl StreamUsageAccumulator {
     /// observable generation/usage. Model-only prelude frames are harmless.
     pub fn has_billable_evidence(&self) -> bool {
         self.parse_error
+            || self.resources.has_positive_usage()
             || self.streamed_text_bytes > 0
             || self.usage.raw_input_tokens.unwrap_or(0) > 0
             || self.usage.input_tokens.unwrap_or(0) > 0
@@ -568,6 +575,7 @@ impl StreamUsageAccumulator {
     }
 
     pub fn observe_json(&mut self, value: &Value) {
+        self.resources.observe(value);
         self.streamed_text_bytes = self
             .streamed_text_bytes
             .saturating_add(generated_text_bytes(value));
@@ -593,6 +601,7 @@ impl StreamUsageAccumulator {
             usage_estimated: self.usage_estimated,
             response_model: self.response_model,
             streamed_text_bytes: self.streamed_text_bytes,
+            resources: self.resources.usage(),
         }
     }
 

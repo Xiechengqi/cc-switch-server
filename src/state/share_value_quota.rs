@@ -307,11 +307,48 @@ fn metered_grant(grant: &ShareUserGrant) -> bool {
 const PHASE_NOT_SENT: u8 = 0;
 const PHASE_SENT: u8 = 1;
 const PHASE_UPSTREAM_ERROR: u8 = 2;
+
+/// State-owned generation admission for Drivers whose control-plane setup
+/// and generation retries are orchestrated inside ServerStateInner.
+pub(crate) struct ValueGenerationAdmission<'a> {
+    pub context: &'a mut UsageLogContext,
+    pub attempt: &'a mut Option<ValueAttemptGuard>,
+    pub model: &'a str,
+    pub tier: Option<&'static str>,
+    pub estimate: RiskEstimate,
+    pub verified_surface: bool,
+    pub resource_plan: Option<crate::domain::usage::value_pricing::ResourcePlan>,
+    pub number: u32,
+}
+impl ValueGenerationAdmission<'_> {
+    pub(crate) async fn begin(&mut self, state: &ServerState) -> anyhow::Result<()> {
+        if let Some(previous) = self.attempt.take() {
+            previous.settle_now().await;
+        }
+        self.number = self
+            .number
+            .checked_add(1)
+            .context("monetary attempt identity exhausted")?;
+        self.context.attempt_count = Some(self.number);
+        *self.attempt = state
+            .admit_share_value_request(
+                self.context,
+                self.model,
+                self.tier,
+                self.estimate,
+                self.verified_surface,
+                self.resource_plan.clone(),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
 /// Terminal guard for one admitted USD attempt. Unless the attempt is settled
 /// by its usage log first, dropping the guard (normal return, early `?`, or
 /// a dropped request future) schedules an outcome settlement: never sent =>
-/// $0, upstream error (error status, or an error/protocol failure before any
-/// output on a 200 stream) => $0 unless usage is logged, otherwise outcome
+/// $0, explicit authentication rejection => $0 unless usage is logged; an
+/// error status, protocol failure, or missing output leaves the outcome
 /// unknown => reserved risk. Before a retry the forwarder calls
 /// [`ValueAttemptGuard::settle_now`] instead, so the retry's admission never
 /// races a still-pending row. Settlement is idempotent with usage-log
@@ -323,6 +360,63 @@ pub(crate) struct ValueAttemptGuard {
     phase: AtomicU8,
 }
 impl ValueAttemptGuard {
+    pub(crate) async fn handoff_task(
+        mut self,
+        task_id: String,
+        expires_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let config_dir = self.state.config_dir.clone();
+        let request = self.request_id.clone();
+        let attempt = self.attempt_id.clone();
+        tokio::task::spawn_blocking(move || {
+            ledger::attach_task(&config_dir, &request, &attempt, &task_id, expires_at_ms)
+        })
+        .await??;
+        self.request_id.clear();
+        Ok(())
+    }
+    pub(crate) async fn observe_tokens(
+        &self,
+        usage: crate::domain::usage::store::TokenUsage,
+        estimated: bool,
+    ) -> anyhow::Result<()> {
+        let (Some(input), Some(output)) = (usage.input_tokens, usage.output_tokens) else {
+            return Ok(());
+        };
+        let cache = usage.cache_creation_tokens.unwrap_or(0);
+        let (five, hour, unknown) = match usage.cache_creation_details {
+            Some(details) if details.five_minutes.checked_add(details.one_hour) == Some(cache) => {
+                (details.five_minutes, details.one_hour, 0)
+            }
+            Some(_) => return Ok(()),
+            None => (0, 0, cache),
+        };
+        let tokens = crate::domain::usage::value_pricing::ValueTokens {
+            fresh_input: input,
+            output,
+            cache_read: usage.cache_read_tokens.unwrap_or(0),
+            cache_write5m: five,
+            cache_write1h: hour,
+            cache_write_unknown: unknown,
+        };
+        if usage
+            .raw_input_tokens
+            .is_some_and(|raw| tokens.raw_input().ok() != Some(raw))
+        {
+            return Ok(());
+        }
+        let config_dir = self.state.config_dir.clone();
+        let request = self.request_id.clone();
+        let attempt = self.attempt_id.clone();
+        tokio::task::spawn_blocking(move || {
+            ledger::observe_attempt_tokens(&config_dir, &request, &attempt, tokens, estimated)
+        })
+        .await??;
+        self.state
+            .sync_market_trial_value(Some(&self.request_id), false)
+            .await?;
+        Ok(())
+    }
     pub(crate) fn proves_no_usage(&self) -> bool {
         self.outcome() != ledger::AttemptOutcome::Unknown
     }
@@ -336,14 +430,12 @@ impl ValueAttemptGuard {
     }
     /// Upstream response headers arrived.
     pub(crate) fn mark_upstream_status(&self, status: u16) {
-        if status >= 400 {
+        if status == 401 {
             self.mark_upstream_error();
         }
     }
-    /// Upstream failed before producing any output (e.g. an Anthropic
-    /// `error` event, a semantic/protocol failure or a first-event read
-    /// error on an HTTP 200 stream). Settles at $0 unless a usage log
-    /// reports usage for this attempt.
+    /// Explicit upstream rejection proving generation did not execute.
+    /// Missing output or a transport/error status alone does not prove this.
     pub(crate) fn mark_upstream_error(&self) {
         self.phase
             .store(PHASE_UPSTREAM_ERROR, AtomicOrdering::Release);
@@ -358,8 +450,8 @@ impl ValueAttemptGuard {
     /// Settles the attempt now (awaited) and disarms the drop hook. Used
     /// before a retry so the next attempt's admission sees this row settled
     /// (no stale concurrency slot or reservation). Returns whether the
-    /// attempt settles at $0 (never sent, or upstream error before output),
-    /// which makes the retry admissible for a USD user.
+    /// attempt has explicit evidence of no execution. Unknown outcomes keep
+    /// their conservative debit; the next admission checks remaining capacity.
     pub(crate) async fn settle_now(mut self) -> bool {
         let outcome = self.outcome();
         let request_id = std::mem::take(&mut self.request_id);
@@ -734,6 +826,22 @@ impl ServerStateInner {
         // may carry a USD-equivalent budget. Always ready.
         checks.push(serde_json::json!({"code":MARKET_TRIAL_VALUE_CHECK, "ready":true}));
         checks.push(serde_json::json!({"code":"value_usage_initialization", "ready":true}));
+        let resource_ready = self.resource_value_router_negotiated().await
+            && scope(&config, share_id, "preview@local.invalid")
+                .and_then(|identity| ledger::resource_tariff_ready(&self.config_dir, &identity))
+                .unwrap_or(false);
+        let requests_resources = policies.values().any(|policy| {
+            policy.value_quota.as_ref().is_some_and(|quota| {
+                quota.tariff_policy_id
+                    == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+            })
+        });
+        if resource_ready || requests_resources {
+            checks.push(
+                serde_json::json!({"code":"resource_metering", "ready":resource_ready,
+                "reasonCode": if resource_ready { "ready" } else { "resource_upgrade_required" }}),
+            );
+        }
         let capability_ready = checks.iter().all(|check| check["ready"] == true);
         let first_failed = checks
             .iter()
@@ -744,6 +852,7 @@ impl ServerStateInner {
             Some("sqlite_authority" | "metering_storage") => "storage_unavailable",
             Some("acknowledged_tariff") => "pricing_unavailable",
             Some("model_price_coverage") => "pricing_unavailable",
+            Some("resource_metering") => "resource_upgrade_required",
             Some(_) => "unverified_surface",
             None => "ready",
         };
@@ -947,6 +1056,21 @@ impl ServerStateInner {
             .as_ref()
             .is_some_and(|(base, id, at, supported)| {
                 supported.2
+                    && at.elapsed() < Duration::from_secs(300)
+                    && config.router_api_base() == Some(base.as_str())
+                    && config
+                        .registered_router_identity()
+                        .is_some_and(|identity| identity.installation_id == *id)
+            })
+    }
+    pub(crate) async fn resource_value_router_negotiated(&self) -> bool {
+        let config = self.config_snapshot().await;
+        self.router_quota_capability
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(base, id, at, supported)| {
+                supported.7
                     && at.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
@@ -1182,6 +1306,14 @@ impl ServerStateInner {
             "VALUE_QUOTA_ROUTER_UPGRADE_OR_COMMITTED_STORAGE_REQUIRED"
         );
         let identity = grant_scope(config, share_id, email, grant)?;
+        if grant.policy.value_quota.as_ref().is_some_and(|quota| {
+            quota.tariff_policy_id == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+        }) {
+            anyhow::ensure!(
+                ledger::resource_tariff_ready(&self.config_dir, &identity)?,
+                "VALUE_QUOTA_RESOURCE_UPGRADE_REQUIRED"
+            );
+        }
         let revision = ledger::active_revision(&self.config_dir, &identity)?
             .context("VALUE_QUOTA_SNAPSHOT_UNAVAILABLE")?;
         let mut binding = match reusable {
@@ -1268,6 +1400,14 @@ impl ServerStateInner {
             }
         }
         let identity = scope(config, share_id, email)?;
+        if grant.policy.value_quota.as_ref().is_some_and(|quota| {
+            quota.tariff_policy_id == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+        }) {
+            anyhow::ensure!(
+                ledger::resource_tariff_ready(&self.config_dir, &identity)?,
+                "VALUE_QUOTA_RESOURCE_UPGRADE_REQUIRED"
+            );
+        }
         let revision = ledger::active_revision(&self.config_dir, &identity)?
             .context("VALUE_QUOTA_SNAPSHOT_UNAVAILABLE")?;
         let prior_active = old
@@ -1388,14 +1528,16 @@ impl ServerStateInner {
         base: &str,
         known: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
-        let request = client::signed_canonical_request(
-            identity,
-            "share_value_pricing_fetch",
-            match known {
-                Some(revision) => serde_json::json!({"knownRevision":revision}),
-                None => serde_json::json!({}),
-            },
-        )?;
+        let mut payload = match known {
+            Some(revision) => serde_json::json!({"knownRevision":revision}),
+            None => serde_json::json!({}),
+        };
+        if self.resource_value_router_negotiated().await {
+            payload["supportedTariffPolicies"] =
+                serde_json::json!(["api-equivalent-v1", "api-equivalent-v2"]);
+        }
+        let request =
+            client::signed_canonical_request(identity, "share_value_pricing_fetch", payload)?;
         Ok(http
             .post(format!(
                 "{}/v1/shares/value-pricing/fetch",
@@ -1406,7 +1548,7 @@ impl ServerStateInner {
             .send()
             .await?)
     }
-    /// Sends the signed pricing ACK (`{"revision","storageSchema":3}`) and
+    /// Sends the signed pricing ACK (`{"revision","storageSchema":5}`) and
     /// checks the echoed revision.
     async fn send_value_pricing_ack(
         http: &reqwest::Client,
@@ -1417,7 +1559,7 @@ impl ServerStateInner {
         let ack = client::signed_canonical_request(
             identity,
             "share_value_pricing_ack",
-            serde_json::json!({"revision":revision,"storageSchema":3}),
+            serde_json::json!({"revision":revision,"storageSchema":5}),
         )?;
         let response: serde_json::Value = http
             .post(format!(
@@ -1557,6 +1699,13 @@ impl ServerStateInner {
                 && manifest.snapshot.revision()? == manifest.revision,
             "value pricing binding/hash mismatch"
         );
+        // A transient capability cache loss or Router rollback must not replace
+        // an installed resource tariff with a text-only tariff.
+        if manifest.snapshot.schema_version == 1
+            && ledger::resource_tariff_ready(&self.config_dir, &pricing_scope)?
+        {
+            anyhow::bail!("VALUE_QUOTA_RESOURCE_ROUTER_UPGRADE_REQUIRED");
+        }
         // Already active, or already installed+acknowledged and scheduled.
         if active.as_deref() == Some(manifest.revision.as_str())
             || pending
@@ -1714,18 +1863,33 @@ impl ServerStateInner {
         }
         Ok(changed)
     }
+    // Kept only for the existing text-contract fixtures. Production always
+    // supplies the prepared resource plan through admit_share_value_request.
+    #[cfg(test)]
+    pub(crate) async fn admit_share_value_text(
+        self: &Arc<Self>,
+        context: &UsageLogContext,
+        model: &str,
+        tier: Option<&'static str>,
+        estimate: RiskEstimate,
+        verified: bool,
+    ) -> anyhow::Result<Option<ValueAttemptGuard>> {
+        self.admit_share_value_request(context, model, tier, estimate, verified, None)
+            .await
+    }
     /// Pre-send USD admission for one attempt. Only enforced USD grants are
     /// metered. Reads the grant under the shares read lock only (the ledger
     /// IMMEDIATE transaction serializes admissions; windows aggregate across
     /// policy epochs, so a racing policy edit cannot erase usage) and runs
     /// SQLite on the blocking pool. Returns the attempt's terminal guard.
-    pub(crate) async fn admit_share_value_text(
+    pub(crate) async fn admit_share_value_request(
         self: &Arc<Self>,
         context: &UsageLogContext,
         effective_model: &str,
         effective_tier: Option<&'static str>,
         estimate: RiskEstimate,
         verified_surface: bool,
+        resource_plan: Option<crate::domain::usage::value_pricing::ResourcePlan>,
     ) -> anyhow::Result<Option<ValueAttemptGuard>> {
         if context.is_health_check {
             return Ok(None);
@@ -1849,6 +2013,7 @@ impl ServerStateInner {
                 let revision = ledger::active_revision(&config_dir, &identity)?
                     .context("VALUE_QUOTA_SNAPSHOT_UNAVAILABLE")?;
                 let admission = ledger::Admission {
+                    resource_plan,
                     enforce: true,
                     scope: &identity,
                     window: &w,

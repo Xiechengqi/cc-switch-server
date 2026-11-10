@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
+mod resources;
+pub use resources::*;
+mod resource_request;
+pub use resource_request::*;
+
 pub const TARIFF_POLICY: &str = "api-equivalent-v1";
 pub const PICOS_PER_MICRO: i128 = 1_000_000;
 pub const PICOS_PER_USD: i128 = 1_000_000_000_000;
@@ -37,7 +42,8 @@ impl PriceRejection {
             "tariff_not_effective" => "Model price update is installed and awaiting its effective time; retry after activation.",
             "tier_unknown" => "The execution service tier is not supported for USD-equivalent pricing.",
             "tier_unpriced" => "The execution service tier has no verified price in the active tariff.",
-            "model_unresolved" => "WorkBuddy must resolve to a concrete execution model for USD-equivalent quotas; select a named model instead of auto/default.",
+            "model_unresolved" => "Resolve the execution model or configure an explicit pricing alias in Router settings before using USD-equivalent quotas.",
+            "resource_unpriced" => "This operation has no resource price in the active tariff; configure its model and resource prices in Router settings.",
             _ => "The execution model has no verified price in the active tariff; configure its price in Router settings.",
         }
     }
@@ -66,32 +72,74 @@ pub enum ValueUsageEditAction {
     Clear,
 }
 
-/// Excludes separately billed resources; tool-call text itself is token usage.
-/// Deliberately conservative: unrecognized typed content is not made free.
-pub fn supports_value_text_runtime(profile: &str, driver: &str, coding_plan: bool) -> bool {
-    // Compatibility ProviderType alone is insufficient: Web Session and
-    // subscription profiles can intentionally share a native ProviderType.
-    !coding_plan
-        && matches!(
-            (profile, driver),
-            ("claude.anthropic_api_key", "http.anthropic_messages")
-                | ("codex.openai_api_key", "http.openai_responses")
-                | ("gemini.google_api_key", "http.gemini_native")
-                | ("claude.custom_http", "http.anthropic_messages")
-                | ("claude.custom_http", "http.openai_chat")
-                | ("claude.custom_http", "http.openai_responses")
-                | ("claude.custom_http", "http.gemini_native")
-                | ("codex.custom_http", "http.anthropic_messages")
-                | ("codex.custom_http", "http.openai_chat")
-                | ("codex.custom_http", "http.openai_responses")
-                | ("gemini.custom_http", "http.anthropic_messages")
-                | ("gemini.custom_http", "http.openai_chat")
-                | ("gemini.custom_http", "http.openai_responses")
-                | ("gemini.custom_http", "http.gemini_native")
-                | ("claude.workbuddy_oauth", "special.workbuddy_oauth")
-                | ("codex.workbuddy_oauth", "special.workbuddy_oauth")
-                | ("gemini.workbuddy_oauth", "special.workbuddy_oauth")
-        )
+/// Text metering follows the authoritative runtime binding, independently of
+/// credentials or subscription type. The shared ledger accepts authoritative
+/// usage and explicitly marked conservative estimates from every Driver.
+/// Resource pricing is checked separately for each operation/payload.
+/// Every registered transport declares its lifecycle owner. Adding a Driver
+/// requires a CI-reviewed strategy; credentials and subscription type do not
+/// determine USD eligibility.
+pub fn value_metering_strategy(driver: &str) -> Option<&'static str> {
+    match driver {
+        "oauth.claude_messages"
+        | "http.anthropic_messages"
+        | "oauth.openai_codex"
+        | "oauth.grok_responses"
+        | "oauth.kimi_code"
+        | "http.openai_chat"
+        | "special.antigravity"
+        | "special.agy"
+        | "special.copilot"
+        | "aws.bedrock_sigv4"
+        | "http.bedrock_bearer"
+        | "http.openai_responses"
+        | "oauth.gemini_native"
+        | "oauth.gemini_code_assist"
+        | "http.gemini_native" => Some("http"),
+        "special.qoder_cosy" => Some("qoder"),
+        "special.codebuddy_oauth" | "special.workbuddy_oauth" => Some("buddy"),
+        "special.trae_solo" | "special.trae_raw_chat" | "special.trae_raw_chat_intl" => {
+            Some("trae")
+        }
+        "special.kiro" | "special.amazon_q" => Some("kiro"),
+        "special.grok_web_session" | "special.perplexity_web_session" => Some("web_session"),
+        "special.cursor" => Some("cursor"),
+        "special.deepseek_account" => Some("deepseek"),
+        "legacy.frozen" => Some("resolved_runtime"),
+        _ => None,
+    }
+}
+
+pub fn supports_value_text_runtime(profile: &str, driver: &str, _coding_plan: bool) -> bool {
+    use crate::domain::providers::registry::{provider_registry, DriverBinding, OperationSupport};
+    let registry = provider_registry();
+    let Some(profile) = registry
+        .profiles
+        .iter()
+        .find(|p| p.profile_id.as_str() == profile)
+    else {
+        return false;
+    };
+    // Frozen legacy plans select the actual Driver from provider settings.
+    let binding_matches = profile.profile_id.as_str().ends_with(".legacy_compat")
+        || match &profile.driver_binding {
+            DriverBinding::Fixed { driver_id } => driver_id.as_str() == driver,
+            DriverBinding::Custom { custom_policy_id } => registry
+                .custom_policies
+                .iter()
+                .find(|policy| &policy.custom_policy_id == custom_policy_id)
+                .is_some_and(|policy| {
+                    policy
+                        .allowed_driver_ids
+                        .iter()
+                        .any(|id| id.as_str() == driver)
+                }),
+        };
+    binding_matches
+        && value_metering_strategy(driver).is_some()
+        && registry.drivers.iter().any(|d| {
+            d.driver_id.as_str() == driver && d.operations.forward == OperationSupport::Supported
+        })
 }
 
 /// Match the WorkBuddy resolver's identifier normalization, without pretending
@@ -510,7 +558,12 @@ pub struct ValueQuota {
 impl ValueQuota {
     pub fn limit_picos(&self) -> Result<i128, ValueError> {
         let micros = unsigned_decimal(&self.limit_usd_micros)?;
-        if self.tariff_policy_id != TARIFF_POLICY || micros == 0 || micros > MAX_LIMIT_MICROS {
+        if !matches!(
+            self.tariff_policy_id.as_str(),
+            TARIFF_POLICY | RESOURCE_TARIFF_POLICY
+        ) || micros == 0
+            || micros > MAX_LIMIT_MICROS
+        {
             return Err(ValueError::InvalidPolicy);
         }
         micros
@@ -669,10 +722,20 @@ pub struct ExecutionModelPrice {
     pub long_context_inclusive: bool,
     #[serde(deserialize_with = "unique_map")]
     pub rates: BTreeMap<String, ExecutionRates>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "unique_map"
+    )]
+    pub resources: BTreeMap<String, String>,
 }
 impl ExecutionModelPrice {
     pub fn validate(&self) -> Result<(), ValueError> {
-        if self.long_context_threshold == Some(0) || self.rates.is_empty() || self.rates.len() > 6 {
+        validate_resource_rates(&self.resources)?;
+        if self.long_context_threshold == Some(0)
+            || (self.rates.is_empty() && self.resources.is_empty())
+            || self.rates.len() > 6
+        {
             return Err(ValueError::InvalidSnapshot);
         }
         for (key, rates) in &self.rates {
@@ -752,8 +815,14 @@ fn valid_model_key(key: &str) -> bool {
 }
 impl PricingSnapshot {
     pub fn validate(&self) -> Result<(), ValueError> {
-        if self.schema_version != 1
-            || self.tariff_policy_id != TARIFF_POLICY
+        if !matches!(
+            (self.schema_version, self.tariff_policy_id.as_str()),
+            (1, TARIFF_POLICY) | (2, RESOURCE_TARIFF_POLICY)
+        ) || (self.schema_version == 1
+            && self
+                .models
+                .values()
+                .any(|model| !model.resources.is_empty()))
             || self.currency != "USD"
             || self.models.is_empty()
             || self.models.len() > MAX_MODELS
@@ -1046,6 +1115,7 @@ mod tests {
             cache_write_policy: CacheWritePolicy::Unavailable,
         };
         let model = ExecutionModelPrice {
+            resources: Default::default(),
             context_input_basis: ContextInputBasis::RawInput,
             long_context_threshold: None,
             long_context_inclusive: false,
@@ -1078,44 +1148,56 @@ mod tests {
     }
 
     #[test]
-    fn value_quota_native_runtime_gate_does_not_trust_compatibility_provider_type() {
-        for (profile, driver) in [
-            ("claude.anthropic_api_key", "http.anthropic_messages"),
-            ("codex.openai_api_key", "http.openai_responses"),
-            ("gemini.google_api_key", "http.gemini_native"),
-            ("claude.custom_http", "http.anthropic_messages"),
-            ("claude.custom_http", "http.openai_chat"),
-            ("claude.custom_http", "http.openai_responses"),
-            ("claude.custom_http", "http.gemini_native"),
-            ("codex.custom_http", "http.anthropic_messages"),
-            ("codex.custom_http", "http.openai_chat"),
-            ("codex.custom_http", "http.openai_responses"),
-            ("gemini.custom_http", "http.gemini_native"),
-            ("gemini.custom_http", "http.anthropic_messages"),
-            ("gemini.custom_http", "http.openai_chat"),
-            ("gemini.custom_http", "http.openai_responses"),
-            ("claude.workbuddy_oauth", "special.workbuddy_oauth"),
-            ("codex.workbuddy_oauth", "special.workbuddy_oauth"),
-            ("gemini.workbuddy_oauth", "special.workbuddy_oauth"),
-        ] {
-            assert!(supports_value_text_runtime(profile, driver, false));
-            assert!(!supports_value_text_runtime(profile, driver, true));
+    fn every_registered_runtime_supports_usd_independently_of_credential_type() {
+        use crate::domain::providers::registry::{provider_registry, DriverBinding};
+        let registry = provider_registry();
+        for profile in &registry.profiles {
+            let drivers = match &profile.driver_binding {
+                DriverBinding::Fixed { driver_id } => vec![driver_id],
+                DriverBinding::Custom { custom_policy_id } => registry
+                    .custom_policies
+                    .iter()
+                    .find(|p| &p.custom_policy_id == custom_policy_id)
+                    .unwrap()
+                    .allowed_driver_ids
+                    .iter()
+                    .collect(),
+            };
+            for driver in drivers {
+                for coding_plan in [false, true] {
+                    assert!(
+                        supports_value_text_runtime(
+                            profile.profile_id.as_str(),
+                            driver.as_str(),
+                            coding_plan
+                        ),
+                        "{} / {}",
+                        profile.profile_id,
+                        driver
+                    );
+                }
+            }
             assert!(!supports_value_text_runtime(
-                profile,
-                "web.perplexity",
+                profile.profile_id.as_str(),
+                "unknown.driver",
                 false
             ));
         }
-        for (profile, driver) in [
-            ("codex.perplexity_web_session", "web_session.perplexity"),
-            ("claude.xiaomi_mimo_token_plan", "http.anthropic_messages"),
-            ("codex.openai_oauth", "oauth.openai_codex"),
-            ("codex.custom_http", "http.gemini_native"),
-            ("claude.codebuddy_oauth", "special.codebuddy_oauth"),
-            ("codex.workbuddy_oauth", "special.codebuddy_oauth"),
-        ] {
-            assert!(!supports_value_text_runtime(profile, driver, false));
-        }
+        assert!(!supports_value_text_runtime(
+            "unknown.profile",
+            "http.openai_chat",
+            false
+        ));
+        assert!(!supports_value_text_runtime(
+            "codex.custom_http",
+            "http.gemini_native",
+            false
+        ));
+        assert!(!supports_value_text_runtime(
+            "codex.workbuddy_oauth",
+            "special.codebuddy_oauth",
+            false
+        ));
     }
     #[test]
     fn workbuddy_value_models_require_concrete_identity_without_changing_other_runtimes() {
@@ -1432,6 +1514,7 @@ mod tests {
         let mut long = rates();
         long.input = Some("6000000".into());
         let p = ExecutionModelPrice {
+            resources: Default::default(),
             context_input_basis: ContextInputBasis::RawInput,
             long_context_threshold: Some(200_000),
             long_context_inclusive: false,
@@ -1483,6 +1566,7 @@ mod tests {
             models: BTreeMap::from([(
                 "test-model".into(),
                 ExecutionModelPrice {
+                    resources: Default::default(),
                     context_input_basis: ContextInputBasis::RawInput,
                     long_context_threshold: None,
                     long_context_inclusive: false,

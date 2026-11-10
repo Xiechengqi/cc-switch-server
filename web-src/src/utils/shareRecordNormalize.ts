@@ -131,8 +131,8 @@ function strictValueQuota(value: unknown): ShareUserPolicy["valueQuota"] | null 
   const amount = raw.limitUsdMicros ?? raw.limit_usd_micros;
   const tariff = raw.tariffPolicyId ?? raw.tariff_policy_id;
   if (typeof amount !== "string" || !/^[1-9]\d*$/.test(amount) || amount.length > 16 ||
-      BigInt(amount) > 1000000000000000n || tariff !== "api-equivalent-v1") return null;
-  return { limitUsdMicros: amount, tariffPolicyId: "api-equivalent-v1" };
+      BigInt(amount) > 1000000000000000n || (tariff !== "api-equivalent-v1" && tariff !== "api-equivalent-v2")) return null;
+  return { limitUsdMicros: amount, tariffPolicyId: tariff };
 }
 
 function normalizeValueQuota(value: unknown, email: string, flag: MalformedFlag): ShareUserPolicy["valueQuota"] {

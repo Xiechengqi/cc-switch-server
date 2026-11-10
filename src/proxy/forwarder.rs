@@ -888,11 +888,6 @@ struct ForwardAttemptContext {
     request_memory: Option<RequestMemoryBudget>,
     raw_body_memory: Option<RequestMemoryReservation>,
     timing: TimingSlot,
-    /// Set only by a retry whose previous attempt was settled (awaited) at
-    /// $0: it provably never reached upstream (connect error), or upstream
-    /// failed before producing any output. Consumed by the next loop
-    /// iteration so a USD quota user may take that retry.
-    value_previous_attempt_free: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -932,7 +927,6 @@ impl Default for ForwardAttemptContext {
             request_memory: None,
             raw_body_memory: None,
             timing: TimingSlot::default(),
-            value_previous_attempt_free: false,
         }
     }
 }
@@ -1614,7 +1608,7 @@ pub async fn forward_codex_models_manifest(
     let request_context = request_context_from_headers(&headers);
     let _share_invocation_guard = if let Some(share_id) = request_context.share_id.as_deref() {
         Some(
-            validate_and_acquire_share_invocation(
+            validate_and_acquire_share_invocation_value_operation(
                 &state,
                 share_id,
                 AppKind::Codex,
@@ -1793,10 +1787,18 @@ pub async fn forward_codex_alpha_search(
     body: Bytes,
 ) -> Result<Response, ProxyError> {
     let body = prepare_codex_alpha_search_body(&headers, body)?;
-    let request_context = request_context_from_headers(&headers);
+    let mut request_context = request_context_from_headers(&headers);
+    request_context.operation = crate::domain::usage::store::InferenceOperation::Responses;
+    request_context.data_source = Some("codex_alpha_search".into());
+    request_context
+        .request_id
+        .get_or_insert_with(crate::domain::sharing::quota_cycle::opaque_id);
+    request_context
+        .started_at_ms
+        .get_or_insert_with(crate::infra::time::now_ms);
     let _share_invocation_guard = if let Some(share_id) = request_context.share_id.as_deref() {
         Some(
-            validate_and_acquire_share_invocation(
+            validate_and_acquire_share_invocation_value_operation(
                 &state,
                 share_id,
                 AppKind::Codex,
@@ -1833,7 +1835,17 @@ pub async fn forward_codex_alpha_search(
     let snapshot = state.account_in_flight.snapshot();
     let _account_in_flight_guard =
         acquire_account_in_flight(&state, &execution.stored, &accounts, &snapshot)?;
+    begin_share_quota_usage(&state, AppKind::Codex, &mut request_context).await?;
+    let started = Instant::now();
     let endpoint = codex_alpha_search_url(&execution);
+    let mut generation = 0u32;
+    let mut plan = crate::domain::usage::value_pricing::resource_request_plan(
+        &serde_json::from_slice::<Value>(&body)
+            .map_err(|error| ProxyError::bad_request(error.to_string()))?,
+        request_context.operation,
+    );
+    plan.requires_v2 = true;
+    plan.quantities.entry("tool.web_search".into()).or_insert(8);
     loop {
         let context =
             materialize_codex_auth_context(&state, &execution, &headers, endpoint.clone()).await?;
@@ -1848,7 +1860,28 @@ pub async fn forward_codex_alpha_search(
         for (name, value) in &context.headers {
             request = request.header(name, value);
         }
+        generation = generation
+            .checked_add(1)
+            .ok_or_else(|| ProxyError::bad_gateway("monetary attempt identity exhausted"))?;
+        request_context.attempt_count = Some(generation);
+        let mut value_attempt = super::value_metering::admit_prepared_with_plan(
+            &state,
+            &request_context,
+            final_model.as_deref().unwrap_or(""),
+            &body,
+            crate::domain::usage::value_pricing::supports_value_text_runtime(
+                execution.plan.profile_id.as_str(),
+                execution.plan.driver_id.as_str(),
+                execution.plan.coding_plan.is_some(),
+            ),
+            Some(plan.clone()),
+        )
+        .await?;
+        super::value_metering::mark_sent(&value_attempt);
         let mut upstream = request.send().await.map_err(ProxyError::bad_gateway)?;
+        if let Some(attempt) = &value_attempt {
+            attempt.mark_upstream_status(upstream.status().as_u16());
+        }
         if upstream.status() == StatusCode::UNAUTHORIZED
             && !audit_attempt.auth_refresh_attempted()
             && advance_audited_attempt(
@@ -1862,6 +1895,7 @@ pub async fn forward_codex_alpha_search(
             )
         {
             drop(upstream);
+            settle_value_attempt_before_retry(&mut value_attempt).await;
             force_refresh_codex_auth_context(&state, &execution).await?;
             let refreshed_accounts = state.accounts_snapshot().await;
             audit_attempt
@@ -1908,12 +1942,44 @@ pub async fn forward_codex_alpha_search(
             provider_outcome_from_status(status.as_u16()),
         )
         .await;
+        let mut observer = StreamUsageAccumulator::new(adapters::usage_input_semantics_for(
+            &context.stored,
+            ProxyRoute::CodexResponses,
+        ));
+        observer.push(&decoded.body);
+        let raw = observer.finish_with_status();
+        let usage = raw.usage;
+        request_context.response_model = Some(raw.response_model);
+        request_context.value_resources = raw.resources;
+        request_context.value_streamed_text_bytes = Some(raw.streamed_text_bytes);
+        request_context.usage_estimated = raw.usage_estimated;
+        if raw.parse_error {
+            request_context.usage_state = Some(UsageState::ParseError);
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            request_context.failure_kind = Some("upstream_auth_rejected".into());
+        }
+        log_usage(
+            &state,
+            &context.stored,
+            status.as_u16(),
+            started.elapsed().as_millis(),
+            UsageModelMetadata {
+                model: final_model.clone(),
+                requested_model: final_model.clone(),
+                actual_model: final_model.clone(),
+                actual_model_source: Some("alpha_search.request".into()),
+            },
+            usage,
+            request_context.clone(),
+        )
+        .await;
         record_share_invocation_result(
             &state,
             request_context.share_id.as_deref(),
             request_context.user_email.as_deref(),
             request_context.started_at_ms,
-            TokenUsage::default(),
+            usage,
         )
         .await;
         let mut response = Response::new(Body::from(decoded.body));
@@ -1929,7 +1995,7 @@ pub async fn forward_codex_alpha_search(
             }
         }
         copy_safe_upstream_response_headers(&response_headers, &mut response);
-        return Ok(response);
+        return Ok(super::value_metering::response(response, value_attempt));
     }
 }
 
@@ -2038,6 +2104,7 @@ async fn next_codex_overflow_attempt(
     url: &str,
     target_headers: &[(String, String)],
     request_context: &UsageLogContext,
+    value_attempt: &mut Option<crate::state::ValueAttemptGuard>,
 ) -> Option<ForwardAttemptContext> {
     if !codex_overflow_compact_eligible(route, execution, attempt_context) {
         return None;
@@ -2045,6 +2112,7 @@ async fn next_codex_overflow_attempt(
     let plan = super::overflow_compact::prepare(&adapter_request.body)?;
     let removed_items = plan.removed_items();
     let retained_items = plan.retained_items();
+    settle_value_attempt_before_retry(value_attempt).await;
     let summary = match plan.summary_request_body() {
         Some(summary_body) => {
             summarize_codex_overflow(
@@ -2112,12 +2180,73 @@ async fn summarize_codex_overflow(
             return None;
         }
     };
+    let mut summary_context = UsageLogContext {
+        request_id: Some(crate::domain::sharing::quota_cycle::opaque_id()),
+        attempt_count: Some(1),
+        operation: crate::domain::usage::store::InferenceOperation::Responses,
+        record_kind: UsageRecordKind::InternalSupplemental,
+        parent_request_id: request_context.request_id.clone(),
+        quota_attribution: request_context.quota_attribution.clone(),
+        started_at_ms: request_context.started_at_ms,
+        share_id: request_context.share_id.clone(),
+        share_name: request_context.share_name.clone(),
+        user_email: request_context.user_email.clone(),
+        session_id: request_context.session_id.clone(),
+        data_source: Some(super::overflow_compact::SUMMARY_DATA_SOURCE.to_string()),
+        user_country: request_context.user_country.clone(),
+        user_country_iso3: request_context.user_country_iso3.clone(),
+        is_streaming: true,
+        stream_status: Some("pending".into()),
+        ..UsageLogContext::default()
+    };
+    apply_codex_policy_metadata(&mut summary_context, policy_metadata);
+    let summary_id = log_usage(
+        state,
+        &stored,
+        200,
+        0,
+        UsageModelMetadata {
+            model: model.clone(),
+            requested_model: model.clone(),
+            actual_model: model.clone(),
+            actual_model_source: Some("codex_overflow_compact_summary".into()),
+        },
+        TokenUsage::default(),
+        summary_context.clone(),
+    )
+    .await;
+    let mut value_attempt = match super::value_metering::admit(
+        state,
+        execution,
+        &summary_context,
+        model.as_deref().unwrap_or(""),
+        &summary_body,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            update_stream_usage(
+                state,
+                &stored,
+                &summary_id,
+                error.status.as_u16(),
+                0,
+                None,
+                TokenUsage::default(),
+                Some("not_sent"),
+            )
+            .await;
+            tracing::warn!(%error, "Codex overflow summary admission refused");
+            return None;
+        }
+    };
     let started = Instant::now();
     let mut client_headers = HeaderMap::new();
     client_headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     client_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let call = async {
-        let mut response = build_upstream_post_request(
+        let request = build_upstream_post_request(
             http_client,
             url,
             summary_body,
@@ -2127,11 +2256,13 @@ async fn summarize_codex_overflow(
             true,
         )
         .map_err(|error| error.to_string())?
-        .header("accept-encoding", "identity")
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
+        .header("accept-encoding", "identity");
+        super::value_metering::mark_sent(&value_attempt);
+        let mut response = request.send().await.map_err(|error| error.to_string())?;
         let status = response.status();
+        if let Some(attempt) = &value_attempt {
+            attempt.mark_upstream_status(status.as_u16());
+        }
         let response_headers = response.headers().clone();
         let body = crate::infra::http::read_response_body_limited(
             &mut response,
@@ -2181,39 +2312,20 @@ async fn summarize_codex_overflow(
         ProxyRoute::CodexResponses,
     ));
     usage.push(&body);
-    let usage = usage.finish();
-    let mut summary_context = UsageLogContext {
-        record_kind: UsageRecordKind::InternalSupplemental,
-        parent_request_id: request_context.request_id.clone(),
-        quota_attribution: request_context.quota_attribution.clone(),
-        started_at_ms: request_context.started_at_ms,
-        share_id: request_context.share_id.clone(),
-        share_name: request_context.share_name.clone(),
-        user_email: request_context.user_email.clone(),
-        session_id: request_context.session_id.clone(),
-        data_source: Some(super::overflow_compact::SUMMARY_DATA_SOURCE.to_string()),
-        user_country: request_context.user_country.clone(),
-        user_country_iso3: request_context.user_country_iso3.clone(),
-        is_streaming: true,
-        stream_status: Some(stream_status.to_string()),
-        ..UsageLogContext::default()
-    };
-    apply_codex_policy_metadata(&mut summary_context, policy_metadata);
-    log_usage(
+    let raw = usage.finish_with_status();
+    let usage = raw.usage;
+    update_stream_usage_result(
         state,
         &stored,
+        &summary_id,
         status,
         started.elapsed().as_millis(),
-        UsageModelMetadata {
-            model: model.clone(),
-            requested_model: model.clone(),
-            actual_model: model,
-            actual_model_source: Some("codex_overflow_compact_summary".to_string()),
-        },
-        usage,
-        summary_context,
+        None,
+        raw,
+        Some(stream_status),
     )
     .await;
+    settle_value_attempt_before_retry(&mut value_attempt).await;
     record_share_supplemental_usage(
         state,
         request_context.share_id.as_deref(),
@@ -2325,6 +2437,7 @@ async fn forward_with_attempt_inner(
             raw_body_for_retry.len(),
         )?;
     }
+    let mut value_generation_count = 0u32;
     'attempt: loop {
         if let Some(delay) = attempt_context.pending_capacity_retry_delay.take() {
             if delay.is_zero() {
@@ -2339,8 +2452,8 @@ async fn forward_with_attempt_inner(
             }
         }
         let attempt_started = Instant::now();
-        let value_retry_after_free_attempt =
-            std::mem::take(&mut attempt_context.value_previous_attempt_free);
+        // Each replay has its own durable attempt, including paid/unknown
+        // prior outcomes. Provider recovery policy still forbids output replay.
         let gemini_path = retry_gemini_path.clone();
         let (body, mut _decoded_body_memory) = decode_request_body_with_memory(
             &headers,
@@ -2416,7 +2529,19 @@ async fn forward_with_attempt_inner(
                 .await
         } else {
             false
-        };
+        } && (matches!(
+            route,
+            ProxyRoute::ClaudeMessages
+                | ProxyRoute::CodexChatCompletions
+                | ProxyRoute::CodexResponses
+                | ProxyRoute::CodexResponsesCompact
+        ) || (route == ProxyRoute::Gemini
+            && gemini_path.as_deref().is_some_and(|path| {
+                matches!(
+                    path.rsplit(':').next(),
+                    Some("generateContent" | "streamGenerateContent")
+                )
+            })));
         let value_text_capable = crate::domain::usage::value_pricing::supports_value_text_runtime(
             execution.plan.profile_id.as_str(),
             execution.plan.driver_id.as_str(),
@@ -2426,6 +2551,7 @@ async fn forward_with_attempt_inner(
             ProxyRoute::ClaudeMessages
                 | ProxyRoute::CodexChatCompletions
                 | ProxyRoute::CodexResponses
+                | ProxyRoute::CodexResponsesCompact
                 | ProxyRoute::Gemini
         ) && (route != ProxyRoute::Gemini
             || gemini_path.as_deref().is_some_and(|path| {
@@ -2433,13 +2559,10 @@ async fn forward_with_attempt_inner(
                     path.rsplit(':').next(),
                     Some("generateContent" | "streamGenerateContent")
                 )
-            }))
-            && (attempt_context.attempt() == 0 || value_retry_after_free_attempt)
-            && (!value_metering
-                || crate::domain::usage::value_pricing::is_metered_text_payload(&body));
+            }));
         if value_metering && !value_text_capable {
             return Err(ProxyError{status:StatusCode::SERVICE_UNAVAILABLE,
-                message:"quota_unavailable: USD-equivalent quota requires a verified text surface; media, built-in paid tools and post-send retries are not covered".into()});
+                message:"quota_unavailable: the configured runtime binding cannot execute this operation".into()});
         }
         if request_memory_enabled_for_provider(app, Some(execution.stored.provider_type))
             && attempt_context.request_memory().is_none()
@@ -3218,8 +3341,15 @@ async fn forward_with_attempt_inner(
                 request_context.effective_service_tier = facts.service_tier.clone();
             }
         }
-        let mut value_attempt_guard = state
-            .admit_share_value_text(
+        if value_metering {
+            value_generation_count = value_generation_count
+                .checked_add(1)
+                .ok_or_else(|| ProxyError::bad_gateway("monetary attempt identity exhausted"))?;
+            request_context.attempt_count = Some(value_generation_count);
+        }
+        let mut value_attempt_guard = if value_metering {
+            state
+            .admit_share_value_request(
                 &request_context,
                 final_model.as_deref().unwrap_or(""),
                 crate::domain::usage::value_pricing::canonical_service_tier(
@@ -3229,7 +3359,8 @@ async fn forward_with_attempt_inner(
                     .as_ref()
                     .map(|facts| facts.estimate)
                     .unwrap_or_default(),
-                value_text_capable && value_facts.as_ref().is_some_and(|facts| facts.metered_text),
+                value_text_capable,
+                serde_json::from_slice(&adapter_request.body).ok().map(|body| crate::domain::usage::value_pricing::resource_request_plan(&body, request_context.operation)),
             )
             .await
             .map_err(|error| {
@@ -3240,7 +3371,10 @@ async fn forward_with_attempt_inner(
                         effective_from_ms=?price.effective_from_ms,upstream_sent=false,"USD price admission refused");
                 }
                 value_quota_proxy_error(error)
-            })?;
+            })?
+        } else {
+            None
+        };
         let request = build_upstream_post_request(
             &http_client,
             &url,
@@ -3285,7 +3419,7 @@ async fn forward_with_attempt_inner(
                     Err(_) => {
                         record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
                             .await;
-                        if let Some(mut next_attempt) = next_claude_transport_attempt(
+                        if let Some(next_attempt) = next_claude_transport_attempt(
                             &state,
                             route,
                             &headers,
@@ -3296,10 +3430,9 @@ async fn forward_with_attempt_inner(
                         )
                         .await
                         {
-                            // Sent without an answer: outcome unknown, so a
-                            // USD user is not re-admitted; settle first anyway.
-                            next_attempt.value_previous_attempt_free =
-                                settle_value_attempt_before_retry(&mut value_attempt_guard).await;
+                            // An unknown sent attempt retains a conservative debit.
+                            // The next admission checks the remaining quota.
+                            settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                             attempt_context = next_attempt;
                             drop(account_in_flight_guard);
                             drop(share_invocation_guard);
@@ -3338,7 +3471,7 @@ async fn forward_with_attempt_inner(
                         guard.mark_not_sent();
                     }
                 }
-                if let Some(mut next_attempt) = next_claude_transport_attempt(
+                if let Some(next_attempt) = next_claude_transport_attempt(
                     &state,
                     route,
                     &headers,
@@ -3355,8 +3488,7 @@ async fn forward_with_attempt_inner(
                 {
                     // Settle synchronously: the retry's admission must not
                     // count this attempt's row as in flight.
-                    next_attempt.value_previous_attempt_free =
-                        settle_value_attempt_before_retry(&mut value_attempt_guard).await;
+                    settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                     attempt_context = next_attempt;
                     drop(account_in_flight_guard);
                     drop(share_invocation_guard);
@@ -3417,6 +3549,7 @@ async fn forward_with_attempt_inner(
                 drop(upstream);
                 drop(account_in_flight_guard);
                 drop(share_invocation_guard);
+                settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                 continue 'attempt;
             }
         }
@@ -3459,6 +3592,7 @@ async fn forward_with_attempt_inner(
                     attempt_context = next_attempt;
                     drop(account_in_flight_guard);
                     drop(share_invocation_guard);
+                    settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                     continue 'attempt;
                 }
             }
@@ -3502,6 +3636,23 @@ async fn forward_with_attempt_inner(
                         execution.request_timeout(),
                         adapter_request.upstream_stream_requested,
                     )?;
+                    settle_value_attempt_before_retry(&mut value_attempt_guard).await;
+                    if value_metering {
+                        value_generation_count =
+                            value_generation_count.checked_add(1).ok_or_else(|| {
+                                ProxyError::bad_gateway("monetary attempt identity exhausted")
+                            })?;
+                        request_context.attempt_count = Some(value_generation_count);
+                        value_attempt_guard = super::value_metering::admit(
+                            &state,
+                            &execution,
+                            &request_context,
+                            final_model.as_deref().unwrap_or(""),
+                            &retry_body,
+                        )
+                        .await?;
+                    }
+                    super::value_metering::mark_sent(&value_attempt_guard);
                     let timing = attempt_context
                         .timing
                         .begin(responses_keepalive_surface(route), Instant::now());
@@ -3522,6 +3673,9 @@ async fn forward_with_attempt_inner(
                             upstream = retry_upstream;
                             status = upstream.status();
                             status_code = status.as_u16();
+                            if let Some(guard) = &value_attempt_guard {
+                                guard.mark_upstream_status(status_code);
+                            }
                             response_headers = upstream.headers().clone();
                             strip_hop_by_hop_response_headers(&mut response_headers);
                             codex::record_quota_response_headers(
@@ -3556,6 +3710,8 @@ async fn forward_with_attempt_inner(
                                     drop(upstream);
                                     drop(account_in_flight_guard);
                                     drop(share_invocation_guard);
+                                    settle_value_attempt_before_retry(&mut value_attempt_guard)
+                                        .await;
                                     continue 'attempt;
                                 }
                             }
@@ -3588,12 +3744,15 @@ async fn forward_with_attempt_inner(
                                 },
                             )
                             .await;
-                            return Ok(decoded_upstream_response(
-                                status,
-                                &response_headers,
-                                content_type,
-                                content_encoding,
-                                original_decoded,
+                            return Ok(super::value_metering::response(
+                                decoded_upstream_response(
+                                    status,
+                                    &response_headers,
+                                    content_type,
+                                    content_encoding,
+                                    original_decoded,
+                                ),
+                                value_attempt_guard,
                             ));
                         }
                     }
@@ -3620,12 +3779,15 @@ async fn forward_with_attempt_inner(
                         },
                     )
                     .await;
-                    return Ok(decoded_upstream_response(
-                        status,
-                        &response_headers,
-                        content_type,
-                        content_encoding,
-                        original_decoded,
+                    return Ok(super::value_metering::response(
+                        decoded_upstream_response(
+                            status,
+                            &response_headers,
+                            content_type,
+                            content_encoding,
+                            original_decoded,
+                        ),
+                        value_attempt_guard,
                     ));
                 }
             } else {
@@ -3671,6 +3833,7 @@ async fn forward_with_attempt_inner(
                     attempt_context = next_attempt;
                     drop(account_in_flight_guard);
                     drop(share_invocation_guard);
+                    settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                     continue 'attempt;
                 }
                 record_provider_outcome(&state, &stored, capacity_shed_provider_outcome()).await;
@@ -3714,12 +3877,14 @@ async fn forward_with_attempt_inner(
                     &url,
                     &target_headers,
                     &request_context,
+                    &mut value_attempt_guard,
                 )
                 .await
                 {
                     attempt_context = next_attempt;
                     drop(account_in_flight_guard);
                     drop(share_invocation_guard);
+                    settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                     continue 'attempt;
                 }
             }
@@ -3763,6 +3928,8 @@ async fn forward_with_attempt_inner(
                                     attempt_context = next_attempt;
                                     drop(account_in_flight_guard);
                                     drop(share_invocation_guard);
+                                    settle_value_attempt_before_retry(&mut value_attempt_guard)
+                                        .await;
                                     continue 'attempt;
                                 }
                                 return Err(error.into_proxy_error());
@@ -3801,6 +3968,7 @@ async fn forward_with_attempt_inner(
                         .map(|timing| timing.wait(WaitKind::Retry));
                     tokio::time::sleep(Duration::from_millis(limit.retry_delay_ms)).await;
                     drop(wait);
+                    settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                     continue 'attempt;
                 }
                 antigravity::mark_limit_cooldown(
@@ -3873,7 +4041,10 @@ async fn forward_with_attempt_inner(
                 }
             }
             copy_safe_upstream_response_headers(&response_headers, &mut response);
-            return Ok(response);
+            return Ok(super::value_metering::response(
+                response,
+                value_attempt_guard,
+            ));
         }
 
         if execution.driver_is("oauth.openai_codex")
@@ -3898,8 +4069,8 @@ async fn forward_with_attempt_inner(
                 },
             )
             .await;
-            return Ok(responses_image_json_heartbeat_response(
-                ResponsesImageJsonHeartbeatArgs {
+            return Ok(super::value_metering::response(
+                responses_image_json_heartbeat_response(ResponsesImageJsonHeartbeatArgs {
                     state,
                     stored,
                     upstream,
@@ -3917,7 +4088,8 @@ async fn forward_with_attempt_inner(
                     account_in_flight_guard,
                     share_invocation_guard,
                     request_memory: attempt_context.request_memory().cloned(),
-                },
+                }),
+                value_attempt_guard,
             ));
         }
 
@@ -3957,12 +4129,14 @@ async fn forward_with_attempt_inner(
                             &url,
                             &target_headers,
                             &request_context,
+                            &mut value_attempt_guard,
                         )
                         .await
                         {
                             attempt_context = next_attempt;
                             drop(account_in_flight_guard);
                             drop(share_invocation_guard);
+                            settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                             continue 'attempt;
                         }
                     }
@@ -4009,6 +4183,7 @@ async fn forward_with_attempt_inner(
                                 attempt_context = next_attempt;
                                 drop(account_in_flight_guard);
                                 drop(share_invocation_guard);
+                                settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                                 continue 'attempt;
                             }
                             if is_openai_capacity_shed_failure(shed)
@@ -4192,6 +4367,7 @@ async fn forward_with_attempt_inner(
                             attempt_context = next_attempt;
                             drop(account_in_flight_guard);
                             drop(share_invocation_guard);
+                            settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                             continue 'attempt;
                         }
                         return Err(ProxyError {
@@ -4732,19 +4908,11 @@ async fn forward_with_attempt_inner(
                         let sse_error_outcome = sse_error
                             .as_ref()
                             .and_then(|error| claude_sse_error_outcome(&error.error_type));
-                        // An upstream error event (or a protocol failure)
-                        // before any business output: the USD attempt is an
-                        // upstream error ($0 unless usage is logged).
-                        if (sse_error.is_some() || semantic_protocol_error.is_some())
-                            && !pending_chunk_saw_business_output
-                        {
-                            if let Some(guard) = &value_attempt_guard {
-                                guard.mark_upstream_error();
-                            }
-                        }
+                        // Absence of output does not prove generation was free.
+                        // Unknown protocol/transport outcomes retain the reservation.
                         if let Some(outcome) = sse_error_outcome {
                             record_provider_outcome(&state, &stored, outcome).await;
-                            if let Some(mut next_attempt) = next_claude_transport_attempt(
+                            if let Some(next_attempt) = next_claude_transport_attempt(
                                 &state,
                                 route,
                                 &headers,
@@ -4755,9 +4923,7 @@ async fn forward_with_attempt_inner(
                             )
                             .await
                             {
-                                next_attempt.value_previous_attempt_free =
-                                    settle_value_attempt_before_retry(&mut value_attempt_guard)
-                                        .await;
+                                settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                                 attempt_context = next_attempt;
                                 drop(account_in_flight_guard);
                                 drop(share_invocation_guard);
@@ -4776,17 +4942,16 @@ async fn forward_with_attempt_inner(
                                             next_stage.as_header_value(),
                                             "sse_error",
                                         );
-                                        if let Some(mut next_attempt) = attempt_context.next(
+                                        if let Some(next_attempt) = attempt_context.next(
                                             &execution,
                                             Some(next_stage),
                                             "body",
                                             next_stage.as_header_value(),
                                         ) {
-                                            next_attempt.value_previous_attempt_free =
-                                                settle_value_attempt_before_retry(
-                                                    &mut value_attempt_guard,
-                                                )
-                                                .await;
+                                            settle_value_attempt_before_retry(
+                                                &mut value_attempt_guard,
+                                            )
+                                            .await;
                                             attempt_context = next_attempt;
                                             drop(account_in_flight_guard);
                                             drop(share_invocation_guard);
@@ -4810,18 +4975,13 @@ async fn forward_with_attempt_inner(
                             | Some(SemanticObservation::ErrorFrame(failure)) => Some(failure),
                             _ => None,
                         } {
-                            if !pending_chunk_saw_business_output {
-                                if let Some(guard) = &value_attempt_guard {
-                                    guard.mark_upstream_error();
-                                }
-                            }
                             if !pending_chunk_saw_business_output
                                 && super::overflow_compact::is_context_length_failure(
                                     &failure.code,
                                     &failure.message,
                                 )
                             {
-                                if let Some(mut next_attempt) = next_codex_overflow_attempt(
+                                if let Some(next_attempt) = next_codex_overflow_attempt(
                                     &state,
                                     route,
                                     &execution,
@@ -4832,12 +4992,12 @@ async fn forward_with_attempt_inner(
                                     &url,
                                     &target_headers,
                                     &request_context,
+                                    &mut value_attempt_guard,
                                 )
                                 .await
                                 {
-                                    next_attempt.value_previous_attempt_free =
-                                        settle_value_attempt_before_retry(&mut value_attempt_guard)
-                                            .await;
+                                    settle_value_attempt_before_retry(&mut value_attempt_guard)
+                                        .await;
                                     attempt_context = next_attempt;
                                     drop(inner);
                                     drop(account_in_flight_guard);
@@ -4884,7 +5044,7 @@ async fn forward_with_attempt_inner(
                                     if !pending_chunk_saw_business_output
                                         && !openai_stream_bytes_start_client_output(&chunk)
                                     {
-                                        if let Some(mut next_attempt) =
+                                        if let Some(next_attempt) =
                                             next_codex_capacity_retry_attempt(
                                                 route,
                                                 &attempt_context,
@@ -4892,11 +5052,10 @@ async fn forward_with_attempt_inner(
                                                 failure,
                                             )
                                         {
-                                            next_attempt.value_previous_attempt_free =
-                                                settle_value_attempt_before_retry(
-                                                    &mut value_attempt_guard,
-                                                )
-                                                .await;
+                                            settle_value_attempt_before_retry(
+                                                &mut value_attempt_guard,
+                                            )
+                                            .await;
                                             attempt_context = next_attempt;
                                             drop(inner);
                                             drop(account_in_flight_guard);
@@ -4941,11 +5100,6 @@ async fn forward_with_attempt_inner(
                     }
                     Ok(None) => {
                         if let Some(error) = semantic_protocol_error {
-                            if !pending_chunk_saw_business_output {
-                                if let Some(guard) = &value_attempt_guard {
-                                    guard.mark_upstream_error();
-                                }
-                            }
                             record_provider_outcome(
                                 &state,
                                 &stored,
@@ -4956,16 +5110,10 @@ async fn forward_with_attempt_inner(
                         }
                     }
                     Err(error) => {
-                        // Nothing reached the client; without business
-                        // output the USD attempt is an upstream error.
-                        if !pending_chunk_saw_business_output {
-                            if let Some(guard) = &value_attempt_guard {
-                                guard.mark_upstream_error();
-                            }
-                        }
+                        // A read failure may follow a completed upstream generation.
                         record_provider_outcome(&state, &stored, ProviderOutcome::NetworkFailure)
                             .await;
-                        if let Some(mut next_attempt) = next_claude_transport_attempt(
+                        if let Some(next_attempt) = next_claude_transport_attempt(
                             &state,
                             route,
                             &headers,
@@ -4976,8 +5124,7 @@ async fn forward_with_attempt_inner(
                         )
                         .await
                         {
-                            next_attempt.value_previous_attempt_free =
-                                settle_value_attempt_before_retry(&mut value_attempt_guard).await;
+                            settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                             attempt_context = next_attempt;
                             drop(account_in_flight_guard);
                             drop(share_invocation_guard);
@@ -6113,7 +6260,10 @@ async fn forward_with_attempt_inner(
             if responses_image_transport {
                 apply_codex_images_streaming_headers(&mut response);
             }
-            return Ok(response);
+            return Ok(super::value_metering::response(
+                response,
+                value_attempt_guard,
+            ));
         }
 
         let decoded = if let Some(decoded) = buffered_upstream_body {
@@ -6149,6 +6299,7 @@ async fn forward_with_attempt_inner(
                         attempt_context = next_attempt;
                         drop(account_in_flight_guard);
                         drop(share_invocation_guard);
+                        settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                         continue 'attempt;
                     }
                     return Err(error.into_proxy_error());
@@ -6216,6 +6367,7 @@ async fn forward_with_attempt_inner(
                     .map(|timing| timing.wait(WaitKind::Retry));
                 tokio::time::sleep(Duration::from_millis(limit.retry_delay_ms)).await;
                 drop(wait);
+                settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                 continue 'attempt;
             }
             antigravity::mark_limit_cooldown(
@@ -6240,6 +6392,7 @@ async fn forward_with_attempt_inner(
                 attempt_context = next_attempt;
                 drop(account_in_flight_guard);
                 drop(share_invocation_guard);
+                settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                 continue 'attempt;
             }
         }
@@ -6291,6 +6444,7 @@ async fn forward_with_attempt_inner(
                     attempt_context = next_attempt;
                     drop(account_in_flight_guard);
                     drop(share_invocation_guard);
+                    settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                     continue 'attempt;
                 }
             }
@@ -6401,12 +6555,14 @@ async fn forward_with_attempt_inner(
                         &url,
                         &target_headers,
                         &request_context,
+                        &mut value_attempt_guard,
                     )
                     .await
                     {
                         attempt_context = next_attempt;
                         drop(account_in_flight_guard);
                         drop(share_invocation_guard);
+                        settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                         continue 'attempt;
                     }
                 }
@@ -6451,6 +6607,7 @@ async fn forward_with_attempt_inner(
                             attempt_context = next_attempt;
                             drop(account_in_flight_guard);
                             drop(share_invocation_guard);
+                            settle_value_attempt_before_retry(&mut value_attempt_guard).await;
                             continue 'attempt;
                         }
                         record_provider_outcome(&state, &stored, capacity_shed_provider_outcome())
@@ -6508,6 +6665,10 @@ async fn forward_with_attempt_inner(
             adapter.parse_usage_observing(&bytes, &stored, route, |value| {
                 if value_text_capable {
                     response_model_evidence.observe(value);
+                    let mut resource_observer =
+                        crate::domain::usage::value_pricing::ResourceUsageObserver::default();
+                    resource_observer.observe(value);
+                    request_context.value_resources = resource_observer.usage();
                 }
                 if status.is_success()
                     && stored.provider_type == ProviderType::GrokOAuth
@@ -6716,7 +6877,10 @@ async fn forward_with_attempt_inner(
             }
         }
         copy_safe_upstream_response_headers(&response_headers, &mut response);
-        return Ok(response);
+        return Ok(super::value_metering::response(
+            response,
+            value_attempt_guard,
+        ));
     }
 }
 
@@ -6732,13 +6896,17 @@ pub async fn forward_codex_responses_ws(
     request_context.operation = InferenceOperation::Responses;
     request_context.session_id = session_id_from_request(route, &headers, b"");
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
-        let (share_name, guard) = validate_and_acquire_share_invocation(
-            &state,
-            &share_id,
-            app,
-            request_context.user_email.as_deref(),
-        )
-        .await?;
+        let (invocation, guard) = state
+            .validate_and_acquire_share_invocation_with_value_text(
+                &share_id,
+                app,
+                request_context.user_email.as_deref(),
+                crate::infra::time::now_ms() as i64,
+                true,
+            )
+            .await
+            .map_err(share_rejection_to_proxy_error)?;
+        let share_name = invocation.share_name;
         request_context.share_name = Some(share_name);
         Some(guard)
     } else {
@@ -7656,7 +7824,7 @@ pub async fn forward_grok_media(
     )?;
     let mut request_context = request_context_from_headers(&headers);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
-        let (share_name, guard) = validate_and_acquire_share_invocation(
+        let (share_name, guard) = validate_and_acquire_share_invocation_value_operation(
             &state,
             &share_id,
             AppKind::Codex,
@@ -7743,7 +7911,7 @@ pub async fn forward_images_generations(
     let wire_body_len = body.len();
     let mut request_context = request_context_from_headers(&headers);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
-        let (share_name, guard) = validate_and_acquire_share_invocation(
+        let (share_name, guard) = validate_and_acquire_share_invocation_value_operation(
             &state,
             &share_id,
             AppKind::Codex,
@@ -7854,7 +8022,7 @@ pub async fn forward_images_edits(
     let wire_body_len = body.len();
     let mut request_context = request_context_from_headers(&headers);
     let share_invocation_guard = if let Some(share_id) = request_context.share_id.clone() {
-        let (share_name, guard) = validate_and_acquire_share_invocation(
+        let (share_name, guard) = validate_and_acquire_share_invocation_value_operation(
             &state,
             &share_id,
             AppKind::Codex,
@@ -8089,6 +8257,7 @@ async fn forward_grok_media_with_execution_inner(
     share_invocation_guard: Option<ShareInFlightGuard>,
     mut request_memory: GrokMediaRequestMemory,
 ) -> Result<Response, ProxyError> {
+    let mut value_attempt = None;
     let stored = execution.runtime_stored_view();
     let started = Instant::now();
     let mut audit_attempt = ForwardAttemptContext::default();
@@ -8266,6 +8435,18 @@ async fn forward_grok_media_with_execution_inner(
             timing.mark(Milestone::SendStarted);
         }
         let wait = timing.as_ref().map(|timing| timing.wait(WaitKind::Headers));
+        if method != Method::GET {
+            request_context.attempt_count = Some(audit_attempt.attempt().saturating_add(1));
+            let model = media_model
+                .actual_model
+                .as_deref()
+                .or(media_model.model.as_deref())
+                .unwrap_or("");
+            value_attempt =
+                super::value_metering::admit(&state, &execution, &request_context, model, &body)
+                    .await?;
+            super::value_metering::mark_sent(&value_attempt);
+        }
         let send_result = request.send().await;
         drop(wait);
         if send_result.is_ok() {
@@ -8292,6 +8473,7 @@ async fn forward_grok_media_with_execution_inner(
         if upstream.status() != StatusCode::UNAUTHORIZED {
             break upstream;
         }
+        super::value_metering::authentication_rejected(&mut value_attempt).await;
         let rejected_access_token = bearer_token_from_owned_headers(&target_headers);
         if audit_attempt.auth_refresh_attempted() {
             mark_managed_account_auth_cooldown(
@@ -8421,25 +8603,28 @@ async fn forward_grok_media_with_execution_inner(
                 super::MEDIA_RESPONSE_BODY_LIMIT_BYTES
             )));
         }
-        return Ok(grok_image_heartbeat_response(GrokImageHeartbeatArgs {
-            keepalive_interval: image_keepalive_interval(&execution),
-            state,
-            execution,
-            stored,
-            upstream,
-            response_headers,
-            content_type,
-            status,
-            capability,
-            share_id,
-            user_email,
-            started,
-            request_context,
-            media_model,
-            account_in_flight_guard,
-            share_invocation_guard,
-            request_memory,
-        }));
+        return Ok(super::value_metering::response(
+            grok_image_heartbeat_response(GrokImageHeartbeatArgs {
+                keepalive_interval: image_keepalive_interval(&execution),
+                state,
+                execution,
+                stored,
+                upstream,
+                response_headers,
+                content_type,
+                status,
+                capability,
+                share_id,
+                user_email,
+                started,
+                request_context,
+                media_model,
+                account_in_flight_guard,
+                share_invocation_guard,
+                request_memory,
+            }),
+            value_attempt,
+        ));
     }
     let (bytes, response_transport_memory) = match read_response_body_limited_with_memory(
         &mut upstream,
@@ -8654,11 +8839,39 @@ async fn forward_grok_media_with_execution_inner(
             .await;
             return Err(error);
         }
+        if let (Some(attempt), Some(task)) =
+            (value_attempt.take(), request_context.media_task_id.clone())
+        {
+            attempt
+                .handoff_task(
+                    task,
+                    (crate::infra::time::now_ms().min(i64::MAX as u128) as i64)
+                        .saturating_add(24 * 60 * 60 * 1000),
+                )
+                .await
+                .map_err(value_quota_proxy_error)?;
+        }
     } else if request_context.operation == InferenceOperation::VideoStatus {
         request_context.media_status = grok_video_status_from_response(
             &response_body,
             request_memory.budget().timing().as_ref(),
         );
+    }
+    if let Ok(value) = serde_json::from_slice::<Value>(&response_body) {
+        if matches!(
+            request_context.operation,
+            InferenceOperation::ImageGeneration | InferenceOperation::ImageEdit
+        ) {
+            if let Some(data) = value.get("data").and_then(Value::as_array) {
+                request_context.image = Some(ImageUsageMetadata {
+                    count: u32::try_from(data.len()).unwrap_or(u32::MAX),
+                    ..Default::default()
+                });
+            }
+        }
+        if request_context.operation == InferenceOperation::VideoStatus {
+            apply_grok_video_usage_metadata(&mut request_context, &response_body);
+        }
     }
     if status.is_success() {
         if let Some(timing) = request_memory.budget().timing() {
@@ -8710,7 +8923,7 @@ async fn forward_grok_media_with_execution_inner(
         elapsed_ms = started.elapsed().as_millis(),
         "grok media request completed"
     );
-    Ok(response)
+    Ok(super::value_metering::response(response, value_attempt))
 }
 
 struct GrokImageHeartbeatArgs {
@@ -9369,6 +9582,7 @@ async fn forward_codex_images_request(
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
+    let mut value_attempt;
     let stored = execution.runtime_stored_view();
     let mut audit_attempt = ForwardAttemptContext::default();
     audit_forward_attempt(
@@ -9469,6 +9683,34 @@ async fn forward_codex_images_request(
         let header_timeout = first_event_deadline
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
             .unwrap_or_else(|| execution.request_timeout());
+        request_context.attempt_count = Some(audit_attempt.attempt().saturating_add(1));
+        let model = final_model.as_deref().unwrap_or("");
+        let facts = crate::domain::usage::value_pricing::value_request_facts(&adapter_request.body);
+        let mut resource_plan = serde_json::from_slice(&adapter_request.body)
+            .ok()
+            .map(|body| {
+                crate::domain::usage::value_pricing::resource_request_plan(
+                    &body,
+                    request_context.operation,
+                )
+            });
+        if let Some(plan) = resource_plan.as_mut() {
+            plan.text_tokens = true;
+        }
+        value_attempt = state
+            .admit_share_value_request(
+                &request_context,
+                model,
+                crate::domain::usage::value_pricing::canonical_service_tier(
+                    facts.service_tier.as_deref(),
+                ),
+                facts.estimate,
+                true,
+                resource_plan,
+            )
+            .await
+            .map_err(value_quota_proxy_error)?;
+        super::value_metering::mark_sent(&value_attempt);
         let attempt = match send_codex_images_attempt(
             &state,
             &execution,
@@ -9511,6 +9753,7 @@ async fn forward_codex_images_request(
         if attempt.response.status() == StatusCode::UNAUTHORIZED
             && !audit_attempt.auth_refresh_attempted()
         {
+            super::value_metering::authentication_rejected(&mut value_attempt).await;
             if let Some((provider_type, account_id, expected_generation)) =
                 execution.managed_account_identity_target()
             {
@@ -9747,7 +9990,7 @@ async fn forward_codex_images_request(
             }
         }
         copy_safe_upstream_response_headers(&response_headers, &mut response);
-        return Ok(response);
+        return Ok(super::value_metering::response(response, value_attempt));
     }
 
     if content_encoding.as_ref().is_some_and(|value| {
@@ -9844,7 +10087,7 @@ async fn forward_codex_images_request(
     );
     apply_codex_images_streaming_headers(&mut response);
     copy_safe_upstream_response_headers(&response_headers, &mut response);
-    Ok(response)
+    Ok(super::value_metering::response(response, value_attempt))
 }
 
 struct CodexImagesAttempt {
@@ -10582,6 +10825,7 @@ fn codex_images_response_stream(
             ProxyRoute::CodexResponses,
         )),
         usage_snapshot: TokenUsage::default(),
+        raw_observed: None,
         operation: prepared.operation,
         downstream_stream: prepared.stream,
         transport_metrics: ImageTransportMetrics::new(
@@ -10814,6 +11058,7 @@ struct CodexImagesLifecycleGuard {
     first_token_ms: Option<u128>,
     usage: StreamUsageAccumulator,
     usage_snapshot: TokenUsage,
+    raw_observed: Option<super::streaming::StreamUsageResult>,
     operation: CodexImagesOperation,
     downstream_stream: bool,
     transport_metrics: ImageTransportMetrics,
@@ -10823,7 +11068,9 @@ struct CodexImagesLifecycleGuard {
 
 impl CodexImagesLifecycleGuard {
     fn finish_usage(&mut self) -> TokenUsage {
-        let usage = std::mem::take(&mut self.usage).finish();
+        let observed = std::mem::take(&mut self.usage).finish_with_status();
+        let usage = observed.usage;
+        self.raw_observed = Some(observed);
         self.usage_snapshot = usage;
         usage
     }
@@ -10850,6 +11097,7 @@ impl CodexImagesLifecycleGuard {
             stream_status,
             error_message,
             image.clone(),
+            self.raw_observed.take(),
         )
         .await;
         record_share_invocation_result(
@@ -10893,7 +11141,11 @@ impl Drop for CodexImagesLifecycleGuard {
         let request_context = self.request_context.clone();
         let duration_ms = self.started.elapsed().as_millis();
         let first_token_ms = self.first_token_ms;
-        let usage = self.usage_snapshot;
+        let raw = self
+            .raw_observed
+            .take()
+            .unwrap_or_else(|| std::mem::take(&mut self.usage).finish_with_status());
+        let usage = raw.usage;
         let operation = self.operation;
         let downstream_stream = self.downstream_stream;
         let account_in_flight_guard = self.account_in_flight_guard.take();
@@ -10910,6 +11162,7 @@ impl Drop for CodexImagesLifecycleGuard {
                 "client_cancelled",
                 Some(IMAGE_CLIENT_CANCELLED_MESSAGE),
                 None,
+                Some(raw),
             )
             .await;
             record_share_invocation_result(
@@ -11866,6 +12119,8 @@ struct ResponsesWebsocketUsageTurn {
     retry_count: u32,
     audit_admitted: bool,
     armed: bool,
+    value_attempt: Option<crate::state::ValueAttemptGuard>,
+    generation_count: u32,
 }
 
 struct PendingWebsocketTurnAudit {
@@ -12142,7 +12397,104 @@ impl ResponsesWebsocketUsageTurn {
             retry_count: 0,
             audit_admitted,
             armed: true,
+            value_attempt: None,
+            generation_count: 0,
         })
+    }
+
+    async fn admit_generation(&mut self, body: &Value) -> Result<(), ProxyError> {
+        // Reconnecting to an existing response does not call this method.
+        // Every actual new generation, including HTTP fallback, does.
+        if self.generation_count > 0 {
+            let raw = self
+                .accumulator
+                .take()
+                .map(|accumulator| accumulator.finish_with_status());
+            if let Some(raw) = &raw {
+                self.usage = raw.usage;
+            }
+            update_websocket_stream_usage(
+                &self.state,
+                &self.stored,
+                &self.request_id,
+                502,
+                self.started.elapsed().as_millis(),
+                self.first_token_ms,
+                self.usage,
+                "interrupted",
+                Some("upstream generation retried"),
+                raw,
+            )
+            .await;
+            record_share_supplemental_usage(
+                &self.state,
+                self.request_context.share_id.as_deref(),
+                self.request_context.user_email.as_deref(),
+                self.request_context.started_at_ms,
+                self.usage,
+            )
+            .await;
+        }
+        if let Some(previous) = self.value_attempt.take() {
+            previous.settle_now().await;
+        }
+        self.generation_count = self
+            .generation_count
+            .checked_add(1)
+            .ok_or_else(|| ProxyError::bad_gateway("monetary attempt identity exhausted"))?;
+        self.request_context.attempt_count = Some(self.generation_count);
+        let payload = serde_json::to_vec(body).map_err(ProxyError::bad_gateway)?;
+        let model = codex_model_from_value(body)
+            .or_else(|| self.sent_model.clone())
+            .unwrap_or_default();
+        self.value_attempt = super::value_metering::admit_prepared(
+            &self.state,
+            &self.request_context,
+            &model,
+            &payload,
+            true,
+        )
+        .await?;
+        self.sent_model = Some(model);
+        if self.generation_count > 1 {
+            self.usage = TokenUsage::default();
+            self.accumulator = Some(StreamUsageAccumulator::new(
+                adapters::usage_input_semantics_for(&self.stored, ProxyRoute::CodexResponses),
+            ));
+            self.reported_model = ReportedResponseModelObserver::default();
+        }
+        let count = self.generation_count;
+        self.state
+            .update_usage_log(&self.request_id, |log| {
+                log.attempt_count = count;
+                log.actual_model = self.sent_model.clone();
+                log.value_resources = None;
+                log.usage_state = UsageState::Pending;
+                log.stream_status = Some("pending".into());
+                if count > 1 {
+                    log.raw_input_tokens = None;
+                    log.input_tokens = None;
+                    log.output_tokens = None;
+                    log.cache_read_tokens = None;
+                    log.cache_creation_tokens = None;
+                    log.cache_creation_details = None;
+                    log.total_tokens = None;
+                    log.reported_model = None;
+                    log.reported_model_mismatch = None;
+                    log.reported_model_conflict = None;
+                    log.reported_service_tier = None;
+                    log.reported_service_tier_conflict = None;
+                    log.value_streamed_text_bytes = None;
+                    log.usage_estimated = false;
+                    log.failure_kind = None;
+                    log.error_message = None;
+                }
+                log.usage_revision = log.usage_revision.saturating_add(1);
+            })
+            .await
+            .map_err(ProxyError::bad_gateway)?;
+        super::value_metering::mark_sent(&self.value_attempt);
+        Ok(())
     }
 
     fn record_retry(&mut self, stage: &'static str, source: &'static str) {
@@ -12243,8 +12595,12 @@ impl ResponsesWebsocketUsageTurn {
         if !self.armed {
             return;
         }
-        if let Some(accumulator) = self.accumulator.take() {
-            self.usage = accumulator.finish();
+        let raw = self
+            .accumulator
+            .take()
+            .map(|accumulator| accumulator.finish_with_status());
+        if let Some(raw) = &raw {
+            self.usage = raw.usage;
         }
         update_websocket_stream_usage(
             &self.state,
@@ -12256,6 +12612,7 @@ impl ResponsesWebsocketUsageTurn {
             self.usage,
             stream_status,
             error.as_deref(),
+            raw,
         )
         .await;
         if self.stored.provider_type == ProviderType::CodexOAuth {
@@ -12359,7 +12716,11 @@ impl Drop for ResponsesWebsocketUsageTurn {
         let request_context = self.request_context.clone();
         let request_id = self.request_id.clone();
         let first_token_ms = self.first_token_ms;
-        let usage = self.usage;
+        let raw = self
+            .accumulator
+            .take()
+            .map(|accumulator| accumulator.finish_with_status());
+        let usage = raw.as_ref().map_or(self.usage, |result| result.usage);
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -12374,6 +12735,7 @@ impl Drop for ResponsesWebsocketUsageTurn {
                 usage,
                 "interrupted",
                 Some("responses websocket turn ended without a terminal event"),
+                raw,
             )
             .await;
             record_share_invocation_result(
@@ -13416,6 +13778,11 @@ async fn bridge_responses_websocket_inner(
                     active_grok_reasoning_retry_message = Some(original);
                     crate::metrics::record_grok_reasoning_replay("binding_reprepared", 1);
                 }
+                if starts_response {
+                    if let (Some(turn), Some(body)) = (active_usage_turn.as_mut(), active_response_body.as_ref()) {
+                        turn.admit_generation(body).await?;
+                    }
+                }
                 let send_result = {
                     let _account_read_guard = if starts_response {
                         Some(
@@ -14240,6 +14607,9 @@ async fn bridge_responses_websocket_inner(
                         next.mark(Milestone::Admission);
                         active_attempt.timing.adopt_websocket_attempt(next.clone());
                         budget.set_timing(next);
+                    }
+                    if let (Some(turn), Some(body)) = (active_usage_turn.as_mut(), active_response_body.as_ref()) {
+                        turn.admit_generation(body).await?;
                     }
                     let retry_send = send_responses_upstream_while_serving_downstream(
                         &entry
@@ -15580,6 +15950,9 @@ fn run_codex_websocket_http_fallback<'a>(
                 timing.mark(Milestone::SendStarted);
             }
             let send_timing = timing.clone();
+            if let Some(turn) = active_usage_turn.as_mut() {
+                turn.admit_generation(response_body).await?;
+            }
             let send_future = async move {
                 let _wait = send_timing
                     .as_ref()
@@ -19323,6 +19696,15 @@ async fn finish_web_session_failure(
 }
 
 async fn forward_web_session(options: WebSessionForwardOptions) -> Result<Response, ProxyError> {
+    let mut value_attempt = None;
+    let result = forward_web_session_metered(options, &mut value_attempt).await;
+    result.map(|response| crate::proxy::value_metering::response(response, value_attempt))
+}
+
+async fn forward_web_session_metered(
+    options: WebSessionForwardOptions,
+    value_attempt: &mut Option<crate::state::ValueAttemptGuard>,
+) -> Result<Response, ProxyError> {
     let WebSessionForwardOptions {
         state,
         execution,
@@ -19398,22 +19780,35 @@ async fn forward_web_session(options: WebSessionForwardOptions) -> Result<Respon
         .await;
     }
 
-    let result = match super::web_session::execute(&state, &execution, route, body).await {
-        Ok(result) => result,
-        Err(error) => {
-            return finish_web_session_failure(
-                &state,
-                &stored,
-                &request_context,
-                started,
-                requested_model,
-                Some(actual_model),
-                true,
-                error,
-            )
+    if route != ProxyRoute::ClaudeCountTokens {
+        *value_attempt = super::value_metering::admit(
+            &state,
+            &execution,
+            &request_context,
+            &actual_model,
+            &body,
+        )
+        .await?;
+    }
+    let result =
+        match super::web_session::execute(&state, &execution, route, body, value_attempt.as_ref())
             .await
-        }
-    };
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return finish_web_session_failure(
+                    &state,
+                    &stored,
+                    &request_context,
+                    started,
+                    requested_model,
+                    Some(actual_model),
+                    true,
+                    error,
+                )
+                .await
+            }
+        };
     let usage = TokenUsage {
         raw_input_tokens: Some(result.input_tokens),
         input_tokens: Some(result.input_tokens),
@@ -19786,7 +20181,7 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
         }
 
         let mut value_attempt_guard = state
-            .admit_share_value_text(
+            .admit_share_value_request(
                 &request_context,
                 &model_id,
                 crate::domain::usage::value_pricing::canonical_service_tier(
@@ -19800,10 +20195,15 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                     serialized_json_bytes(&prepared.payload),
                     Some(&prepared.payload),
                 ),
-                value_metering
-                    && crate::domain::usage::value_pricing::is_metered_text_value(
-                        &prepared.payload,
-                    ),
+                crate::domain::usage::value_pricing::supports_value_text_runtime(
+                    execution.plan.profile_id.as_str(),
+                    execution.plan.driver_id.as_str(),
+                    execution.plan.coding_plan.is_some(),
+                ),
+                Some(crate::domain::usage::value_pricing::resource_request_plan(
+                    &prepared.payload,
+                    request_context.operation,
+                )),
             )
             .await
             .map_err(value_quota_proxy_error)?;
@@ -20088,6 +20488,7 @@ async fn record_codebuddy_metered_failure(
     let observed = raw_usage.finish_with_status();
     let usage = observed.usage;
     let mut failure = context.clone();
+    failure.value_resources = observed.resources;
     failure.response_model = Some(observed.response_model);
     failure.value_streamed_text_bytes = Some(observed.streamed_text_bytes);
     failure.usage_estimated = observed.usage_estimated;
@@ -20357,7 +20758,7 @@ fn codebuddy_observed_decode_error(
     }
     match error {
         super::codebuddy::CodeBuddySseDecodeError::Upstream(error) => {
-            if !usage.has_billable_evidence() {
+            if error.is_authentication_failure() && !usage.has_billable_evidence() {
                 if let Some(guard) = guard {
                     guard.mark_upstream_error();
                 }
@@ -20391,7 +20792,7 @@ async fn mark_codebuddy_declared_stream_rejection(
             if log.failure_kind.as_deref() != Some("upstream_outcome_unknown") {
                 return false;
             }
-            log.failure_kind = None;
+            log.failure_kind = Some("upstream_auth_rejected".into());
             log.reset_router_sync_state();
             true
         })
@@ -20738,7 +21139,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                         Ok(canonical) => canonical,
                         Err(error) => {
                             if let Some(usage) = wire.decoder.take_value_usage() { interrupt_guard.usage = usage; }
-                            if matches!(&error, super::codebuddy::CodeBuddySseDecodeError::Upstream(_)) {
+                            if matches!(&error, super::codebuddy::CodeBuddySseDecodeError::Upstream(upstream) if upstream.is_authentication_failure()) {
                                 mark_codebuddy_declared_stream_rejection(&interrupt_guard, value_body_guard.as_ref()).await;
                             }
                             let error = error.into_proxy_error_for_provider(stored.provider_type);
@@ -20841,7 +21242,9 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                 Ok(canonical) => canonical,
                 Err(super::codebuddy::CodeBuddySseDecodeError::Upstream(error)) => {
                     if let Some(usage) = wire.decoder.take_value_usage() { interrupt_guard.usage = usage; }
-                    mark_codebuddy_declared_stream_rejection(&interrupt_guard, value_body_guard.as_ref()).await;
+                    if error.is_authentication_failure() {
+                        mark_codebuddy_declared_stream_rejection(&interrupt_guard, value_body_guard.as_ref()).await;
+                    }
                     let error = error.into_proxy_error_for_provider(stored.provider_type);
                     if let Some(frame) = finish_qoder_observed_stream_failure(
                         &mut interrupt_guard,
@@ -20968,6 +21371,15 @@ enum TraeForwardAttemptError {
 }
 
 async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyError> {
+    let mut value_attempt = None;
+    let result = forward_trae_metered(options, &mut value_attempt).await;
+    result.map(|response| crate::proxy::value_metering::response(response, value_attempt))
+}
+
+async fn forward_trae_metered(
+    options: TraeForwardOptions,
+    value_attempt: &mut Option<crate::state::ValueAttemptGuard>,
+) -> Result<Response, ProxyError> {
     let TraeForwardOptions {
         state,
         execution,
@@ -20975,7 +21387,7 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
         adapter,
         mut adapter_request,
         route,
-        request_context,
+        mut request_context,
         account_in_flight_guard,
         share_invocation_guard,
         started,
@@ -21024,6 +21436,7 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
         {
             Ok(runtime) => runtime,
             Err(error) if error.is_authentication_failure() && !auth_recovery_attempted => {
+                super::value_metering::authentication_rejected(value_attempt).await;
                 auth_recovery_attempted = true;
                 recover_trae_auth(&state, &execution, None).await?;
                 continue;
@@ -21150,6 +21563,16 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
             .await;
         }
 
+        request_context.attempt_count = Some(u32::from(auth_recovery_attempted).saturating_add(1));
+        let value_payload = serde_json::to_vec(&payload).map_err(ProxyError::bad_gateway)?;
+        *value_attempt = super::value_metering::admit(
+            &state,
+            &execution,
+            &request_context,
+            &model_id,
+            &value_payload,
+        )
+        .await?;
         let wire = match send_trae_generation(TraeGenerationOptions {
             state: &state,
             execution: &execution,
@@ -21159,6 +21582,7 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
             tool_contract,
             simulate_tools,
             request_memory: request_memory.as_ref(),
+            value_attempt: value_attempt.as_ref(),
         })
         .await
         {
@@ -21166,6 +21590,7 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
             Err(TraeForwardAttemptError::Upstream(error))
                 if error.is_authentication_failure() && !auth_recovery_attempted =>
             {
+                super::value_metering::authentication_rejected(value_attempt).await;
                 auth_recovery_attempted = true;
                 recover_trae_auth(&state, &execution, Some(&runtime)).await?;
                 continue;
@@ -21256,6 +21681,7 @@ async fn forward_trae(options: TraeForwardOptions) -> Result<Response, ProxyErro
             Err(TraeForwardAttemptError::Upstream(error))
                 if error.is_authentication_failure() && !auth_recovery_attempted =>
             {
+                super::value_metering::authentication_rejected(value_attempt).await;
                 auth_recovery_attempted = true;
                 recover_trae_auth(&state, &execution, Some(&runtime)).await?;
             }
@@ -21297,6 +21723,7 @@ struct TraeGenerationOptions<'a> {
     tool_contract: super::trae::TraeToolContract,
     simulate_tools: bool,
     request_memory: Option<&'a RequestMemoryBudget>,
+    value_attempt: Option<&'a crate::state::ValueAttemptGuard>,
 }
 
 async fn send_trae_generation(
@@ -21311,6 +21738,7 @@ async fn send_trae_generation(
         tool_contract,
         simulate_tools,
         request_memory,
+        value_attempt,
     } = options;
     // One deadline covers response headers, error bodies and all queue/progress
     // frames before the first semantic output. Transport activity cannot renew it.
@@ -21348,6 +21776,9 @@ async fn send_trae_generation(
     let header_timeout = execution
         .stream_first_byte_timeout()
         .map_or(remaining, |timeout| timeout.min(remaining));
+    if let Some(attempt) = value_attempt {
+        attempt.mark_sent();
+    }
     let response = tokio::time::timeout(header_timeout, request.send())
         .await
         .map_err(|_| {
@@ -22048,6 +22479,15 @@ enum QoderForwardAttemptError {
 }
 
 async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyError> {
+    let mut value_attempt = None;
+    let result = forward_qoder_metered(options, &mut value_attempt).await;
+    result.map(|response| crate::proxy::value_metering::response(response, value_attempt))
+}
+
+async fn forward_qoder_metered(
+    options: QoderForwardOptions,
+    value_attempt: &mut Option<crate::state::ValueAttemptGuard>,
+) -> Result<Response, ProxyError> {
     let QoderForwardOptions {
         state,
         execution,
@@ -22204,6 +22644,7 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
                 ) {
                     return Err(qoder_runtime_error_to_proxy_error(error));
                 }
+                super::value_metering::authentication_rejected(value_attempt).await;
                 let previous_timing = timing.get();
                 if let Some(previous) = &previous_timing {
                     previous.finish_attempt(TimingResult::Retried);
@@ -22302,6 +22743,17 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
                 .await;
             }
         };
+        request_context.attempt_count = Some(recovery_attempt.attempt().saturating_add(1));
+        let value_payload =
+            serde_json::to_vec(&prepared.payload.body).map_err(ProxyError::bad_gateway)?;
+        *value_attempt = super::value_metering::admit(
+            &state,
+            &execution,
+            &request_context,
+            &prepared.model_key,
+            &value_payload,
+        )
+        .await?;
         if let Some((_, expected_model, expected_continuation)) = continuation_runtime.as_ref() {
             if &prepared.model_key != expected_model {
                 return Err(ProxyError::qoder_response_context_unavailable());
@@ -22344,6 +22796,7 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
             &prepared.model_source,
             request_memory.as_ref(),
             responses_chat_id.as_deref(),
+            value_attempt.as_ref(),
         )
         .await;
         match wire {
@@ -22372,6 +22825,7 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
                 ) {
                     return Err(error.into_proxy_error());
                 }
+                super::value_metering::authentication_rejected(value_attempt).await;
                 let previous_timing = timing.get();
                 if let Some(previous) = &previous_timing {
                     previous.finish_attempt(TimingResult::Retried);
@@ -22554,6 +23008,7 @@ async fn forward_qoder(options: QoderForwardOptions) -> Result<Response, ProxyEr
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_qoder_generation(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -22562,6 +23017,7 @@ async fn send_qoder_generation(
     model_source: &str,
     request_memory: Option<&RequestMemoryBudget>,
     responses_chat_id: Option<&str>,
+    value_attempt: Option<&crate::state::ValueAttemptGuard>,
 ) -> Result<PreparedQoderWireResponse, QoderForwardAttemptError> {
     if !qoder_provider::runtime_is_current(state, execution, runtime).await {
         return Err(QoderForwardAttemptError::Proxy(ProxyError::conflict(
@@ -22681,6 +23137,9 @@ async fn send_qoder_generation(
         .unwrap_or(execution.request_timeout());
     let qoder_prelude_deadline = tokio::time::Instant::now() + qoder_first_timeout;
     let headers_wait = timing.as_ref().map(|timing| timing.wait(WaitKind::Headers));
+    if let Some(attempt) = value_attempt {
+        attempt.mark_sent();
+    }
     let response = tokio::time::timeout_at(qoder_prelude_deadline, request.send())
         .await
         .map_err(|_| {
@@ -24070,12 +24529,21 @@ struct ClaudeDeepSeekForwardOptions {
 async fn forward_claude_deepseek(
     options: ClaudeDeepSeekForwardOptions,
 ) -> Result<Response, ProxyError> {
+    let mut value_attempt = None;
+    let result = forward_claude_deepseek_metered(options, &mut value_attempt).await;
+    result.map(|response| crate::proxy::value_metering::response(response, value_attempt))
+}
+
+async fn forward_claude_deepseek_metered(
+    options: ClaudeDeepSeekForwardOptions,
+    value_attempt: &mut Option<crate::state::ValueAttemptGuard>,
+) -> Result<Response, ProxyError> {
     let ClaudeDeepSeekForwardOptions {
         state,
         execution,
         stored,
         body,
-        request_context,
+        mut request_context,
         account_in_flight_guard,
         share_invocation_guard,
         started,
@@ -24144,32 +24612,59 @@ async fn forward_claude_deepseek(
     debug_assert_eq!(provider_type, ProviderType::DeepSeekAccount);
     let share_id = request_context
         .share_id
-        .as_deref()
+        .clone()
         .ok_or_else(|| ProxyError::unauthorized("DeepSeek Web requires signed Share ingress"))?;
     let user_identity = request_context
         .user_email
-        .as_deref()
-        .unwrap_or("share-owner");
+        .clone()
+        .unwrap_or_else(|| "share-owner".into());
     let client_session_id = request_context
         .session_id
         .clone()
         .or_else(|| request_context.request_id.clone())
         .unwrap_or_else(deepseek::request_scoped_session_id);
+    let mut resource_plan = serde_json::from_slice::<Value>(&body).ok().map(|body| {
+        crate::domain::usage::value_pricing::resource_request_plan(&body, request_context.operation)
+    });
+    if prepared.search_enabled {
+        if let Some(plan) = &mut resource_plan {
+            plan.requires_v2 = true;
+            plan.quantities.entry("tool.web_search".into()).or_insert(8);
+        }
+    }
+    let facts = crate::domain::usage::value_pricing::value_request_facts(&body);
+    let mut metering = crate::state::ValueGenerationAdmission {
+        context: &mut request_context,
+        attempt: value_attempt,
+        model: &deepseek_model,
+        tier: crate::domain::usage::value_pricing::canonical_service_tier(
+            facts.service_tier.as_deref(),
+        ),
+        estimate: facts.estimate,
+        verified_surface: crate::domain::usage::value_pricing::supports_value_text_runtime(
+            execution.plan.profile_id.as_str(),
+            execution.plan.driver_id.as_str(),
+            execution.plan.coding_plan.is_some(),
+        ),
+        resource_plan,
+        number: 0,
+    };
     let upstream = state
-        .start_deepseek_chat_completion(
+        .start_deepseek_chat_completion_metered(
             stored.app,
             &stored.provider.id,
             stored.resource.revision,
             &execution.plan.runtime_fingerprint,
             account_id,
             expected_generation,
-            share_id,
-            user_identity,
+            &share_id,
+            &user_identity,
             &client_session_id,
             &deepseek_model,
             &prepared.prompt,
             prepared.thinking_enabled,
             prepared.search_enabled,
+            Some(&mut metering),
         )
         .await
         .map_err(deepseek_upstream_error_to_proxy_error)?;
@@ -24379,6 +24874,7 @@ async fn forward_claude_deepseek(
 
 fn deepseek_upstream_error_to_proxy_error(error: DeepSeekUpstreamError) -> ProxyError {
     match error {
+        DeepSeekUpstreamError::ValueQuota(error) => value_quota_proxy_error(error),
         DeepSeekUpstreamError::NotFound => {
             ProxyError::not_found("deepseek_account managed account not found")
         }
@@ -24469,6 +24965,15 @@ async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Respon
 
 async fn forward_claude_kiro_inner(
     options: ClaudeKiroForwardOptions,
+) -> Result<Response, ProxyError> {
+    let mut value_attempt = None;
+    let result = forward_claude_kiro_inner_metered(options, &mut value_attempt).await;
+    result.map(|response| crate::proxy::value_metering::response(response, value_attempt))
+}
+
+async fn forward_claude_kiro_inner_metered(
+    options: ClaudeKiroForwardOptions,
+    value_attempt: &mut Option<crate::state::ValueAttemptGuard>,
 ) -> Result<Response, ProxyError> {
     let ClaudeKiroForwardOptions {
         state,
@@ -24601,6 +25106,15 @@ async fn forward_claude_kiro_inner(
             .map(Bytes::from)
             .map_err(|error| ProxyError::bad_request(format!("encode Kiro request: {error}")))?;
         debug_assert_eq!(serialized_body.len(), serialized_body_bytes);
+        request_context.attempt_count = Some(audit_attempt.attempt().saturating_add(1));
+        *value_attempt = super::value_metering::admit(
+            &state,
+            &execution,
+            &request_context,
+            &actual_model,
+            &serialized_body,
+        )
+        .await?;
         let target_headers = prepared
             .headers
             .iter()
@@ -24628,6 +25142,7 @@ async fn forward_claude_kiro_inner(
         let headers_wait = current_timing
             .as_ref()
             .map(|timing| timing.wait(WaitKind::Headers));
+        super::value_metering::mark_sent(value_attempt);
         let upstream_result = if stream_requested {
             match (first_frame_timeout, first_frame_deadline) {
                 (Some(timeout), Some(deadline)) => {
@@ -24700,6 +25215,7 @@ async fn forward_claude_kiro_inner(
                 let retry_wait = current_timing
                     .as_ref()
                     .map(|timing| timing.wait(WaitKind::Retry));
+                super::value_metering::authentication_rejected(value_attempt).await;
                 drop(upstream);
                 if let Err(error) = state
                     .refresh_managed_account_now_for_generation(
@@ -25586,6 +26102,33 @@ fn account_concurrency_proxy_error(
     )
 }
 
+async fn validate_and_acquire_share_invocation_value_operation(
+    state: &ServerState,
+    share_id: &str,
+    app: AppKind,
+    email: Option<&str>,
+) -> Result<(String, ShareInFlightGuard), ProxyError> {
+    let (invocation, guard) = state
+        .validate_and_acquire_share_invocation_with_value_text(
+            share_id,
+            app,
+            email,
+            crate::infra::time::now_ms() as i64,
+            true,
+        )
+        .await
+        .map_err(share_rejection_to_proxy_error)?;
+    if app == AppKind::Codex {
+        if let Err(error) = state
+            .maybe_auto_consume_banked_reset_for_share(share_id)
+            .await
+        {
+            tracing::warn!(share_id, %error, "Share-scoped automatic Codex banked reset failed");
+        }
+    }
+    Ok((invocation.share_name, guard))
+}
+
 pub(crate) async fn validate_and_acquire_share_invocation(
     state: &ServerState,
     share_id: &str,
@@ -25695,9 +26238,9 @@ async fn revalidate_execution_before_account_lease(
 
 /// Settles a USD attempt before a retry and awaits it, so the retry's
 /// admission never counts this attempt as in flight (`VALUE_QUOTA_BUSY`
-/// race) or keeps its reservation. Returns whether the retry may be admitted
-/// for a USD user: the attempt settled at $0 (never sent, or upstream failed
-/// before producing output). Without a guard (no USD metering) it is false.
+/// race). Unknown outcomes retain their conservative debit; the next
+/// admission independently checks the remaining quota. The return value
+/// reports explicit evidence that the prior generation did not execute.
 async fn settle_value_attempt_before_retry(
     guard: &mut Option<crate::state::ValueAttemptGuard>,
 ) -> bool {
@@ -25708,7 +26251,7 @@ async fn settle_value_attempt_before_retry(
 }
 
 /// Typed USD-equivalent admission errors to stable wire codes.
-fn value_quota_proxy_error(error: anyhow::Error) -> ProxyError {
+pub(super) fn value_quota_proxy_error(error: anyhow::Error) -> ProxyError {
     use crate::domain::usage::value_pricing::{
         ValueError, ValueQuotaRejection, ValueQuotaRejectionKind,
     };
@@ -25751,6 +26294,10 @@ fn value_quota_proxy_error(error: anyhow::Error) -> ProxyError {
                         .into(),
             },
         };
+    }
+    if error.to_string().contains("RESOURCE_POLICY_REQUIRED") {
+        return ProxyError { status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "quota_unavailable: this operation requires the resource-metering USD policy (api-equivalent-v2); enable it explicitly and configure resource prices in Router settings".into() };
     }
     if error.downcast_ref::<ValueError>() == Some(&ValueError::PriceUnavailable) {
         return ProxyError {
@@ -27523,6 +28070,7 @@ impl ResponsesImageJsonLifecycleGuard {
                 usage,
                 parse_error,
                 usage_estimated: false,
+                resources: None,
                 response_model: ResponseModelEvidence::default(),
                 streamed_text_bytes: 0,
             },

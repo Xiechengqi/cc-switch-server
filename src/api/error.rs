@@ -556,6 +556,16 @@ impl ApiError {
                 "The target cannot be below observed usage or outside the supported range",
             );
         }
+        if message.contains("RESOURCE_ROUTER_UPGRADE") || message.contains("RESOURCE_UPGRADE") {
+            return Self::conflict_code(
+                "resource_upgrade_required",
+                "Resource metering requires Router v11 negotiation and an acknowledged v2 tariff",
+            );
+        }
+        if message.contains("RESOURCE_POLICY_REQUIRED") {
+            return Self::bad_request_code("resource_policy_required",
+                "This operation requires an explicitly selected resource-metering USD policy and its resource prices");
+        }
         if message == "price_unavailable" {
             let mut error = Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,

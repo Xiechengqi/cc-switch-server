@@ -386,6 +386,8 @@ pub struct UsageLog {
     /// streams; never exported to the Router.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_streamed_text_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_resources: Option<super::value_pricing::ResourceUsage>,
     #[serde(default)]
     pub share_name: Option<String>,
     #[serde(default)]
@@ -566,6 +568,7 @@ impl ResponseModelEvidence {
 
 #[derive(Debug, Clone, Default)]
 pub struct UsageLogContext {
+    pub value_resources: Option<super::value_pricing::ResourceUsage>,
     pub response_model: Option<ResponseModelEvidence>,
     pub value_streamed_text_bytes: Option<u64>,
     /// Buffered WorkBuddy generation already observed before a downstream
@@ -1183,6 +1186,7 @@ impl UsageLog {
             usage_revision: 1,
             usage_estimated: false,
             value_streamed_text_bytes: None,
+            value_resources: None,
             share_name: None,
             user_country: None,
             user_country_iso3: None,
@@ -1198,6 +1202,7 @@ impl UsageLog {
     }
 
     pub fn apply_context(&mut self, context: UsageLogContext) {
+        self.value_resources = context.value_resources.clone();
         self.value_streamed_text_bytes = context.value_streamed_text_bytes;
         if let Some(evidence) = context.response_model {
             evidence.apply(self);

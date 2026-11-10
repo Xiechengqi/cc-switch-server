@@ -13,8 +13,22 @@ use crate::domain::usage::value_pricing::{
 };
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod resource_tasks;
 mod tariff;
+pub(crate) use resource_tasks::attach_task;
 pub(crate) use tariff::{activate_due_tariff, model_coverage, schedule_tariff};
+
+pub(crate) fn resource_tariff_ready(dir: &Path, scope: &Scope) -> anyhow::Result<bool> {
+    let Some(revision) = active_revision(dir, scope)? else {
+        return Ok(false);
+    };
+    let conn = open_database(&database_path(dir), true)?;
+    Ok(
+        cached_snapshot(&conn, &scope.router_url, &scope.installation_id, &revision)?
+            .schema_version
+            == 2,
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -90,6 +104,7 @@ pub(crate) struct Admission<'a> {
     pub started_at_ms: i64,
     /// Bounded reservation input; the risk is priced from the frozen tariff.
     pub estimate: RiskEstimate,
+    pub resource_plan: Option<crate::domain::usage::value_pricing::ResourcePlan>,
     /// min(grant parallel limit, 4); counted over this scope's pending attempts.
     pub parallel_limit: u32,
 }
@@ -297,6 +312,8 @@ struct AttemptMeta {
     input_tokens: u64,
     output_tokens: u64,
     reserved_picos: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource_plan: Option<crate::domain::usage::value_pricing::ResourcePlan>,
 }
 impl AttemptMeta {
     fn reserved(&self) -> i128 {
@@ -1178,10 +1195,37 @@ fn admit_with_trial_in_tx(
             a.pricing_revision,
             a.effective_model,
             a.effective_tier,
-            "model_unpriced",
+            if a.effective_model.is_empty() {
+                "model_unresolved"
+            } else {
+                "model_unpriced"
+            },
         )
     })?;
-    if !model.supports_tier(a.effective_tier) {
+    if let Some(plan) = &a.resource_plan {
+        if plan.requires_v2 {
+            ensure!(
+                a.quota.tariff_policy_id
+                    == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+                    && snapshot.schema_version == 2,
+                "VALUE_QUOTA_RESOURCE_POLICY_REQUIRED"
+            );
+        }
+        crate::domain::usage::value_pricing::price_resources(&model.resources, &plan.quantities)
+            .map_err(|_| {
+                tariff::price_rejection(
+                    tx,
+                    a.scope,
+                    a.pricing_revision,
+                    a.effective_model,
+                    a.effective_tier,
+                    "resource_unpriced",
+                )
+            })?;
+    }
+    if a.resource_plan.as_ref().is_none_or(|plan| plan.text_tokens)
+        && !model.supports_tier(a.effective_tier)
+    {
         return Err(tariff::price_rejection(
             tx,
             a.scope,
@@ -1281,10 +1325,27 @@ fn admit_with_trial_in_tx(
         }
         // Bounded reservation: price(input estimate + output ceiling) at the
         // context tier implied by the estimate, never more than remains.
-        model
-            .price(a.effective_tier, &a.estimate.tokens())
-            .map(|price| price.usage_picos)
-            .unwrap_or(available)
+        let text = if a.resource_plan.as_ref().is_none_or(|plan| plan.text_tokens) {
+            model
+                .price(a.effective_tier, &a.estimate.tokens())
+                .map(|price| price.usage_picos)
+                .unwrap_or(available)
+        } else {
+            0
+        };
+        let resources = a
+            .resource_plan
+            .as_ref()
+            .map(|plan| {
+                crate::domain::usage::value_pricing::price_resources(
+                    &model.resources,
+                    &plan.quantities,
+                )
+            })
+            .transpose()?
+            .unwrap_or(0);
+        text.checked_add(resources)
+            .context("value quota arithmetic overflow")?
             .clamp(0, available)
     } else {
         0
@@ -1305,6 +1366,7 @@ fn admit_with_trial_in_tx(
                 input_tokens: a.estimate.input_tokens,
                 output_tokens: a.estimate.output_tokens,
                 reserved_picos: reserved.to_string(),
+                resource_plan: a.resource_plan.clone(),
             })?
         ],
     )?;
@@ -1412,6 +1474,8 @@ pub(crate) struct Observation<'a> {
     /// admitted tier; settlement charges the higher price conservatively.
     pub observed_tier: Option<&'a str>,
     pub tokens: Option<ValueTokens>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<crate::domain::usage::value_pricing::ResourceUsage>,
     pub outcome: ObservedOutcome,
     /// Sweeper-produced observation: any later genuine terminal usage log may
     /// replace it even at the same revision.
@@ -1683,7 +1747,14 @@ pub(super) fn settle_usage_log_isolated(
                 let mut query = tx.prepare(
                     "SELECT DISTINCT scope,window_id FROM value_quota_attempts WHERE request_id=?1",
                 )?;
-                let rows = query.query_map([&log.request_id], |r| {
+                let target = if log.operation
+                    == crate::domain::usage::store::InferenceOperation::VideoStatus
+                {
+                    log.parent_request_id.as_deref().unwrap_or(&log.request_id)
+                } else {
+                    &log.request_id
+                };
+                let rows = query.query_map([target], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -1702,7 +1773,10 @@ pub(super) fn settle_usage_log_isolated(
 }
 fn in_progress_log(log: &crate::domain::usage::store::UsageLog) -> bool {
     use crate::domain::usage::store::UsageState;
-    log.usage_state == UsageState::Pending
+    matches!(
+        log.media_status.as_deref(),
+        Some("submitted" | "pending" | "in_progress" | "processing" | "running")
+    ) || log.usage_state == UsageState::Pending
         || (log.is_streaming
             && matches!(log.stream_status.as_deref(), Some("pending" | "streaming")))
 }
@@ -1753,17 +1827,31 @@ fn classify_log(
         && !log.reported_model_conflict.unwrap_or(false)
         && !log.reported_service_tier_conflict.unwrap_or(false)
         && log.usage_state != crate::domain::usage::store::UsageState::ParseError
-        && log.request_kind == RequestKind::Text
+        && (log.request_kind == RequestKind::Text
+            || meta.and_then(|m| m.resource_plan.as_ref()).is_some())
         && !log.is_health_check;
-    let tokens = (!log.usage_estimated)
-        .then(|| tokens_for_log(log))
-        .flatten();
+    // Estimates are valid quota observations, with an explicit conservative
+    // outcome. They must never be presented as authoritative upstream usage.
+    let resource_only = meta
+        .and_then(|meta| meta.resource_plan.as_ref())
+        .is_some_and(|plan| !plan.text_tokens);
+    let tokens = if resource_only {
+        Some(ValueTokens::default())
+    } else {
+        tokens_for_log(log)
+    };
     // Incomplete or inconsistent usage is not proof of a free error. In
     // particular an HTTP error may report input/cache without output usage.
     let has_usage = tokens.is_some_and(|t| t != ValueTokens::default())
         || log.processed_tokens() > 0
         || log.raw_input_tokens.unwrap_or(0) > 0
-        || log.total_tokens.unwrap_or(0) > 0;
+        || log.total_tokens.unwrap_or(0) > 0
+        || log
+            .value_resources
+            .as_ref()
+            .is_some_and(|usage| usage.quantities.values().any(|quantity| *quantity > 0))
+        || log.image_count.unwrap_or(0) > 0
+        || log.video_duration_seconds.unwrap_or(0) > 0;
     let uncertain_tokens =
         tokens.or_else(|| (!log.usage_estimated && has_usage).then(|| partial_tokens(log, meta)));
     let tier = canonical_service_tier(
@@ -1780,14 +1868,21 @@ fn classify_log(
         );
     }
     let streamed = log.value_streamed_text_bytes.unwrap_or(0);
-    if log.status_code >= 400
+    if (log.status_code == 401
+        || matches!(
+            log.failure_kind.as_deref(),
+            Some("request_not_sent" | "upstream_auth_rejected")
+        ))
         && !has_usage
         && streamed == 0
         && log.failure_kind.as_deref() != Some("upstream_outcome_unknown")
     {
         return (ObservedOutcome::Free, None, None);
     }
-    if !evidence_ok || tier.is_none() {
+    if !evidence_ok
+        || tier.is_none()
+        || log.failure_kind.as_deref() == Some("upstream_outcome_unknown")
+    {
         return (ObservedOutcome::Unknown, uncertain_tokens, observed_tier);
     }
     let completed = if log.is_streaming {
@@ -1797,7 +1892,7 @@ fn classify_log(
     };
     if completed && ((200..300).contains(&log.status_code) || has_usage) {
         return match tokens {
-            Some(tokens) if log.attempt_count > 1 || observed_tier.is_some() => (
+            Some(tokens) if log.usage_estimated || observed_tier.is_some() => (
                 ObservedOutcome::FinalConservative,
                 Some(tokens),
                 observed_tier,
@@ -1828,6 +1923,9 @@ fn settle_log_in_tx(
     log: &crate::domain::usage::store::UsageLog,
     force_terminal: bool,
 ) -> anyhow::Result<bool> {
+    if log.operation == crate::domain::usage::store::InferenceOperation::VideoStatus {
+        return resource_tasks::observe_task_in_tx(tx, log);
+    }
     let rows = {
         let mut q=tx.prepare("SELECT attempt_id,scope,effective_model,effective_tier,usage_revision FROM value_quota_attempts WHERE request_id=?1")?;
         let mapped = q.query_map([&log.request_id], |r| {
@@ -1878,6 +1976,7 @@ fn settle_log_in_tx(
     settle_in_tx(
         tx,
         &Observation {
+            resources: resource_usage_for_log(log, meta.as_ref()),
             request_id: &log.request_id,
             attempt_id: &attempt,
             scope: &scope,
@@ -1892,6 +1991,81 @@ fn settle_log_in_tx(
         },
     )
 }
+fn resource_usage_for_log(
+    log: &crate::domain::usage::store::UsageLog,
+    meta: Option<&AttemptMeta>,
+) -> Option<crate::domain::usage::value_pricing::ResourceUsage> {
+    use crate::domain::usage::value_pricing::{ResourceUsage, RESOURCE_ESTIMATE_VERSION};
+    let plan = meta?.resource_plan.as_ref()?;
+    let mut quantities = BTreeMap::new();
+    let evidence_estimated = log
+        .value_resources
+        .as_ref()
+        .is_some_and(|usage| usage.estimated);
+    let mut estimated = evidence_estimated;
+    for (key, risk) in &plan.quantities {
+        let base = key.split('/').next().unwrap_or(key);
+        let exact = log
+            .value_resources
+            .as_ref()
+            .and_then(|usage| {
+                usage
+                    .quantities
+                    .get(key)
+                    .or_else(|| usage.quantities.get(base))
+            })
+            .copied()
+            .or_else(|| {
+                (base == "image.output")
+                    .then_some(log.image_count)
+                    .flatten()
+                    .map(u64::from)
+            })
+            .or_else(|| {
+                (base == "video.output_millisecond")
+                    .then_some(log.video_duration_seconds)
+                    .flatten()
+                    .map(|n| u64::from(n) * 1000)
+            });
+        // Partial/heuristic protocol counts are lower bounds, not proof that
+        // fewer resources executed. Only trusted evidence may reduce the
+        // versioned request bound; larger observed quantities always win.
+        let quantity = match exact {
+            Some(count) if evidence_estimated => count.max(*risk),
+            Some(count) => count,
+            None => *risk,
+        };
+        quantities.insert(key.clone(), quantity);
+        estimated |= exact.is_none();
+    }
+    if let Some(evidence) = &log.value_resources {
+        estimated |= evidence.estimated;
+        for (key, value) in &evidence.quantities {
+            if *value > 0
+                && !quantities
+                    .keys()
+                    .any(|planned| planned.split('/').next() == key.split('/').next())
+            {
+                quantities.insert(key.clone(), *value);
+            }
+        }
+    }
+    if quantities.is_empty() {
+        return None;
+    }
+    Some(ResourceUsage {
+        quantities,
+        source: if estimated {
+            "request.resource_bound"
+        } else {
+            "upstream.protocol"
+        }
+        .into(),
+        estimated,
+        version: RESOURCE_ESTIMATE_VERSION.into(),
+    })
+}
+
 fn tokens_for_log(log: &crate::domain::usage::store::UsageLog) -> Option<ValueTokens> {
     let fresh_input = log.input_tokens?;
     let output = log.output_tokens?;
@@ -2096,16 +2270,52 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
         .map(|meta| meta.reserved())
         .unwrap_or(0);
     let old_amount = unsigned_decimal(&old.5)?;
+    let meta = read_attempt_meta(tx, o.request_id, o.attempt_id)?;
+    let plan = meta.as_ref().and_then(|meta| meta.resource_plan.as_ref());
+    if let Some(usage) = &o.resources {
+        // A positive dimension discovered after send must not disappear into
+        // the text reservation when its price is missing. The isolated
+        // settlement caller retains the risk/evidence and fences this window
+        // for reconciliation; other scopes remain available.
+        usage.validate()?;
+        crate::domain::usage::value_pricing::price_resources(&tariff.resources, &usage.quantities)?;
+    }
     let price = |tier: &str| {
-        o.tokens
-            .as_ref()
-            .and_then(|tokens| tariff.price(tier, tokens).ok())
+        let text = if plan.is_some_and(|plan| !plan.text_tokens) {
+            Some(crate::domain::usage::value_pricing::PricedValue {
+                usage_picos: 0,
+                conservative_cache_ttl: false,
+            })
+        } else {
+            o.tokens.as_ref().and_then(|tokens| {
+                tariff
+                    .price_text_with_resources(tier, tokens, o.resources.as_ref())
+                    .ok()
+            })
+        }?;
+        let resources = match &o.resources {
+            Some(usage) => {
+                usage.validate().ok()?;
+                crate::domain::usage::value_pricing::price_resources(
+                    &tariff.resources,
+                    &usage.quantities,
+                )
+                .ok()?
+            }
+            None if plan.is_some_and(|plan| !plan.quantities.is_empty()) => return None,
+            None => 0,
+        };
+        Some(crate::domain::usage::value_pricing::PricedValue {
+            usage_picos: text.usage_picos.checked_add(resources)?,
+            conservative_cache_ttl: text.conservative_cache_ttl
+                || o.resources.as_ref().is_some_and(|usage| usage.estimated),
+        })
     };
     let unknown = || {
         let priced = price(o.effective_tier)
             .map_or(0, |p| p.usage_picos)
             .max(o.observed_tier.and_then(price).map_or(0, |p| p.usage_picos));
-        let floor = if old.8 == "pending" { old_amount } else { 0 };
+        let floor = old_amount;
         (priced.max(reserved).max(floor), "conservative")
     };
     let (amount, state) = match o.outcome {
@@ -2174,7 +2384,7 @@ pub(crate) enum AttemptOutcome {
     /// Never written upstream (connect/DNS/TLS failure, early error, client
     /// gone before send): `$0`, observed.
     NotSent,
-    /// Upstream answered an error HTTP status and no usage was observed.
+    /// Explicit authentication rejection before any billable evidence.
     UpstreamError,
     /// Sent but the outcome is unknown: the reserved risk is charged.
     Unknown,
@@ -2194,11 +2404,17 @@ fn settle_outcome_in_tx(
     let Some(old) = read_attempt_row(tx, request_id, attempt_id)? else {
         return Ok(false);
     };
-    if !matches!(old.8.as_str(), "pending" | "unavailable")
-        || (only_unobserved && (old.4 != 0 || old.6.is_some()))
-    {
+    if !matches!(old.8.as_str(), "pending" | "unavailable") {
         return Ok(false);
     }
+    // A pending usage-log revision does not discharge the lifetime guard.
+    // On body cancellation/EOF, close it now instead of holding capacity until
+    // the sweeper. Existing partial evidence cannot become a synthetic zero.
+    let outcome = if only_unobserved && (old.4 != 0 || old.6.is_some()) {
+        AttemptOutcome::Unknown
+    } else {
+        outcome
+    };
     let reserved = read_attempt_meta(tx, request_id, attempt_id)?
         .map(|meta| meta.reserved())
         .unwrap_or(0);
@@ -2239,6 +2455,50 @@ pub(crate) fn settle_attempt_outcome(
     let settled = settle_outcome_in_tx(&tx, request_id, attempt_id, outcome, true)?;
     tx.commit()?;
     Ok(settled)
+}
+
+/// A Driver may complete several generations inside one downstream request.
+/// Observe each before its buffers are discarded, without creating another
+/// user-invocation log or attributing the final generation to an earlier one.
+pub(crate) fn observe_attempt_tokens(
+    config_dir: &Path,
+    request_id: &str,
+    attempt_id: &str,
+    tokens: ValueTokens,
+    estimated: bool,
+) -> anyhow::Result<bool> {
+    assert_committed(config_dir)?;
+    let mut conn = open_database(&database_path(config_dir), false)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let Some(old) = read_attempt_row(&tx, request_id, attempt_id)? else {
+        return Ok(false);
+    };
+    let scope = serde_json::from_str(&old.0)?;
+    let changed = settle_in_tx(
+        &tx,
+        &Observation {
+            resources: None,
+            request_id,
+            attempt_id,
+            scope: &scope,
+            usage_revision: u64::try_from(old.4)?
+                .checked_add(1)
+                .context("value usage revision overflow")?,
+            effective_model: &old.1,
+            effective_tier: &old.2,
+            reported_model: None,
+            observed_tier: None,
+            tokens: Some(tokens),
+            outcome: if estimated {
+                ObservedOutcome::FinalConservative
+            } else {
+                ObservedOutcome::Final
+            },
+            synthetic: false,
+        },
+    )?;
+    tx.commit()?;
+    Ok(changed)
 }
 /// One request whose settled USD-equivalent value a Share Market trial
 /// budget reads: the attempt rows must belong to this Share, email and contract.
@@ -2365,6 +2625,8 @@ fn sweep_candidates(
         let mut query = connection.prepare(
             "SELECT request_id,attempt_id FROM value_quota_attempts
              WHERE metering_status=?1 AND started_at_ms<?2
+               AND NOT EXISTS(SELECT 1 FROM value_async_tasks t WHERE t.request_id=value_quota_attempts.request_id
+                 AND t.attempt_id=value_quota_attempts.attempt_id AND t.status='pending' AND t.expires_at_ms>CAST(strftime('%s','now') AS INTEGER)*1000)
              ORDER BY started_at_ms LIMIT ?3",
         )?;
         let rows = query.query_map(
@@ -2386,7 +2648,11 @@ fn sweep_one_in_tx(
     use crate::domain::usage::store::UsageLog;
     let still_stale: Option<bool> = tx
         .query_row(
-            "SELECT metering_status IN ('pending','unavailable') FROM value_quota_attempts WHERE request_id=?1 AND attempt_id=?2",
+            "SELECT metering_status IN ('pending','unavailable')
+             AND NOT EXISTS(SELECT 1 FROM value_async_tasks t
+               WHERE t.request_id=value_quota_attempts.request_id AND t.attempt_id=value_quota_attempts.attempt_id
+               AND t.status='pending' AND t.expires_at_ms>CAST(strftime('%s','now') AS INTEGER)*1000)
+             FROM value_quota_attempts WHERE request_id=?1 AND attempt_id=?2",
             params![request, attempt],
             |r| r.get(0),
         )
@@ -2545,10 +2811,17 @@ fn compact_in_tx(tx: &Transaction<'_>, cutoff: i64, now: i64) -> anyhow::Result<
         tx.execute("DELETE FROM value_quota_revisions WHERE request_id=?1 AND attempt_id=?2 AND usage_revision<
             (SELECT usage_revision FROM value_quota_attempts WHERE request_id=?1 AND attempt_id=?2)",params![request,attempt])?;
         tx.execute("UPDATE value_quota_attempts SET frozen_tariff_json='null',compacted_at_ms=?3 WHERE request_id=?1 AND attempt_id=?2",params![request,attempt,now])?;
-        tx.execute(
-            "DELETE FROM meta WHERE key=?1",
-            [attempt_meta_key(request, attempt)?],
-        )?;
+        // Late async/media observations still need their original resource
+        // plan after tariff compaction; retain this small immutable fact.
+        let resources = read_attempt_meta(tx, request, attempt)?
+            .and_then(|meta| meta.resource_plan)
+            .is_some_and(|plan| !plan.quantities.is_empty() || !plan.text_tokens);
+        if !resources {
+            tx.execute(
+                "DELETE FROM meta WHERE key=?1",
+                [attempt_meta_key(request, attempt)?],
+            )?;
+        }
     }
     Ok(rows.len())
 }
@@ -2588,6 +2861,7 @@ pub(crate) fn diagnostics(dir: &Path, share_id: &str) -> anyhow::Result<serde_js
 mod tests {
     use super::*;
     include!("value_quota/tariff_tests.rs");
+    include!("value_quota/resource_tests.rs");
     /// 2M tokens at $1/M = $2: larger than the $1 fixture limit, so the
     /// bounded reservation equals the remaining capacity.
     const ESTIMATE: RiskEstimate = RiskEstimate {
@@ -2654,6 +2928,7 @@ mod tests {
             admit_in_tx(
                 &tx,
                 &Admission {
+                    resource_plan: None,
                     enforce: true,
                     scope: &scope,
                     window: &window,
@@ -2673,6 +2948,7 @@ mod tests {
             settle_in_tx(
                 &tx,
                 &Observation {
+                    resources: None,
                     request_id: "reported-model",
                     attempt_id: "1",
                     scope: &scope,
@@ -2743,6 +3019,7 @@ mod tests {
                 let result = admit_in_tx(
                     &tx,
                     &Admission {
+                        resource_plan: None,
                         enforce: true,
                         scope: &scope,
                         window: &window,
@@ -2825,6 +3102,7 @@ mod tests {
             admit_in_tx(
                 &tx,
                 &Admission {
+                    resource_plan: None,
                     enforce: false,
                     scope: &scope,
                     window: &lifetime,
@@ -2844,6 +3122,7 @@ mod tests {
             settle_in_tx(
                 &tx,
                 &Observation {
+                    resources: None,
                     scope: &scope,
                     request_id: &request,
                     reported_model: None,
@@ -2936,6 +3215,7 @@ mod tests {
     fn value_quota_compaction_keeps_deduplication_and_accepts_exact_late_revisions() {
         let (mut conn, scope, window, quota, revision) = setup();
         let a = Admission {
+            resource_plan: None,
             enforce: true,
             scope: &scope,
             window: &window,
@@ -2956,6 +3236,7 @@ mod tests {
             settle_in_tx(
                 &tx,
                 &Observation {
+                    resources: None,
                     scope: &scope,
                     request_id: a.request_id,
                     reported_model: None,
@@ -2988,6 +3269,7 @@ mod tests {
         );
         admit_in_tx(&tx, &a).unwrap();
         let o = Observation {
+            resources: None,
             scope: &scope,
             request_id: a.request_id,
             reported_model: None,
@@ -3111,6 +3393,7 @@ mod tests {
         admit_in_tx(
             &tx,
             &Admission {
+                resource_plan: None,
                 enforce: true,
                 scope: &scope,
                 window: &window,
@@ -3365,6 +3648,7 @@ mod tests {
         admit_in_tx(
             &tx,
             &Admission {
+                resource_plan: None,
                 enforce: true,
                 scope: &scope,
                 window: &window,
@@ -3384,6 +3668,7 @@ mod tests {
         settle_in_tx(
             &tx,
             &Observation {
+                resources: None,
                 request_id: "used",
                 reported_model: None,
                 attempt_id: "1",
@@ -3457,6 +3742,7 @@ mod tests {
         )
         .unwrap();
         let admission = |request_id, scope| Admission {
+            resource_plan: None,
             enforce: true,
             scope,
             window: &window,
@@ -3618,6 +3904,7 @@ mod tests {
             models: BTreeMap::from([(
                 "model".into(),
                 ExecutionModelPrice {
+                    resources: Default::default(),
                     context_input_basis: ContextInputBasis::RawInput,
                     long_context_threshold: None,
                     long_context_inclusive: false,
@@ -3644,6 +3931,7 @@ mod tests {
     fn durable_risk_and_revision_idempotency_survive_policy_changes() {
         let (mut conn, scope, window, quota, revision) = setup();
         let a = Admission {
+            resource_plan: None,
             enforce: true,
             scope: &scope,
             window: &window,
@@ -3676,6 +3964,7 @@ mod tests {
             .is_err());
         }
         let o = Observation {
+            resources: None,
             request_id: "r1",
             reported_model: None,
             attempt_id: "0",
@@ -3744,6 +4033,7 @@ mod tests {
             settle_in_tx(
                 &tx,
                 &Observation {
+                    resources: None,
                     usage_revision: 2,
                     tokens: Some(ValueTokens {
                         fresh_input: 10,
@@ -3764,6 +4054,7 @@ mod tests {
     fn missing_usage_charges_reserved_risk_conservatively_and_cross_scope_reuse_fails() {
         let (mut conn, scope, window, quota, revision) = setup();
         let a = Admission {
+            resource_plan: None,
             enforce: true,
             scope: &scope,
             window: &window,
@@ -3783,6 +4074,7 @@ mod tests {
         settle_in_tx(
             &tx,
             &Observation {
+                resources: None,
                 request_id: "r1",
                 reported_model: None,
                 attempt_id: "0",
@@ -3813,6 +4105,7 @@ mod tests {
     fn report_cleanup_and_old_window_revisions_do_not_reset_current_usage() {
         let (mut conn, scope, window, quota, revision) = setup();
         let a = Admission {
+            resource_plan: None,
             enforce: true,
             scope: &scope,
             window: &window,
@@ -3854,6 +4147,7 @@ mod tests {
         let (mut conn, scope, window, quota, revision) = setup();
         let tx = conn.transaction().unwrap();
         let base = Admission {
+            resource_plan: None,
             enforce: true,
             scope: &scope,
             window: &window,
@@ -3928,6 +4222,7 @@ mod tests {
         let (mut conn, scope, window, quota, revision) = setup();
         let tx = conn.transaction().unwrap();
         let a = Admission {
+            resource_plan: None,
             enforce: true,
             scope: &scope,
             window: &window,
@@ -3972,6 +4267,7 @@ mod tests {
         assert!(settle_in_tx(
             &tx,
             &Observation {
+                resources: None,
                 request_id: "unknown",
                 attempt_id: "1",
                 scope: &scope,
@@ -4024,6 +4320,7 @@ mod tests {
     fn value_quota_log_outcomes_classify_errors_interruptions_and_retries() {
         let (_, scope, _, _, _) = setup();
         let meta = AttemptMeta {
+            resource_plan: None,
             input_tokens: 100,
             output_tokens: 50,
             reserved_picos: "1".into(),
@@ -4032,7 +4329,7 @@ mod tests {
         error.status_code = 529;
         assert_eq!(
             classify_log(&error, "model", "standard", Some(&meta), false).0,
-            ObservedOutcome::Free
+            ObservedOutcome::Unknown
         );
         let mut cut = log_for(&scope, "i");
         cut.is_streaming = true;
@@ -4057,7 +4354,7 @@ mod tests {
         retried.usage_state = crate::domain::usage::store::UsageState::Observed;
         assert_eq!(
             classify_log(&retried, "model", "standard", None, false).0,
-            ObservedOutcome::FinalConservative
+            ObservedOutcome::Final
         );
         retried.attempt_count = 1;
         retried.actual_model = Some("other".into());
@@ -4085,6 +4382,7 @@ mod tests {
             admit_in_tx(
                 &tx,
                 &Admission {
+                    resource_plan: None,
                     enforce: true,
                     scope: &scope,
                     window: &window,
@@ -4158,6 +4456,7 @@ mod tests {
         let (mut conn, scope, window, quota, revision) = setup();
         let tx = conn.transaction().unwrap();
         let admission = |request_id, attempt_id| Admission {
+            resource_plan: None,
             enforce: true,
             scope: &scope,
             window: &window,
@@ -4231,6 +4530,7 @@ mod tests {
         admit_in_tx(
             &tx,
             &Admission {
+                resource_plan: None,
                 enforce: true,
                 scope: &scope,
                 window: &window,
@@ -4296,7 +4596,7 @@ mod tests {
         log.failure_kind = None;
         assert_eq!(
             classify_log(&log, "model", "standard", None, false).0,
-            ObservedOutcome::Free
+            ObservedOutcome::Unknown
         );
         log.input_tokens = Some(10);
         let (outcome, tokens, _) = classify_log(&log, "model", "standard", None, false);
@@ -4311,6 +4611,7 @@ mod tests {
             admit_in_tx(
                 &tx,
                 &Admission {
+                    resource_plan: None,
                     enforce: true,
                     scope: &scope,
                     window: &window,
@@ -4387,6 +4688,7 @@ mod tests {
             admit_in_tx(
                 &tx,
                 &Admission {
+                    resource_plan: None,
                     enforce: true,
                     scope: &scope,
                     window: w,

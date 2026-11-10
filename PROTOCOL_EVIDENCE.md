@@ -3031,3 +3031,11 @@ Server 在 Buddy 共用 SSE 解码器中按本次生成请求的工具 schema �
 参考快照：workbuddy2api-hub `269385d` 的 wb_proxy.py 与 Anthropic 测试、cli2api `da74ec3` 的 internal/providers/workbuddy/sse.go；其宽松索引规则未迁入。Hub 的 Bash cmd fixture 不等于 Claude CLI required command 合同。此改动不添加重试、指令猜测、模型切换或账号切换。真实 Claude CLI 验收与发布仍待独立完成。
 
 本次最终独立快照验证：Rust 全套 4360 passed / 3 ignored，含 8 项参数/关联/内存底层测试与双产品 Claude 流式/非流式 Bash HTTP 回环矩阵；Node 审计 2135 passed。格式（含 include! 文件）、Provider 覆盖和 UI 矩阵检查通过。cargo check 通过；本地 smoke 在 Cargo 启动锁超时后改用已构建候选二进制并保留原断言通过。离线 readiness failures=0，真实输入与部署未验证，状态仍 blocked_inputs。无远程部署或真实 CLI 执行验收。
+
+## 2026-11-10 全供应商美元等值计量
+
+依据为本仓 Provider Registry 与现有 Driver/传输实现、Router `PROTOCOL.md §13.4`，未增加外部仓库输入或新的 Provider 转发能力。金额支持不依赖凭据类别；所有已支持绑定使用同一个 durable ledger，专用 Driver 提供模型与用量，未知结果不能伪造为零。生成的 `assets/contract/value-metering-coverage.json` 记录 99 个 Profile/Driver 组合的静态生命周期策略；该清单不等同逐组合真实验收。
+
+已实现文本 v10/api-equivalent-v1、资源 v11/api-equivalent-v2 的显式协商，signed fetch 声明支持策略、ACK/active 上报 schema 5；旧授权不自动迁移。资源价目保留整数 picos、不可变修订和审计，媒体异步终态回写原生成。原始 audio/token/tool 证据与版本化 conservative 资源界限分开记录。
+
+本轮仅运行编译、类型、格式和静态审计，不运行本地产品测试、浏览器、真实模型请求。CI 回归与生产灰度仍待执行，全部真实验收 live_pending；未部署。详细规则见 `docs/share/universal-value-metering.md`。

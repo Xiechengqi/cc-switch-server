@@ -167,6 +167,7 @@ pub(crate) async fn execute(
     execution: &ProviderExecution,
     route: ProxyRoute,
     body: Bytes,
+    value_attempt: Option<&crate::state::ValueAttemptGuard>,
 ) -> Result<WebSessionForwardResult, ProxyError> {
     let driver_id = execution.plan.driver_id.as_str();
     let kind = WebSessionKind::for_driver(driver_id)
@@ -264,12 +265,18 @@ pub(crate) async fn execute(
             .header("x-request-id", &request_id),
     };
 
+    if let Some(attempt) = value_attempt {
+        attempt.mark_sent();
+    }
     let response = request_builder
         .timeout(execution.request_timeout())
         .send()
         .await
         .map_err(|error| network_error("send", error))?;
     let status = response.status();
+    if let Some(attempt) = value_attempt {
+        attempt.mark_upstream_status(status.as_u16());
+    }
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         state
             .invalidate_web_session_authentication(&scope)

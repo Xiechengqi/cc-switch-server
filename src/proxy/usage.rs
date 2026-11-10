@@ -133,6 +133,7 @@ pub(super) async fn update_stream_usage(
         false,
         None,
         None,
+        None,
         stream_status,
     )
     .await;
@@ -160,6 +161,7 @@ pub(super) async fn update_stream_usage_result(
         result.parse_error,
         result.usage_estimated,
         Some(result.response_model),
+        result.resources,
         (result.streamed_text_bytes > 0).then_some(result.streamed_text_bytes),
         stream_status,
     )
@@ -178,6 +180,7 @@ async fn update_stream_usage_with_parse_status(
     usage_parse_error: bool,
     usage_estimated: bool,
     response_model: Option<ResponseModelEvidence>,
+    resources: Option<crate::domain::usage::value_pricing::ResourceUsage>,
     streamed_text_bytes: Option<u64>,
     stream_status: Option<&str>,
 ) {
@@ -185,6 +188,9 @@ async fn update_stream_usage_with_parse_status(
         .update_usage_log(request_id, |log| {
             if let Some(evidence) = &response_model {
                 evidence.apply(log);
+            }
+            if resources.is_some() {
+                log.value_resources = resources.clone();
             }
             if streamed_text_bytes.is_some() {
                 log.value_streamed_text_bytes = streamed_text_bytes;
@@ -246,6 +252,7 @@ pub(super) async fn update_image_stream_usage(
     stream_status: &str,
     error_message: Option<&str>,
     image: Option<ImageUsageMetadata>,
+    raw: Option<StreamUsageResult>,
 ) {
     let persisted = state
         .update_usage_log(request_id, |log| {
@@ -255,10 +262,15 @@ pub(super) async fn update_image_stream_usage(
                 duration_ms,
                 first_token_ms,
                 usage,
-                false,
-                false,
+                raw.as_ref().is_some_and(|result| result.parse_error),
+                raw.as_ref().is_some_and(|result| result.usage_estimated),
                 Some(stream_status),
             );
+            if let Some(raw) = &raw {
+                raw.response_model.apply(log);
+                log.value_resources = raw.resources.clone();
+                log.value_streamed_text_bytes = Some(raw.streamed_text_bytes);
+            }
             let next_error = error_message.map(str::to_string);
             router_visible_changed |= log.error_message != next_error;
             log.error_message = next_error;
@@ -319,6 +331,7 @@ pub(super) async fn update_websocket_stream_usage(
     usage: TokenUsage,
     stream_status: &str,
     error_message: Option<&str>,
+    raw: Option<StreamUsageResult>,
 ) {
     let persisted = state
         .update_usage_log(request_id, |log| {
@@ -328,10 +341,15 @@ pub(super) async fn update_websocket_stream_usage(
                 duration_ms,
                 first_token_ms,
                 usage,
-                false,
-                false,
+                raw.as_ref().is_some_and(|result| result.parse_error),
+                raw.as_ref().is_some_and(|result| result.usage_estimated),
                 Some(stream_status),
             );
+            if let Some(raw) = &raw {
+                raw.response_model.apply(log);
+                log.value_resources = raw.resources.clone();
+                log.value_streamed_text_bytes = Some(raw.streamed_text_bytes);
+            }
             let next_error = error_message.map(str::to_string);
             router_visible_changed |= log.error_message != next_error;
             log.error_message = next_error;

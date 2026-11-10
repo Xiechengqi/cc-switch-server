@@ -1233,9 +1233,9 @@
           "sqlite_authority": "Server の SQLite がまだ正式なストレージではありません。設定 → 一般 → データストレージ で移行してください。",
           "metering_storage": "計量ストレージが異常です。Server ストレージを確認・復旧してください。",
           "acknowledged_tariff": "Server が現在の USD 料金表をまだ確認していません。通常 1 分以内に完了します。",
-          "text_surface": "この実行バインディングはテキスト金額計量で未検証です：",
+          "text_surface": "この実行設定では操作を実行できません。Profile、Driver、有効な API を確認してください：",
           "model_price_coverage": "実行モデルの有効な価格がありません。Router 設定で価格を設定するか、新しい料金表の有効化を待ってください。",
-          "model_unresolved": "WorkBuddy は auto/default ではなく具体的なモデルを選び、Router 設定で価格を設定してください。不透明なルーティング別名は安全に課金できません。",
+          "model_unresolved": "具体的な実行モデルまたは正確な価格マッピングを設定してください。auto/default には明示的な対象が必要です。",
           "offline": "Server に接続できません。接続を回復してから再確認してください。",
           "timeout": "Server が時間内に応答しませんでした。再試行してください。",
           "controlAuth": "現在のセッションにはこの確認の権限がありません。再ログインしてください。",
@@ -1248,13 +1248,16 @@
             "metering_storage": "計測ストレージに問題があります",
             "tariff_published": "Router の料金表が未生成です",
             "acknowledged_tariff": "Server の料金表確認を待っています",
-            "text_surface": "USD 計測に未対応の Provider があります",
-            "model_price_coverage": "実行モデルの価格が未準備です"
+            "text_surface": "実行設定の確認が必要",
+            "model_price_coverage": "実行モデルの価格が未準備です",
+            "resource_metering": "リソース料金表または更新が必要"
           },
           "more": "ほか {{count}} 件",
           "waitingOn": "先に解決が必要：{{blocker}}",
           "openStorage": "ストレージ設定を開く",
-          "opensNewTab": "（新しいタブで開きます）"
+          "opensNewTab": "（新しいタブで開きます）",
+          "resource_metering": "プロトコル v11 と有効なリソース料金表が必要です。Router と Server を更新し、料金表の配信を確認してください。",
+          "resource_unpriced": "実行モデルが使う各リソースに価格を設定してください。未設定の価格は無料になりません。"
         },
         "remaining": "残りの換算使用量：{{amount}}",
         "exhausted": "上限に達しました",
@@ -1312,12 +1315,13 @@
           "ready": "適用できます",
           "scheduled_next_window": "次の完全な期間から開始",
           "metered_from_now": "今から計測",
-          "unverified_surface": "この Share のランタイムバインディングが米ドル計測向けに検証されていません。",
+          "unverified_surface": "Share の Profile、Driver、有効な API を確認してください。",
           "pricing_unavailable": "この Share のモデルを含む確認済みの価格表がまだありません。",
           "storage_unavailable": "Server の計測ストレージが利用できません。",
           "router_upgrade_required": "米ドル上限を使うには Router と Server をアップグレードしてください。",
           "blocked_needs_reconcile": "このユーザーの米ドル使用量を先に調整してください（使用量列の「今すぐ調整」）。",
-          "invalid_policy": "この上限または期間は米ドル上限に使用できません。"
+          "invalid_policy": "この上限または期間は米ドル上限に使用できません。",
+          "resource_upgrade_required": "Router と Server を更新し、リソース料金表を有効にしてください。"
         },
         "rowReason": "{{email}}：{{reason}}",
         "usageEditUnavailable": "米ドル上限のユーザーには消費トークンを設定できません。使用量列の「今すぐ調整」を使ってください。",
@@ -1346,10 +1350,12 @@
         "details": "米ドル上限の詳細",
         "scheduledLine": "→ {{date}} から {{amount}}",
         "scheduledHint": "米ドル換算の上限が予定されています。それまでは現在のポリシーと使用量が有効で、単位間で使用量が換算されることはありません。",
-        "usdDisabledReason": "USD 換算は、USD 枠の準備チェックがすべて通過するまで利用できません。",
+        "usdDisabledReason": "USD 枠を選択できます。適用前に表示された設定を確認してください。",
         "invalidRows": "{{count}} 人のユーザーはこの USD 枠を使用できません：",
         "malformed": "このユーザーの USD 枠データを読み取れないため、読み取り専用で表示し、変更しません。",
-        "malformedSave": "{{email}} の USD 枠を読み取れません。保存する前に再読み込みするか、このユーザーを削除してください。"
+        "malformedSave": "{{email}} の USD 枠を読み取れません。保存する前に再読み込みするか、このユーザーを削除してください。",
+        "resources": "画像・音声・動画・有料ツールを含める",
+        "resourcesHint": "リソース価格の設定と Server の更新が必要です。既存のテキスト枠の価格は維持されます。"
       },
       "accountReset": {
         "label": "アカウントのリセット周期",

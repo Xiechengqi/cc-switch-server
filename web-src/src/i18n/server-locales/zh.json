@@ -1233,9 +1233,9 @@
           "sqlite_authority": "Server 尚未以 SQLite 作为权威存储，请在 设置 → 通用 → 数据存储 中完成迁移。",
           "metering_storage": "计量存储异常，请检查并恢复 Server 存储。",
           "acknowledged_tariff": "Server 尚未确认当前美元额度价目，通常一分钟内完成。",
-          "text_surface": "此运行时绑定尚未通过文本金额计量验证：",
+          "text_surface": "此运行时绑定无法执行配置的操作，请检查 Profile、Driver 与已启用的 API：",
           "model_price_coverage": "实际执行模型尚无已生效价格，请在 Router 设置中定价，或等待新价目激活。",
-          "model_unresolved": "请为 WorkBuddy 选择具体模型（不用 auto/default），并在 Router 设置中定价。不透明的路由别名无法安全计价。",
+          "model_unresolved": "请选择具体的实际执行模型，或配置精确价格映射；auto/default 等别名需要明确目标。",
           "offline": "无法连接 Server，恢复连接后再检查。",
           "timeout": "Server 响应超时，请重试。",
           "controlAuth": "当前会话无权执行此检查，请重新登录。",
@@ -1248,13 +1248,16 @@
             "metering_storage": "计量存储异常",
             "tariff_published": "Router 价目尚未生成",
             "acknowledged_tariff": "等待 Server 确认价目",
-            "text_surface": "有 Provider 不支持美元计量",
-            "model_price_coverage": "执行模型价格尚未就绪"
+            "text_surface": "运行时绑定需要配置",
+            "model_price_coverage": "执行模型价格尚未就绪",
+            "resource_metering": "资源价目未激活或需要升级"
           },
           "more": "+{{count}} 项",
           "waitingOn": "需先解决：{{blocker}}",
           "openStorage": "前往存储设置",
-          "opensNewTab": "（在新标签页打开）"
+          "opensNewTab": "（在新标签页打开）",
+          "resource_metering": "资源计量正在等待协议 v11 和已激活的资源价目。请升级 Router、Server 并检查价目下发状态。",
+          "resource_unpriced": "请为实际执行模型使用的每项资源配置明确价格，缺价不会按免费处理。"
         },
         "remaining": "剩余等值额度：{{amount}}",
         "exhausted": "已耗尽",
@@ -1312,12 +1315,13 @@
           "ready": "可以应用",
           "scheduled_next_window": "下一个完整周期开始生效",
           "metered_from_now": "自现在起计量",
-          "unverified_surface": "该 Share 有运行时绑定尚未通过美元计量验证。",
+          "unverified_surface": "请检查该 Share 的运行时 Profile、Driver 与已启用的 API。",
           "pricing_unavailable": "尚无已确认的价目覆盖该 Share 的模型。",
           "storage_unavailable": "Server 计量存储不可用。",
           "router_upgrade_required": "请升级 Router 和 Server 后再使用美元额度。",
           "blocked_needs_reconcile": "该用户的美元用量需要先校准（在用量列中立即校准）。",
-          "invalid_policy": "该额度或周期不适用于美元额度。"
+          "invalid_policy": "该额度或周期不适用于美元额度。",
+          "resource_upgrade_required": "请升级 Router、Server 并激活资源价目。"
         },
         "rowReason": "{{email}}：{{reason}}",
         "usageEditUnavailable": "美元额度用户不能设置已消耗 Token，请在其用量列中立即校准。",
@@ -1346,10 +1350,12 @@
         "details": "美元额度详情",
         "scheduledLine": "→ {{date}} 起 {{amount}}",
         "scheduledHint": "已安排美元等值额度。在生效前当前策略及其用量继续有效；两种单位之间的用量不会互相折算。",
-        "usdDisabledReason": "美元等值暂不可用，需美元额度的全部就绪检查通过。",
+        "usdDisabledReason": "可选择美元额度；应用前请解决列出的配置问题。",
         "invalidRows": "{{count}} 个用户无法使用该美元额度：",
         "malformed": "无法读取该用户的美元额度数据，已设为只读，不会被修改。",
-        "malformedSave": "无法读取 {{email}} 的美元额度。请重新加载，或移除该用户后再保存。"
+        "malformedSave": "无法读取 {{email}} 的美元额度。请重新加载，或移除该用户后再保存。",
+        "resources": "包含图片、音频、视频与付费工具",
+        "resourcesHint": "需要配置资源价格并升级 Server。已有文本额度继续使用原计价策略。"
       },
       "accountReset": {
         "label": "账号重置周期",

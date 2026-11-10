@@ -75,6 +75,9 @@ jobs:
           cargo test --locked market_termination --lib
           cargo test --locked repository::server_sqlite::schema::tests --lib
           cargo test --locked opening_usd --lib
+          cargo test --locked domain::usage::value_pricing:: --lib
+          cargo test --locked value_quota --lib
+          cargo test --locked workbuddy_value --lib
 
   # The committed web-dist can lag web-src. Generate release assets once and
   # pass exactly those bytes to both architecture builds.
