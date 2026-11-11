@@ -444,7 +444,7 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
 
 #[tokio::test]
 async fn value_quota_deepseek_cached_recovery_admits_each_real_generation() {
-    use crate::domain::usage::value_pricing::{PricingSnapshot, ValueQuota};
+    use crate::domain::usage::value_pricing::PricingSnapshot;
     use crate::repository::server_sqlite::{self, value_quota as ledger};
     let (address, observations, server) =
         spawn_deepseek_session_fixture(DeepSeekSessionFixtureMode::RebuildCachedSession).await;
@@ -468,14 +468,6 @@ async fn value_quota_deepseek_cached_recovery_admits_each_real_generation() {
         .unwrap()
         .unwrap();
     let share_id = "value-deepseek-share";
-    install_antigravity_test_share(
-        &state,
-        share_id,
-        AppKind::Claude,
-        ProviderType::DeepSeekAccount,
-        &provider_id,
-    )
-    .await;
     let config = state.config_snapshot().await;
     let scope = ledger::Scope {
         router_url: config.router_api_base().unwrap().into(),
@@ -505,21 +497,20 @@ async fn value_quota_deepseek_cached_recovery_admits_each_real_generation() {
     )
     .unwrap();
     ledger::activate_snapshot(&state.config_dir, &scope, &revision).unwrap();
+    // Create the USD grant with its Share. Later unit changes require a signed
+    // conversion preview, independently of cached-session recovery.
     state
         .mutate_shares_immediate(|store| {
-            let share = store
-                .shares
-                .iter_mut()
-                .find(|share| share.id == share_id)
-                .unwrap();
-            let grant = share.user_grants.get_mut("owner@example.com").unwrap();
-            grant.policy.token_period =
-                crate::domain::sharing::router_contract::ShareTokenPeriod::Lifetime;
-            grant.policy.parallel_limit = Some(1);
-            grant.policy.value_quota = Some(ValueQuota {
-                limit_usd_micros: "10000000".into(),
-                tariff_policy_id: "api-equivalent-v1".into(),
-            });
+            store.shares.push(serde_json::from_value(json!({
+                "id":share_id,"app":"claude","providerId":provider_id,
+                "providerType":ProviderType::DeepSeekAccount.as_str(),
+                "ownerEmail":"owner@example.com","enabled":true,"status":"active",
+                "bindings":[{"app":"claude","providerId":provider_id,
+                    "providerType":ProviderType::DeepSeekAccount.as_str()}],
+                "userGrants":{"owner@example.com":{"email":"owner@example.com","role":"owner","active":true,
+                    "policy":{"tokenPeriod":"lifetime","parallelLimit":1,
+                        "valueQuota":{"limitUsdMicros":"10000000","tariffPolicyId":"api-equivalent-v1"}}}}
+            })).unwrap());
         })
         .await
         .unwrap();

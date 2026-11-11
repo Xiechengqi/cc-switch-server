@@ -206,23 +206,19 @@ async fn workbuddy_value_setup(
     )
     .unwrap();
     ledger::activate_snapshot(&state.config_dir, &scope, &revision).unwrap();
-    install_codebuddy_share(
-        &state,
-        "workbuddy-value-share",
-        route.app(),
-        &provider,
-        "owner@example.com",
-    )
-    .await;
+    // The monetary fixture starts with USD enabled when its Share is created.
     state
         .mutate_shares_immediate(|shares| {
-            shares.shares[0]
-                .user_grants
-                .get_mut("owner@example.com")
-                .unwrap()
-                .policy = serde_json::from_value(json!({"tokenPeriod":"lifetime",
-            "valueQuota":{"limitUsdMicros":limit,"tariffPolicyId":"api-equivalent-v1"}}))
-            .unwrap();
+            shares.shares.push(serde_json::from_value(json!({
+                "id":"workbuddy-value-share","app":route.app(),"providerId":provider,
+                "providerType":ProviderType::WorkBuddyOAuth.as_str(),
+                "ownerEmail":"owner@example.com","enabled":true,"status":"active",
+                "bindings":[{"app":route.app(),"providerId":provider,
+                    "providerType":ProviderType::WorkBuddyOAuth.as_str()}],
+                "userGrants":{"owner@example.com":{"email":"owner@example.com","role":"owner","active":true,
+                    "policy":{"tokenPeriod":"lifetime",
+                        "valueQuota":{"limitUsdMicros":limit,"tariffPolicyId":"api-equivalent-v1"}}}}
+            })).unwrap());
         })
         .await
         .unwrap();

@@ -1266,11 +1266,10 @@ impl ServerStateInner {
                 let old = old_share.and_then(|s| s.user_grants.get(email));
                 let original = grant.clone();
                 let requested = grant.policy.clone();
+                // Manually applying a pending policy is still an owner edit.
+                // Background activation starts with the current policy unchanged.
                 let user_edit = converted.contains(&(share.id.clone(), email.clone()))
-                    || old.is_none_or(|g| {
-                        (!g.active || g.policy != requested)
-                            && g.pending_value_quota.as_ref().map(|p| &p.policy) != Some(&requested)
-                    });
+                    || old.is_none_or(|g| !g.active || g.policy != requested);
                 if user_edit && grant.policy.value_quota.is_some() {
                     require_prices()?;
                 }

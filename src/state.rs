@@ -34056,6 +34056,8 @@ mod tests {
             .unwrap();
         let before = state.shares.read().await.clone();
         let grant = &before.get("value-share").unwrap().user_grants["owner@example.com"];
+        assert_eq!(grant.policy.token_limit, Some(100));
+        assert!(grant.policy.value_quota.is_none());
         state.mutate_shares_immediate(|_| {}).await.unwrap();
         assert_eq!(
             state
@@ -34067,21 +34069,58 @@ mod tests {
                 .user_grants["owner@example.com"],
             *grant
         );
-        let mut unsigned = before.clone();
-        unsigned
-            .shares
-            .iter_mut()
-            .find(|s| s.id == "value-share")
-            .unwrap()
-            .user_grants
-            .get_mut("owner@example.com")
-            .unwrap()
-            .policy = grant.pending_value_quota.as_ref().unwrap().policy.clone();
+        let mut early = before.clone();
+        state
+            .prepare_value_bindings_at(&mut early, &before, boundary - 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            early.get("value-share").unwrap().user_grants["owner@example.com"],
+            *grant
+        );
+        for at in [boundary - 1, boundary] {
+            let mut unsigned = before.clone();
+            unsigned
+                .shares
+                .iter_mut()
+                .find(|s| s.id == "value-share")
+                .unwrap()
+                .user_grants
+                .get_mut("owner@example.com")
+                .unwrap()
+                .policy = grant.pending_value_quota.as_ref().unwrap().policy.clone();
+            let error = state
+                .prepare_value_bindings_at(&mut unsigned, &before, at)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "QUOTA_CONVERSION_PREVIEW_REQUIRED");
+        }
         let error = state
-            .prepare_value_bindings_at(&mut unsigned, &before, now_ms_i64())
+            .mutate_shares_immediate(|store| {
+                store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "value-share")
+                    .unwrap()
+                    .user_grants
+                    .get_mut("owner@example.com")
+                    .unwrap()
+                    .policy = grant.pending_value_quota.as_ref().unwrap().policy.clone();
+            })
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("PREVIEW_REQUIRED"));
+        assert_eq!(error.to_string(), "QUOTA_CONVERSION_PREVIEW_REQUIRED");
+        for unchanged in [
+            state.shares.read().await.clone(),
+            crate::repository::server_sqlite::load_authoritative(&state.config_dir)
+                .unwrap()
+                .shares,
+        ] {
+            assert_eq!(
+                unchanged.get("value-share").unwrap().user_grants["owner@example.com"],
+                *grant
+            );
+        }
         let mut after = before.clone();
         state
             .prepare_value_bindings_at(&mut after, &before, boundary)
