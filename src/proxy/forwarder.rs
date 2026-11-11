@@ -2523,14 +2523,21 @@ async fn forward_with_attempt_inner(
                 ));
             }
         };
-        // Only enforced USD-equivalent grants are metered (no Token shadow).
-        let value_metering = if let Some(share_id) = request_context.share_id.as_deref() {
+        // USD enforcement is distinct from durable unit-independent evidence.
+        let value_enforced = if let Some(share_id) = request_context.share_id.as_deref() {
             state
                 .share_uses_value_quota(share_id, request_context.user_email.as_deref())
                 .await
         } else {
             false
         } && route != ProxyRoute::ClaudeCountTokens
+            && !(route == ProxyRoute::Gemini
+                && gemini_path
+                    .as_deref()
+                    .is_some_and(|path| path.rsplit(':').next() == Some("countTokens")));
+        let value_metering = request_context.share_id.is_some()
+            && request_context.user_email.is_some()
+            && route != ProxyRoute::ClaudeCountTokens
             && !(route == ProxyRoute::Gemini
                 && gemini_path
                     .as_deref()
@@ -2553,7 +2560,7 @@ async fn forward_with_attempt_inner(
                     Some("generateContent" | "streamGenerateContent")
                 )
             }));
-        if value_metering && !value_text_capable {
+        if value_enforced && !value_text_capable {
             return Err(ProxyError{status:StatusCode::SERVICE_UNAVAILABLE,
                 message:"quota_unavailable: the configured runtime binding cannot execute this operation".into()});
         }
@@ -2973,7 +2980,7 @@ async fn forward_with_attempt_inner(
             }
             return Box::pin(forward_codebuddy(CodeBuddyForwardOptions {
                 state,
-                value_metering,
+                value_metering: value_enforced,
                 execution,
                 stored,
                 adapter,
@@ -12579,21 +12586,12 @@ impl ResponsesWebsocketUsageTurn {
         })
     }
 
-    async fn admit_generation(&mut self, body: &Value) -> Result<(), ProxyError> {
+    async fn admit_generation(&mut self, body: &Value, body_len: usize) -> Result<(), ProxyError> {
         // Reconnecting to an existing response does not call this method.
         // Every actual new generation, including HTTP fallback, does.
-        // Keep non-USD turns out of monetary serialization and persistence.
-        // The upstream handshake has completed, so serializing a large frame
-        // here would block control frames and cancellation on the bridge.
-        let value_metering = match (
-            self.request_context.share_id.as_deref(),
-            self.request_context.user_email.as_deref(),
-        ) {
-            (Some(share), Some(email)) => {
-                self.state.share_uses_value_quota(share, Some(email)).await
-            }
-            _ => false,
-        };
+        // Every generation records evidence and re-reads the current policy.
+        let value_metering =
+            self.request_context.share_id.is_some() && self.request_context.user_email.is_some();
         if !value_metering {
             return Ok(());
         }
@@ -12635,18 +12633,34 @@ impl ResponsesWebsocketUsageTurn {
             .checked_add(1)
             .ok_or_else(|| ProxyError::bad_gateway("monetary attempt identity exhausted"))?;
         self.request_context.attempt_count = Some(self.generation_count);
-        let payload = serde_json::to_vec(body).map_err(ProxyError::bad_gateway)?;
+        // Reuse the parsed frame and wire size. Re-serializing/re-parsing a
+        // large Token frame here delays WebSocket Ping/cancel processing.
+        let estimate =
+            crate::domain::usage::value_pricing::RiskEstimate::from_request(body_len, Some(body));
+        let plan = crate::domain::usage::value_pricing::resource_request_plan(
+            body,
+            self.request_context.operation,
+        );
+        let tier = crate::domain::usage::value_pricing::canonical_service_tier(
+            body.get("service_tier")
+                .and_then(Value::as_str)
+                .or(self.request_context.effective_service_tier.as_deref()),
+        );
         let model = codex_model_from_value(body)
             .or_else(|| self.sent_model.clone())
             .unwrap_or_default();
-        self.value_attempt = super::value_metering::admit_prepared(
-            &self.state,
-            &self.request_context,
-            &model,
-            &payload,
-            true,
-        )
-        .await?;
+        self.value_attempt = self
+            .state
+            .admit_share_value_request(
+                &self.request_context,
+                &model,
+                tier,
+                estimate,
+                true,
+                Some(plan),
+            )
+            .await
+            .map_err(value_quota_proxy_error)?;
         self.sent_model = Some(model);
         if self.generation_count > 1 {
             self.usage = TokenUsage::default();
@@ -13972,7 +13986,7 @@ async fn bridge_responses_websocket_inner(
                 }
                 if starts_response {
                     if let (Some(turn), Some(body)) = (active_usage_turn.as_mut(), active_response_body.as_ref()) {
-                        turn.admit_generation(body).await?;
+                        turn.admit_generation(body, websocket_message_payload_len(&message)).await?;
                     }
                 }
                 let send_result = {
@@ -14801,7 +14815,7 @@ async fn bridge_responses_websocket_inner(
                         budget.set_timing(next);
                     }
                     if let (Some(turn), Some(body)) = (active_usage_turn.as_mut(), active_response_body.as_ref()) {
-                        turn.admit_generation(body).await?;
+                        turn.admit_generation(body, websocket_message_payload_len(&retry_message)).await?;
                     }
                     let retry_send = send_responses_upstream_while_serving_downstream(
                         &entry
@@ -16101,9 +16115,10 @@ fn run_codex_websocket_http_fallback<'a>(
                             .map_err(|error| error.into_proxy_error())
                     })
                     .transpose()?;
-                build_codex_http_fallback_request(target).map(|request| (request, memory))
+                let body_len = target.body.len();
+                build_codex_http_fallback_request(target).map(|request| (request, memory, body_len))
             });
-            let ((request, rejected_access_token), _fallback_request_memory) =
+            let ((request, rejected_access_token), _fallback_request_memory, fallback_body_len) =
                 match prepared_request {
                     Ok(prepared) => prepared,
                     Err(error) => {
@@ -16143,7 +16158,8 @@ fn run_codex_websocket_http_fallback<'a>(
             }
             let send_timing = timing.clone();
             if let Some(turn) = active_usage_turn.as_mut() {
-                turn.admit_generation(response_body).await?;
+                turn.admit_generation(response_body, fallback_body_len)
+                    .await?;
             }
             let send_future = async move {
                 let _wait = send_timing

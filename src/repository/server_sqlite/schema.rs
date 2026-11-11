@@ -95,7 +95,7 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
         hex::encode(Sha256::digest(include_bytes!("value_quota_schema.sql")))
     );
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    anyhow::ensure!((1..=5).contains(&version),
+    anyhow::ensure!((1..=6).contains(&version),
         "unsupported Server SQLite schema {version}; use a matching Server binary/backup (never downgrade)");
     let checksum: String = connection.query_row(
         "SELECT checksum FROM schema_migrations WHERE version=1",
@@ -228,6 +228,37 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
         checksum == resource_checksum,
         "Server SQLite v5 migration checksum mismatch"
     );
+    let conversion_checksum = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(include_bytes!(
+            "quota_conversion_schema.sql"
+        )))
+    );
+    if version < 6 {
+        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> anyhow::Result<()> {
+            connection.execute_batch(include_str!("quota_conversion_schema.sql"))?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES(6,'quota_unit_conversion',0,?1)",
+                [&conversion_checksum],
+            )?;
+            connection.execute_batch("PRAGMA user_version=6; COMMIT;")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = connection.execute_batch("ROLLBACK;");
+        }
+        result.context("migrate Server SQLite to v6 quota conversion")?;
+    }
+    let checksum: String = connection.query_row(
+        "SELECT checksum FROM schema_migrations WHERE version=6",
+        [],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        checksum == conversion_checksum,
+        "Server SQLite v6 migration checksum mismatch"
+    );
     Ok(())
 }
 
@@ -239,7 +270,7 @@ mod tests {
     fn quota_v1_migration_is_idempotent_and_preserves_original_checksum() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
-        connection.execute_batch("DROP TABLE market_settlement_ack_outbox; DROP TABLE market_settlement_receipts; DROP TABLE market_settlement_requests; DELETE FROM meta WHERE key='market_settlement_since_ms';
+        connection.execute_batch("DROP TABLE quota_metering_facts; DROP TABLE quota_history_preparations; DROP TABLE quota_conversion_receipts; DROP TABLE quota_adjustment_mappings; DROP TABLE quota_shadow_intervals; DROP INDEX usage_records_quota_backfill_idx; DROP TABLE market_settlement_ack_outbox; DROP TABLE market_settlement_receipts; DROP TABLE market_settlement_requests; DELETE FROM meta WHERE key='market_settlement_since_ms';
             DROP TABLE value_async_tasks;
             DROP TABLE value_quota_revisions; DROP TABLE value_quota_attempts;
             DROP TABLE value_quota_checkpoints;

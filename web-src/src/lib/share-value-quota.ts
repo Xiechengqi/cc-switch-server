@@ -55,13 +55,17 @@ export function valueUsageLabel(picos: string | null | undefined): string {
 }
 
 export const VALUE_REASON_CODES = ["ready", "scheduled_next_window", "metered_from_now", "unverified_surface", "pricing_unavailable",
-  "storage_unavailable", "router_upgrade_required", "blocked_needs_reconcile", "invalid_policy", "resource_upgrade_required"] as const;
+  "storage_unavailable", "router_upgrade_required", "blocked_needs_reconcile", "invalid_policy", "resource_upgrade_required", "history_incomplete", "history_preparing", "pending_evidence_missing", "conversion_upgrade_required"] as const;
 export type ValueReasonCode = (typeof VALUE_REASON_CODES)[number];
 const BLOCKING_CODES = new Set<string>(VALUE_REASON_CODES.slice(3));
 export function valueReasonCode(code: unknown): ValueReasonCode | undefined {
   return VALUE_REASON_CODES.find((known) => known === code);
 }
-export type ValuePreviewRow = { email: string; effectiveFromMs: number; meteredFromMs?: number; usedPicos?: string | null;
+export type ValuePreviewRow = {
+  conversionRequired?: boolean; conversionCredential?: string; credentialExpiresAtMs?: number; calibrationRequired?: boolean;
+  sourceUnit?: "tokens" | "usdEquivalent"; targetUnit?: "tokens" | "usdEquivalent";
+  tokenLimit?: number | null; limitUsdMicros?: string | null; observedTokens?: number; effectiveTokens?: number; pendingTokens?: number; remainingTokens?: number | null; pendingRiskPicos?: string; remainingPicos?: string | null;
+  coverage?: { status?: {meteringStatus: string; observedPicos: string}; complete: boolean; missingFacts: number; evidenceTokens: number; evidenceRequests: number; pricingBasis?: string; preparationState?: string; processed?: number }; email: string; effectiveFromMs: number; meteredFromMs?: number; usedPicos?: string | null;
   windowId?: string; canInitializeUsage?: boolean;
   reason?: string | null; reasonCode?: string | null; ready?: boolean | null };
 /** A requested policy refused before any timing is worked out (bad amount, period or user). */
@@ -285,4 +289,49 @@ export function parseValueUsage(value: string): string | undefined {
   if (typeof parts === "string") return undefined;
   const result = BigInt(parts.whole) * 1000000000000n + BigInt(parts.fraction.padEnd(12, "0"));
   return result <= 1000000000000000000000n ? result.toString() : undefined;
+}
+
+/** Structural unit/window changes require the signed, current-window preview. */
+export function quotaConversionNeeded(previous: {policy: import("./api/share").ShareUserPolicy} | undefined,
+  policy: import("./api/share").ShareUserPolicy) {
+  return !!previous?.policy.valueQuota !== !!policy.valueQuota || (!!policy.valueQuota && !!previous
+    && ((previous.policy.tokenPeriod || "lifetime") !== (policy.tokenPeriod || "lifetime")
+      || (previous.policy.tokenPeriodAnchorAtMs ?? null) !== (policy.tokenPeriodAnchorAtMs ?? null)));
+}
+export function quotaConversionInput(row: ValuePreviewRow, calibration?: {amount: string; reason: string}) {
+  if (!row.conversionRequired) return undefined;
+  if (!row.conversionCredential || row.ready === false || (row.credentialExpiresAtMs ?? 0) <= Date.now()) throw new Error("quota_conversion_preview_stale");
+  const input: import("./api/share").ShareUserQuotaConversion = {credential: row.conversionCredential};
+  if (row.calibrationRequired) {
+    if (!calibration?.amount.trim() || !calibration.reason.trim() || new TextEncoder().encode(calibration.reason.trim()).length > 1000) throw new Error("quota_conversion_calibration_required");
+    if (row.targetUnit === "usdEquivalent") {
+      const amount = parseValueUsage(calibration.amount);
+      if (amount == null || BigInt(amount) < BigInt(row.coverage?.status?.observedPicos ?? "0")) throw new Error("quota_conversion_calibration_invalid");
+      input.targetUsedPicos = amount;
+    } else {
+      const raw = calibration.amount.trim();
+      if (!/^\d+$/.test(raw)) throw new Error("quota_conversion_calibration_invalid");
+      const amount = BigInt(raw);
+      if (amount > BigInt(Number.MAX_SAFE_INTEGER) || amount < BigInt(row.observedTokens ?? 0)) throw new Error("quota_conversion_calibration_invalid");
+      input.targetUsedTokens = Number(amount);
+    }
+    input.reason = calibration.reason.trim();
+  }
+  return input;
+}
+
+/** Preview a valid local calibration; pending usage remains independently reserved. */
+export function calibratedConversionRow(row: ValuePreviewRow, calibration?: {amount: string; reason: string}): ValuePreviewRow {
+  if (!row.calibrationRequired || !calibration) return row;
+  try {
+    const input = quotaConversionInput(row, calibration);
+    if (input?.targetUsedPicos != null) {
+      const used = BigInt(input.targetUsedPicos), pending = BigInt(row.pendingRiskPicos ?? "0");
+      const remaining = row.limitUsdMicros == null ? null : BigInt(row.limitUsdMicros) * 1_000_000n - used - pending;
+      return {...row, usedPicos: used.toString(), remainingPicos: remaining == null ? null : (remaining < 0n ? 0n : remaining).toString()};
+    }
+    if (input?.targetUsedTokens != null) return {...row, effectiveTokens: input.targetUsedTokens,
+      remainingTokens: row.tokenLimit == null ? null : Math.max(0, row.tokenLimit-input.targetUsedTokens-(row.pendingTokens ?? 0))};
+  } catch { /* Invalid drafts keep the authoritative preview until corrected. */ }
+  return row;
 }

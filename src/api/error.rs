@@ -469,7 +469,9 @@ impl ApiError {
     }
 
     pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
-        if error.to_string().starts_with("VALUE_QUOTA_") || error.to_string() == "price_unavailable"
+        if error.to_string().starts_with("VALUE_QUOTA_")
+            || error.to_string().starts_with("QUOTA_CONVERSION_")
+            || error.to_string() == "price_unavailable"
         {
             return Self::value_quota(error);
         }
@@ -531,6 +533,9 @@ impl ApiError {
 
     pub(crate) fn value_quota(error: impl std::fmt::Display) -> Self {
         let message = error.to_string();
+        if message.starts_with("QUOTA_CONVERSION_") {
+            return Self::conflict_code("quota_conversion_conflict", message);
+        }
         if let Some(json) = message.strip_prefix("VALUE_QUOTA_PRICE_COVERAGE: ") {
             let mut error = Self::bad_request_code("invalid_policy","The configured execution model is not priced in the active tariff. Set its price or wait for activation.");
             error.details = serde_json::from_str(json).ok();

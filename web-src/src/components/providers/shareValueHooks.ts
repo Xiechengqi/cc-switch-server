@@ -27,7 +27,7 @@ function useCurrentLogin() {
 }
 
 const CAPABILITY_RECHECK_MS = 30_000;
-type CapabilityCheck = { key: string; preview?: ValuePreview; error?: ValueRequestError; loading: boolean };
+type CapabilityCheck = { key: string; preview?: ValuePreview; error?: ValueRequestError; loading: boolean; preparedRecords?: number };
 
 /**
  * Whether this Share can run a USD-equivalent quota at all (protocol, SQLite
@@ -91,7 +91,7 @@ export function useShareValueReadiness(shareId?: string, revision?: number, { en
  * nor restarts the timer. A failed refresh keeps the last rows, marked stale;
  * refusals mixed into a response never replace a user's last good row.
  */
-export function useShareValueStatus(shareId?: string, enabled = true) {
+export function useShareValueStatus(shareId?: string, enabled = true, revision?: number) {
   const login = useCurrentLogin();
   const [snapshot, setSnapshot] = useState<{ scope: string; items: ValueStatus[]; diagnostics?: ValueDiagnostics; stale: boolean }>();
   const scope = `${login}:${shareId ?? ""}`;
@@ -106,7 +106,7 @@ export function useShareValueStatus(shareId?: string, enabled = true) {
     refresh();
     const timer = window.setInterval(refresh, 15_000);
     return () => { live = false; window.clearInterval(timer); };
-  }, [shareId, enabled, scope]);
+  }, [shareId, enabled, scope, revision]);
   const visible = snapshot?.scope === scope ? snapshot : undefined;
   /** Fold in rows returned by a correction; other users keep theirs. */
   const merge = useCallback((rows: ValueStatus[]) => setSnapshot((previous) => ({
@@ -120,7 +120,7 @@ export function useShareValueStatus(shareId?: string, enabled = true) {
 export function valuePreviewIntent(scope: string, policies?: Record<string, ShareUserPolicy>) {
   return policies ? JSON.stringify([scope, Object.keys(policies).sort().map((email) => [email, policies[email]])]) : "";
 }
-export type ValuePreviewState = { intent: string; preview?: ValuePreview; error?: unknown; loading: boolean };
+export type ValuePreviewState = { intent: string; preview?: ValuePreview; error?: unknown; loading: boolean; preparedRecords?: number };
 
 /**
  * When the given USD policies would start and what usage they would carry,
@@ -130,7 +130,7 @@ export type ValuePreviewState = { intent: string; preview?: ValuePreview; error?
  */
 export function useShareValuePreview(shareId: string | undefined, revision: number | undefined, scope: string,
   policies: Record<string, ShareUserPolicy> | undefined, delayMs = 400) {
-  const intent = shareId && revision != null ? valuePreviewIntent(scope, policies) : "";
+  const intent = shareId && revision != null ? valuePreviewIntent(`${scope}:${shareId}:${revision}`, policies) : "";
   const [state, setState] = useState<ValuePreviewState>({ intent: "", loading: false });
   const pending = useRef<{ intent: string; controller: AbortController; promise: Promise<ValuePreview | undefined> }>();
   const wanted = useRef({ intent, shareId, revision, policies });
@@ -142,7 +142,23 @@ export function useShareValuePreview(shareId: string | undefined, revision: numb
     pending.current?.controller.abort();
     const controller = new AbortController();
     setState({ intent: question, loading: true });
-    const promise = shareApi.previewValueQuota(id, rev, body, controller.signal).then((preview) => {
+    const promise = (async () => {
+      let preview = await shareApi.previewValueQuota(id, rev, body, controller.signal);
+      let users = preview.rows.filter(row => row.conversionRequired && row.targetUnit === "usdEquivalent"
+        && ["history_incomplete", "history_preparing"].includes(row.reasonCode ?? "")).map(row => row.email);
+      const prepared=new Map<string,number>();
+      while (users.length && !controller.signal.aborted && wanted.current.intent === question) {
+        const page = await shareApi.prepareQuotaHistory(id, rev, users.slice(0, 10), controller.signal);
+        page.items.forEach(item=>prepared.set(item.email,item.preparation.processed));
+        const processed=Array.from(prepared.values()).reduce((sum,n)=>sum+n,0);
+        setState({intent: question, loading: true, preparedRecords: processed});
+        const complete = new Set(page.items.filter(item => item.preparation.state === "complete").map(item => item.email));
+        users = users.filter(email => !complete.has(email));
+        if (!page.items.length) throw new Error("quota_history_invalid_response");
+      }
+      if (!controller.signal.aborted) preview = await shareApi.previewValueQuota(id, rev, body, controller.signal);
+      return preview;
+    })().then((preview) => {
       if (!isValuePreview(preview, rev)) throw new ValueQuotaResponseError();
       if (controller.signal.aborted || wanted.current.intent !== question) return undefined;
       setState({ intent: question, preview, loading: false });
@@ -164,5 +180,5 @@ export function useShareValuePreview(shareId: string | undefined, revision: numb
   }, [intent, delayMs, ask]);
   useEffect(() => () => pending.current?.controller.abort(), []);
   const current: ValuePreviewState = state.intent === intent ? state : { intent, loading: !!intent };
-  return { ...current, fetchNow: (): Promise<ValuePreview | undefined> => current.preview ? Promise.resolve(current.preview) : ask() };
+  return { ...current, fetchNow: (): Promise<ValuePreview | undefined> => current.preview && current.preview.rows.every(row => !row.credentialExpiresAtMs || row.credentialExpiresAtMs > Date.now() + 5_000) ? Promise.resolve(current.preview) : ask() };
 }

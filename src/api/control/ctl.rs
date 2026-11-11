@@ -38,6 +38,54 @@ pub(crate) async fn control_preview_account_reset(
         .map(Json)
         .map_err(ApiError::account_quota_preview)
 }
+pub(crate) async fn control_prepare_quota_history(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    verify_control_request(&state, "/_ctl/prepare_quota_history", &headers, &body).await?;
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Input {
+        share_id: String,
+        expected_config_revision: u64,
+        emails: Vec<String>,
+        #[serde(default)]
+        restart: bool,
+    }
+    let input: Input = serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    state
+        .prepare_share_quota_history(
+            &input.share_id,
+            input.expected_config_revision,
+            input.emails,
+            input.restart,
+        )
+        .await
+        .map(Json)
+        .map_err(ApiError::value_quota_preview)
+}
+
+pub(crate) async fn control_quota_conversion_receipt(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    verify_control_request(&state, "/_ctl/quota_conversion_receipt", &headers, &body).await?;
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Input {
+        share_id: String,
+        operation_id: String,
+    }
+    let input: Input = serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    state
+        .share_quota_conversion_result(&input.share_id, &input.operation_id)
+        .await
+        .map(Json)
+        .map_err(ApiError::value_quota_preview)
+}
+
 pub(crate) async fn control_preview_value_quota(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -194,7 +242,8 @@ pub(crate) async fn control_apply_share_settings(
     // Control RPC is Router → Client only. Managed Share Market grants must be
     // applied here too; the ordinary dashboard patch helper rejects them.
     let edit_context = input.patch.edit_context.clone();
-    let has_value_initializations = input.patch.user_value_usage_initializations.is_some();
+    let has_value_initializations = input.patch.user_value_usage_initializations.is_some()
+        || input.patch.user_quota_conversions.is_some();
     let share = match state
         .apply_router_share_settings_patch_immediate(&input.share_id, input.patch)
         .await
@@ -274,9 +323,31 @@ pub(crate) async fn control_apply_share_settings(
     let descriptor = crate::state::authoritative_share_descriptor(&state, &share.id)
         .await
         .map_err(ApiError::internal)?;
+    let conversion_config = state.config_snapshot().await;
+    let conversion_receipts = if let Some(context) = &edit_context {
+        crate::repository::server_sqlite::value_quota::conversion::receipts(
+            &state.config_dir,
+            &context.operation_id,
+            &input.share_id,
+            &conversion_config,
+        )
+        .map_err(ApiError::internal)?
+    } else {
+        Vec::new()
+    };
+    let value_statuses = if !conversion_receipts.is_empty() {
+        state
+            .value_quota_statuses(&input.share_id)
+            .await
+            .map_err(ApiError::value_quota)?
+    } else {
+        Vec::new()
+    };
     Ok(Json(ControlApplyShareSettingsResponse {
         ok: true,
         share: descriptor,
+        quota_conversions: conversion_receipts,
+        value_quota_statuses: value_statuses,
         settings_receipt: match edit_context {
             Some(context) => state
                 .shares
@@ -284,7 +355,16 @@ pub(crate) async fn control_apply_share_settings(
                 .await
                 .applied_settings_operations
                 .get(&context.operation_id)
-                .cloned(),
+                .cloned()
+                .or(
+                    crate::repository::server_sqlite::value_quota::conversion::settings_receipt(
+                        &state.config_dir,
+                        &context.operation_id,
+                        &input.share_id,
+                        &conversion_config,
+                    )
+                    .map_err(ApiError::internal)?,
+                ),
             None => None,
         },
     }))
@@ -1130,6 +1210,10 @@ pub(crate) struct ControlAbortClientSubdomainAdoptionResponse {
 pub(crate) struct ControlApplyShareSettingsResponse {
     ok: bool,
     share: ShareDescriptor,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    quota_conversions: Vec<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    value_quota_statuses: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     settings_receipt: Option<crate::domain::sharing::router_contract::ShareSettingsReceipt>,
 }

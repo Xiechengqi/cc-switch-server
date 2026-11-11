@@ -7,6 +7,21 @@ async fn fixed_execution_model_coverage_gates_usd_edits_but_not_ordinary_backgro
     state
         .configure_value_quota_router_for_test("coverage-server")
         .await;
+    let mut config = state.config_snapshot().await;
+    config.owner.email = Some("owner@example.com".into());
+    state.replace_config(config.clone()).await.unwrap();
+    state
+        .record_router_quota_capability(
+            &config,
+            client::RouterShareCapabilities {
+                share_contract_version: 12,
+                capabilities: vec![
+                    "usdEquivalentQuotaV1".into(),
+                    "quotaUnitConversionV1".into(),
+                ],
+            },
+        )
+        .await;
     let mut provider = test_provider("provider", "Provider");
     provider.settings_config =
         json!({"modelMapping":{"mode":"single","upstreamModel":"qiniu/conatus-free"}});
@@ -152,7 +167,26 @@ async fn fixed_execution_model_coverage_gates_usd_edits_but_not_ordinary_backgro
             .unwrap()["capabilityReady"],
         true
     );
-    state.mutate_shares_immediate(insert_grant).await.unwrap();
+    // An ordinary grant addition now uses the signed conversion path too.
+    let preview = state
+        .preview_share_value_quota(
+            "coverage-share",
+            revision,
+            BTreeMap::from([("user@example.test".into(), grant.policy.clone())]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["ready"], true, "{preview}");
+    let patch = serde_json::from_value(json!({
+        "editContext":{"operationId":"model-coverage-conversion","expectedConfigRevision":revision},
+        "userGrantEdits":{"user@example.test":{"expectedRevision":0,"policy":grant.policy}},
+        "userQuotaConversions":{"user@example.test":{"credential":preview["rows"][0]["conversionCredential"]}}
+    })).unwrap();
+    state
+        .apply_share_settings_patch_immediate("coverage-share", patch)
+        .await
+        .unwrap()
+        .unwrap();
     let bound = state
         .shares
         .read()

@@ -78,9 +78,9 @@ Server 侧校验（`src/clients/router/ingress.rs`）：
 
 Router 通过**未签名**头 `x-cc-switch-ingress-body-limit` 声明其上限；Server 的生效值为 `min(本地 requestBodyLimits, Router 声明)`。本地值存于 `server.json` 的 `requestBodyLimits`。
 
-## 7. Share 契约 v7 兼容与 v8/v9/v10 协商
+## 7. Share 契约 v7 兼容与 v8–v12 协商
 
-Server 普通未协商 descriptor 保持 Share Contract v7；accountReset 及其只读投影须显式协商后写 v8，一次性市场试用须 `marketTrialV1`＋reader≥9 后写 v9，USD 等值配额须 `usdEquivalentQuotaV1`＋reader≥10 后写 v10。Router 滚动升级可读 v2..v10，Share Market 最低版本仍 v5。`cacheCreationTtlV1` 为独立日志能力。各版本在 v2 的统一 Share 访问边界上逐步追加：
+Server 普通未协商 descriptor 保持 Share Contract v7；accountReset 及其只读投影须显式协商后写 v8，一次性市场试用须 `marketTrialV1`＋reader≥9 后写 v9，USD 等值配额须 `usdEquivalentQuotaV1`＋reader≥10 后写 v10。Router 滚动升级可读 v2..v12，Share Market 最低版本仍 v5。`cacheCreationTtlV1` 为独立日志能力。各版本在 v2 的统一 Share 访问边界上逐步追加：
 
 - v2：`freeAccess`（默认 `false`，即私有）、`userGrants`、`tokenLimit`、`parallelLimit`。
 - v4：不含凭据的 Provider 运行时探针描述 `appRuntimes.*.modelProbe` / `appProviders.*.modelProbe`。它包含 Server 权威测试模型、wire model、结构化请求、响应完成模式、payload revision 和 health fingerprint。Router 的 Curl、端到端测试、半小时定时探针不得另行维护硬编码模型或请求模板。
@@ -137,3 +137,6 @@ Router 上的独立 Token Market 接口 `/v1/markets*`、`/v1/market/*`、`/_mar
 - 联调步骤：[`../guide/router-integration.md`](../guide/router-integration.md)
 - 验收剧本：[`../acceptance/router-share-acceptance.md`](../acceptance/router-share-acceptance.md)
 - 上层总览：[`overview.md`](overview.md)
+
+- v11：`resourceValueQuotaV2`，资源价目与显式资源策略。
+- v12：`quotaUnitConversionV1`，Server-owned `quotaConversionId`、签名即时转换、独立历史准备与永久回执；转换后的 Token binding 保留，旧 reader 能力丢失时隔离相关 Share。见 [即时单位转换](../share/quota-unit-conversions.md)。

@@ -1284,7 +1284,7 @@
         "tokens": "Token",
         "usd": "美元等值",
         "hint": "按模型 API 標價折算，不從任何錢包扣款。軟上限在請求開始時檢查，已放行的請求可能略超額度結束。每位使用者同時最多執行 min(並行上限, 4) 個美元額度請求；用量不確定的請求可能佔用全部剩餘額度。",
-        "start": "每天、每週、每月及固定 7／30 天週期在下一個完整週期開始時切換為美元額度，之前的策略在此之前繼續生效；累計與帳號重置週期從套用時刻起計量。切換單位不會清空用量。",
+        "start": "歷史證據完整時，儲存後立即按目標單位執行，承接目標週期全部已用額度及執行中的預留用量；證據不足時保留原策略。",
         "notReady": "需要 Router v10、已切換的 SQLite 權威儲存和已確認的執行價目。",
         "pending": "等待權威用量同步",
         "unitUsdShort": "$",
@@ -1306,9 +1306,9 @@
           "fromNow": "自現在起計量",
           "now": "立即生效 · 已用 {{used}}",
           "summary": "{{count}} 位使用者 · {{scheduled}} 位待生效 · {{fromNow}} 位自現在起計量",
-          "hintScheduled": "自然週期與固定週期在下一個完整週期開始時切換為美元額度。在此之前原策略繼續生效，該週期內已記錄的美元用量會一併計入。",
-          "hintFromNow": "累計與帳號重置週期沒有更早的美元計量證據，因此從套用時刻開始計量，先前的用量不會折算。",
-          "hintNow": "此使用者本週期已按美元計量，新額度立即生效，並保留所示用量。"
+          "hintScheduled": "旧版本排期保持原生效时间；新转换按证据承接当前周期消费。",
+          "hintFromNow": "此處顯示舊版已儲存的計量起點；新提交的明確轉換必須具備目標週期完整歷史證據。",
+          "hintNow": "保存后立即执行，并承接预览后新增的消费。"
         },
         "confirmApply": "確認並套用",
         "reasonCode": {
@@ -1321,7 +1321,11 @@
           "router_upgrade_required": "請升級 Router 與 Server 後再使用美元額度。",
           "blocked_needs_reconcile": "此使用者的美元用量需要先校準（在用量欄中立即校準）。",
           "invalid_policy": "此額度或週期不適用於美元額度。",
-          "resource_upgrade_required": "請升級 Router、Server 並啟用資源價目。"
+          "resource_upgrade_required": "請升級 Router、Server 並啟用資源價目。",
+          "history_incomplete": "歷史請求證據缺失或尚未定價，補齊前保留目前的額度單位。",
+          "history_preparing": "正在準備歷史請求證據，目前策略繼續生效。",
+          "conversion_upgrade_required": "請升級 Router 和 Server，以支援立即切換額度單位。",
+          "pending_evidence_missing": "執行中的請求缺少目標單位的可信上限，請等待結算後再轉換。"
         },
         "rowReason": "{{email}}：{{reason}}",
         "usageEditUnavailable": "美元額度使用者不能設定已消耗 Token，請在其用量欄中立即校準。",
@@ -1355,7 +1359,14 @@
         "malformed": "無法讀取此使用者的美元額度資料，已設為唯讀，不會被修改。",
         "malformedSave": "無法讀取 {{email}} 的美元額度。請重新載入，或移除該使用者後再儲存。",
         "resources": "包含圖片、音訊、影片與付費工具",
-        "resourcesHint": "需要設定資源價格並升級 Server。既有文字額度保留原計價策略。"
+        "resourcesHint": "需要設定資源價格並升級 Server。既有文字額度保留原計價策略。",
+        "conversionCalibrationRequired": "人工調整或沒有精確 Token 對應的消費，需要填寫目標單位已用額度及稽核原因（美元或 Token）；實際請求消費會自動承接。",
+        "convertedUsd": "隨 Share 儲存生效 · 已用 {{used}} · 執行中 {{pending}} · 剩餘 {{remaining}}",
+        "convertedTokens": "隨 Share 儲存生效 · 已用 {{tokens}} Token · 執行中 {{pending}} · 剩餘 {{remaining}}",
+        "preparationProgress": "正在準備歷史 · 已核對 {{count}} 條請求",
+        "evidence": "已核對：{{tokens}} Token · {{requests}} 條請求 · {{missing}} 條待補證的嘗試",
+        "pricingBasis": "原請求凍結價格優先，重建部分使用價目 {{revision}}",
+        "originalPrices": "原始凍結價格"
       },
       "accountReset": {
         "label": "帳號重置週期",

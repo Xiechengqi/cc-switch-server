@@ -18,7 +18,7 @@
 | 文档 | 状态 | 说明 |
 | --- | --- | --- |
 | [overview.md](architecture/overview.md) | 权威 | 三角色拓扑、资金边界、两条链路、模块分层与强约束。**架构叙述的真值来源** |
-| [router-contract.md](architecture/router-contract.md) | 权威 | Server 侧 Router 协议：控制面、探针、IngressContext、Share v7 兼容与 v8/v9/v10 独立能力协商 |
+| [router-contract.md](architecture/router-contract.md) | 权威 | Server 侧 Router 协议：控制面、探针、IngressContext、Share v7 兼容与 v8–v12 独立能力协商 |
 | [storage.md](architecture/storage.md) | 权威 | 数据目录、文件清单、凭据加密、用量存储、备份、写入锁序 |
 | [usage-accounting.md](architecture/usage-accounting.md) | 权威 | Usage token 计量口径 |
 
@@ -72,6 +72,7 @@
 | [account-reset.md](share/account-reset.md) | 权威 | 账号重置周期实现、全供应商门槛、53项离线映射、存储恢复和review；真实验收独立live_pending |
 | [market-trials.md](share/market-trials.md) | 权威 | v9 一次性市场试用、请求阶段归属、迟到用量、重启隔离与正式授权确认 |
 | [market-termination.md](share/market-termination.md) | 权威 | Share 立即退租的原 entitlement 撤权、SQLite 最终消费归档、独立能力协商和不可变签名回执；资金仍由 Router 管理 |
+| [quota-unit-conversions.md](share/quota-unit-conversions.md) | 权威 | 普通授权 Token / USD 即时切换、历史证据、签名预览、校准、原子回执与恢复 |
 | [value-quotas.md](share/value-quotas.md) | 权威 | v10 双口径额度、有界预占与结果分类结算、作用域阻断与对账、生效规则、错误码、规范签名与 knownRevision、就绪诊断和 live_pending 门槛 |
 | [universal-value-metering.md](share/universal-value-metering.md) | 权威 | 全供应商美元等值额度、统一准入与终结、传输及资源计量覆盖和验收边界 |
 

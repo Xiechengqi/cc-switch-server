@@ -39,6 +39,7 @@ pub const ACCOUNT_RESET_CONTRACT_VERSION: u16 = 8;
 pub const MARKET_TRIAL_CONTRACT_VERSION: u16 = 9;
 pub const VALUE_QUOTA_CONTRACT_VERSION: u16 = 10;
 pub const RESOURCE_VALUE_QUOTA_CONTRACT_VERSION: u16 = 11;
+pub const QUOTA_UNIT_CONVERSION_CONTRACT_VERSION: u16 = 12;
 use crate::domain::usage::store::UsageStore;
 
 /// Distinguishes a missing JSON field (`None`) from an explicit `null`
@@ -96,11 +97,26 @@ pub struct ShareSettingsPatch {
     pub user_value_usage_initializations:
         Option<BTreeMap<String, ShareUserValueUsageInitialization>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_quota_conversions: Option<BTreeMap<String, ShareUserQuotaConversion>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grant_edits: Option<BTreeMap<String, ShareUserGrantEdit>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_context: Option<ShareSettingsEditContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_grant: Option<ShareManagedGrantOperation>,
+}
+
+/// Server-signed preview binds the target policy and window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShareUserQuotaConversion {
+    pub credential: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_used_picos: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_used_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,6 +493,9 @@ pub struct ShareUserGrant {
     pub value_metering: Option<crate::domain::usage::value_pricing::ValueMeteringBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_value_quota: Option<PendingValueQuota>,
+    /// Last atomic quota conversion; requires Share contract v12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_conversion_id: Option<String>,
     #[serde(default)]
     pub usage: ShareUserUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1361,7 +1380,12 @@ pub fn descriptor_for_share_with_accounts_and_usage(
     }
     ShareDescriptor {
         termination_archive_since_ms: None,
-        contract_version: if user_grants.values().any(|grant| {
+        contract_version: if user_grants
+            .values()
+            .any(|g| g.quota_conversion_id.is_some())
+        {
+            QUOTA_UNIT_CONVERSION_CONTRACT_VERSION
+        } else if user_grants.values().any(|grant| {
             grant
                 .policy
                 .value_quota

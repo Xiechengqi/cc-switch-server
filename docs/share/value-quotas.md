@@ -1,6 +1,6 @@
 # Share Token／USD 等值双口径额度
 
-> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-11-10。当前全供应商与资源扩展见 [统一计量规范](universal-value-metering.md)；本轮只做编译、类型和静态检查，产品测试由 CI 执行。
+> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-11-11。当前全供应商与资源扩展见 [统一计量规范](universal-value-metering.md)，单位即时切换以 [转换规范](quota-unit-conversions.md) 为准；本轮只做编译、类型和静态检查，产品测试由 CI 执行。
 
 ## 1. 含义与启用条件
 
@@ -20,20 +20,11 @@
 
 wire：`policy.valueQuota={limitUsdMicros:"10000000",tariffPolicyId:"api-equivalent-v1"}` 表示 $10，和 `tokenLimit` 互斥，周期与 anchor 沿用 `tokenPeriod`。额度为正整数 micro-USD 字符串，最高 $1,000,000,000；不是 JS 浮点金额。
 
-Server-owned `valueMetering` 保存 `quotaPolicyEpoch/valueMeteredFromMs/effectiveFromMs/pricingRevision`。**只有存在生效中的 `policy.valueQuota` 或 `pendingValueQuota` 的授权才获得／保留 binding**；Token 授权不再做 shadow 金额计量，也不记录 coverage gap。旧版本给 Token 授权写入的 binding 原样保留但不再准入或同步，ledger 历史不删除。
+Server-owned `valueMetering` 保存 `quotaPolicyEpoch/valueMeteredFromMs/effectiveFromMs/pricingRevision`。生效 / 排期 USD 和已完成 v12 单位转换的 Token 授权保留 binding。所有生成保存独立于单位的事实；Token 模式可选冻结金额，缺价仍可调用，不把缺历史当零。
 
-生效规则（保存与预览共用同一函数）：
+普通授权单位或 USD 周期 / anchor 改动，经 v12 签名预览后保存立即生效，并承接目标当前窗口真实消费。只改 USD 额度沿用原计量起点。历史不完整、来源无法证明或在途无上界时拒绝保存，保留原策略。人工调整通过目标已用与原因建立跨单位审计映射，往返不重获额度；详细例子及协议见 [转换规范](quota-unit-conversions.md)。
 
-| 情况 | 生效 | 计量起点 | 预览 `reasonCode` |
-| --- | --- | --- | --- |
-| 已是 USD 且周期／anchor 不变（只改额度） | 立即 | 沿用原起点 | `ready` |
-| lifetime／accountReset | 立即 | 当前时刻（已是生效中的 USD 时沿用原起点） | `metered_from_now`／`ready` |
-| 自然日／周／月、sevenDays、thirtyDays，且 Server 能证明该用户当前窗口**零**已记录 Share 请求（新增授权天然满足） | 立即 | 当前窗口起点（精确，无遗漏） | `ready` |
-| 自然日／周／月、sevenDays、thirtyDays，其他情况 | 下一窗口起点 | 保存时刻 | `scheduled_next_window` |
-
-“零请求”证明使用与 Token 额度相同的每用户用量记录（`UsageStore::share_user_quota_usage`，日志＋汇总桶）：窗口起点至现在该 Share+email 的请求数与 Token 数都为 0。证明成立时 coverage 下调到窗口起点，使空 ledger 即为该窗口的精确历史。保存路径不等待 usage 锁（部分调用方已持有 usage 读锁，排队写者会让嵌套读死锁），拿不到快照时按“无法证明”处理，退回下一窗口排期；预览与保存共用同一函数。尚未写入用量日志的在途 Token 请求不在证明范围内（软上限容忍）。
-
-排期期间原 policy 继续真正执行，`pendingValueQuota={policy,effectiveFromMs,retainAccess}`；新授权等待时不提供无限制访问。lifetime 首次切换明确“从现在起计量”，此前 Token 用量不折算。删除后重新添加同身份授权视为新授权（Owner 可用 `set` 校准）。同一 Share 批量保存时，属于用户本次编辑的授权准备失败会让保存失败；其他授权（例如后台提交时到期激活）失败只记 warn、保持原状，不中止整个 ShareStore 提交。
+已有 `pendingValueQuota` 继续按原时刻后台激活，不因升级提前生效；主动修改该排期须重新预览并即时承接。新建 Share 的兼容初始策略仍可沿用旧初始化规则，后续普通授权编辑均走 v12。市场托管合同不使用单位转换协议。
 
 自然日／周／月为 UTC；sevenDays/thirtyDays 是既有锚定固定窗口。accountReset 需有效 source/epoch/bucket/cycle。按请求开始时间归属窗口。窗口 ID 由显式映射生成，与历史 `{:?}` 输出逐字节相同（如 `Day:<start>:<end>`、`Lifetime:0:0`）。
 
@@ -41,7 +32,7 @@ Server-owned `valueMetering` 保存 `quotaPolicyEpoch/valueMeteredFromMs/effecti
 
 这是**请求级软上限**：宁可小幅、有界超额，也绝不误锁用户。
 
-`state/share_value_quota.rs` 统一编排；generic forwarder 在真实模型／tier 和最终 payload 确定后、发网前调用准入。准入只在 shares 读锁下读取授权（不再持有全局 `share_quota_mutations`／`shares_persistence.gate`），SQLite 工作在 blocking 线程池执行；解析并校验过的价目快照按 (router, installation, revision) 进程级缓存（revision 即内容哈希，内容不可变），准入和结算共用。
+`state/share_value_quota.rs` 统一编排；generic forwarder 在真实模型／tier 和最终 payload 确定后、发网前调用准入。准入在 usage 读锁及 shares 提交 gate 内重新验证最新权限与策略，完成 SQLite 事实 / 风险提交后释放，再发网上游；SQLite 工作在 blocking 线程池执行；解析并校验过的价目快照按 (router, installation, revision) 进程级缓存（revision 即内容哈希，内容不可变），准入和结算共用。
 
 `repository/server_sqlite/value_quota.rs` 在 IMMEDIATE 事务内：
 
@@ -72,7 +63,7 @@ Server-owned `valueMetering` 保存 `quotaPolicyEpoch/valueMeteredFromMs/effecti
 免费 attempt 的重试：重试前 forwarder **同步等待**前一 attempt 的结算（`ValueAttemptGuard::settle_now`，结算后解除 drop 钩子），再 `continue 'attempt`，因此重试准入不会因旧行仍计入并发／预占而得到 `VALUE_QUOTA_BUSY`。前一 attempt 结算为 $0 时重试作为新 attempt（attemptId+1）重新准入：
 - Claude 连接失败（`is_connect()`，请求未写出）；
 - HTTP 200 流在任何业务输出之前出现上游错误：Anthropic `error` 事件、语义／协议错误（`semantic_protocol_error`）、首事件读取失败、Responses 语义失败帧（overflow／capacity 重试）、Claude body-stage 重试。这些 attempt 标记为上游错误（`mark_upstream_error`），无用量日志时按 $0 结算；若随后有真实用量日志，按其用量计价。
-其它发网后重试（首字节超时、发网后的发送错误、按状态码的重试等）结果未知，仍拒绝金额模式，但同样先同步结算再重试。
+其它发网后重试（首字节超时、发网后的发送错误、按状态码的重试等）独立准入，先保守结算旧 attempt，再按剩余额度判断新生成。
 
 清扫器（`state/background.rs`）每 5 分钟运行，启动时立即运行：对开始时间早于 max(进程启动时刻, now − (最长 Provider 请求超时 + 5 分钟)) 仍为 pending（含旧 `unavailable`）的 attempt，若有持久化用量日志则按上表分类（未结束的流视为中断），否则按“结果未知”收取预占，并以 info 记录数量。候选在**只读事务**中选出（WAL 读者不阻塞写；状态扫描无索引，schema 冻结不加索引），先 `pending` 后旧 `unavailable`，每次最多 400 条；随后以每批 25 条的短 IMMEDIATE 写事务结算。每条 attempt 在自己的 savepoint 中结算，失败（如检查点损坏）只回滚该条并阻断该 (scope, window)，其余照常提交。准入并发只统计**本 scope 当前窗口**的 `pending` 行；旧 Token shadow 遗留的 `unavailable` 行不计入并发、无预占，不会阻挡任何用户。
 
@@ -269,3 +260,7 @@ Review 后未发现尚未解决的阻断性代码问题。过滤套件有重叠�
 当前规范见 [全供应商美元等值额度](universal-value-metering.md)。普通、批量、市场席位和试用均可显式选择 v1 文本或 v2 资源策略；已有 Token/v1 授权与冻结合同不自动迁移。Router 迁移 111、Server schema 5；先升级 Router，再升级 Server。未知结果保留有界风险，异步视频轮询回写原生成 attempt，连接恢复不新增生成计费。
 
 本轮验证范围仅为编译（含测试目标）、类型、格式和静态审计；回归用例须在 CI 执行。所有真实 Provider/App 验收仍为 live_pending，未部署、未改远端配置。
+
+## 16. 单位即时切换（2026-11-11）
+
+普通授权当前采用 schema 6 / Share v12，详见 [转换规范](quota-unit-conversions.md)。本节及 §2–§3 的新语义取代历史验证记录中的“取消 shadow”与“新增转换自动排下期”规则；历史测试数字不代表本轮执行。

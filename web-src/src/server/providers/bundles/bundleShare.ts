@@ -290,6 +290,12 @@ export async function saveBundleShare(
   }
   const initializations = Object.fromEntries(Object.entries(draft.userValueUsageInitializations).filter(([email]) =>
     allowedUsageEmails.has(email) && !!draft.userGrants[email]?.policy.valueQuota));
+  const conversions = Object.fromEntries(Object.entries(draft.userGrants).flatMap(([email, grant]) => {
+    if (!allowedUsageEmails.has(email) || !grant.quotaUnitConversion) return [];
+    if (grant.quotaUnitConversionPolicy !== sharePolicyKey(grant.policy)) throw new Error("quota_conversion_preview_stale");
+    delete userUsageEdits[email];
+    return [[email, grant.quotaUnitConversion]];
+  }));
   return shareApi.saveProviderBundleShare({
     expectedAccountCycle: Object.values(draft.userGrants).find((grant) => grant.active !== false && grant.policy.tokenPeriod === "accountReset")?.accountQuotaCycle,
     bundleId,
@@ -310,7 +316,9 @@ export async function saveBundleShare(
     userGrants: draft.baseline ? undefined : userGrants,
     userGrantEdits,
     userUsageEdits,
-    ...(Object.keys(initializations).length ? {userValueUsageInitializations: initializations, valueUsageOperationId: draft.valueUsageOperationId} : {}),
+    ...(Object.keys(initializations).length ? {userValueUsageInitializations: initializations} : {}),
+    ...(Object.keys(conversions).length ? {userQuotaConversions: conversions} : {}),
+    ...(Object.keys(initializations).length || Object.keys(conversions).length ? {valueUsageOperationId: draft.valueUsageOperationId} : {}),
   });
 }
 

@@ -33,6 +33,7 @@ fn resource_admission<'a>(
     text: bool,
 ) -> Admission<'a> {
     Admission {
+        attribution: None,
         policy_epoch: "epoch",
         resource_plan: Some(crate::domain::usage::value_pricing::ResourcePlan {
             quantities: BTreeMap::from([(resource.0.into(), resource.1)]),

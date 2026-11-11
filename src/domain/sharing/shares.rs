@@ -456,7 +456,27 @@ fn effective_user_tokens(grant: &ShareUserGrant, snapshot: &ShareUserQuotaSnapsh
     )
 }
 
-fn effective_grant_tokens_for_policy(grant: &ShareUserGrant, now_ms: i64) -> u64 {
+pub(crate) fn quota_view_from_history(
+    usage: &UsageStore,
+    share_id: &str,
+    email: &str,
+    grant: &ShareUserGrant,
+    now: i64,
+) -> Result<ShareUserQuotaView, String> {
+    let snapshot = observe_user_quota(usage, share_id, email, grant, now)?;
+    let applies = grant
+        .usage_rebase
+        .as_ref()
+        .is_none_or(|r| rebase_matches_window(r, &snapshot.window));
+    Ok(quota_view(
+        grant,
+        &snapshot,
+        effective_user_tokens(grant, &snapshot),
+        applies,
+    ))
+}
+
+pub(crate) fn effective_grant_tokens_for_policy(grant: &ShareUserGrant, now_ms: i64) -> u64 {
     if grant.policy.token_period == ShareTokenPeriod::AccountReset {
         return grant
             .usage_quota
@@ -4219,6 +4239,7 @@ fn new_user_grant(share: &Share, email: String, role: &str) -> ShareUserGrant {
         policy: default_user_policy(share),
         value_metering: None,
         pending_value_quota: None,
+        quota_conversion_id: None,
         usage: Default::default(),
         usage_rebase: None,
         usage_quota: None,
@@ -4547,6 +4568,7 @@ fn apply_managed_grant_operation(
                     policy,
                     value_metering: None,
                     pending_value_quota: None,
+                    quota_conversion_id: None,
                     usage: previous
                         .as_ref()
                         .map(|grant| grant.usage.clone())
@@ -4686,6 +4708,7 @@ fn normalize_user_grants(
         grant.active = true;
         grant.usage = previous.map(|item| item.usage.clone()).unwrap_or_default();
         grant.value_metering = previous.and_then(|item| item.value_metering.clone());
+        grant.quota_conversion_id = previous.and_then(|item| item.quota_conversion_id.clone());
         grant.pending_value_quota = previous
             .and_then(|item| item.pending_value_quota.clone())
             .filter(|pending| pending.policy == incoming_grant.policy);
@@ -4751,6 +4774,7 @@ fn reconcile_user_grants(share: &mut Share) {
                 policy: policy_template.clone(),
                 value_metering: None,
                 pending_value_quota: None,
+                quota_conversion_id: None,
                 usage: Default::default(),
                 usage_rebase: None,
                 usage_quota: None,

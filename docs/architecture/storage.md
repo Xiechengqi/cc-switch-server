@@ -215,3 +215,5 @@ committed、legacy retire 的每个崩溃点 roll-forward。staged restore 还�
 密文 rollback payload 只读重建 Provider/Account/Share，并核对逐表数量、generation hash 与
 subscription reference graph；不会修改 stage。损坏 DB/WAL 必须 fail closed；committed 后
 重新出现或损坏的 legacy 文件不得成为读取来源。
+
+Share 单位转换使用 SQLite schema 6：单位无关 facts、历史准备游标、永久转换 / settings 回执、调整映射和 Token shadow 区间不依赖报表 retention。异步 ownership 可引用未定价事实。策略、调整、回执在同一 IMMEDIATE 事务提交，详情见 [额度单位转换](../share/quota-unit-conversions.md)。

@@ -1284,7 +1284,7 @@
         "tokens": "Token",
         "usd": "美元等值",
         "hint": "按模型 API 标价折算，不从任何钱包扣款。软上限在请求开始时检查，已放行的请求可能略超额度结束。每个用户同时最多执行 min(并发上限, 4) 个美元额度请求；用量不确定的请求可能占用全部剩余额度。",
-        "start": "每天、每周、每月及固定 7／30 天周期在下一个完整周期开始时切换为美元额度，之前的策略在此之前继续生效；累计与账号重置周期从应用时刻起计量。切换单位不会清空用量。",
+        "start": "历史证据完整时，保存后立即按目标单位执行，并承接目标周期全部已用额度和在途用量；证据不足时保留原策略。",
         "notReady": "需要 Router v10、已切换的 SQLite 权威存储和已确认的执行价目。",
         "pending": "等待权威用量同步",
         "unitUsdShort": "$",
@@ -1306,9 +1306,9 @@
           "fromNow": "自现在起计量",
           "now": "立即生效 · 已用 {{used}}",
           "summary": "{{count}} 个用户 · {{scheduled}} 个待生效 · {{fromNow}} 个自现在起计量",
-          "hintScheduled": "自然周期和固定周期在下一个完整周期开始时切换为美元额度。在此之前之前的策略继续生效，该周期内已记录的美元用量会一并计入。",
-          "hintFromNow": "累计与账号重置周期没有更早的美元计量证据，因此从应用时刻开始计量，之前的用量不会折算。",
-          "hintNow": "该用户本周期已按美元计量，新额度立即生效，并保留所示用量。"
+          "hintScheduled": "旧版本排期保持原生效时间；新转换按证据承接当前周期消费。",
+          "hintFromNow": "此处显示旧版本已经保存的计量起点；新提交的显式转换必须具备目标周期完整历史证据。",
+          "hintNow": "保存后立即执行，并承接预览后新增的消费。"
         },
         "confirmApply": "确认并应用",
         "reasonCode": {
@@ -1321,7 +1321,11 @@
           "router_upgrade_required": "请升级 Router 和 Server 后再使用美元额度。",
           "blocked_needs_reconcile": "该用户的美元用量需要先校准（在用量列中立即校准）。",
           "invalid_policy": "该额度或周期不适用于美元额度。",
-          "resource_upgrade_required": "请升级 Router、Server 并激活资源价目。"
+          "resource_upgrade_required": "请升级 Router、Server 并激活资源价目。",
+          "history_incomplete": "历史请求证据缺失或尚未定价，补齐证据或价格前不能转换。",
+          "history_preparing": "正在准备历史请求证据，当前策略继续生效。",
+          "conversion_upgrade_required": "请升级 Router 和 Server，以支持立即切换额度单位。",
+          "pending_evidence_missing": "在途请求缺少目标单位的可信上界，请等待结算后再转换。"
         },
         "rowReason": "{{email}}：{{reason}}",
         "usageEditUnavailable": "美元额度用户不能设置已消耗 Token，请在其用量列中立即校准。",
@@ -1355,7 +1359,14 @@
         "malformed": "无法读取该用户的美元额度数据，已设为只读，不会被修改。",
         "malformedSave": "无法读取 {{email}} 的美元额度。请重新加载，或移除该用户后再保存。",
         "resources": "包含图片、音频、视频与付费工具",
-        "resourcesHint": "需要配置资源价格并升级 Server。已有文本额度继续使用原计价策略。"
+        "resourcesHint": "需要配置资源价格并升级 Server。已有文本额度继续使用原计价策略。",
+        "conversionCalibrationRequired": "人工调整或缺少精确 Token 对应的消费需要填写目标单位已用额度及审计原因（美元或 Token）；真实请求消费会自动承接。",
+        "convertedUsd": "随 Share 保存生效 · 已用 {{used}} · 在途 {{pending}} · 剩余 {{remaining}}",
+        "convertedTokens": "随 Share 保存生效 · 已用 {{tokens}} Token · 在途 {{pending}} · 剩余 {{remaining}}",
+        "preparationProgress": "正在准备历史 · 已核对 {{count}} 条请求",
+        "evidence": "已核对：{{tokens}} Token · {{requests}} 条请求 · {{missing}} 条待补证的尝试",
+        "pricingBasis": "原请求冻结价优先，重建部分使用价目 {{revision}}",
+        "originalPrices": "原始冻结价格"
       },
       "accountReset": {
         "label": "账号重置周期",

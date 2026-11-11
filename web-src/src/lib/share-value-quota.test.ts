@@ -1,3 +1,4 @@
+import { quotaConversionInput, quotaConversionNeeded, calibratedConversionRow, type ValuePreviewRow } from "./share-value-quota";
 import { describe, expect, it } from "vitest";
 import { parseValueLimit, valueLimitInput, parseValueUsage, valueUsageLabel, valueUsageInput, parseInitialValueUsage, valueStateKey, matchingValueStatus, valueQuotaAvailability, valueCapabilityReady, isValuePreview, type ValueStatus, type ValuePreview,
   parseValueLimitInput, valueLimitLabel, valueRowKind, valuePreviewNeedsConfirmation, valuePreviewBlocker, valueErrorMessage, valueRequestError, ValueQuotaResponseError,
@@ -127,10 +128,10 @@ describe("Share USD-equivalent quotas", () => {
     expect(dollars[grant.email].policy.tokenLimit).toBeUndefined();
     expect(one[grant.email].policy.tokenLimit).toBe(100);
   });
-  it("drops a waiting USD policy only when the owner stages a different policy", () => {
+  it("explicit policy application replaces a legacy schedule", () => {
     const kept=stageGrantPolicy(grant,{...grant.pendingValueQuota!.policy});
-    expect(kept.pendingValueQuota).toBe(grant.pendingValueQuota);
-    expect(kept.policy).toBe(grant.policy);
+    expect(kept.pendingValueQuota).toBeUndefined();
+    expect(kept.policy).toEqual(grant.pendingValueQuota!.policy);
     const tokens=stageGrantPolicy(grant,{tokenLimit:300,tokenPeriod:"day"});
     expect(tokens.pendingValueQuota).toBeUndefined();
     expect(tokens.policy).toEqual({tokenLimit:300,tokenPeriod:"day"});
@@ -221,5 +222,23 @@ describe("Share USD-equivalent quotas", () => {
     expect(valueRequestError(new Error("boom"))).toBe("failed");
     expect(valueErrorMessage(new HttpResponseError("x",400,{code:"quota_target_invalid"}))).toEqual({key:"share.userLimit.valueQuota.error.targetInvalid"});
     expect(valueStateKey({meteringStatus:"blocked",syncedAtMs:1} as ValueStatus,2)).toBe("share.userLimit.valueQuota.state.blocked");
+  });
+});
+
+
+describe("signed quota conversions",()=>{
+  it("retains exact calibrated amounts for independent batch rows and rejects stale/invalid evidence",()=>{
+    const usd:ValuePreviewRow={email:"a@example.test",effectiveFromMs:1,conversionRequired:true,conversionCredential:"signed",credentialExpiresAtMs:Date.now()+60_000,ready:true,calibrationRequired:true,targetUnit:"usdEquivalent",usedPicos:"42000000000000",pendingRiskPicos:"2000000000000",limitUsdMicros:"100000000",coverage:{complete:true,missingFacts:0,evidenceTokens:30_000_000,evidenceRequests:1,status:{meteringStatus:"observed",observedPicos:"42000000000000"}}};
+    const calibration={amount:"50.000000000001",reason:"Reviewed"};
+    expect(quotaConversionInput(usd,calibration)).toEqual({credential:"signed",targetUsedPicos:"50000000000001",reason:"Reviewed"});
+    expect(calibratedConversionRow(usd,calibration).remainingPicos).toBe("47999999999999");
+    for(const bad of [{amount:"41",reason:"Reviewed"},{amount:"50",reason:""},{amount:"50",reason:"中".repeat(334)}]) expect(()=>quotaConversionInput(usd,bad)).toThrow();
+    expect(()=>quotaConversionInput({...usd,credentialExpiresAtMs:0},calibration)).toThrow();
+    const token={...usd,targetUnit:"tokens" as const,observedTokens:30_000_000,tokenLimit:100_000_000,pendingTokens:5_000_000};
+    expect(quotaConversionInput(token,{amount:"40000001",reason:"Reviewed"})?.targetUsedTokens).toBe(40_000_001);
+    expect(calibratedConversionRow(token,{amount:"40000001",reason:"Reviewed"}).remainingTokens).toBe(54_999_999);
+    expect(()=>quotaConversionInput(token,{amount:"29999999",reason:"Reviewed"})).toThrow();
+    expect(quotaConversionNeeded({policy:{tokenPeriod:"day",valueQuota:{limitUsdMicros:"100000000",tariffPolicyId:"api-equivalent-v1"}}},{tokenPeriod:"day",tokenLimit:100_000_000})).toBe(true);
+    expect(quotaConversionNeeded({policy:{tokenPeriod:"day",tokenLimit:100}},{tokenPeriod:"day",tokenLimit:200})).toBe(false);
   });
 });

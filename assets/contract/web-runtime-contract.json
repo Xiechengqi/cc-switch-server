@@ -2264,6 +2264,22 @@
       "implemented": true,
       "feature": "cloudSync",
       "notes": "Server-native Web compatibility command."
+    },
+    {
+      "name": "prepare_share_quota_history",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/prepare_share_quota_history",
+      "notes": "Explicit, bounded and resumable historical metering preparation; no quota policy change."
+    },
+    {
+      "name": "get_share_quota_conversion",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/get_share_quota_conversion",
+      "notes": "Read-only lookup of a durable atomic unit-conversion operation for timeout recovery."
     }
   ],
   "invokeCommands": []

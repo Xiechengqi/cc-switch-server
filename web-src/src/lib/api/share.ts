@@ -135,7 +135,12 @@ export type ShareTotalUsageEdit = {
   tokensUsed?: number;
 };
 
+export type ShareUserQuotaConversion = { credential: string; targetUsedPicos?: string; targetUsedTokens?: number; reason?: string };
 export type ShareUserGrant = {
+  quotaConversionId?: string;
+  /** Local draft only; the save builder emits an explicit conversion input. */
+  quotaUnitConversion?: ShareUserQuotaConversion;
+  quotaUnitConversionPolicy?: string;
   valueMetering?: {quotaPolicyEpoch:string;valueMeteredFromMs:number;effectiveFromMs:number;pricingRevision:string};
   pendingValueQuota?: {policy:ShareUserPolicy;effectiveFromMs:number;retainAccess:boolean};
   /**
@@ -325,6 +330,7 @@ export interface SaveProviderBundleShareParams {
   userGrants?: ShareUserGrantMap;
   userUsageEdits?: ShareUserUsageEditMap;
   userValueUsageInitializations?: ShareUserValueUsageInitializationMap;
+  userQuotaConversions?: Record<string, ShareUserQuotaConversion>;
   valueUsageOperationId?: string;
   shareUsageEdit?: ShareTotalUsageEdit;
 }
@@ -728,6 +734,8 @@ export const shareApi = {
     if (session !== readToken() || router !== readRouterAccessToken()) throw new DOMException("The signed-in user changed", "AbortError");
     return result;
   },
+  prepareQuotaHistory: (shareId: string, expectedConfigRevision: number, emails: string[], signal?: AbortSignal) =>
+    invokeCommand<{items: {email: string; preparation: {state: "preparing" | "complete"; processed: number}}[]}>("prepare_share_quota_history", {shareId, expectedConfigRevision, emails}, {signal, cache: "no-store"}),
   previewValueQuota: (shareId:string,expectedConfigRevision:number,policies?:Record<string,ShareUserPolicy>,signal?:AbortSignal) =>
     invokeCommand<import("../share-value-quota").ValuePreview>("preview_share_value_quota",{shareId,expectedConfigRevision,policies},{signal,cache:"no-store"}),
   valueQuotaStatus: (shareId:string) => invokeCommand<{items:import("../share-value-quota").ValueStatus[];diagnostics?:import("../share-value-quota").ValueDiagnostics}>("get_share_value_quota_status",{shareId}),

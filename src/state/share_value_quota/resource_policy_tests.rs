@@ -80,6 +80,16 @@ async fn value_quota_resource_readiness_is_per_grant_and_fences_scheduled_activa
         .unwrap()
         .user_grants
         .insert(other.email.clone(), other.clone());
+    let owner = previous
+        .shares
+        .iter_mut()
+        .find(|s| s.id == scope.share_id)
+        .unwrap()
+        .user_grants
+        .get_mut("owner@example.com")
+        .unwrap();
+    owner.policy = policy("api-equivalent-v1");
+    owner.value_metering = Some(binding.clone());
     let mut candidate = previous.clone();
     candidate
         .shares
@@ -99,6 +109,7 @@ async fn value_quota_resource_readiness_is_per_grant_and_fences_scheduled_activa
             true,
             &providers,
             Some(&usage),
+            &BTreeSet::new(),
         )
         .unwrap();
     let share = candidate.get(&scope.share_id).unwrap();
@@ -132,6 +143,7 @@ async fn value_quota_resource_readiness_is_per_grant_and_fences_scheduled_activa
             true,
             &providers,
             Some(&usage),
+            &BTreeSet::new(),
         )
         .unwrap();
     assert_eq!(

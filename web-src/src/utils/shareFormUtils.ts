@@ -24,9 +24,9 @@ export function sharePolicyKey(policy: ShareUserPolicy): string {
  * is saved. `valueMetering` is left alone so recorded USD usage is kept.
  */
 export function stageGrantPolicy(grant: ShareUserGrant, policy: ShareUserPolicy): ShareUserGrant {
-  const waiting = grant.pendingValueQuota;
-  if (waiting?.policy && sharePolicyKey(waiting.policy) === sharePolicyKey(policy)) return { ...grant };
-  return { ...grant, policy, pendingValueQuota: undefined };
+  return { ...grant, policy, pendingValueQuota: undefined,
+    quotaUnitConversion: grant.quotaUnitConversionPolicy === sharePolicyKey(policy) ? grant.quotaUnitConversion : undefined,
+  };
 }
 
 export function uniqueSortedEmails(emails: string[]): string[] {

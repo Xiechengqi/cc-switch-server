@@ -568,6 +568,8 @@ impl ResponseModelEvidence {
 
 #[derive(Debug, Clone, Default)]
 pub struct UsageLogContext {
+    /// Authenticated ingress App, retained across internal generations.
+    pub quota_app: Option<AppKind>,
     pub value_resources: Option<super::value_pricing::ResourceUsage>,
     pub response_model: Option<ResponseModelEvidence>,
     pub value_streamed_text_bytes: Option<u64>,

@@ -2,8 +2,8 @@
 //!
 //! USD-equivalent quotas are a request-level soft cap: prefer a small,
 //! bounded overshoot and never falsely lock a user out. Only grants with an
-//! active `policy.valueQuota` or a `pendingValueQuota` are metered; Token
-//! grants carry no USD metering (legacy bindings are left untouched).
+//! active `policy.valueQuota` enforce USD; ordinary Token grants retain
+//! independent evidence without reserving USD capacity or requiring a price.
 use super::*;
 use crate::domain::sharing::router_contract::{
     PendingValueQuota, ShareGrantManager, ShareTokenPeriod, ShareUserGrant, ShareUserPolicy,
@@ -27,6 +27,7 @@ pub(crate) const MARKET_TRIAL_VALUE_CHECK: &str = "market_trial_value";
 /// Margin added to the longest provider request timeout before a pending
 /// attempt counts as stuck (sweeper and `set` reconcile share it).
 const STALE_ATTEMPT_MARGIN_MS: i64 = 5 * 60 * 1000;
+mod conversion;
 mod initialization;
 mod tariff;
 pub(crate) use initialization::{InitializedShareSnapshot, ValueUsageInitializationRequest};
@@ -92,6 +93,7 @@ fn window(grant: &ShareUserGrant, now: i64) -> anyhow::Result<ledger::Window> {
             "VALUE_QUOTA_ACCOUNT_CYCLE_UNAVAILABLE"
         );
         return Ok(ledger::Window {
+            account: Some(cycle.clone()),
             id: format!(
                 "account:{}:{}:{}:{}",
                 cycle.source_ref, cycle.source_epoch, cycle.bucket_id, cycle.cycle_id
@@ -104,6 +106,7 @@ fn window(grant: &ShareUserGrant, now: i64) -> anyhow::Result<ledger::Window> {
     let period = crate::domain::sharing::token_period::token_period_window(&grant.policy, now)
         .map_err(anyhow::Error::msg)?;
     Ok(ledger::Window {
+        account: None,
         id: format!(
             "{}:{}:{}",
             period_label(grant.policy.token_period),
@@ -358,6 +361,7 @@ pub(crate) struct ValueAttemptGuard {
     request_id: String,
     attempt_id: String,
     phase: AtomicU8,
+    enforced: bool,
 }
 impl ValueAttemptGuard {
     pub(crate) async fn handoff_task(
@@ -368,10 +372,19 @@ impl ValueAttemptGuard {
         let config_dir = self.state.config_dir.clone();
         let request = self.request_id.clone();
         let attempt = self.attempt_id.clone();
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             ledger::attach_task(&config_dir, &request, &attempt, &task_id, expires_at_ms)
         })
-        .await??;
+        .await
+        .context("async evidence task panicked")
+        .and_then(|r| r);
+        if let Err(error) = result {
+            if self.enforced {
+                return Err(error);
+            }
+            self.state.mark_quota_usage_degraded();
+            tracing::error!(%error,"Token async request continues; quota conversion needs evidence recovery");
+        }
         self.request_id.clear();
         Ok(())
     }
@@ -408,10 +421,20 @@ impl ValueAttemptGuard {
         let config_dir = self.state.config_dir.clone();
         let request = self.request_id.clone();
         let attempt = self.attempt_id.clone();
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             ledger::observe_attempt_tokens(&config_dir, &request, &attempt, tokens, estimated)
         })
-        .await??;
+        .await
+        .context("generation evidence task panicked")
+        .and_then(|r| r);
+        if let Err(error) = result {
+            if self.enforced {
+                return Err(error);
+            }
+            self.state.mark_quota_usage_degraded();
+            tracing::error!(%error,"Token generation continues; quota conversion needs evidence recovery");
+            return Ok(());
+        }
         self.state
             .sync_market_trial_value(Some(&self.request_id), false)
             .await?;
@@ -795,6 +818,7 @@ impl ServerStateInner {
             })
             .collect::<Vec<_>>();
         let router_negotiated = self.value_quota_router_negotiated().await;
+        let conversion_negotiated = self.quota_conversion_router_negotiated().await;
         let mut tariff_check =
             serde_json::json!({"code":"acknowledged_tariff", "ready":tariff.is_ok()});
         // Pricing sync needs both a committed ledger and a negotiated Router,
@@ -826,6 +850,7 @@ impl ServerStateInner {
         // may carry a USD-equivalent budget. Always ready.
         checks.push(serde_json::json!({"code":MARKET_TRIAL_VALUE_CHECK, "ready":true}));
         checks.push(serde_json::json!({"code":"value_usage_initialization", "ready":true}));
+        checks.push(serde_json::json!({"code":"quota_unit_conversion", "ready":true}));
         let resource_ready = self.resource_value_router_negotiated().await
             && scope(&config, share_id, "preview@local.invalid")
                 .and_then(|identity| ledger::resource_tariff_ready(&self.config_dir, &identity))
@@ -857,7 +882,18 @@ impl ServerStateInner {
             None => "ready",
         };
         let invalid_row = |email: &str, reason: String| serde_json::json!({"email":email,"ready":false,"reason":reason,"reasonCode":"invalid_policy"});
-        if !capability_ready {
+        let token_conversion_only = !policies.is_empty()
+            && policies.values().all(|p| p.value_quota.is_none())
+            && checks
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c["code"].as_str(),
+                        Some("router_protocol" | "sqlite_authority" | "metering_storage")
+                    )
+                })
+                .all(|c| c["ready"] == true);
+        if !capability_ready && !token_conversion_only {
             // Validate the proposed policies without opening the ledger.
             let rows = policies
                 .iter()
@@ -915,6 +951,7 @@ impl ServerStateInner {
                 .collect();
             (empty_windows, no_prior_usage)
         };
+        let conversion_usage = self.usage.read().await.clone();
         let mut rows = Vec::new();
         let mut first_blocker: Option<&'static str> = None;
         for (email, policy) in &policies {
@@ -935,6 +972,22 @@ impl ServerStateInner {
                     &email,
                     "Share Market managed users are read-only".into(),
                 ));
+                continue;
+            }
+            if conversion::needed(previous, policy) {
+                let row = self.conversion_preview_row(
+                    &config,
+                    &share,
+                    &email,
+                    policy,
+                    &conversion_usage,
+                    now,
+                    conversion_negotiated,
+                )?;
+                if row["ready"] != true {
+                    first_blocker.get_or_insert("history_incomplete");
+                }
+                rows.push(row);
                 continue;
             }
             let mut grant = previous.cloned().unwrap_or_default();
@@ -1029,7 +1082,7 @@ impl ServerStateInner {
         });
         Ok(
             serde_json::json!({"shareId":share_id,"configRevision":share.config_revision,"ready":ready,
-            "capabilityReady":capability_ready,"checks":checks,
+            "capabilityReady":capability_ready || token_conversion_only,"checks":checks,
             "reason":if ready {None} else {Some("Some policies are invalid or a user's window needs reconcile")},
             "reasonCode":top_code,
             "activePricingRevision":tariff.as_ref().ok(),"meteredFromConfirmationRequired":true,
@@ -1107,9 +1160,10 @@ impl ServerStateInner {
             capable,
             &providers,
             Some(&usage),
+            &BTreeSet::new(),
         )
     }
-    /// Only USD grants (active policy or pending) get or keep a binding.
+    /// USD grants and converted Token grants retain their metering bindings.
     /// A user's own policy edit that cannot be prepared fails the save; any
     /// other grant error (e.g. a background commit activating a due policy)
     /// leaves that grant untouched and never aborts the whole ShareStore.
@@ -1125,6 +1179,7 @@ impl ServerStateInner {
         capable: bool,
         providers: &ProviderStore,
         usage: Option<&crate::domain::usage::store::UsageStore>,
+        converted: &BTreeSet<(String, String)>,
     ) -> anyhow::Result<()> {
         for share in &mut candidate.shares {
             let verified_surface = verified_text_bindings(share, providers);
@@ -1200,17 +1255,22 @@ impl ServerStateInner {
                 }
                 if !grant.active
                     || grant.manager == ShareGrantManager::RouterShareMarket
-                    || (grant.policy.value_quota.is_none() && grant.pending_value_quota.is_none())
+                    || (grant.policy.value_quota.is_none()
+                        && grant.pending_value_quota.is_none()
+                        && old_share
+                            .and_then(|s| s.user_grants.get(email))
+                            .is_none_or(|g| g.policy.value_quota.is_none()))
                 {
                     continue;
                 }
                 let old = old_share.and_then(|s| s.user_grants.get(email));
                 let original = grant.clone();
                 let requested = grant.policy.clone();
-                let user_edit = old.is_none_or(|g| {
-                    (!g.active || g.policy != requested)
-                        && g.pending_value_quota.as_ref().map(|p| &p.policy) != Some(&requested)
-                });
+                let user_edit = converted.contains(&(share.id.clone(), email.clone()))
+                    || old.is_none_or(|g| {
+                        (!g.active || g.policy != requested)
+                            && g.pending_value_quota.as_ref().map(|p| &p.policy) != Some(&requested)
+                    });
                 if user_edit && grant.policy.value_quota.is_some() {
                     require_prices()?;
                 }
@@ -1224,6 +1284,8 @@ impl ServerStateInner {
                     capable,
                     verified_surface,
                     usage,
+                    converted.contains(&(share.id.clone(), email.clone())),
+                    old_share.is_none(),
                 ) {
                     Ok(grant_changed) => changed |= grant_changed,
                     Err(error) if user_edit => return Err(error),
@@ -1355,8 +1417,22 @@ impl ServerStateInner {
         capable: bool,
         verified_surface: bool,
         usage: Option<&crate::domain::usage::store::UsageStore>,
+        converted: bool,
+        brand_new_share: bool,
     ) -> anyhow::Result<bool> {
         let original = grant.clone();
+        if !brand_new_share && conversion::needed(old, &grant.policy) {
+            anyhow::ensure!(converted, "QUOTA_CONVERSION_PREVIEW_REQUIRED");
+            if grant.policy.value_quota.is_some() {
+                anyhow::ensure!(
+                    capable && verified_surface,
+                    "VALUE_QUOTA_UNSUPPORTED_PROVIDER_SURFACE"
+                );
+            }
+            window(grant, now)?;
+            grant.pending_value_quota = None;
+            return Ok(*grant != original);
+        }
         let requested = grant.policy.clone();
         let mut policy_changed = old.is_none_or(|g| g.policy != grant.policy || !g.active);
         let mut activating = None;
@@ -1548,7 +1624,7 @@ impl ServerStateInner {
             .send()
             .await?)
     }
-    /// Sends the signed pricing ACK (`{"revision","storageSchema":5}`) and
+    /// Sends the signed pricing ACK (`{"revision","storageSchema":6}`) and
     /// checks the echoed revision.
     async fn send_value_pricing_ack(
         http: &reqwest::Client,
@@ -1559,7 +1635,7 @@ impl ServerStateInner {
         let ack = client::signed_canonical_request(
             identity,
             "share_value_pricing_ack",
-            serde_json::json!({"revision":revision,"storageSchema":5}),
+            serde_json::json!({"revision":revision,"storageSchema":6}),
         )?;
         let response: serde_json::Value = http
             .post(format!(
@@ -1877,11 +1953,8 @@ impl ServerStateInner {
         self.admit_share_value_request(context, model, tier, estimate, verified, None)
             .await
     }
-    /// Pre-send USD admission for one attempt. Only enforced USD grants are
-    /// metered. Reads the grant under the shares read lock only (the ledger
-    /// IMMEDIATE transaction serializes admissions; windows aggregate across
-    /// policy epochs, so a racing policy edit cannot erase usage) and runs
-    /// SQLite on the blocking pool. Returns the attempt's terminal guard.
+    /// Re-read current authorization and persist unit-independent admission
+    /// under the short Share commit gate, before upstream generation I/O.
     pub(crate) async fn admit_share_value_request(
         self: &Arc<Self>,
         context: &UsageLogContext,
@@ -1897,10 +1970,46 @@ impl ServerStateInner {
         let (Some(share_id), Some(email)) = (&context.share_id, &context.user_email) else {
             return Ok(None);
         };
+        let config = self.config_snapshot().await;
+        // Serializes policy reads + durable admission with policy commits. The
+        // gate is released before any upstream I/O or response body lifetime.
+        let usage = self.usage.read().await;
+        let _admission = self.shares_persistence.gate.lock().await;
         let (free_access, grant, trial) = {
             let shares = self.shares.read().await;
             let share = shares.get(share_id).context("VALUE_QUOTA_SHARE_REVOKED")?;
+            if !share.enabled
+                || share.status != "active"
+                || share.expires_at.is_some_and(|at| at <= now_ms_i64())
+                || share
+                    .token_limit
+                    .is_some_and(|cap| share.tokens_used >= cap)
+            {
+                return Err(ValueQuotaRejection::new(
+                    ValueQuotaRejectionKind::AuthorizationRevoked,
+                )
+                .into());
+            }
+            if context.quota_app.is_some_and(|app| {
+                !crate::domain::sharing::shares::share_app_api_enabled(share, app)
+            }) {
+                return Err(ValueQuotaRejection::new(
+                    ValueQuotaRejectionKind::AuthorizationRevoked,
+                )
+                .into());
+            }
             let grant = share.user_grants.get(&email.to_ascii_lowercase()).cloned();
+            if grant.as_ref().filter(|g| g.active).is_some_and(|g| {
+                !g.policy.allowed_apps.is_empty()
+                    && context
+                        .quota_app
+                        .is_none_or(|app| !g.policy.allowed_apps.contains(&app))
+            }) {
+                return Err(ValueQuotaRejection::new(
+                    ValueQuotaRejectionKind::AuthorizationRevoked,
+                )
+                .into());
+            }
             let mut trial = None;
             if let Some(grant) = grant.as_ref().filter(|g| {
                 g.manager == ShareGrantManager::RouterShareMarket && g.policy.value_quota.is_some()
@@ -1955,7 +2064,9 @@ impl ServerStateInner {
             }
             (share.free_access, grant, trial)
         };
-        let Some(grant) = grant.filter(|grant| grant.active) else {
+        let grant = if let Some(grant) = grant.filter(|grant| grant.active) {
+            grant
+        } else {
             // Free-access traffic does not acquire a revoked individual's
             // policy. Private Shares still reject a revocation that raced
             // the initial authorization check.
@@ -1965,19 +2076,108 @@ impl ServerStateInner {
                 )
                 .into());
             }
-            return Ok(None);
+            ShareUserGrant {
+                email: email.to_ascii_lowercase(),
+                active: true,
+                ..Default::default()
+            }
         };
-        let Some(quota) = grant.policy.value_quota.clone() else {
+        let now = now_ms_i64();
+        if grant.policy.expires_at.is_some_and(|at| at <= now) {
+            return Err(
+                ValueQuotaRejection::new(ValueQuotaRejectionKind::AuthorizationRevoked).into(),
+            );
+        }
+        if let Some(limit) = grant.policy.token_limit {
+            let view = crate::domain::sharing::shares::quota_view_from_history(
+                &usage, share_id, email, &grant, now,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let used = view.effective_tokens_used.max(
+                crate::domain::sharing::shares::effective_grant_tokens_for_policy(&grant, now),
+            );
+            if used >= limit {
+                return Err(ValueQuotaRejection {
+                    kind: ValueQuotaRejectionKind::Exhausted,
+                    resets_at_ms: view.window_ends_at_ms,
+                }
+                .into());
+            }
+        }
+        if let Some(limit) = grant
+            .policy
+            .token_limit
+            .filter(|_| grant.quota_conversion_id.is_some())
+        {
+            let mut bound = grant.clone();
+            if bound.value_metering.is_none() {
+                bound.value_metering = Some(ValueMeteringBinding {
+                    quota_policy_epoch: "evidence".into(),
+                    value_metered_from_ms: 0,
+                    effective_from_ms: 0,
+                    pricing_revision: String::new(),
+                });
+            }
+            let w = window(&bound, now)?;
+            let identity = grant_scope(&config, share_id, email, &grant)?;
+            let (pending, complete) = ledger::evidence::pending_tokens(
+                &self.config_dir,
+                &identity,
+                &w,
+                context.request_id.as_deref(),
+            )?;
+            let view = crate::domain::sharing::shares::quota_view_from_history(
+                &usage, share_id, email, &grant, now,
+            )
+            .map_err(anyhow::Error::msg)?;
+            if !complete {
+                return Err(ValueQuotaRejection::new(ValueQuotaRejectionKind::Blocked).into());
+            }
+            if view.effective_tokens_used.saturating_add(pending) >= limit {
+                return Err(ValueQuotaRejection::new(ValueQuotaRejectionKind::Busy).into());
+            }
+        }
+        let enforce = grant.policy.value_quota.is_some();
+        if !enforce
+            && (!server_sqlite::is_committed(&self.config_dir).unwrap_or(false)
+                || scope(&config, share_id, email).is_err())
+        {
             return Ok(None);
-        };
+        }
+        let quota = grant.policy.value_quota.clone().unwrap_or_else(|| {
+            crate::domain::usage::value_pricing::ValueQuota {
+                limit_usd_micros: "1".into(),
+                tariff_policy_id: if resource_plan.as_ref().is_some_and(|p| p.requires_v2) {
+                    crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+                } else {
+                    crate::domain::usage::value_pricing::TARIFF_POLICY
+                }
+                .into(),
+            }
+        });
         let result = async {
-            let binding = grant
-                .value_metering
-                .clone()
-                .context("VALUE_QUOTA_BINDING_UNAVAILABLE")?;
-            anyhow::ensure!(verified_surface, "VALUE_QUOTA_UNVERIFIED_SURFACE");
-            let tier = effective_tier.ok_or_else(|| {
-                crate::domain::usage::value_pricing::PriceRejection {
+            let binding = if enforce {
+                grant
+                    .value_metering
+                    .clone()
+                    .context("VALUE_QUOTA_BINDING_UNAVAILABLE")?
+            } else {
+                // A legacy future USD binding must not suppress today's
+                // independent Token facts or mark healthy storage degraded.
+                ValueMeteringBinding {
+                    quota_policy_epoch: "evidence".into(),
+                    value_metered_from_ms: 0,
+                    effective_from_ms: 0,
+                    pricing_revision: String::new(),
+                }
+            };
+            anyhow::ensure!(
+                !enforce || verified_surface,
+                "VALUE_QUOTA_UNVERIFIED_SURFACE"
+            );
+            let tier = effective_tier
+                .or_else(|| (!enforce).then_some("unknown"))
+                .ok_or_else(|| crate::domain::usage::value_pricing::PriceRejection {
                     reason_code: "tier_unknown",
                     model: crate::domain::usage::value_pricing::diagnostic_identity(
                         effective_model,
@@ -1986,20 +2186,32 @@ impl ServerStateInner {
                     active_pricing_revision: None,
                     pending_pricing_revision: None,
                     effective_from_ms: None,
-                }
-            })?;
+                })?;
             let started = i64::try_from(
                 context
                     .started_at_ms
                     .context("value quota start time missing")?,
             )?;
             anyhow::ensure!(
-                started >= binding.effective_from_ms,
+                now_ms_i64() >= binding.effective_from_ms,
                 "VALUE_QUOTA_SCHEDULED"
             );
-            let config = self.config_snapshot().await;
             let identity = grant_scope(&config, share_id, email, &grant)?;
-            let w = window(&grant, started)?;
+            let mut bound_grant = grant.clone();
+            bound_grant.value_metering = Some(binding.clone());
+            let w = window(&bound_grant, now).or_else(|error| {
+                if enforce {
+                    Err(error)
+                } else {
+                    Ok(ledger::Window {
+                        account: None,
+                        id: "evidence".into(),
+                        starts_at_ms: 0,
+                        ends_at_ms: None,
+                        metered_from_ms: 0,
+                    })
+                }
+            })?;
             let request_id = context
                 .request_id
                 .clone()
@@ -2008,13 +2220,19 @@ impl ServerStateInner {
             let parallel_limit = grant.policy.parallel_limit.unwrap_or(4).min(4);
             let config_dir = self.config_dir.clone();
             let model = effective_model.to_owned();
+            let attribution = context.quota_attribution.clone();
             let (blocking_request, blocking_attempt) = (request_id.clone(), attempt_id.clone());
             tokio::task::spawn_blocking(move || {
-                let revision = ledger::active_revision(&config_dir, &identity)?
-                    .context("VALUE_QUOTA_SNAPSHOT_UNAVAILABLE")?;
+                let revision = if enforce {
+                    ledger::active_revision(&config_dir, &identity)?
+                        .context("VALUE_QUOTA_SNAPSHOT_UNAVAILABLE")?
+                } else {
+                    String::new()
+                };
                 let admission = ledger::Admission {
+                    attribution,
                     resource_plan,
-                    enforce: true,
+                    enforce,
                     scope: &identity,
                     window: &w,
                     policy_epoch: &binding.quota_policy_epoch,
@@ -2028,6 +2246,13 @@ impl ServerStateInner {
                     estimate,
                     parallel_limit,
                 };
+                if !enforce {
+                    return ledger::evidence::admit_shadow(
+                        &config_dir,
+                        &admission,
+                        verified_surface,
+                    );
+                }
                 match trial.as_ref() {
                     Some(trial) => {
                         ledger::admit_with_market_trial(&config_dir, &admission, Some(trial))
@@ -2042,6 +2267,7 @@ impl ServerStateInner {
                 request_id,
                 attempt_id,
                 phase: AtomicU8::new(PHASE_NOT_SENT),
+                enforced: enforce,
             })
         }
         .await
@@ -2053,6 +2279,11 @@ impl ServerStateInner {
             }
         });
         if let Err(error) = &result {
+            if !enforce {
+                self.mark_quota_usage_degraded();
+                tracing::error!(%error, share_id, "Token request metering evidence could not be persisted; conversions remain unavailable");
+                return Ok(None);
+            }
             metrics::counter!("share_value_quota_rejections_total","reason"=>rejection_reason(error))
                 .increment(1);
         }

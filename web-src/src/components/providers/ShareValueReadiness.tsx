@@ -8,7 +8,7 @@ import { cn } from "@/lib/utils";
 import { SERVER_STORAGE_SETTINGS_SECTION, serverSettingsSectionUrl } from "@/lib/serverView";
 import {
   formatValueTime, valueCheckBlocker, valueErrorMessage, valueFailedChecks, valueReadinessRoots, valueReadinessSummary, VALUE_CHECK_ORDER, valueInvalidRowMessage, valueLimitLabel, valuePreviewBlocker, valueQuotaAvailability, valueRowKind,
-  valueStateKey, valueStateName, valueStatusReason, valueUsageLabel, VALUE_STATUS_STALE_MS, type ValueMessage, type ValuePreviewRow,
+  valueStateKey, valueStateName, valueStatusReason, calibratedConversionRow, valueUsageLabel, VALUE_STATUS_STALE_MS, type ValueMessage, type ValuePreviewRow,
   type ValueStatus,
 } from "@/lib/share-value-quota";
 import type { useShareValueReadiness, ValuePreviewState } from "./shareValueHooks";
@@ -157,25 +157,28 @@ export function ShareValueLimitField({ id, unit, value, onChange, error, disable
 function RowLine({ row, withEmail }: { row: ValuePreviewRow; withEmail?: boolean }) {
   const { t, i18n } = useTranslation(); const p = "share.userLimit.valueQuota.preview.";
   const kind = valueRowKind(row);
-  const used = valueUsageLabel(row.usedPicos ?? "0");
-  const text = kind === "scheduled" ? t(p + "starts", { date: formatValueTime(row.effectiveFromMs, i18n.language, "short"), used })
+  const used = valueUsageLabel(row.usedPicos);
+  const text = row.conversionRequired && row.targetUnit === "tokens" ? t("share.userLimit.valueQuota.convertedTokens", {tokens: row.effectiveTokens?.toLocaleString() ?? "—", pending: row.pendingTokens?.toLocaleString() ?? "—", remaining: row.remainingTokens?.toLocaleString() ?? "—"})
+    : row.conversionRequired ? t("share.userLimit.valueQuota.convertedUsd", {used, pending: valueUsageLabel(row.pendingRiskPicos), remaining: valueUsageLabel(row.remainingPicos)})
+    : kind === "scheduled" ? t(p + "starts", { date: formatValueTime(row.effectiveFromMs, i18n.language, "short"), used })
     : kind === "fromNow" ? t(p + "fromNow") : t(p + "now", { used });
   const hint = kind === "scheduled" ? "hintScheduled" : kind === "fromNow" ? "hintFromNow" : "hintNow";
   return <span className="inline-flex min-w-0 items-center gap-1">
     <span className="min-w-0 break-words">{withEmail ? <span className="font-mono">{row.email} · </span> : null}{text}</span>
     {withEmail ? null : <ShareValueInfo label={t(p + "title")}>
       <p>{t(p + hint)}</p>
+      {row.coverage ? <p>{t("share.userLimit.valueQuota.pricingBasis",{revision:row.coverage.pricingBasis?.slice(0,12) ?? t("share.userLimit.valueQuota.originalPrices")})} · {row.coverage.status?.meteringStatus}</p> : null}
       {row.meteredFromMs != null ? <p className="text-muted-foreground">{t("share.userLimit.valueQuota.meteredSince", { time: formatValueTime(row.meteredFromMs, i18n.language) })}</p> : null}
     </ShareValueInfo>}
   </span>;
 }
 /** One line under the amount; batches add a short per-user list. */
-export function ShareValuePreviewLine({ state }: { state: ValuePreviewState }) {
+export function ShareValuePreviewLine({ state, calibrations }: { state: ValuePreviewState; calibrations?: Record<string,{amount:string;reason:string}> }) {
   const { t } = useTranslation(); const render = useValueMessage(); const p = "share.userLimit.valueQuota.preview.";
   if (!state.intent) return null;
-  if (state.loading) return <p className="text-xs text-muted-foreground" role="status">{t(p + "loading")}</p>;
+  if (state.loading) return <p className="text-xs text-muted-foreground" role="status">{state.preparedRecords == null ? t(p + "loading") : t("share.userLimit.valueQuota.preparationProgress",{count:state.preparedRecords})}</p>;
   if (state.error) return <p className="text-xs text-destructive" role="alert">{render(valueErrorMessage(state.error))}</p>;
-  const preview = state.preview;
+  const preview = state.preview && {...state.preview, rows: state.preview.rows.map(row => calibratedConversionRow(row, calibrations?.[row.email]))};
   if (!preview) return null;
   const blocker = valuePreviewBlocker(preview);
   const invalid = preview.invalidRows ?? [];
@@ -190,7 +193,9 @@ export function ShareValuePreviewLine({ state }: { state: ValuePreviewState }) {
   }
   if (blocker) {
     const reason = render(blocker.message);
-    return <p className="text-xs text-destructive" role="alert">{blocker.email && preview.rows.length + invalid.length > 1 ? t("share.userLimit.valueQuota.rowReason", { email: blocker.email, reason }) : reason}</p>;
+    return <p className="text-xs text-destructive" role="alert">{blocker.email && preview.rows.length + invalid.length > 1 ? t("share.userLimit.valueQuota.rowReason", { email: blocker.email, reason }) : reason}
+      {preview.rows.filter(row=>row.coverage && (!blocker.email || row.email===blocker.email)).map(row=><span key={row.email} className="mt-1 block">{t("share.userLimit.valueQuota.evidence",{tokens:row.coverage!.evidenceTokens,requests:row.coverage!.evidenceRequests,missing:row.coverage!.missingFacts})}</span>)}
+    </p>;
   }
   if (preview.rows.length <= 1) return preview.rows[0] ? <p className="text-xs text-muted-foreground" role="status"><RowLine row={preview.rows[0]} /></p> : null;
   const scheduled = preview.rows.filter((row) => valueRowKind(row) === "scheduled").length;

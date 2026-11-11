@@ -1284,7 +1284,7 @@
         "tokens": "トークン",
         "usd": "米ドル換算",
         "hint": "モデルの API 定価で換算した額で、ウォレットからは請求されません。リクエスト開始時に確認するソフト上限のため、受け付け済みのリクエストは上限をわずかに超えて完了することがあります。ユーザーごとの同時実行は min(並列上限, 4) 件までで、使用量が不確かなリクエストは残り枠をすべて確保することがあります。",
-        "start": "日・週・月および固定 7／30 日の期間は、次の完全な期間の開始時に米ドル上限へ切り替わり、それまでは現在のポリシーが適用されます。累計とアカウントリセット期間は適用した時点から計測します。単位を切り替えても使用量は消えません。",
+        "start": "証拠が揃っていれば保存時に変更先の単位が即時適用され、対象期間の消費と実行中の予約が引き継がれます。",
         "notReady": "Router v10、確定済み SQLite ストレージ、確認済み実行価格表が必要です。",
         "pending": "確定した使用量を同期中",
         "unitUsdShort": "$",
@@ -1306,9 +1306,9 @@
           "fromNow": "今から計測",
           "now": "すぐに適用 · 使用済み {{used}}",
           "summary": "{{count}} 人 · {{scheduled}} 人が予定 · {{fromNow}} 人が今から計測",
-          "hintScheduled": "暦および固定の期間は、次の完全な期間の開始時に米ドル上限へ切り替わります。それまでは現在のポリシーが適用され、その期間に記録済みの米ドル使用量は引き継がれます。",
-          "hintFromNow": "累計とアカウントリセット期間には以前の米ドル計測の証拠がないため、適用した時点から計測します。以前の使用量は換算されません。",
-          "hintNow": "このユーザーは現在の期間ですでに米ドルで計測されているため、新しい上限はすぐに適用され、表示中の使用量を引き継ぎます。"
+          "hintScheduled": "Existing schedules keep their activation time. New conversions carry current-window usage.",
+          "hintFromNow": "以前のバージョンで保存された計量開始点です。新しい単位変更には対象期間の完全な履歴証拠が必要です。",
+          "hintNow": "Saving takes effect immediately and includes consumption accrued after this preview."
         },
         "confirmApply": "確認して適用",
         "reasonCode": {
@@ -1321,7 +1321,11 @@
           "router_upgrade_required": "米ドル上限を使うには Router と Server をアップグレードしてください。",
           "blocked_needs_reconcile": "このユーザーの米ドル使用量を先に調整してください（使用量列の「今すぐ調整」）。",
           "invalid_policy": "この上限または期間は米ドル上限に使用できません。",
-          "resource_upgrade_required": "Router と Server を更新し、リソース料金表を有効にしてください。"
+          "resource_upgrade_required": "Router と Server を更新し、リソース料金表を有効にしてください。",
+          "history_incomplete": "履歴証拠が不足しているか、料金が確定していません。修復されるまで現在の単位が維持されます。",
+          "history_preparing": "履歴証拠を準備しています。現在のポリシーは引き続き適用されます。",
+          "conversion_upgrade_required": "即時の単位変更に対応する Router と Server に更新してください。",
+          "pending_evidence_missing": "実行中のリクエストには変更先の単位で信頼できる上限がありません。精算完了後に変更してください。"
         },
         "rowReason": "{{email}}：{{reason}}",
         "usageEditUnavailable": "米ドル上限のユーザーには消費トークンを設定できません。使用量列の「今すぐ調整」を使ってください。",
@@ -1355,7 +1359,14 @@
         "malformed": "このユーザーの USD 枠データを読み取れないため、読み取り専用で表示し、変更しません。",
         "malformedSave": "{{email}} の USD 枠を読み取れません。保存する前に再読み込みするか、このユーザーを削除してください。",
         "resources": "画像・音声・動画・有料ツールを含める",
-        "resourcesHint": "リソース価格の設定と Server の更新が必要です。既存のテキスト枠の価格は維持されます。"
+        "resourcesHint": "リソース価格の設定と Server の更新が必要です。既存のテキスト枠の価格は維持されます。",
+        "conversionCalibrationRequired": "手動調整や正確な Token 換算がない消費には、変更先の使用済み額（USD または Token）と監査理由を入力してください。実際のリクエスト消費は引き継がれます。",
+        "convertedUsd": "Share 保存時に適用 · 使用済み {{used}} · 実行中 {{pending}} · 残り {{remaining}}",
+        "convertedTokens": "Share 保存時に適用 · 使用済み {{tokens}} Token · 実行中 {{pending}} · 残り {{remaining}}",
+        "preparationProgress": "履歴を準備中 · {{count}} 件を確認済み",
+        "evidence": "確認済み：{{tokens}} Token · {{requests}} 件 · 証拠不足の試行 {{missing}} 件",
+        "pricingBasis": "リクエスト時の固定価格を優先し、復元分には料金表 {{revision}} を使用",
+        "originalPrices": "リクエスト時の固定価格"
       },
       "accountReset": {
         "label": "アカウントのリセット周期",

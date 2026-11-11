@@ -117,7 +117,7 @@ impl ServerStateInner {
         let request = client::signed_canonical_request(
             identity,
             "share_value_pricing_active",
-            serde_json::json!({"revision":revision,"storageSchema":5}),
+            serde_json::json!({"revision":revision,"storageSchema":6}),
         )?;
         let response: Value = self
             .http_client()

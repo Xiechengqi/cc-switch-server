@@ -40,7 +40,7 @@ use wal::validate_wal_if_present;
 pub(crate) const DATABASE_FILE_NAME: &str = "server-store.sqlite3";
 pub(crate) const MARKER_FILE_NAME: &str = "server-store-migration.json";
 pub(crate) const ACTIVATION_REQUEST_FILE_NAME: &str = "server-store-activation-request.json";
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -922,19 +922,21 @@ fn persist_accounts_with_hook(
 }
 
 pub(crate) fn persist_shares(config_dir: &Path, shares: &ShareStore) -> anyhow::Result<()> {
-    persist_shares_with_value_initializations(config_dir, shares, &[], "", 0)
+    persist_shares_with_value_initializations(config_dir, shares, &[], &[], "", 0)
 }
 
 pub(crate) fn persist_shares_with_value_initializations(
     config_dir: &Path,
     shares: &ShareStore,
     initializations: &[value_quota::Initialization],
+    conversions: &[value_quota::conversion::Conversion],
     actor: &str,
     now: i64,
 ) -> anyhow::Result<()> {
     let mut observation = CommitObservation::start("shares");
     assert_committed(config_dir)?;
     value_quota::ensure_initializations_unfenced(config_dir, initializations)?;
+    value_quota::conversion::ensure_unfenced(config_dir, conversions)?;
     let bytes = serde_json::to_vec_pretty(shares).context("encode Share SQLite payload")?;
     let root: Value = serde_json::from_slice(&bytes)?;
     let payloads = share_payloads(Some(&root), shares)?;
@@ -943,9 +945,11 @@ pub(crate) fn persist_shares_with_value_initializations(
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .context("begin Share SQLite commit")?;
     validate_share_revision_transition(&transaction, shares)?;
+    value_quota::conversion::apply_in_tx(&transaction, conversions)?;
     if !initializations.is_empty() {
         value_quota::initialize_in_tx(&transaction, initializations, actor, now)?;
     }
+    value_quota::conversion::finalize_in_tx(&transaction, conversions, shares)?;
     transaction.execute("DELETE FROM share_bindings", [])?;
     transaction.execute("DELETE FROM shares", [])?;
     import_share_rows(&transaction, shares, &payloads)?;
@@ -1089,6 +1093,7 @@ pub(crate) fn upsert_usage_log(config_dir: &Path, log: &UsageLog) -> anyhow::Res
         .context("begin Usage SQLite UPSERT")?;
     upsert_usage_row(&transaction, log)?;
     quota::upsert_log(&transaction, log)?;
+    value_quota::evidence::capture_log(&transaction, log, None)?;
     let value_degraded = value_quota::settle_usage_log_isolated(&transaction, log)?;
     market_termination::finalize_log_in(&transaction, log)?;
     bump_repository_generation(&transaction)?;
@@ -1536,6 +1541,7 @@ fn replace_usage_records_in_connection(
     transaction.execute("DELETE FROM usage_records", [])?;
     for log in &usage.logs {
         upsert_usage_row(&transaction, log)?;
+        value_quota::evidence::capture_log(&transaction, log, None)?;
     }
     // Detail replacement must not delete pinned exact revisions.
     quota::merge(&transaction, &usage.quota_ledger)?;

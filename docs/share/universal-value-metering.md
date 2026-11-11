@@ -48,13 +48,13 @@ Observer 在协议转换前采集证据；累计计数取最大值，稳定调�
 
 ## 异步与恢复
 
-Server schema 5 的 `value_async_tasks` 保存 task 到 scope、原 request/attempt 的关联。有效 pending task 不被普通超时清扫结为零；过期转为未知结果，之后可信完成仍可修订。轮询必须同时匹配任务、父请求、Share 和用户，终态内容按摘要幂等。
+Server schema 6 的 `value_async_tasks` 保存 task 到 scope、原 request/attempt 的关联。有效 pending task 不被普通超时清扫结为零；过期转为未知结果，之后可信完成仍可修订。轮询必须同时匹配任务、父请求、Share 和用户，终态内容按摘要幂等。
 
 完成后迟到失败不能回退；失败本身可能已消耗资源，因此保守保留风险，之后完成可更正。原生成资源计划不会被一般历史压缩清掉。轮询结算和 usage 在一个事务完成，故障隔离回到原生成窗口，市场试用镜像也同步原请求。修订下调周期金额不会重新开放已经消费的一次性试用额度。
 
 ## 协议与价目管理
 
-文本扩面沿用 v10 / `api-equivalent-v1`。资源策略使用 v11 / `api-equivalent-v2`、价目 schema 2、Router heartbeat `resourceValueQuotaV2`；signed fetch 发送 `supportedTariffPolicies` 后才下发 v2。旧 Server 继续获得 v1，不能静默降级现有 v2 授权。签名时间较旧的能力声明不覆盖较新的记录，v2 ACK/active 要求存储 schema 5。
+文本扩面沿用 v10 / `api-equivalent-v1`。资源策略使用 v11 / `api-equivalent-v2`、价目 schema 2、Router heartbeat `resourceValueQuotaV2`；signed fetch 发送 `supportedTariffPolicies` 后才下发 v2。旧 Server 继续获得 v1，不能静默降级现有 v2 授权。签名时间较旧的能力声明不覆盖较新的记录，v2 ACK/active 最低要求存储 schema 5；当前实现上报 schema 6。
 
 Router 迁移 111 并行保存两类价目及独立资源价格编辑历史。管理页以整数换算每张/次、每秒、每百万 Token，支持模型资源价和 exact alias，CAS 防止覆盖并发修改，冲突保留草稿。两个策略的价格与 alias 从同一当前目录派生并在事务中发布；不可变 hash、生效延迟、ACK、active receipt 和历史冻结保持原语义。
 
@@ -68,7 +68,7 @@ CI 应执行新增的资源计划/证据、audio 去重及长上下文、持久�
 
 先发布 Router，再发布 Server；等待协商、资源价格和 active receipt 后显式启用新策略。`woegum--f11pf11rf7` 的 Claude/Codex OpenAI OAuth 两绑定须在生产独立验证：预览、保存、实际请求入账及耗尽拦截。每个开放面继续满足既有 7 个自然日、至少 100 条完成请求的灰度对账门槛，缺输入不得标为 live_verified。
 
-回滚先停止新策略启用、保留全部账本及快照，v2 合同须继续由支持 v11/schema 5 的版本执行；不可直接降到无法读取现有合同/数据库的旧二进制。没有追溯猜算历史美元、在线重建账本或自动切回 Token。
+回滚先停止新策略启用、保留全部账本及快照，v2 合同须继续由支持 v11/schema 5 的版本执行；不可直接降到无法读取现有合同/数据库的旧二进制。历史美元只可根据持久事实和冻结迁移价目补齐，缺证据拒绝转换；不得自动切回 Token。详见 [即时单位转换](quota-unit-conversions.md)。
 
 ## 整体 review 记录
 
@@ -76,8 +76,10 @@ CI 应执行新增的资源计划/证据、audio 去重及长上下文、持久�
 
 接续 CI 修正迁移表数和未来版本断言、SQLite authority 激活顺序及 DeepSeek 完整执行模型价目夹具。Web Session 缺价按执行模型诊断，WorkBuddy 不支持的图片由模型能力校验拒绝；非认证限流且无用量证据仍按未知保守结算，相应回归按这些规则断言。
 
-非美元 WebSocket turn 在金额准入入口直接返回，避免握手后为大消息额外序列化和持久化而阻塞控制帧或取消；大消息 Ping 与取消回归接入 CI，沿用原有延迟门槛。
+WebSocket 每次生成重新读取当前策略并记录独立事实，Token 模式缺价继续运行；大消息 Ping 与取消回归保留在 CI。
 
 辅助操作按明确入口豁免：Claude count_tokens 与 Gemini countTokens 不创建金额 attempt；未实现美元计量的 Gemini embedding、batch 等操作在发包前拒绝，不能因不属于文本生成入口而绕过准入。
 
 复核状态写入仍经 ServerStateInner 域方法封装，未新增存储锁逆序、Provider 凭据白名单或钱包写入。严格 Clippy（全部目标）、两端类型检查、include! 源格式、Provider writer 证据、Registry/USD 覆盖、SQLite authority、Web 边界和文档索引静态检查通过。发布门槛仍包括 CI 产品回归与上述真实灰度，不能以静态覆盖代替。
+
+普通授权单位 / USD 窗口改动使用 v12 签名转换，保存立即承接当前窗口消费、人工调整与在途风险；Token 模式持续保存金额事实，往返不清零。schema 6 事实与永久回执不随报表保留期清理，详见 [即时转换规范](quota-unit-conversions.md)。

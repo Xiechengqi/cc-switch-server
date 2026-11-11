@@ -2,7 +2,7 @@
 //! accepted for a new ordinary grant, and commits with the Share and receipt.
 use super::*;
 use crate::domain::sharing::router_contract::{
-    ShareSettingsPatch, ShareUserValueUsageInitialization,
+    ShareSettingsPatch, ShareUserQuotaConversion, ShareUserValueUsageInitialization,
 };
 use crate::domain::usage::value_pricing::{ValueUsageEdit, ValueUsageEditAction};
 use sha2::{Digest, Sha256};
@@ -13,6 +13,7 @@ pub(crate) struct ValueUsageInitializationRequest {
     pub operation_id: String,
     pub actor: String,
     pub edits: BTreeMap<String, ShareUserValueUsageInitialization>,
+    pub conversions: BTreeMap<String, ShareUserQuotaConversion>,
 }
 
 impl ValueUsageInitializationRequest {
@@ -20,13 +21,58 @@ impl ValueUsageInitializationRequest {
         share_id: &str,
         patch: &ShareSettingsPatch,
     ) -> anyhow::Result<Option<Self>> {
-        let Some(edits) = &patch.user_value_usage_initializations else {
+        if patch.user_value_usage_initializations.is_none()
+            && patch.user_quota_conversions.is_none()
+        {
             return Ok(None);
-        };
+        }
+        let edits = patch
+            .user_value_usage_initializations
+            .clone()
+            .unwrap_or_default();
+        let conversions = patch.user_quota_conversions.clone().unwrap_or_default();
+        anyhow::ensure!(
+            conversions.len() <= 500
+                && conversions
+                    .iter()
+                    .all(|(email, input)| email == &email.trim().to_ascii_lowercase()
+                        && !input.credential.is_empty()
+                        && input.credential.len() <= 32768),
+            "QUOTA_CONVERSION_INVALID_INPUT"
+        );
+        anyhow::ensure!(
+            patch
+                .user_quota_conversions
+                .as_ref()
+                .is_none_or(|c| !c.is_empty()),
+            "QUOTA_CONVERSION_INVALID_INPUT"
+        );
+        for email in conversions.keys() {
+            anyhow::ensure!(
+                patch
+                    .user_grant_edits
+                    .as_ref()
+                    .is_some_and(|edits| edits.get(email).is_some_and(|e| e.policy.is_some()))
+                    || patch
+                        .user_grants
+                        .as_ref()
+                        .is_some_and(|grants| grants.get(email).is_some_and(|g| g.active)),
+                "QUOTA_CONVERSION_INVALID_INPUT"
+            );
+        }
         let context = patch
             .edit_context
             .as_ref()
             .context("VALUE_QUOTA_TARGET_INVALID: initialization requires an edit context")?;
+        if !conversions.is_empty() {
+            anyhow::ensure!(
+                !context.operation_id.is_empty()
+                    && context.operation_id.len() <= 128
+                    && context.operation_id.trim() == context.operation_id
+                    && !context.operation_id.chars().any(char::is_control),
+                "QUOTA_CONVERSION_INVALID_INPUT"
+            );
+        }
         anyhow::ensure!(
             patch.managed_grant.is_none(),
             "VALUE_QUOTA_TARGET_INVALID: managed grants are read-only"
@@ -35,9 +81,14 @@ impl ValueUsageInitializationRequest {
             patch
                 .user_usage_edits
                 .as_ref()
-                .is_none_or(|token_edits| !edits.keys().any(|email| token_edits
-                    .keys()
-                    .any(|key| key.eq_ignore_ascii_case(email)))),
+                .is_none_or(
+                    |token_edits| !edits
+                        .keys()
+                        .chain(conversions.keys())
+                        .any(|email| token_edits
+                            .keys()
+                            .any(|key| key.eq_ignore_ascii_case(email)))
+                ),
             "VALUE_QUOTA_TARGET_INVALID: do not mix Token and USD usage edits"
         );
         for input in edits.values() {
@@ -56,7 +107,8 @@ impl ValueUsageInitializationRequest {
                 .actor
                 .clone()
                 .context("VALUE_QUOTA_TARGET_INVALID: initialization requires an actor")?,
-            edits: edits.clone(),
+            edits,
+            conversions,
         }))
     }
 
@@ -68,6 +120,9 @@ impl ValueUsageInitializationRequest {
         usage: Option<&crate::domain::usage::store::UsageStore>,
         now: i64,
     ) -> anyhow::Result<Vec<ledger::Initialization>> {
+        if self.edits.is_empty() {
+            return Ok(Vec::new());
+        }
         anyhow::ensure!(
             !self.operation_id.is_empty()
                 && self.operation_id.len() <= 128
@@ -154,6 +209,7 @@ impl ValueUsageInitializationRequest {
 pub(crate) struct InitializedShareSnapshot {
     pub shares: ShareStore,
     pub initializations: Vec<ledger::Initialization>,
+    pub conversions: Vec<ledger::conversion::Conversion>,
     pub actor: String,
     pub now: i64,
 }
@@ -164,6 +220,7 @@ impl PersistedStateSnapshot for InitializedShareSnapshot {
             config_dir,
             &self.shares,
             &self.initializations,
+            &self.conversions,
             &self.actor,
             self.now,
         )
@@ -172,6 +229,7 @@ impl PersistedStateSnapshot for InitializedShareSnapshot {
         Ok(Self {
             shares: <ShareStore as PersistedStateSnapshot>::load_snapshot(config_dir)?,
             initializations: Vec::new(),
+            conversions: Vec::new(),
             actor: String::new(),
             now: 0,
         })

@@ -600,6 +600,10 @@ pub struct SharePendingEditsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareEditAckPayload {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_conversions: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_quota_statuses: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub termination_receipt:
         Option<crate::domain::sharing::market_termination_contract::TerminationReceipt>,
@@ -1001,6 +1005,13 @@ impl RouterShareCapabilities {
                 .capabilities
                 .iter()
                 .any(|c| c == "usdEquivalentQuotaV1")
+    }
+    pub fn quota_unit_conversion(&self) -> bool {
+        self.share_contract_version >= 12
+            && self
+                .capabilities
+                .iter()
+                .any(|c| c == "quotaUnitConversionV1")
     }
     pub fn resource_value_quotas(&self) -> bool {
         self.share_contract_version >= 11
@@ -3461,6 +3472,8 @@ mod tests {
 
         let edit_ack = ShareEditAckEnvelope {
             ack: ShareEditAckPayload {
+                quota_conversions: Vec::new(),
+                value_quota_statuses: Vec::new(),
                 termination_receipt: None,
                 settings_receipt: None,
                 edit_id: "edit-42".to_string(),
@@ -3496,6 +3509,8 @@ mod tests {
     fn revision_conflict_ack_includes_authoritative_share_snapshot() {
         let payload = ShareEditAckEnvelope {
             ack: ShareEditAckPayload {
+                quota_conversions: Vec::new(),
+                value_quota_statuses: Vec::new(),
                 termination_receipt: None,
                 settings_receipt: None,
                 edit_id: "edit-conflict".into(),
@@ -5085,6 +5100,8 @@ mod tests {
     #[test]
     fn share_edit_ack_envelope_reuses_the_exact_raw_ack() {
         let ack = ShareEditAckPayload {
+            quota_conversions: Vec::new(),
+            value_quota_statuses: Vec::new(),
             termination_receipt: None,
             settings_receipt: None,
             edit_id: "edit-raw-ack".into(),

@@ -368,7 +368,8 @@ pub(in crate::api) async fn web_patch_share_settings(
     patch: ShareSettingsPatch,
 ) -> Result<Share, ApiError> {
     let share_id = web_arg_share_id(args)?;
-    let has_value_initializations = patch.user_value_usage_initializations.is_some();
+    let has_value_initializations =
+        patch.user_value_usage_initializations.is_some() || patch.user_quota_conversions.is_some();
     let share = state
         .apply_share_settings_patch_immediate(&share_id, patch)
         .await
@@ -1058,6 +1059,9 @@ struct SaveProviderBundleShareCommand {
     >,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     value_usage_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_quota_conversions:
+        Option<BTreeMap<String, crate::domain::sharing::router_contract::ShareUserQuotaConversion>>,
     #[serde(default)]
     user_grant_edits:
         Option<BTreeMap<String, crate::domain::sharing::router_contract::ShareUserGrantEdit>>,
@@ -1381,18 +1385,40 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
     reject_retired_share_input_fields(value)?;
     let command = serde_json::from_value::<SaveProviderBundleShareCommand>(value.clone())
         .map_err(ApiError::bad_request)?;
-    let initialization_operation = if let Some(edits) = &command.user_value_usage_initializations {
+    if command.user_quota_conversions.is_some() && !state.quota_conversion_router_negotiated().await
+    {
+        return Err(ApiError::value_usage_edit(anyhow::anyhow!(
+            "QUOTA_CONVERSION_ROUTER_UPGRADE_REQUIRED"
+        )));
+    }
+    let initialization_operation = if command.user_value_usage_initializations.is_some()
+        || command.user_quota_conversions.is_some()
+    {
+        let edits = command
+            .user_value_usage_initializations
+            .clone()
+            .unwrap_or_default();
+        let conversions = command.user_quota_conversions.clone().unwrap_or_default();
         let id = command
             .value_usage_operation_id
             .as_deref()
-            .filter(|id| !id.is_empty() && id.len() <= 80)
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 80
+                    && id.trim() == *id
+                    && !id.chars().any(char::is_control)
+            })
             .ok_or_else(|| {
                 ApiError::bad_request_code(
                     "quota_target_invalid",
                     "USD usage initialization requires an operation ID",
                 )
             })?;
-        if edits.is_empty() || edits.len() > 500 || command.share_id.is_none() {
+        if (edits.is_empty() && conversions.is_empty())
+            || edits.len() > 500
+            || conversions.len() > 500
+            || command.share_id.is_none()
+        {
             return Err(ApiError::bad_request_code(
                 "quota_target_invalid",
                 "USD usage initialization requires an existing Share and new users",
@@ -1402,7 +1428,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
             .user_usage_edits
             .as_ref()
             .is_some_and(|token_edits| {
-                edits.keys().any(|email| {
+                edits.keys().chain(conversions.keys()).any(|email| {
                     token_edits
                         .keys()
                         .any(|key| key.eq_ignore_ascii_case(email))
@@ -1493,7 +1519,19 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
     let usage = state.usage.read().await.clone();
     let shares = state.shares.read().await.clone();
     if let Some((operation_id, fingerprint)) = &initialization_operation {
-        if let Some(receipt) = shares.applied_settings_operations.get(operation_id) {
+        let permanent =
+            crate::repository::server_sqlite::value_quota::conversion::settings_receipt(
+                &state.config_dir,
+                operation_id,
+                command.share_id.as_deref().unwrap_or_default(),
+                &state.config_snapshot().await,
+            )
+            .map_err(ApiError::internal)?;
+        if let Some(receipt) = shares
+            .applied_settings_operations
+            .get(operation_id)
+            .or(permanent.as_ref())
+        {
             if &receipt.patch_fingerprint != fingerprint {
                 return Err(ApiError::conflict_code(
                     "quota_revision_conflict",
@@ -1651,6 +1689,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
             share_id: staged_share.id.clone(),
             operation_id: operation_id.clone(),
             actor: operator.clone().unwrap_or_else(|| owner_email.clone()),
+            conversions: command.user_quota_conversions.clone().unwrap_or_default(),
             edits: command
                 .user_value_usage_initializations
                 .clone()

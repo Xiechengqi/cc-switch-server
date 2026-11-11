@@ -1284,7 +1284,7 @@
         "tokens": "Tokens",
         "usd": "USD equivalent",
         "hint": "API list-price equivalent; never charged to any wallet. A soft limit checked when a request starts, so an admitted request may finish slightly above it. At most min(parallel limit, 4) USD requests run at once per user; a request with uncertain usage may reserve all remaining capacity.",
-        "start": "Day, week, month and fixed 7/30-day periods switch to USD at the start of the next full window; the current policy stays enforced until then. Lifetime and account-reset periods are metered from the moment you apply. Switching units never clears usage.",
+        "start": "With complete evidence, saving applies the target unit immediately and carries all usage and in-flight reservations in the target window.",
         "notReady": "Requires Router v10, committed SQLite storage and an acknowledged executable tariff.",
         "pending": "Awaiting authoritative usage",
         "unitUsdShort": "$",
@@ -1306,9 +1306,9 @@
           "fromNow": "Metered from now",
           "now": "Applies now · used {{used}}",
           "summary": "{{count}} users · {{scheduled}} scheduled · {{fromNow}} from now",
-          "hintScheduled": "Calendar and fixed periods switch to USD at the start of the next full window. The current policy stays enforced until then, and USD usage already recorded in that window carries over.",
-          "hintFromNow": "Lifetime and account-reset periods have no earlier USD evidence, so metering starts when you apply. Earlier usage is not converted.",
-          "hintNow": "This user is already USD-metered in the current window, so the new limit applies immediately and keeps the usage shown."
+          "hintScheduled": "Existing schedules keep their activation time. New conversions carry current-window usage.",
+          "hintFromNow": "This is an existing legacy metering origin. New explicit conversions require complete target-window evidence.",
+          "hintNow": "Saving takes effect immediately and includes consumption accrued after this preview."
         },
         "confirmApply": "Confirm & apply",
         "reasonCode": {
@@ -1321,7 +1321,11 @@
           "router_upgrade_required": "Upgrade Router and Server to use USD quotas.",
           "blocked_needs_reconcile": "This user's USD usage needs reconciling first (Apply now in the usage column).",
           "invalid_policy": "This limit or period isn't valid for a USD quota.",
-          "resource_upgrade_required": "Upgrade Router and Server and activate the resource tariff."
+          "resource_upgrade_required": "Upgrade Router and Server and activate the resource tariff.",
+          "history_incomplete": "Historical request evidence is incomplete or unpriced. Repair evidence or prices before converting.",
+          "history_preparing": "Preparing request history. The current policy remains active.",
+          "conversion_upgrade_required": "Upgrade Router and Server for immediate quota unit conversion.",
+          "pending_evidence_missing": "An in-flight request has no trustworthy bound in the target unit. Wait for settlement before converting."
         },
         "rowReason": "{{email}}: {{reason}}",
         "usageEditUnavailable": "Consumed tokens can't be set for USD-quota users. Use Apply now in their usage column instead.",
@@ -1355,7 +1359,14 @@
         "malformed": "USD quota data for this user can't be read; it is shown read-only and won't be changed.",
         "malformedSave": "{{email}} has a USD quota this page can't read. Reload, or remove the user, before saving.",
         "resources": "Include images, audio, video and paid tools",
-        "resourcesHint": "Requires resource prices and an upgraded Server. Existing text quotas keep their current prices."
+        "resourcesHint": "Requires resource prices and an upgraded Server. Existing text quotas keep their current prices.",
+        "conversionCalibrationRequired": "Enter the target used amount and audit reason for manual adjustments or charges without an exact Token counterpart (USD or Tokens). Request usage carries over automatically.",
+        "convertedUsd": "On Share save · used {{used}} · in flight {{pending}} · remaining {{remaining}}",
+        "convertedTokens": "On Share save · used {{tokens}} Tokens · in flight {{pending}} · remaining {{remaining}}",
+        "preparationProgress": "Preparing history · {{count}} requests examined",
+        "evidence": "Evidence: {{tokens}} Tokens · {{requests}} requests · {{missing}} unresolved attempts",
+        "pricingBasis": "Frozen request prices; reconstructed entries use tariff {{revision}}",
+        "originalPrices": "Original frozen prices"
       },
       "accountReset": {
         "label": "Account reset cycle",

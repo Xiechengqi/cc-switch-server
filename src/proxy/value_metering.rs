@@ -123,13 +123,9 @@ pub(crate) async fn admit_prepared_with_plan(
     if context.is_health_check {
         return Ok(None);
     }
-    let (Some(share), Some(email)) = (context.share_id.as_deref(), context.user_email.as_deref())
-    else {
+    let (Some(_), Some(_)) = (context.share_id.as_deref(), context.user_email.as_deref()) else {
         return Ok(None);
     };
-    if !state.share_uses_value_quota(share, Some(email)).await {
-        return Ok(None);
-    }
     let facts = value_request_facts(payload);
     let plan = resource_plan.or_else(|| {
         serde_json::from_slice(payload).ok().map(|body| {

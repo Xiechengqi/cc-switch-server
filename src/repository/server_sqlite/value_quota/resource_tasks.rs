@@ -14,11 +14,33 @@ pub(crate) fn attach_task(
     assert_committed(config_dir)?;
     let mut conn = open_database(&database_path(config_dir), false)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let row = read_attempt_row(&tx, request, attempt)?.context("VALUE_QUOTA_ATTEMPT_UNKNOWN")?;
+    attach_task_in_tx(&tx, request, attempt, task, expires)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(super) fn attach_task_in_tx(
+    tx: &Transaction<'_>,
+    request: &str,
+    attempt: &str,
+    task: &str,
+    expires: i64,
+) -> anyhow::Result<()> {
+    let scope = if let Some(row) = read_attempt_row(tx, request, attempt)? {
+        row.0
+    } else {
+        tx.query_row(
+            "SELECT scope FROM quota_metering_facts WHERE request_id=?1 AND attempt_id=?2",
+            params![request, attempt],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .context("VALUE_QUOTA_ATTEMPT_UNKNOWN")?
+    };
     let existing: Option<(String, String)> = tx
         .query_row(
             "SELECT request_id,attempt_id FROM value_async_tasks WHERE scope=?1 AND task_id=?2",
-            params![row.0, task],
+            params![scope, task],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -28,9 +50,8 @@ pub(crate) fn attach_task(
             "VALUE_QUOTA_ASYNC_TASK_CONFLICT"
         );
     } else {
-        tx.execute("INSERT INTO value_async_tasks(scope,task_id,request_id,attempt_id,status,expires_at_ms) VALUES(?1,?2,?3,?4,'pending',?5)", params![row.0,task,request,attempt,expires])?;
+        tx.execute("INSERT INTO value_async_tasks(scope,task_id,request_id,attempt_id,status,expires_at_ms) VALUES(?1,?2,?3,?4,'pending',?5)", params![scope,task,request,attempt,expires])?;
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -86,8 +107,12 @@ pub(super) fn observe_task_in_tx(tx: &Transaction<'_>, log: &UsageLog) -> anyhow
     if previous.as_deref() == Some(&digest) {
         return Ok(false);
     }
-    let old =
-        read_attempt_row(tx, &request, &attempt)?.context("VALUE_QUOTA_ASYNC_ATTEMPT_MISSING")?;
+    let Some(old) = read_attempt_row(tx, &request, &attempt)? else {
+        // A Token request with an unknown tariff still completes normally.
+        // capture_async_fact retained its body-free terminal quantities.
+        tx.execute("UPDATE value_async_tasks SET status=?3,observation_sha256=?4 WHERE scope=?1 AND task_id=?2",params![scope,task,if completed {"completed"} else {"failed"},digest])?;
+        return Ok(true);
+    };
     let mut evidence = log.clone();
     evidence.request_id = request.clone();
     evidence.operation = InferenceOperation::VideoGeneration;
@@ -109,4 +134,42 @@ pub(super) fn observe_task_in_tx(tx: &Transaction<'_>, log: &UsageLog) -> anyhow
     let changed = settle_log_in_tx(tx, &evidence, false)?;
     tx.execute("UPDATE value_async_tasks SET status=?3,observation_sha256=?4 WHERE scope=?1 AND task_id=?2",params![scope,task,if completed {"completed"} else {"failed"},digest])?;
     Ok(changed)
+}
+
+/// This evidence is part of the ordinary Usage transaction, outside the
+/// optional monetary savepoint. Settlement failures cannot discard it.
+pub(super) fn capture_async_fact(tx: &Transaction<'_>, log: &UsageLog) -> anyhow::Result<()> {
+    use crate::domain::usage::store::InferenceOperation;
+    if log.operation != InferenceOperation::VideoStatus {
+        return Ok(());
+    }
+    let (Some(task), Some(parent)) = (&log.media_task_id, &log.parent_request_id) else {
+        return Ok(());
+    };
+    let row:Option<(String,String,String,String)>=tx.query_row("SELECT scope,request_id,attempt_id,status FROM value_async_tasks WHERE task_id=?1 AND request_id=?2",params![task,parent],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    let Some((scope, request, attempt, status)) = row else {
+        return Ok(());
+    };
+    let identity: Scope = serde_json::from_str(&scope)?;
+    ensure!(
+        log.share_id.as_deref() == Some(&identity.share_id)
+            && log
+                .user_email
+                .as_ref()
+                .is_some_and(|e| e.eq_ignore_ascii_case(&identity.email)),
+        "VALUE_QUOTA_ASYNC_OWNER_CONFLICT"
+    );
+    let completed = matches!(
+        log.media_status.as_deref(),
+        Some("completed" | "succeeded" | "done")
+    );
+    let failed = matches!(
+        log.media_status.as_deref(),
+        Some("failed" | "cancelled" | "canceled" | "expired")
+    );
+    if !completed && (!failed || status == "completed") {
+        return Ok(());
+    }
+    evidence::observe_task_fact(tx, &request, &attempt, log, completed)?;
+    Ok(())
 }

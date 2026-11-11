@@ -13,6 +13,8 @@ use crate::domain::usage::value_pricing::{
 };
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub(crate) mod conversion;
+pub(crate) mod evidence;
 mod resource_tasks;
 mod tariff;
 pub(crate) use resource_tasks::attach_task;
@@ -72,8 +74,19 @@ pub(crate) struct Window {
     pub starts_at_ms: i64,
     pub ends_at_ms: Option<i64>,
     pub metered_from_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<crate::domain::sharing::quota_cycle::AccountQuotaCycle>,
 }
 impl Window {
+    fn account_key(&self) -> anyhow::Result<Option<String>> {
+        self.account
+            .as_ref()
+            .map(|c| {
+                serde_json::to_string(&(&c.source_ref, c.source_epoch, &c.bucket_id))
+                    .map_err(Into::into)
+            })
+            .transpose()
+    }
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(
             !self.id.is_empty() && self.starts_at_ms >= 0 && self.metered_from_ms >= 0,
@@ -105,6 +118,7 @@ pub(crate) struct Admission<'a> {
     /// Bounded reservation input; the risk is priced from the frozen tariff.
     pub estimate: RiskEstimate,
     pub resource_plan: Option<crate::domain::usage::value_pricing::ResourcePlan>,
+    pub attribution: Option<crate::domain::usage::quota_ledger::QuotaAttribution>,
     /// min(grant parallel limit, 4); counted over this scope's pending attempts.
     pub parallel_limit: u32,
 }
@@ -312,6 +326,10 @@ struct AttemptMeta {
     input_tokens: u64,
     output_tokens: u64,
     reserved_picos: String,
+    #[serde(default)]
+    frozen_tariff_sha256: Option<String>,
+    #[serde(default)]
+    exact_aliases: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resource_plan: Option<crate::domain::usage::value_pricing::ResourcePlan>,
 }
@@ -915,6 +933,7 @@ fn ack_in_tx(
 ) -> anyhow::Result<bool> {
     if ack > status.usage_watermark {
         let window = Window {
+            account: None,
             id: status.window_id.clone(),
             starts_at_ms: status.window_starts_at_ms,
             ends_at_ms: status.resets_at_ms,
@@ -991,6 +1010,14 @@ fn status_in_tx(
     scope: &Scope,
     window: &Window,
 ) -> anyhow::Result<QuotaStatus> {
+    status_with_coverage_in(connection, scope, window, true)
+}
+fn status_with_coverage_in(
+    connection: &Connection,
+    scope: &Scope,
+    window: &Window,
+    require_coverage: bool,
+) -> anyhow::Result<QuotaStatus> {
     window.validate()?;
     let key = scope.key()?;
     let blocked = window_blocked(connection, &key, &window.id)?;
@@ -1002,69 +1029,74 @@ fn status_in_tx(
         )
         .optional()?;
     ensure!(
-        coverage.is_some_and(|at| at <= window.metered_start_ms()),
+        !require_coverage || coverage.is_some_and(|at| at <= window.metered_start_ms()),
         "VALUE_QUOTA_COVERAGE_INCOMPLETE"
     );
     let from = window.metered_start_ms();
-    let full_from = from
-        .checked_add(DAY_MS - 1)
-        .context("invalid value window")?
-        .div_euclid(DAY_MS)
-        * DAY_MS;
-    let full_until = window.ends_at_ms.unwrap_or(i64::MAX).div_euclid(DAY_MS) * DAY_MS;
-    let mut aggregate = Checkpoint::empty();
-    let mut buckets=connection.prepare("SELECT day_start_ms FROM value_quota_checkpoints WHERE scope=?1 AND day_start_ms>=?2 AND day_start_ms<?3")?;
-    for day in buckets.query_map(params![key, full_from, full_until], |r| r.get::<_, i64>(0))? {
-        aggregate.merge(&read_checkpoint(connection, &key, day?)?)?;
-    }
-    // Missing materialized evidence cannot masquerade as an empty window.
-    let actual_count:i64=connection.query_row("SELECT
+    let aggregate = if window.account.is_some() {
+        evidence::account_aggregate(connection, scope, window)?
+    } else {
+        let full_from = from
+            .checked_add(DAY_MS - 1)
+            .context("invalid value window")?
+            .div_euclid(DAY_MS)
+            * DAY_MS;
+        let full_until = window.ends_at_ms.unwrap_or(i64::MAX).div_euclid(DAY_MS) * DAY_MS;
+        let mut aggregate = Checkpoint::empty();
+        let mut buckets=connection.prepare("SELECT day_start_ms FROM value_quota_checkpoints WHERE scope=?1 AND day_start_ms>=?2 AND day_start_ms<?3")?;
+        for day in buckets.query_map(params![key, full_from, full_until], |r| r.get::<_, i64>(0))? {
+            aggregate.merge(&read_checkpoint(connection, &key, day?)?)?;
+        }
+        // Missing materialized evidence cannot masquerade as an empty window.
+        let actual_count:i64=connection.query_row("SELECT
         (SELECT count(*) FROM value_quota_attempts WHERE scope=?1 AND started_at_ms>=?2 AND started_at_ms<?3)+
         (SELECT count(*) FROM value_quota_gaps WHERE scope=?1 AND started_at_ms>=?2 AND started_at_ms<?3)",params![key,full_from,full_until],|r|r.get(0))?;
-    ensure!(
-        u64::try_from(actual_count)? == aggregate.count()?,
-        "VALUE_QUOTA_CHECKPOINT_CORRUPT"
-    );
-    let mut query = connection.prepare(
+        ensure!(
+            u64::try_from(actual_count)? == aggregate.count()?,
+            "VALUE_QUOTA_CHECKPOINT_CORRUPT"
+        );
+        let mut query = connection.prepare(
         "SELECT usage_picos,pending_risk_picos,metering_status,watermark,pricing_revision FROM value_quota_attempts
          WHERE scope=?1 AND started_at_ms>=?2 AND (?3 IS NULL OR started_at_ms<?3)
          AND NOT(started_at_ms>=?4 AND started_at_ms<?5)")?;
-    let rows = query.query_map(
-        params![key, from, window.ends_at_ms, full_from, full_until],
-        |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        },
-    )?;
-    for row in rows {
-        let (amount, pending, state, mark, revision) = row?;
-        aggregate.change(
-            &amount,
-            &pending,
-            &state,
-            Some(&revision),
-            u64::try_from(mark)?,
-            true,
+        let rows = query.query_map(
+            params![key, from, window.ends_at_ms, full_from, full_until],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            },
         )?;
-    }
-    let gaps: (i64, i64) = connection.query_row(
-        "SELECT count(*),COALESCE(MAX(watermark),0) FROM value_quota_gaps
+        for row in rows {
+            let (amount, pending, state, mark, revision) = row?;
+            aggregate.change(
+                &amount,
+                &pending,
+                &state,
+                Some(&revision),
+                u64::try_from(mark)?,
+                true,
+            )?;
+        }
+        let gaps: (i64, i64) = connection.query_row(
+            "SELECT count(*),COALESCE(MAX(watermark),0) FROM value_quota_gaps
          WHERE scope=?1 AND started_at_ms>=?2 AND (?3 IS NULL OR started_at_ms<?3)
          AND NOT(started_at_ms>=?4 AND started_at_ms<?5)",
-        params![key, from, window.ends_at_ms, full_from, full_until],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    if gaps.0 > 0 {
+            params![key, from, window.ends_at_ms, full_from, full_until],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if gaps.0 > 0 {
+            aggregate
+                .states
+                .insert("gap".into(), u64::try_from(gaps.0)?);
+            aggregate.watermark = aggregate.watermark.max(u64::try_from(gaps.1)?);
+        }
         aggregate
-            .states
-            .insert("gap".into(), u64::try_from(gaps.0)?);
-        aggregate.watermark = aggregate.watermark.max(u64::try_from(gaps.1)?);
-    }
+    };
     let mut used = unsigned_decimal(&aggregate.amount)?;
     let mut watermark = aggregate.watermark;
     let last_adjustment:Option<(String,i64)>=connection.query_row(
@@ -1085,6 +1117,9 @@ fn status_in_tx(
             .context("value adjusted quota overflow")?;
         watermark = watermark.max(u64::try_from(mark)?);
     }
+    let conversion_mark:i64=connection.query_row("SELECT COALESCE(max(watermark),0) FROM quota_conversion_receipts WHERE scope=?1 AND window_id=?2",
+        params![key,window.id],|r|r.get(0))?;
+    watermark = watermark.max(u64::try_from(conversion_mark)?);
     // Policy epochs are deliberately absent from this query: editing a grant
     // or changing units cannot erase requests in the same real window.
     Ok(QuotaStatus {
@@ -1092,7 +1127,9 @@ fn status_in_tx(
         manual_offset_picos: offset.to_string(),
         used_picos: used.to_string(),
         pending_risk_picos: aggregate.risk.clone(),
-        metering_status: if blocked {
+        metering_status: if blocked
+            || window.account.is_some() && aggregate.states.contains_key("gap")
+        {
             "blocked".into()
         } else {
             aggregate.metering().into()
@@ -1149,6 +1186,7 @@ pub(crate) fn admit_with_market_trial(
         pricing_revision: &revision,
         ..input.clone()
     };
+    evidence::record_admission(&tx, &frozen, true)?;
     let result = admit_with_trial_in_tx(&tx, &frozen, trial)?;
     tx.commit()?;
     Ok(result)
@@ -1365,7 +1403,17 @@ fn admit_with_trial_in_tx(
             serde_json::to_string(&AttemptMeta {
                 input_tokens: a.estimate.input_tokens,
                 output_tokens: a.estimate.output_tokens,
-                reserved_picos: reserved.to_string(),
+                reserved_picos: if a.enforce { reserved } else {
+                    let text = if a.resource_plan.as_ref().is_none_or(|p| p.text_tokens) {
+                        model.price(a.effective_tier, &a.estimate.tokens())?.usage_picos
+                    } else { 0 };
+                    let resources = a.resource_plan.as_ref().map(|p|
+                        crate::domain::usage::value_pricing::price_resources(&model.resources, &p.quantities)
+                    ).transpose()?.unwrap_or(0);
+                    text.checked_add(resources).context("value quota arithmetic overflow")?
+                }.to_string(),
+                frozen_tariff_sha256: Some(sha256_hex(frozen.as_bytes())),
+                exact_aliases: snapshot.exact_aliases.clone(),
                 resource_plan: a.resource_plan.clone(),
             })?
         ],
@@ -1438,7 +1486,7 @@ fn admit_with_trial_in_tx(
 }
 
 /// How one usage observation settles an attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ObservedOutcome {
     /// Partial usage of a still-running attempt; risk stays reserved.
@@ -2109,7 +2157,7 @@ type AttemptStateRow = (
     String,
 );
 fn read_attempt_row(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     request_id: &str,
     attempt_id: &str,
 ) -> anyhow::Result<Option<AttemptStateRow>> {
@@ -2245,20 +2293,34 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
         }
     }
     let scope: Scope = serde_json::from_str(&old.0)?;
-    let snapshot = cached_snapshot(tx, &scope.router_url, &scope.installation_id, &old.11)?;
-    let tariff: ExecutionModelPrice = if old.10.is_some() {
-        ensure!(old.3 == "null", "VALUE_QUOTA_COMPACTED_TARIFF_CORRUPT");
-        snapshot.model(o.effective_model)?.clone()
-    } else {
-        serde_json::from_str(&old.3)?
-    };
-    ensure!(
-        snapshot.model(o.effective_model)? == &tariff,
-        "VALUE_QUOTA_FROZEN_TARIFF_CORRUPT"
-    );
+    // New attempts retain the minimal tariff and aliases independently of the
+    // catalog/report retention. Old compacted rows still need their snapshot.
+    let meta = read_attempt_meta(tx, o.request_id, o.attempt_id)?;
+    let (tariff, aliases) =
+        if let Some(hash) = meta.as_ref().and_then(|m| m.frozen_tariff_sha256.as_ref()) {
+            ensure!(
+                *hash == sha256_hex(old.3.as_bytes()),
+                "VALUE_QUOTA_FROZEN_TARIFF_CORRUPT"
+            );
+            (
+                serde_json::from_str::<ExecutionModelPrice>(&old.3)?,
+                meta.as_ref().unwrap().exact_aliases.clone(),
+            )
+        } else {
+            let snapshot = cached_snapshot(tx, &scope.router_url, &scope.installation_id, &old.11)?;
+            let tariff: ExecutionModelPrice = if old.3 == "null" && old.10.is_some() {
+                snapshot.model(o.effective_model)?.clone()
+            } else {
+                serde_json::from_str(&old.3)?
+            };
+            ensure!(
+                snapshot.model(o.effective_model)? == &tariff,
+                "VALUE_QUOTA_FROZEN_TARIFF_CORRUPT"
+            );
+            (tariff, snapshot.exact_aliases.clone())
+        };
     let canonical = |model: &str| {
-        snapshot
-            .exact_aliases
+        aliases
             .get(model)
             .cloned()
             .unwrap_or_else(|| model.to_owned())
@@ -2452,8 +2514,37 @@ pub(crate) fn settle_attempt_outcome(
     assert_committed(config_dir)?;
     let mut conn = open_database(&database_path(config_dir), false)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let settled = settle_outcome_in_tx(&tx, request_id, attempt_id, outcome, true)?;
+    let settled = settle_attempt_outcome_in_tx(&tx, request_id, attempt_id, outcome)?;
     tx.commit()?;
+    Ok(settled)
+}
+
+fn settle_attempt_outcome_in_tx(
+    tx: &Transaction<'_>,
+    request_id: &str,
+    attempt_id: &str,
+    outcome: AttemptOutcome,
+) -> anyhow::Result<bool> {
+    evidence::outcome(tx, request_id, attempt_id, outcome)?;
+    tx.execute_batch("SAVEPOINT optional_outcome_price")?;
+    let settled = match settle_outcome_in_tx(tx, request_id, attempt_id, outcome, true) {
+        Ok(settled) => {
+            tx.execute_batch("RELEASE optional_outcome_price")?;
+            settled
+        }
+        Err(error) => {
+            tx.execute_batch("ROLLBACK TO optional_outcome_price; RELEASE optional_outcome_price")?;
+            if let Some((scope, window)) = tx.query_row(
+                "SELECT scope,window_id FROM value_quota_attempts WHERE request_id=?1 AND attempt_id=?2",
+                params![request_id, attempt_id],
+                |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)),
+            ).optional()? {
+                tx.execute("INSERT INTO meta(key,value) VALUES(?1,'settlement_requires_reconcile') ON CONFLICT(key) DO NOTHING",[block_key(&scope,&window)])?;
+            }
+            tracing::warn!(%error,"generation outcome retained while monetary settlement awaits reconciliation");
+            false
+        }
+    };
     Ok(settled)
 }
 
@@ -2470,10 +2561,13 @@ pub(crate) fn observe_attempt_tokens(
     assert_committed(config_dir)?;
     let mut conn = open_database(&database_path(config_dir), false)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    evidence::observe_tokens(&tx, request_id, attempt_id, tokens, estimated)?;
     let Some(old) = read_attempt_row(&tx, request_id, attempt_id)? else {
+        tx.commit()?;
         return Ok(false);
     };
     let scope = serde_json::from_str(&old.0)?;
+    tx.execute_batch("SAVEPOINT optional_attempt_price")?;
     let changed = settle_in_tx(
         &tx,
         &Observation {
@@ -2496,7 +2590,24 @@ pub(crate) fn observe_attempt_tokens(
             },
             synthetic: false,
         },
-    )?;
+    );
+    let changed = match changed {
+        Ok(changed) => {
+            tx.execute_batch("RELEASE optional_attempt_price")?;
+            changed
+        }
+        Err(error) => {
+            tx.execute_batch("ROLLBACK TO optional_attempt_price; RELEASE optional_attempt_price")?;
+            let window_id: String = tx.query_row(
+                "SELECT window_id FROM value_quota_attempts WHERE request_id=?1 AND attempt_id=?2",
+                params![request_id, attempt_id],
+                |r| r.get(0),
+            )?;
+            tx.execute("INSERT INTO meta(key,value) VALUES(?1,'settlement_requires_reconcile') ON CONFLICT(key) DO NOTHING",[block_key(&old.0,&window_id)])?;
+            tracing::warn!(%error,"generation facts retained while monetary settlement awaits reconciliation");
+            false
+        }
+    };
     tx.commit()?;
     Ok(changed)
 }
@@ -2810,18 +2921,9 @@ fn compact_in_tx(tx: &Transaction<'_>, cutoff: i64, now: i64) -> anyhow::Result<
         ensure!(checkpoint.count()? > 0, "VALUE_QUOTA_CHECKPOINT_CORRUPT");
         tx.execute("DELETE FROM value_quota_revisions WHERE request_id=?1 AND attempt_id=?2 AND usage_revision<
             (SELECT usage_revision FROM value_quota_attempts WHERE request_id=?1 AND attempt_id=?2)",params![request,attempt])?;
-        tx.execute("UPDATE value_quota_attempts SET frozen_tariff_json='null',compacted_at_ms=?3 WHERE request_id=?1 AND attempt_id=?2",params![request,attempt,now])?;
-        // Late async/media observations still need their original resource
-        // plan after tariff compaction; retain this small immutable fact.
-        let resources = read_attempt_meta(tx, request, attempt)?
-            .and_then(|meta| meta.resource_plan)
-            .is_some_and(|plan| !plan.quantities.is_empty() || !plan.text_tokens);
-        if !resources {
-            tx.execute(
-                "DELETE FROM meta WHERE key=?1",
-                [attempt_meta_key(request, attempt)?],
-            )?;
-        }
+        // Amount revisions may be compacted; pricing, aliases, resource plans
+        // and bounds are the durable minimum needed by late observations.
+        tx.execute("UPDATE value_quota_attempts SET compacted_at_ms=?3 WHERE request_id=?1 AND attempt_id=?2",params![request,attempt,now])?;
     }
     Ok(rows.len())
 }
@@ -2928,6 +3030,7 @@ mod tests {
             admit_in_tx(
                 &tx,
                 &Admission {
+                    attribution: None,
                     resource_plan: None,
                     enforce: true,
                     scope: &scope,
@@ -2983,6 +3086,7 @@ mod tests {
             );
         }
     }
+    include!("value_quota/conversion_tests.rs");
     use crate::domain::usage::value_pricing::*;
     #[test]
     fn value_quota_durable_admission_is_atomic_across_connections_and_survives_reopen() {
@@ -3019,6 +3123,7 @@ mod tests {
                 let result = admit_in_tx(
                     &tx,
                     &Admission {
+                        attribution: None,
                         resource_plan: None,
                         enforce: true,
                         scope: &scope,
@@ -3102,6 +3207,7 @@ mod tests {
             admit_in_tx(
                 &tx,
                 &Admission {
+                    attribution: None,
                     resource_plan: None,
                     enforce: false,
                     scope: &scope,
@@ -3147,6 +3253,7 @@ mod tests {
             "30000000"
         );
         let partial = Window {
+            account: None,
             id: "anchored".into(),
             starts_at_ms: 2,
             ends_at_ms: Some(2 * DAY_MS + 2),
@@ -3215,6 +3322,7 @@ mod tests {
     fn value_quota_compaction_keeps_deduplication_and_accepts_exact_late_revisions() {
         let (mut conn, scope, window, quota, revision) = setup();
         let a = Admission {
+            attribution: None,
             resource_plan: None,
             enforce: true,
             scope: &scope,
@@ -3329,6 +3437,7 @@ mod tests {
             "blocked"
         );
         let next = Window {
+            account: None,
             id: "day:1".into(),
             starts_at_ms: DAY_MS,
             ends_at_ms: Some(2 * DAY_MS),
@@ -3393,6 +3502,7 @@ mod tests {
         admit_in_tx(
             &tx,
             &Admission {
+                attribution: None,
                 resource_plan: None,
                 enforce: true,
                 scope: &scope,
@@ -3648,6 +3758,7 @@ mod tests {
         admit_in_tx(
             &tx,
             &Admission {
+                attribution: None,
                 resource_plan: None,
                 enforce: true,
                 scope: &scope,
@@ -3742,6 +3853,7 @@ mod tests {
         )
         .unwrap();
         let admission = |request_id, scope| Admission {
+            attribution: None,
             resource_plan: None,
             enforce: true,
             scope,
@@ -3883,6 +3995,7 @@ mod tests {
             entitlement_id: None,
         };
         let window = Window {
+            account: None,
             id: "day:0".into(),
             starts_at_ms: 0,
             ends_at_ms: Some(86400000),
@@ -3931,6 +4044,7 @@ mod tests {
     fn durable_risk_and_revision_idempotency_survive_policy_changes() {
         let (mut conn, scope, window, quota, revision) = setup();
         let a = Admission {
+            attribution: None,
             resource_plan: None,
             enforce: true,
             scope: &scope,
@@ -4054,6 +4168,7 @@ mod tests {
     fn missing_usage_charges_reserved_risk_conservatively_and_cross_scope_reuse_fails() {
         let (mut conn, scope, window, quota, revision) = setup();
         let a = Admission {
+            attribution: None,
             resource_plan: None,
             enforce: true,
             scope: &scope,
@@ -4105,6 +4220,7 @@ mod tests {
     fn report_cleanup_and_old_window_revisions_do_not_reset_current_usage() {
         let (mut conn, scope, window, quota, revision) = setup();
         let a = Admission {
+            attribution: None,
             resource_plan: None,
             enforce: true,
             scope: &scope,
@@ -4147,6 +4263,7 @@ mod tests {
         let (mut conn, scope, window, quota, revision) = setup();
         let tx = conn.transaction().unwrap();
         let base = Admission {
+            attribution: None,
             resource_plan: None,
             enforce: true,
             scope: &scope,
@@ -4222,6 +4339,7 @@ mod tests {
         let (mut conn, scope, window, quota, revision) = setup();
         let tx = conn.transaction().unwrap();
         let a = Admission {
+            attribution: None,
             resource_plan: None,
             enforce: true,
             scope: &scope,
@@ -4320,6 +4438,8 @@ mod tests {
     fn value_quota_log_outcomes_classify_errors_interruptions_and_retries() {
         let (_, scope, _, _, _) = setup();
         let meta = AttemptMeta {
+            frozen_tariff_sha256: None,
+            exact_aliases: BTreeMap::new(),
             resource_plan: None,
             input_tokens: 100,
             output_tokens: 50,
@@ -4382,6 +4502,7 @@ mod tests {
             admit_in_tx(
                 &tx,
                 &Admission {
+                    attribution: None,
                     resource_plan: None,
                     enforce: true,
                     scope: &scope,
@@ -4456,6 +4577,7 @@ mod tests {
         let (mut conn, scope, window, quota, revision) = setup();
         let tx = conn.transaction().unwrap();
         let admission = |request_id, attempt_id| Admission {
+            attribution: None,
             resource_plan: None,
             enforce: true,
             scope: &scope,
@@ -4530,6 +4652,7 @@ mod tests {
         admit_in_tx(
             &tx,
             &Admission {
+                attribution: None,
                 resource_plan: None,
                 enforce: true,
                 scope: &scope,
@@ -4611,6 +4734,7 @@ mod tests {
             admit_in_tx(
                 &tx,
                 &Admission {
+                    attribution: None,
                     resource_plan: None,
                     enforce: true,
                     scope: &scope,
@@ -4674,6 +4798,7 @@ mod tests {
     fn value_quota_sweeper_isolates_failing_rows_and_prefers_pending_over_legacy() {
         let (mut conn, scope, window, quota, revision) = setup();
         let next = Window {
+            account: None,
             id: "day:1".into(),
             starts_at_ms: DAY_MS,
             ends_at_ms: Some(2 * DAY_MS),
@@ -4688,6 +4813,7 @@ mod tests {
             admit_in_tx(
                 &tx,
                 &Admission {
+                    attribution: None,
                     resource_plan: None,
                     enforce: true,
                     scope: &scope,

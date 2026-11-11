@@ -992,7 +992,7 @@ type CachedRouterShareCapabilities = (
     String,
     String,
     std::time::Instant,
-    (bool, bool, bool, bool, bool, bool, bool, bool),
+    (bool, bool, bool, bool, bool, bool, bool, bool, bool),
 );
 
 #[derive(Clone, Copy)]
@@ -7291,6 +7291,11 @@ impl ServerStateInner {
                 .context("initialize image capability store")?,
         );
 
+        crate::repository::server_sqlite::value_quota::evidence::pin_legacy_origin(
+            &config_dir,
+            &config,
+            &shares,
+        )?;
         let request_body_limits = config.request_body_limits.resolve();
         tracing::info!(
             default_bytes = request_body_limits.default_bytes,
@@ -19440,7 +19445,7 @@ impl ServerStateInner {
         &self,
         mutate: impl FnOnce(&mut ShareStore) -> Result<R, E>,
     ) -> anyhow::Result<Result<R, E>> {
-        self.try_mutate_shares_with_value_initializations(mutate, None)
+        self.try_mutate_shares_with_value_initializations(mutate, None, None)
             .await
     }
 
@@ -19448,6 +19453,7 @@ impl ServerStateInner {
         &self,
         mutate: impl FnOnce(&mut ShareStore) -> Result<R, E>,
         initializations: Option<share_value_quota::ValueUsageInitializationRequest>,
+        usage_context: Option<&UsageStore>,
     ) -> anyhow::Result<Result<R, E>> {
         let value_usage_changed = initializations.is_some();
         let value_config = self.config_snapshot().await;
@@ -19492,7 +19498,30 @@ impl ServerStateInner {
         // usage read guard, and a queued writer would deadlock a nested
         // read. Without a snapshot, natural-period USD policies are simply
         // scheduled for the next window instead of starting now.
-        let value_usage = self.usage.try_read().ok();
+        let value_usage_guard = if usage_context.is_none() {
+            self.usage.try_read().ok()
+        } else {
+            None
+        };
+        let value_usage = usage_context.or(value_usage_guard.as_deref());
+        let prepared_conversions = initializations
+            .as_ref()
+            .map(|request| {
+                self.prepare_unit_conversions(
+                    request,
+                    &value_previous,
+                    &mut candidate,
+                    &value_config,
+                    value_usage,
+                    now_ms_i64(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let converted = prepared_conversions
+            .iter()
+            .map(|c| (c.scope.share_id.clone(), c.scope.email.clone()))
+            .collect();
         self.prepare_value_bindings_with_context(
             &mut candidate,
             &value_previous,
@@ -19500,7 +19529,8 @@ impl ServerStateInner {
             &value_config,
             value_capable,
             &value_providers,
-            value_usage.as_deref(),
+            value_usage,
+            &converted,
         )?;
         let prepared_initializations = initializations
             .as_ref()
@@ -19509,12 +19539,12 @@ impl ServerStateInner {
                     &value_previous,
                     &candidate,
                     &value_config,
-                    value_usage.as_deref(),
+                    value_usage,
                     now_ms_i64(),
                 )
             })
             .transpose()?;
-        drop(value_usage);
+        drop(value_usage_guard);
         #[cfg(test)]
         self.shares_persistence.apply_test_persist_delay().await;
         if let Some(request) = initializations {
@@ -19525,6 +19555,7 @@ impl ServerStateInner {
                 share_value_quota::InitializedShareSnapshot {
                     shares: candidate.clone(),
                     initializations,
+                    conversions: prepared_conversions,
                     actor: request.actor,
                     now,
                 },
@@ -19574,6 +19605,7 @@ impl ServerStateInner {
                         capability.provider_identity(),
                         capability.buddy_quota_presentation(),
                         capability.resource_value_quotas(),
+                        capability.quota_unit_conversion(),
                     ),
                 )
             });
@@ -19581,8 +19613,10 @@ impl ServerStateInner {
             let mut previous = self.router_quota_capability.write().await;
             let changed = previous
                 .as_ref()
-                .map(|(base, id, _, c)| (base, id, c.5, c.6))
-                != value.as_ref().map(|(base, id, _, c)| (base, id, c.5, c.6))
+                .map(|(base, id, _, c)| (base, id, c.5, c.6, c.7, c.8))
+                != value
+                    .as_ref()
+                    .map(|(base, id, _, c)| (base, id, c.5, c.6, c.7, c.8))
                 || previous
                     .as_ref()
                     .is_some_and(|(_, _, at, c)| c.6 && at.elapsed() >= Duration::from_secs(300));
@@ -19848,6 +19882,7 @@ impl ServerStateInner {
         app: AppKind,
         context: &mut UsageLogContext,
     ) -> anyhow::Result<()> {
+        context.quota_app = Some(app);
         let (Some(share_id), Some(_)) =
             (context.share_id.as_deref(), context.user_email.as_deref())
         else {
@@ -19991,7 +20026,9 @@ impl ServerStateInner {
                 ),
             ));
         }
-        if patch.user_value_usage_initializations.is_some() {
+        if patch.user_value_usage_initializations.is_some()
+            || patch.user_quota_conversions.is_some()
+        {
             if let Some(context) = &mut patch.edit_context {
                 context.actor = self.config_snapshot().await.owner.email;
             }
@@ -20026,7 +20063,40 @@ impl ServerStateInner {
         patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
     ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
         use crate::domain::sharing::router_contract::ShareTokenPeriod;
+        if patch.user_quota_conversions.is_some() {
+            if let Some(context) = &patch.edit_context {
+                if let Some(receipt) =
+                    crate::repository::server_sqlite::value_quota::conversion::settings_receipt(
+                        &self.config_dir,
+                        &context.operation_id,
+                        share_id,
+                        &self.config_snapshot().await,
+                    )?
+                {
+                    anyhow::ensure!(
+                        receipt.patch_fingerprint
+                            == crate::domain::sharing::router_contract::share_settings_fingerprint(
+                                share_id, &patch
+                            ),
+                        "QUOTA_CONVERSION_OPERATION_CONFLICT"
+                    );
+                    return Ok(self
+                        .shares
+                        .read()
+                        .await
+                        .get(share_id)
+                        .cloned()
+                        .ok_or(SharePatchError::NotFound));
+                }
+            }
+        }
         let value_initializations = ValueUsageInitializationRequest::from_patch(share_id, &patch)?;
+        if patch.user_quota_conversions.is_some() {
+            anyhow::ensure!(
+                self.quota_conversion_router_negotiated().await,
+                "QUOTA_CONVERSION_ROUTER_UPGRADE_REQUIRED"
+            );
+        }
         let requests_account_reset = patch.user_grants.as_ref().is_some_and(|grants| {
             grants
                 .values()
@@ -20216,6 +20286,7 @@ impl ServerStateInner {
         self.try_mutate_shares_with_value_initializations(
             |shares| mutate(shares, &usage, applied_at_ms),
             initializations,
+            Some(&usage),
         )
         .await
     }
@@ -22244,16 +22315,65 @@ async fn apply_and_ack_share_edit(
         }
     };
     let applied_ack = ack_status == "applied";
+    // If durable result lookup is temporarily unavailable, leave the Router
+    // edit pending. Its next delivery replays the already committed operation.
+    let metadata = (|| -> anyhow::Result<_> {
+        let conversions = if applied_ack && edit.patch.user_quota_conversions.is_some() {
+            crate::repository::server_sqlite::value_quota::conversion::receipts(
+                &state.config_dir,
+                &edit.id,
+                &edit.share_id,
+                config,
+            )?
+        } else {
+            Vec::new()
+        };
+        let receipt = match &edit.patch.edit_context {
+            Some(context) => {
+                crate::repository::server_sqlite::value_quota::conversion::settings_receipt(
+                    &state.config_dir,
+                    &context.operation_id,
+                    &edit.share_id,
+                    config,
+                )?
+            }
+            None => None,
+        };
+        Ok((conversions, receipt))
+    })();
+    let (quota_conversions, permanent_receipt) = match metadata {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error,edit_id=%edit.id,"quota conversion ACK will retry durable result lookup");
+            summary.ack_failed += 1;
+            return;
+        }
+    };
+    let value_quota_statuses = if !quota_conversions.is_empty() {
+        match state.value_quota_statuses(&edit.share_id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error,"quota conversion ACK status lookup will retry");
+                summary.ack_failed += 1;
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let ack = ShareEditAckPayload {
+        quota_conversions,
+        value_quota_statuses,
         termination_receipt,
-        settings_receipt: match edit.patch.edit_context.as_ref() {
+        settings_receipt: match &edit.patch.edit_context {
             Some(context) => state
                 .shares
                 .read()
                 .await
                 .applied_settings_operations
                 .get(&context.operation_id)
-                .cloned(),
+                .cloned()
+                .or(permanent_receipt),
             None => None,
         },
         edit_id: edit.id.clone(),
@@ -23067,6 +23187,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         let market_trial_supported = state.router_supports_market_trials().await;
         let value_supported = state.router_supports_value_quotas().await;
         let resources_supported = state.resource_value_router_negotiated().await;
+        let conversions_supported = state.quota_conversion_router_negotiated().await;
         let provider_identity_supported = state.router_supports_provider_identity().await;
         let buddy_quota_supported = state.router_supports_buddy_quota_presentation().await;
         let termination_archive_since_ms = if state.router_supports_share_termination().await {
@@ -23088,7 +23209,14 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         let unsupported = shares
             .iter()
             .filter_map(|share| {
-                let reason = if !market_trial_supported && !share.market_entitlements.is_empty() {
+                let reason = if !conversions_supported
+                    && share
+                        .user_grants
+                        .values()
+                        .any(|g| g.quota_conversion_id.is_some())
+                {
+                    "QUOTA_CONVERSION_ROUTER_UPGRADE_REQUIRED"
+                } else if !market_trial_supported && !share.market_entitlements.is_empty() {
                     "MARKET_TRIAL_ROUTER_UPGRADE_REQUIRED"
                 } else if !value_supported
                     && share.user_grants.values().any(|g| {
@@ -33824,7 +33952,7 @@ mod tests {
     #[tokio::test]
     async fn value_quota_scheduled_switch_preserves_old_token_limits_and_activates_at_the_complete_boundary(
     ) {
-        use crate::domain::sharing::router_contract::{ShareSettingsPatch, ShareTokenPeriod};
+        use crate::domain::sharing::router_contract::ShareTokenPeriod;
         use crate::domain::usage::value_pricing::{PricingSnapshot, ValueQuota};
         use crate::repository::server_sqlite::value_quota as value_ledger;
         let state = test_state();
@@ -33891,248 +34019,84 @@ mod tests {
         )
         .unwrap();
         value_ledger::activate_snapshot(&state.config_dir, &scope, &revision).unwrap();
-        // A Share request already recorded in the current window: the switch
-        // cannot be proved exact, so it is scheduled for the next window.
-        {
-            let mut recorded = crate::domain::usage::store::UsageLog::new(
-                AppKind::Codex,
-                "provider".into(),
-                "Provider".into(),
-                ProviderType::Codex,
-                200,
-                1,
-                crate::domain::usage::store::UsageModelMetadata {
-                    model: Some("model".into()),
-                    ..Default::default()
-                },
-                crate::domain::usage::store::TokenUsage::default(),
-            );
-            recorded.apply_context(UsageLogContext {
-                request_id: Some("token-window-request".into()),
-                share_id: Some("value-share".into()),
-                user_email: Some("owner@example.com".into()),
-                ..Default::default()
-            });
-            state.usage.write().await.logs.push(recorded);
-        }
-        state.mutate_shares_immediate(|_| {}).await.unwrap();
-        let share = state
-            .shares
-            .read()
-            .await
-            .get("value-share")
-            .unwrap()
-            .clone();
-        // No Token-mode shadow metering: an ordinary Token grant has no binding.
-        assert!(share.user_grants["owner@example.com"]
-            .value_metering
-            .is_none());
-        let mut grants = share.user_grants.clone();
-        let grant = grants.get_mut("owner@example.com").unwrap();
-        grant.policy.token_limit = None;
-        grant.policy.value_quota = Some(ValueQuota {
-            limit_usd_micros: "1000000".into(),
-            tariff_policy_id: "api-equivalent-v1".into(),
-        });
-        let saved = state
-            .apply_share_settings_patch_immediate(
-                "value-share",
-                ShareSettingsPatch {
-                    user_grants: Some(grants),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let saved_grant = &saved.user_grants["owner@example.com"];
-        assert_eq!(saved_grant.policy.token_limit, Some(100));
-        assert!(saved_grant.policy.value_quota.is_none());
-        let pending = saved_grant.pending_value_quota.as_ref().unwrap();
-        assert!(pending.retain_access);
-        assert!(pending.effective_from_ms > now_ms_i64());
-        // Natural periods start USD metering at the next window boundary.
-        assert_eq!(pending.effective_from_ms % 86_400_000, 0);
-        let origin = saved_grant
-            .value_metering
-            .as_ref()
-            .unwrap()
-            .value_metered_from_ms;
-        let mut projection =
-            crate::domain::sharing::router_contract::descriptor_for_share_with_usage(
-                &saved,
-                &*state.providers.read().await,
-                None,
-            );
-        assert!(apply_value_descriptor_projection(&mut projection, false, false).is_err());
-        for grant in projection.user_grants.values_mut() {
-            grant.active = false;
-        }
-        apply_value_descriptor_projection(&mut projection, false, false).unwrap();
-        assert!(projection.user_grants.values().all(|g| !g.active
-            && g.value_metering.is_none()
-            && g.policy.value_quota.is_none()
-            && g.pending_value_quota.is_none()));
-        assert!(
-            saved_grant.pending_value_quota.is_some(),
-            "projection must not erase durable policy history"
-        );
-        let policy_preview = state
-            .preview_share_value_quota(
-                "value-share",
-                saved.config_revision,
-                BTreeMap::from([("owner@example.com".into(), pending.policy.clone())]),
-            )
+        // Seed a v10 pending policy exactly as it existed before the upgrade.
+        // New owner edits may not create this deferred policy any more.
+        let boundary = (now_ms_i64() / 86_400_000 + 1) * 86_400_000;
+        state
+            .mutate_shares_immediate(|store| {
+                let grant = store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "value-share")
+                    .unwrap()
+                    .user_grants
+                    .get_mut("owner@example.com")
+                    .unwrap();
+                let mut policy = grant.policy.clone();
+                policy.token_limit = None;
+                policy.value_quota = Some(ValueQuota {
+                    limit_usd_micros: "1000000".into(),
+                    tariff_policy_id: "api-equivalent-v1".into(),
+                });
+                grant.pending_value_quota =
+                    Some(crate::domain::sharing::router_contract::PendingValueQuota {
+                        policy,
+                        effective_from_ms: boundary,
+                        retain_access: true,
+                    });
+                grant.value_metering =
+                    Some(crate::domain::usage::value_pricing::ValueMeteringBinding {
+                        quota_policy_epoch: "legacy".into(),
+                        value_metered_from_ms: boundary,
+                        effective_from_ms: boundary,
+                        pricing_revision: revision.clone(),
+                    });
+            })
             .await
             .unwrap();
-        assert_eq!(policy_preview["ready"], true);
-        assert_eq!(
-            policy_preview["rows"][0]["effectiveFromMs"],
-            pending.effective_from_ms
-        );
-        assert_eq!(
-            policy_preview["rows"][0]["reasonCode"],
-            "scheduled_next_window"
-        );
-        let mut lifetime = pending.policy.clone();
-        lifetime.token_period = ShareTokenPeriod::Lifetime;
-        let immediate = state
-            .preview_share_value_quota(
-                "value-share",
-                saved.config_revision,
-                BTreeMap::from([("owner@example.com".into(), lifetime)]),
-            )
-            .await
-            .unwrap();
-        assert_eq!(immediate["ready"], true);
-        assert!(immediate["rows"][0]["effectiveFromMs"].as_i64().unwrap() <= now_ms_i64());
-        // Lifetime starts metering now, explicitly, instead of trusting history.
-        assert_eq!(immediate["rows"][0]["reasonCode"], "metered_from_now");
-        assert!(immediate["rows"][0]["meteredFromMs"].as_i64().unwrap() >= origin);
-        let current = now_ms_i64();
-        let mut copy = state.shares.read().await.clone();
-        assert!(copy
-            .validate_for_invocation(
-                "value-share",
-                AppKind::Codex,
-                Some("owner@example.com"),
-                current
-            )
-            .is_ok());
-        copy.record_user_invocation_result("value-share", Some("owner@example.com"), 100, current);
-        assert_eq!(
-            copy.validate_for_invocation(
-                "value-share",
-                AppKind::Codex,
-                Some("owner@example.com"),
-                current
-            )
-            .unwrap_err()
-            .reason,
-            ShareRejectReason::UserExhausted
-        );
         let before = state.shares.read().await.clone();
-        // A brand-new authorization has no history in the current window:
-        // it activates now, metered exactly from the window start.
-        let mut newly_authorized = before.clone();
-        newly_authorized
+        let grant = &before.get("value-share").unwrap().user_grants["owner@example.com"];
+        state.mutate_shares_immediate(|_| {}).await.unwrap();
+        assert_eq!(
+            state
+                .shares
+                .read()
+                .await
+                .get("value-share")
+                .unwrap()
+                .user_grants["owner@example.com"],
+            *grant
+        );
+        let mut unsigned = before.clone();
+        unsigned
             .shares
             .iter_mut()
             .find(|s| s.id == "value-share")
             .unwrap()
             .user_grants
-            .insert(
-                "new@example.test".into(),
-                crate::domain::sharing::router_contract::ShareUserGrant {
-                    email: "new@example.test".into(),
-                    active: true,
-                    policy: pending.policy.clone(),
-                    ..Default::default()
-                },
-            );
-        state
-            .prepare_value_bindings_at(&mut newly_authorized, &before, current)
-            .await
-            .unwrap();
-        let new_grant =
-            &newly_authorized.get("value-share").unwrap().user_grants["new@example.test"];
-        assert!(new_grant.pending_value_quota.is_none());
-        assert!(new_grant.policy.value_quota.is_some());
-        assert_eq!(
-            new_grant
-                .value_metering
-                .as_ref()
-                .unwrap()
-                .value_metered_from_ms,
-            current - current.rem_euclid(86_400_000)
-        );
-        let new_scope = value_ledger::Scope {
-            email: "new@example.test".into(),
-            ..scope.clone()
-        };
-        let new_window = value_ledger::Window {
-            id: format!(
-                "Day:{}:{}",
-                current - current.rem_euclid(86_400_000),
-                current - current.rem_euclid(86_400_000) + 86_400_000
-            ),
-            starts_at_ms: current - current.rem_euclid(86_400_000),
-            ends_at_ms: Some(current - current.rem_euclid(86_400_000) + 86_400_000),
-            metered_from_ms: current - current.rem_euclid(86_400_000),
-        };
-        // Coverage starts at the window start, so the empty window is exact.
-        assert_eq!(
-            value_ledger::status(&state.config_dir, &new_scope, &new_window)
-                .unwrap()
-                .used_picos,
-            "0"
-        );
-        assert_eq!(
-            value_ledger::begin_coverage(&state.config_dir, &scope, current + 100).unwrap(),
-            origin
-        );
-        // A Token-enforced grant with a scheduled USD policy is not metered.
-        assert!(state
-            .admit_share_value_text(
-                &UsageLogContext {
-                    share_id: Some("value-share".into()),
-                    user_email: Some(scope.email.clone()),
-                    request_id: Some("token-while-scheduled".into()),
-                    started_at_ms: Some(current as u128),
-                    ..Default::default()
-                },
-                "unpriced",
-                Some("standard"),
-                crate::domain::usage::value_pricing::RiskEstimate::default(),
-                true,
-            )
-            .await
+            .get_mut("owner@example.com")
             .unwrap()
-            .is_none());
-        state
-            .record_router_quota_capability(
-                &config,
-                client::RouterShareCapabilities {
-                    share_contract_version: 7,
-                    capabilities: vec![],
-                },
-            )
-            .await;
+            .policy = grant.pending_value_quota.as_ref().unwrap().policy.clone();
+        let error = state
+            .prepare_value_bindings_at(&mut unsigned, &before, now_ms_i64())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("PREVIEW_REQUIRED"));
         let mut after = before.clone();
         state
-            .prepare_value_bindings_at(&mut after, &before, pending.effective_from_ms)
+            .prepare_value_bindings_at(&mut after, &before, boundary)
             .await
             .unwrap();
-        let activated = &after.get("value-share").unwrap().user_grants["owner@example.com"];
-        assert!(activated.pending_value_quota.is_none());
-        assert!(activated.policy.value_quota.is_some());
+        let active = &after.get("value-share").unwrap().user_grants["owner@example.com"];
+        assert!(active.pending_value_quota.is_none());
+        assert!(active.policy.value_quota.is_some());
         assert_eq!(
-            activated
+            active
                 .value_metering
                 .as_ref()
                 .unwrap()
                 .value_metered_from_ms,
-            origin
+            boundary
         );
     }
 
@@ -34617,6 +34581,7 @@ mod tests {
             &state.config_dir,
             &scope,
             &value_ledger::Window {
+                account: None,
                 id: "Lifetime:0:0".into(),
                 starts_at_ms: 0,
                 ends_at_ms: None,

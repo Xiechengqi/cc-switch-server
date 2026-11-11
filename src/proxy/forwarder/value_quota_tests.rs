@@ -259,6 +259,7 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                         .clone();
                     assert!(grant.pending_value_quota.is_none());
                     let window = ledger::Window {
+                        account: None,
                         id: "Lifetime:0:0".into(),
                         starts_at_ms: 0,
                         ends_at_ms: None,

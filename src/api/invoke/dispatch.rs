@@ -713,6 +713,17 @@ async fn web_invoke_dispatch(
             state.preview_share_account_reset(&id, revision, policies).await
                 .map_err(ApiError::account_quota_preview)
         }
+        "get_share_quota_conversion" => {
+            let id=web_arg_share_id(&args)?;
+            let operation=web_arg_string_any(&args,&["operationId"])?;
+            state.share_quota_conversion_result(&id,&operation).await.map_err(ApiError::value_quota_preview)
+        }
+        "prepare_share_quota_history" => {
+            let id=web_arg_share_id(&args)?;
+            let revision=web_optional_u64(&args,&["expectedConfigRevision"]).ok_or_else(||ApiError::bad_request("expectedConfigRevision is required"))?;
+            let emails=serde_json::from_value(args.get("emails").cloned().ok_or_else(||ApiError::bad_request("emails are required"))?).map_err(ApiError::bad_request)?;
+            state.prepare_share_quota_history(&id,revision,emails,args.get("restart").and_then(Value::as_bool).unwrap_or(false)).await.map_err(ApiError::value_quota_preview)
+        }
         "preview_share_value_quota" => {
             let id=web_arg_share_id(&args)?;
             let revision=web_optional_u64(&args,&["expectedConfigRevision"]).ok_or_else(||ApiError::bad_request("expectedConfigRevision is required"))?;
