@@ -1,4 +1,5 @@
 use super::*;
+use crate::clients::router::client::RouterShareCapabilities;
 use crate::domain::usage::value_pricing::PricingSnapshot;
 use crate::repository::server_sqlite::{self, value_quota as ledger};
 
@@ -40,6 +41,18 @@ async fn fixture() -> (ServerState, Value) {
           "credentialPatches":{"/settingsConfig/apiKey":{"action":"replace","value":"fixture-only-key"}}}]
     })).unwrap()).await.unwrap().unwrap();
     let config = state.config_snapshot().await;
+    state
+        .record_router_quota_capability(
+            &config,
+            RouterShareCapabilities {
+                share_contract_version: 12,
+                capabilities: vec![
+                    "usdEquivalentQuotaV1".into(),
+                    "quotaUnitConversionV1".into(),
+                ],
+            },
+        )
+        .await;
     let scope = ledger::Scope {
         router_url: config.router_api_base().unwrap().into(),
         installation_id: "opening-bundle-install".into(),
@@ -85,10 +98,14 @@ async fn fixture() -> (ServerState, Value) {
         .await
         .unwrap();
     assert_eq!(preview["ready"], true, "{preview}");
+    let row = &preview["rows"][0];
+    assert_eq!(row["canInitializeUsage"], true, "{preview}");
     command["userGrantEdits"] = json!({"new@example.test":{"expectedRevision":0,"policy":policy}});
     command["valueUsageOperationId"] = json!("fixture-operation");
+    command["userQuotaConversions"] =
+        json!({"new@example.test":{"credential":row["conversionCredential"]}});
     command["userValueUsageInitializations"] = json!({"new@example.test":{"targetPicos":"123456789123",
-        "windowId":preview["rows"][0]["windowId"],"reason":"Verified opening usage"}});
+        "windowId":row["windowId"],"reason":"Verified opening usage"}});
     (state, command)
 }
 
@@ -100,6 +117,12 @@ async fn native_bundle_opening_usd_usage_is_atomic_replayable_and_never_succeeds
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        saved.user_grants["new@example.test"]
+            .quota_conversion_id
+            .as_deref(),
+        Some("bundle-value:fixture-operation")
+    );
     assert!(saved.user_grants["new@example.test"]
         .value_metering
         .is_some());
@@ -123,6 +146,20 @@ async fn native_bundle_opening_usd_usage_is_atomic_replayable_and_never_succeeds
         })
         .unwrap(),
         1
+    );
+    let result = state
+        .share_quota_conversion_result(&saved.id, "bundle-value:fixture-operation")
+        .await
+        .unwrap();
+    assert_eq!(result["committed"], true, "{result}");
+    assert_eq!(
+        result["settingsReceipt"]["configRevision"],
+        saved.config_revision
+    );
+    assert_eq!(result["quotaConversions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["quotaConversions"][0]["status"]["usedPicos"],
+        "123456789123"
     );
     let mut changed = command.clone();
     changed["userValueUsageInitializations"]["new@example.test"]["targetPicos"] = json!("1");
@@ -156,6 +193,7 @@ async fn native_bundle_invalid_opening_usd_usage_keeps_grants_ledger_and_receipt
         .await
         .unwrap_err();
     assert_eq!(error.status, StatusCode::BAD_REQUEST, "{error:?}");
+    assert_eq!(error.code, Some("quota_target_invalid"), "{error:?}");
     let durable = server_sqlite::load_authoritative(&state.config_dir)
         .unwrap()
         .shares;
@@ -172,6 +210,15 @@ async fn native_bundle_invalid_opening_usd_usage_keeps_grants_ledger_and_receipt
         db.query_row("SELECT count(*) FROM value_quota_adjustments", [], |row| {
             row.get::<_, i64>(0)
         })
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM quota_conversion_receipts",
+            [],
+            |row| { row.get::<_, i64>(0) }
+        )
         .unwrap(),
         0
     );
