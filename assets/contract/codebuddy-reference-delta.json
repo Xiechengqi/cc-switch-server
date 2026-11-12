@@ -2222,7 +2222,8 @@
       "serverDownloads": false
     },
     "limits": {
-      "images": 16,
+      "images": null,
+      "imageCountPolicy": "upstream_enforced_no_local_count_ceiling",
       "inlineImageDecodedBytes": 20971520,
       "inlineTotalDecodedBytes": 33554432,
       "httpsUrlBytes": 16384,
@@ -2264,7 +2265,8 @@
       {
         "path": "src/proxy/codebuddy_runtime/images.rs",
         "anchors": [
-          "buddy_images_enforce_decoded_limits_and_count_at_the_boundary",
+          "buddy_images_enforce_decoded_byte_limits",
+          "buddy_images_above_sixteen_preserve_history_and_tool_results_with_byte_limits",
           "buddy_images_do_not_interpret_tool_schemas_or_json_text_as_media"
         ]
       },

@@ -3199,3 +3199,7 @@ Server 在 Buddy 共用 SSE 解码器中按本次生成请求的工具 schema �
 验证：17 图专项 6 项通过（含双产品×双站×四入口×双流模式回环），Node 审计 2158 项通过；cargo check、cargo fmt 和 include! 文件 rustfmt、Provider/UI 覆盖审计通过。原 smoke 因 Cargo 锁超时，改用本次构建二进制运行原断言后通过。全库默认线程栈在账号导入测试栈溢出；RUST_MIN_STACK=16777216 重跑得 4386 passed / 2 failed / 3 ignored，两项失败位于未改动的额度状态测试（tariff ACK schema 预期 5 实际 6、tampered 设置拒绝断言），各自单独重跑仍失败，不宣称全套通过。离线 readiness failures=0，缺真实输入/本地合同验收及部署，仍 blocked_inputs。
 
 补充验证：API 集成 138 项及两个独立 fixture 各 1 项通过；跳过 state 模块的库回归 4134 passed / 3 ignored。该结果不覆盖或消除上述两项全库失败。
+
+### 2026-11-12 图片数量策略 CI 契约同步
+
+997eb2e 遗漏独立 reference-delta 审计：imageInputExtension 仍声明 images=16，localEvidence 引用旧测试名，导致 CI 的 audit-codebuddy-reference-delta.mjs 失败。现以 images=null 和明确的 upstream_enforced_no_local_count_ceiling 策略描述无本地数量上限，同步新测试锚点；审计继续要求原有解码字节/URL/内存保护，并检查 Buddy 不再引用共享数量常量。外部冻结证据、Driver revision 与 live_pending 验收边界不变。

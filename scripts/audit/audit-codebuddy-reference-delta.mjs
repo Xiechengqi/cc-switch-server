@@ -1076,7 +1076,9 @@ assert(imageInput.scope?.clientIdentity === "CLI/2.142.0" &&
   JSON.stringify(imageInput.scope.products) === JSON.stringify(["codebuddy_oauth", "workbuddy_oauth"]) &&
   JSON.stringify(imageInput.scope.sites) === JSON.stringify(["cn", "intl"]),
   "Buddy images must remain exact-catalog input under the reviewed identity");
-assert(imageInput.limits?.images === 16 && imageInput.limits.inlineImageDecodedBytes === 20971520 &&
+assert(imageInput.limits?.images === null &&
+  imageInput.limits.imageCountPolicy === "upstream_enforced_no_local_count_ceiling" &&
+  imageInput.limits.inlineImageDecodedBytes === 20971520 &&
   imageInput.limits.inlineTotalDecodedBytes === 33554432 && imageInput.limits.httpsUrlBytes === 16384 &&
   imageInput.limits.existingRequestBodyAndMemoryLimitsApply === true,
   "Buddy image-input limits changed");
@@ -1109,6 +1111,16 @@ for (const evidence of imageInput.localEvidence) {
   assert(evidence.anchors?.length > 0 && evidence.anchors.every((anchor) => local.includes(anchor)),
     `Buddy image local evidence missing: ${evidence.path}`);
 }
+// Keep the local protection contract aligned with the user-authorized
+// removal of Buddy's count ceiling; other providers retain their own limits.
+const buddyImageValidator = fs.readFileSync(path.join(repoRoot,
+  "src/proxy/codebuddy_runtime/images.rs"), "utf8");
+assert(!buddyImageValidator.includes("MAX_IMAGES_PER_REQUEST") &&
+  !buddyImageValidator.includes("image input exceeds") &&
+  buddyImageValidator.includes("MAX_CODEX_IMAGE_BYTES") &&
+  buddyImageValidator.includes("MAX_CODEX_IMAGES_TOTAL_BYTES") &&
+  buddyImageValidator.includes("inline_bytes > max_total_bytes"),
+  "Buddy must retain decoded-byte protection without the shared image-count ceiling");
 const workbuddyImage = JSON.parse(fs.readFileSync(path.join(repoRoot, "assets/contract/workbuddy-protocol.json"), "utf8")).imageInputExtension;
 assert(workbuddyImage?.referenceContract === "assets/contract/codebuddy-reference-delta.json#imageInputExtension" &&
   workbuddyImage.driverContractRevision === 3 && workbuddyImage.harnessRevision === 3 &&
