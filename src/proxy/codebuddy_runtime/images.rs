@@ -4,7 +4,6 @@ use serde_json::Value;
 
 use crate::proxy::remote_image::{
     decode_image_data_uri, MAX_CODEX_IMAGES_TOTAL_BYTES, MAX_CODEX_IMAGE_BYTES,
-    MAX_IMAGES_PER_REQUEST,
 };
 
 const MAX_IMAGE_URL_BYTES: usize = 16 * 1024;
@@ -214,22 +213,18 @@ pub(crate) fn has_image_input(request: &Value) -> bool {
         })
 }
 
+// Buddy has no local image-count ceiling. The caller bounds the request body
+// and working set; decoded inline bytes remain bounded here. Upstream limits
+// are returned by the bound upstream without deleting or rewriting images.
 pub(super) fn validate_image_input(request: &Value) -> Result<(), String> {
-    validate_with_limits(
-        request,
-        MAX_IMAGES_PER_REQUEST,
-        MAX_CODEX_IMAGE_BYTES,
-        MAX_CODEX_IMAGES_TOTAL_BYTES,
-    )
+    validate_with_limits(request, MAX_CODEX_IMAGE_BYTES, MAX_CODEX_IMAGES_TOTAL_BYTES)
 }
 
 fn validate_with_limits(
     request: &Value,
-    max_images: usize,
     max_image_bytes: usize,
     max_total_bytes: usize,
 ) -> Result<(), String> {
-    let mut image_count = 0_usize;
     let mut inline_bytes = 0_usize;
     for message in request["messages"].as_array().into_iter().flatten() {
         let Some(parts) = message["content"].as_array() else {
@@ -244,10 +239,6 @@ fn validate_with_limits(
             }
             if !matches!(message["role"].as_str(), Some("user" | "tool")) {
                 return Err("CodeBuddy image input requires a user or tool message".into());
-            }
-            image_count += 1;
-            if image_count > max_images {
-                return Err(format!("CodeBuddy image input exceeds {max_images} images"));
             }
             let image = &part["image_url"];
             let url = image["url"]
@@ -309,22 +300,38 @@ mod tests {
     }
 
     #[test]
-    fn buddy_images_enforce_decoded_limits_and_count_at_the_boundary() {
+    fn buddy_images_enforce_decoded_byte_limits() {
         let mut body = request(PNG);
-        assert!(validate_with_limits(&body, 1, 8, 8).is_ok());
-        assert!(validate_with_limits(&body, 1, 7, 8).is_err());
+        assert!(validate_with_limits(&body, 8, 8).is_ok());
+        assert!(validate_with_limits(&body, 7, 8).is_err());
         let part = body["messages"][0]["content"][0].clone();
         body["messages"][0]["content"]
             .as_array_mut()
             .unwrap()
             .push(part);
-        assert!(validate_with_limits(&body, 2, 8, 16).is_ok());
-        assert!(validate_with_limits(&body, 1, 8, 16)
-            .unwrap_err()
-            .contains("1 images"));
-        assert!(validate_with_limits(&body, 2, 8, 15)
+        assert!(validate_with_limits(&body, 8, 16).is_ok());
+        assert!(validate_with_limits(&body, 8, 15)
             .unwrap_err()
             .contains("total decoded"));
+    }
+
+    #[test]
+    fn buddy_images_above_sixteen_preserve_history_and_tool_results_with_byte_limits() {
+        let part = request(PNG)["messages"][0]["content"][0].clone();
+        let remote = request("https://example.com/image.png")["messages"][0]["content"][0].clone();
+        let body = json!({"messages":[
+            {"role":"user","content":vec![part.clone(); 17]},
+            {"role":"assistant","content":"received"},
+            {"role":"tool","tool_call_id":"images","content":vec![part; 17]},
+            {"role":"user","content":vec![remote; 17]}
+        ]});
+        let original = body.clone();
+        assert!(validate_image_input(&body).is_ok());
+        assert!(validate_with_limits(&body, 8, 34 * 8).is_ok());
+        assert!(validate_with_limits(&body, 8, 34 * 8 - 1)
+            .unwrap_err()
+            .contains("total decoded"));
+        assert_eq!(body, original);
     }
 
     #[test]

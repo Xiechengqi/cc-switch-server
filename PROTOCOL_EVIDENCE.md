@@ -3189,3 +3189,13 @@ Server 在 Buddy 共用 SSE 解码器中按本次生成请求的工具 schema �
 已实现文本 v10/api-equivalent-v1、资源 v11/api-equivalent-v2 的显式协商，signed fetch 声明支持策略、ACK/active 上报 schema 5；旧授权不自动迁移。资源价目保留整数 picos、不可变修订和审计，媒体异步终态回写原生成。原始 audio/token/tool 证据与版本化 conservative 资源界限分开记录。
 
 本轮仅运行编译、类型、格式和静态审计，不运行本地产品测试、浏览器、真实模型请求。CI 回归与生产灰度仍待执行，全部真实验收 live_pending；未部署。详细规则见 `docs/share/universal-value-metering.md`。
+
+## 2026-11-12 Buddy 图片数量限制独立化
+
+依据为本仓 `codebuddy_runtime/images.rs`、共享 `remote_image.rs` 与双产品 Driver 调用链。线上旧版本 2d2641d 的受控请求中，16 个小图片块成功，17 个普通/历史/工具结果图片块均返回本地 `cc_switch_invalid_request`；客户端请求 claude-opus-5-5，成功响应标记实际模型 kimi-k3-1。该证据不证明上游 17 图失败或成功。
+
+现仅删除 Buddy 本地数量检查，保留单图/总内联解码预算、格式校验、图片能力准入与请求生命周期保护；未改共享常量或其他 Provider，未引入外部代码依赖。新增底层数量/累计字节回归，并将双产品、双站、四入口、双流模式图片回环提升至 17 图。部署与真实上游超 16 图验收仍 pending。
+
+验证：17 图专项 6 项通过（含双产品×双站×四入口×双流模式回环），Node 审计 2158 项通过；cargo check、cargo fmt 和 include! 文件 rustfmt、Provider/UI 覆盖审计通过。原 smoke 因 Cargo 锁超时，改用本次构建二进制运行原断言后通过。全库默认线程栈在账号导入测试栈溢出；RUST_MIN_STACK=16777216 重跑得 4386 passed / 2 failed / 3 ignored，两项失败位于未改动的额度状态测试（tariff ACK schema 预期 5 实际 6、tampered 设置拒绝断言），各自单独重跑仍失败，不宣称全套通过。离线 readiness failures=0，缺真实输入/本地合同验收及部署，仍 blocked_inputs。
+
+补充验证：API 集成 138 项及两个独立 fixture 各 1 项通过；跳过 state 模块的库回归 4134 passed / 3 ignored。该结果不覆盖或消除上述两项全库失败。

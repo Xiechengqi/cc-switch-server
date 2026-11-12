@@ -978,3 +978,11 @@ CodeBuddy/WorkBuddy 共用 SSE 解码器按本次实际生成请求的工具 sch
 `assets/contract/r5-buddy.json` 冻结推荐 Hub/cli2api/workbuddy-switch 的十份 committed source 与十组本仓既有回归。CodeBuddy 双站 platform=CLI；WorkBuddy CN=workbuddy、Intl=workbuddy-ai。两产品推理继续使用受审 CLI 2.142.0，refresh source=plugin；参考 Hub CN=workbuddy 或可切换 Desktop/VSCode/CLI 不构成本仓必须改身份或借权的证据。真实原生登录与 CLI 推理联合接受性按产品×站点独立 live_pending。
 
 本轮无新增生产 wire 缺口。复用精确目录默认 reasoning、namespaced tools/图片、多轮、单账号轮换 journal、计费 paid/free、官方用量连续扫描及取消/预算回归。保留严格 finish_reason、唯一 DONE、EOF 与截断工具拒绝；不采纳 Hub 默认 stop 聚合、WAF/系统提示清洗、跨身份重试、uTLS 变更或原生媒体新操作。实际验证见增强文档 §22.14。
+
+### 图片数量策略（2026-11-12）
+
+CodeBuddy / WorkBuddy 不再执行本地固定 16 个图片块上限。普通消息、历史消息及工具结果中的图片继续完整传递，不删图、不去重、不拆分推理。此策略覆盖 Claude Messages、Codex Chat / Responses 和 Gemini；不改变模型目录的图片能力准入。
+
+保留单图 20 MiB、内联图片合计 32 MiB 的解码字节校验、URL/MIME/签名校验，以及原有请求体、生命周期内存预算和超时。HTTPS 图片不由此校验器下载，内联合计预算不代表远程图片大小已验证。上游实际图片数量和上下文限制仍由固定绑定的上游返回；取消本地数量检查不等于所有模型已验证支持任意数量。其他 Provider 的数量策略不变。
+
+本地回环覆盖双产品、双站、四请求入口及流式/非流式 17 图保真；生产 17 图上游能力仍待部署后单独验收。

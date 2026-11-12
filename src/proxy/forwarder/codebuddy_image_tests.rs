@@ -89,6 +89,19 @@ fn buddy_images_reach_four_surfaces_both_sites_and_products_without_changing_dat
                         )
                         .await;
                         let (path, body) = buddy_image_surface_request(route, streaming);
+                        // Cross the former 16-image ceiling on every surface,
+                        // product, site and streaming mode without losing data.
+                        let mut body: Value = serde_json::from_slice(&body).unwrap();
+                        let parts = match route {
+                            ProxyRoute::CodexResponses => &mut body["input"][0]["content"],
+                            ProxyRoute::Gemini => &mut body["contents"][0]["parts"],
+                            _ => &mut body["messages"][0]["content"],
+                        }
+                        .as_array_mut()
+                        .unwrap();
+                        let image = parts[1].clone();
+                        parts.extend(std::iter::repeat_n(image, 15));
+                        let body = Bytes::from(body.to_string());
                         let response = super::forward_for_test_surface(
                             state.clone(),
                             route,
@@ -116,6 +129,10 @@ fn buddy_images_reach_four_surfaces_both_sites_and_products_without_changing_dat
                         let observation = &fixture.generation_observations()[0];
                         assert_eq!(observation.body["model"], "glm-5.2");
                         let content = &observation.body["messages"][1]["content"];
+                        assert_eq!(content.as_array().unwrap().len(), 18);
+                        for part in &content.as_array().unwrap()[3..] {
+                            assert_eq!(part, &content[1]);
+                        }
                         assert_eq!(content[0]["text"], "识别这张发票");
                         assert_eq!(
                             content[1]["image_url"]["url"],
