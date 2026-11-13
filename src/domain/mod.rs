@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod antigravity_identity;
 pub mod claude_cli;
+pub mod claude_identity;
 pub mod claude_models;
 pub mod codebuddy;
 pub mod grok_cli;

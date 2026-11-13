@@ -2695,11 +2695,13 @@ fn codebuddy_truncation_before_done_is_never_reported_as_success() {
             assert!(body.contains("event: error"), "{body}");
             assert!(body.contains("exactly one [DONE]"), "{body}");
             assert!(!body.contains("event: message_delta"), "{body}");
-            assert_eq!(body.matches("event: message_stop").count(), 1, "{body}");
-            assert!(
-                body.find("event: error") < body.find("event: message_stop"),
-                "{body}"
-            );
+            assert!(!body.contains("event: message_stop"), "{body}");
+            let mut inspector = AnthropicSseInspector::default();
+            inspector.push(body.as_bytes()).unwrap();
+            assert!(matches!(
+                inspector.terminal(),
+                Some(AnthropicTerminal::Error(_))
+            ));
             let usage = state.usage_snapshot().await;
             assert_eq!(
                 usage

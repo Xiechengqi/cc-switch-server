@@ -87,6 +87,15 @@ const operationSpecs = Object.freeze({
     expectedPlan: null,
     exactModel: "claude-opus-5-5",
   }),
+  fable_5_2: Object.freeze({
+    accountEnv: "CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT",
+    providerEnv: "CC_SWITCH_CLAUDE_FABLE_5_2_PROVIDER_ID",
+    shareEnv: "CC_SWITCH_CLAUDE_FABLE_5_2_SHARE_ID",
+    modelEnv: "CC_SWITCH_CLAUDE_FABLE_5_2_MODEL",
+    receiptEnv: "CLAUDE_FABLE_5_2_REAL_RECEIPT_FILE",
+    expectedPlan: Object.freeze({ planType: "claude_max_20x", planLabel: "Claude Max 20x" }),
+    exactModel: "claude-fable-5-2",
+  }),
 });
 
 function env(name, fallback = "") {
@@ -153,7 +162,7 @@ if (!spec) {
       verificationState: "blocked_inputs",
       liveState: "live_pending",
       missingInputs: [
-        "--operation oauth_inference|max_5x_plan|max_20x_plan|fable_5_1|opus_5_5",
+        "--operation oauth_inference|max_5x_plan|max_20x_plan|fable_5_1|opus_5_5|fable_5_2",
       ],
     }),
   );
@@ -657,7 +666,7 @@ function expectedDecisions() {
       rateLimitScope: "bounded_exact_scope",
       terminalLateDisconnect: "complete",
     });
-  } else if (operation === "fable_5_1") {
+  } else if (operation === "fable_5_1" || operation === "fable_5_2") {
     Object.assign(decisions, {
       quotaRefresh: "forced",
       rateLimitScope: "fable_pool",

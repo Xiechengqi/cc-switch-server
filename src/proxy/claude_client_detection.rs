@@ -41,7 +41,7 @@ pub(crate) fn detect_claude_client(
     let Some(entrypoint) = parse_native_user_agent(user_agent) else {
         return ClaudeClientClass::ThirdPartyAnthropic;
     };
-    if header(headers, "x-app") != Some("cli") {
+    if !matches!(header(headers, "x-app"), Some("cli" | "cli-bg")) {
         return ClaudeClientClass::ThirdPartyAnthropic;
     }
 
@@ -51,7 +51,7 @@ pub(crate) fn detect_claude_client(
     if standard {
         return match entrypoint {
             "cli" => ClaudeClientClass::NativeCli,
-            "sdk-cli" => ClaudeClientClass::SdkCli,
+            "sdk-cli" | "sdk-ts" => ClaudeClientClass::SdkCli,
             "claude-vscode" => ClaudeClientClass::VsCode,
             _ => ClaudeClientClass::ThirdPartyAnthropic,
         };
@@ -76,7 +76,7 @@ fn parse_native_user_agent(user_agent: &str) -> Option<&str> {
     }
     let details = details.strip_suffix(')')?;
     let entrypoint = details.split(',').next()?.trim();
-    matches!(entrypoint, "cli" | "sdk-cli" | "claude-vscode").then_some(entrypoint)
+    matches!(entrypoint, "cli" | "sdk-cli" | "sdk-ts" | "claude-vscode").then_some(entrypoint)
 }
 
 fn metadata_is_native(body: &Value, count_tokens: bool) -> bool {
@@ -98,17 +98,14 @@ fn metadata_is_native(body: &Value, count_tokens: bool) -> bool {
 }
 
 fn valid_user_id(value: &str) -> bool {
-    let value = value.trim();
-    value.contains("_session_") && value.len() <= 512 && valid_identifier(value)
+    crate::domain::claude_identity::parse_metadata_identity(value).is_some()
+        || (value.starts_with("user_")
+            && value.contains("_account_")
+            && crate::domain::claude_identity::session_from_metadata_user_id(value).is_some())
 }
 
 fn valid_identifier(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty()
-        && value.len() <= 512
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':'))
+    crate::domain::claude_identity::valid_session_identifier(value.trim())
 }
 
 fn helper_profile_matches(beta: &str, body: &Value) -> bool {
@@ -118,7 +115,8 @@ fn helper_profile_matches(beta: &str, body: &Value) -> bool {
     let core = beta == HELPER_CORE_WITH_REDACTION
         || beta == HELPER_CORE_WITHOUT_REDACTION
         || helper_trailing_profile(beta, HELPER_CORE_WITH_REDACTION)
-        || helper_trailing_profile(beta, HELPER_CORE_WITHOUT_REDACTION);
+        || helper_trailing_profile(beta, HELPER_CORE_WITHOUT_REDACTION)
+        || beta == "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
     if !core {
         return false;
     }
@@ -200,6 +198,30 @@ mod tests {
         assert_eq!(
             detect_claude_client(&headers, &json!({}), false),
             ClaudeClientClass::ThirdPartyAnthropic
+        );
+    }
+
+    #[test]
+    fn fable52_modern_metadata_recognizes_measured_entrypoints_not_ua_alone() {
+        let identity=json!({"device_id":"f".repeat(64),"account_uuid":"", "session_id":"11111111-2222-4333-8444-555555555555"}).to_string();
+        let body = json!({"metadata":{"user_id":identity}});
+        for entry in ["cli", "sdk-cli", "sdk-ts", "claude-vscode"] {
+            let mut headers = native_headers(CLAUDE_CODE_BETA, entry);
+            headers.insert("x-app", HeaderValue::from_static("cli-bg"));
+            assert!(detect_claude_client(&headers, &body, false).is_confirmed_native());
+            headers.remove("anthropic-beta");
+            assert_eq!(
+                detect_claude_client(&headers, &body, false),
+                ClaudeClientClass::ThirdPartyAnthropic
+            );
+        }
+        assert!(
+            detect_claude_client(&native_headers(CLAUDE_CODE_BETA, "cli"), &json!({}), true)
+                .is_confirmed_native()
+        );
+        assert!(
+            !detect_claude_client(&native_headers(CLAUDE_CODE_BETA, "sdk-py"), &body, false)
+                .is_confirmed_native()
         );
     }
 

@@ -1310,12 +1310,20 @@ fn transform_body_for_upstream(
         }
         (AppKind::Codex, UpstreamFormat::AnthropicMessages) => {
             if input.get("messages").is_some() {
-                transforms::openai_chat_to_anthropic(&input)
+                if stored.provider_type == ProviderType::ClaudeOAuth {
+                    transforms::openai_chat_to_claude_oauth(&input)
+                } else {
+                    transforms::openai_chat_to_anthropic(&input)
+                }
             } else {
                 if stored.provider_type == ProviderType::ClaudeOAuth {
                     super::claude_oauth::apply_responses_default_max_tokens(&mut input);
                 }
-                transforms::openai_responses_to_anthropic(&input)
+                if stored.provider_type == ProviderType::ClaudeOAuth {
+                    transforms::openai_responses_to_claude_oauth(&input)
+                } else {
+                    transforms::openai_responses_to_anthropic(&input)
+                }
             }
         }
         (AppKind::Codex, UpstreamFormat::OpenAiChat) => {

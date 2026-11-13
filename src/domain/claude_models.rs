@@ -30,9 +30,24 @@ const STANDARD_EFFORT: &[&str] = &["low", "medium", "high", "max"];
 const FULL_EFFORT: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// Sanitized subset of the model catalog embedded in official Claude Code
-/// 2.1.280. This is the single runtime truth for model-gated OAuth behavior and
-/// static model discovery; unknown models deliberately receive no capability.
+/// 2.1.280, extended by the reviewed 2.1.321 Fable 5.2 capture. This is the
+/// single runtime truth for model-gated OAuth behavior and static discovery;
+/// unknown models deliberately receive no capability.
 pub const CLAUDE_MODEL_CAPABILITIES: &[ClaudeModelCapability] = &[
+    ClaudeModelCapability {
+        id: "claude-fable-5-2",
+        context_window: 1_000_000,
+        max_output_tokens: 128_000,
+        input_modalities: TEXT_IMAGE,
+        effort_levels: FULL_EFFORT,
+        dynamic_thinking: true,
+        rejects_disabled_thinking: true,
+        mid_conversation_system: true,
+        mid_conversation_tool_changes: true,
+        per_turn_effort: true,
+        per_turn_timing: true,
+        web_search: true,
+    },
     ClaudeModelCapability {
         id: "claude-opus-5-5",
         context_window: 1_000_000,
@@ -175,6 +190,15 @@ pub fn claude_model_capability(model: &str) -> Option<&'static ClaudeModelCapabi
         .find(|capability| capability.id == canonical)
 }
 
+pub fn supports_preserved_thinking(model: &str) -> bool {
+    claude_model_capability(model).is_some_and(|capability| {
+        matches!(
+            capability.id,
+            "claude-fable-5-1" | "claude-fable-5-2" | "claude-opus-5-5"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +221,15 @@ mod tests {
     fn unknown_models_are_fail_closed() {
         assert!(claude_model_capability("claude-opus-next").is_none());
         assert!(claude_model_capability("vendor/claude-opus-5-5").is_none());
+    }
+
+    #[test]
+    fn fable52_is_explicit_suffix_aware_and_preserves_all_effort_levels() {
+        let capability = claude_model_capability("claude-fable-5-2[1m]").unwrap();
+        assert_eq!(capability.max_output_tokens, 128_000);
+        assert_eq!(capability.effort_levels, FULL_EFFORT);
+        assert!(capability.per_turn_effort && capability.per_turn_timing);
+        assert!(supports_preserved_thinking("claude-fable-5-2[1m]"));
+        assert!(claude_model_capability("claude-fable-5-20").is_none());
     }
 }

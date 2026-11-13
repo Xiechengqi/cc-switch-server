@@ -75,9 +75,7 @@ use super::anthropic_semantics::{
 use super::claude_oauth::ClaudeBodyRetryStage;
 #[cfg(test)]
 use super::claude_quota_headers::parse_anthropic_reset_header;
-use super::claude_thread_alias::{
-    self, ClaudeThreadAliasLookup, ClaudeThreadAliasScope, ClaudeThreadMode,
-};
+use super::claude_thread_alias::{self, ClaudeThreadAliasScope, ClaudeThreadMode};
 use super::deepseek;
 use super::execution::context::{
     AttemptBudget, AttemptLimits, BindingSnapshot, BindingSnapshotError, CommitGuard, DelaySource,
@@ -3082,8 +3080,9 @@ async fn forward_with_attempt_inner(
         };
         let mut codex_previous_response_cache_write = None;
         let mut claude_thread_mode = None;
+        let mut claude_thread_declared_betas = Vec::new();
         let explicit_claude_session_id = request_context.session_id.clone();
-        let (mut adapter_request, url, target_headers) = if execution
+        let (mut adapter_request, url, mut target_headers) = if execution
             .driver_is("oauth.claude_messages")
         {
             let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
@@ -3098,6 +3097,7 @@ async fn forward_with_attempt_inner(
                 request_context.session_id = prepared.session_id.clone();
             }
             claude_thread_mode = prepared.thread_mode;
+            claude_thread_declared_betas = prepared.thread_declared_betas;
             (
                 prepared.adapter_request,
                 prepared.endpoint,
@@ -3252,6 +3252,7 @@ async fn forward_with_attempt_inner(
         }
 
         let mut claude_thread_alias_write = None;
+        let mut _claude_previous_profile = None;
         let mut _claude_previous_alias_memory = None;
         if execution.driver_is("oauth.claude_messages") && route == ProxyRoute::ClaudeMessages {
             if let Some(mode) = claude_thread_mode {
@@ -3263,50 +3264,83 @@ async fn forward_with_attempt_inner(
                     &target_headers,
                 )
                 .await;
+                let durable_scope = if let Some(scope) = scope.as_ref() {
+                    state.claude_thread_profile_scope(scope).await
+                } else {
+                    None
+                }
+                .ok_or_else(super::claude_thread_profile::unavailable)?;
+                use sha2::Digest as _;
+                let durable_scope = hex::encode(sha2::Sha256::digest(
+                    serde_json::to_vec(&(&durable_scope, &url, &adapter_request.model))
+                        .map_err(|_| super::claude_thread_profile::unavailable())?,
+                ));
+                let policy = super::claude_thread_profile::policy();
                 if let ClaudeThreadMode::Continue {
                     previous_message_id,
-                    needs_state,
+                    ..
                 } = &mode
                 {
-                    let previous_lookup = if let Some(scope) = scope.as_ref() {
-                        let (lookup, memory) = state.claude_thread_alias_lookup_with(
-                            scope,
-                            previous_message_id,
-                            |bytes| {
-                                attempt_context
-                                    .request_memory()
-                                    .map(|budget| {
-                                        budget
-                                            .reserve(
-                                                RequestMemoryComponent::StreamRetainedState,
-                                                bytes,
-                                            )
-                                            .map_err(|error| error.into_proxy_error())
-                                    })
-                                    .transpose()
-                            },
-                        )?;
-                        _claude_previous_alias_memory = memory;
-                        lookup
-                    } else {
-                        ClaudeThreadAliasLookup::Missing
-                    };
-                    let previous = match previous_lookup {
-                        ClaudeThreadAliasLookup::Conflicted => {
-                            return Err(ProxyError {
-                                status: StatusCode::CONFLICT,
-                                message: "Claude thread message_id has conflicting alias state; replay the full conversation with thread create".to_string(),
-                            });
-                        }
-                        ClaudeThreadAliasLookup::Ready(aliases) => Some(aliases),
-                        ClaudeThreadAliasLookup::Missing => None,
-                    };
-                    if *needs_state && previous.is_none() {
-                        return Err(claude_thread_state_not_found());
+                    let loaded = state
+                        .claude_thread_profile_load(
+                            durable_scope.clone(),
+                            previous_message_id.clone(),
+                            attempt_context.request_memory().cloned(),
+                        )
+                        .await?
+                        .ok_or_else(super::claude_thread_profile::unavailable)?;
+                    if loaded.profile.policy != policy {
+                        return Err(super::claude_thread_profile::unavailable());
                     }
-                    if let Some(previous) = previous {
+                    let (cached, charge) = state.claude_thread_alias_lookup_with(
+                        scope.as_ref().expect("validated scope"),
+                        previous_message_id,
+                        |bytes| {
+                            attempt_context
+                                .request_memory()
+                                .map(|budget| {
+                                    budget
+                                        .reserve(RequestMemoryComponent::StreamRetainedState, bytes)
+                                        .map_err(|error| error.into_proxy_error())
+                                })
+                                .transpose()
+                        },
+                    )?;
+                    _claude_previous_alias_memory = charge;
+                    match &cached {
+                        claude_thread_alias::ClaudeThreadAliasLookup::Conflicted => {
+                            return Err(super::claude_thread_profile::unavailable())
+                        }
+                        claude_thread_alias::ClaudeThreadAliasLookup::Ready(aliases)
+                            if aliases != &loaded.profile.aliases =>
+                        {
+                            return Err(super::claude_thread_profile::unavailable())
+                        }
+                        _ => {}
+                    }
+                    let restored = loaded
+                        .profile
+                        .betas
+                        .split(',')
+                        .map(str::trim)
+                        .collect::<BTreeSet<_>>();
+                    if super::claude_oauth::thread_beta_requirements(&adapter_request.body)?
+                        .iter()
+                        .any(|beta| !restored.contains(beta))
+                        || claude_thread_declared_betas
+                            .iter()
+                            .any(|beta| !restored.contains(beta.as_str()))
+                    {
+                        return Err(super::claude_thread_profile::unavailable());
+                    }
+                    replace_or_push_owned_header(
+                        &mut target_headers,
+                        "anthropic-beta".into(),
+                        loaded.profile.betas.clone(),
+                    );
+                    {
                         let aliases = claude_thread_alias::merge_alias_maps(
-                            previous,
+                            loaded.profile.aliases.clone(),
                             std::mem::take(&mut adapter_request.claude_tool_name_map),
                         )?;
                         claude_thread_alias::restore_request_names(
@@ -3315,11 +3349,28 @@ async fn forward_with_attempt_inner(
                         )?;
                         adapter_request.claude_tool_name_map = aliases;
                     }
+                    _claude_previous_profile = Some(loaded);
                 }
                 if let Some(scope) = scope {
+                    let betas = target_headers
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+                        .map(|(_, value)| value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let declared = betas.split(',').map(str::trim).collect::<BTreeSet<_>>();
+                    if super::claude_oauth::thread_beta_requirements(&adapter_request.body)?
+                        .iter()
+                        .any(|beta| !declared.contains(beta))
+                    {
+                        return Err(super::claude_thread_profile::unavailable());
+                    }
                     claude_thread_alias_write = Some(ClaudeThreadAliasWrite {
                         scope,
                         aliases: adapter_request.claude_tool_name_map.clone(),
+                        durable_scope,
+                        betas,
+                        policy,
                     });
                 }
             }
@@ -5930,7 +5981,9 @@ async fn forward_with_attempt_inner(
                                 return stream_state.terminate_transform_error(error).await;
                             }
                             stream_state.commit_kimi_thinking_replay_stream().await;
-                            stream_state.finalize_terminal_usage(false).await;
+                            if let Err(error) = stream_state.finalize_terminal_usage(false).await {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
                             stream_state.downstream_pending_memory = normalized_event_memory;
                             let transformed = stream_state.retain_grok_delivered_chunk(transformed);
                             Ok(Some((transformed, stream_state)))
@@ -6161,7 +6214,10 @@ async fn forward_with_attempt_inner(
                                         .await;
                                 }
                                 stream_state.commit_kimi_thinking_replay_stream().await;
-                                stream_state.finalize_terminal_usage(true).await;
+                                if let Err(error) = stream_state.finalize_terminal_usage(true).await
+                                {
+                                    return stream_state.terminate_transform_error(error).await;
+                                }
                                 if let Err(error) =
                                     stream_state.retain_downstream_chunk(transformed.len())
                                 {
@@ -6273,7 +6329,9 @@ async fn forward_with_attempt_inner(
                                 stream_state.terminal_frame_sent = true;
                             }
                             let custom_tail = join_bytes(custom_tail, synthesized);
-                            stream_state.finalize_terminal_usage(true).await;
+                            if let Err(error) = stream_state.finalize_terminal_usage(true).await {
+                                return stream_state.terminate_transform_error(error).await;
+                            }
                             if !custom_tail.is_empty() {
                                 if let Err(error) =
                                     stream_state.retain_downstream_chunk(custom_tail.len())
@@ -6944,11 +7002,13 @@ async fn forward_with_attempt_inner(
             attempt_context.request_memory(),
             RequestMemoryComponent::NormalizedEvent,
         )?;
-        if let (Some(write), Some(message_id)) =
+        let claude_thread_commit_error = if let (Some(write), Some(message_id)) =
             (claude_thread_alias_write, claude_thread_response_id)
         {
-            state.cache_claude_thread_aliases(write.scope, &message_id, write.aliases);
-        }
+            write.commit(&state, &message_id).await.err()
+        } else {
+            None
+        };
         if status.is_success() {
             antigravity::commit_captured_response(
                 &state,
@@ -6978,12 +7038,18 @@ async fn forward_with_attempt_inner(
             let request_id = log_usage(
                 &state,
                 &stored,
-                status_code,
+                claude_thread_commit_error
+                    .as_ref()
+                    .map_or(status_code, |error| error.status.as_u16()),
                 started.elapsed().as_millis(),
                 model_metadata(&adapter_request),
                 usage,
                 UsageLogContext {
                     is_streaming: adapter_request.stream_requested,
+                    error_message: claude_thread_commit_error
+                        .as_ref()
+                        .map(|error| error.client_message().to_string())
+                        .or(request_context.error_message),
                     ..request_context
                 },
             )
@@ -7048,6 +7114,11 @@ async fn forward_with_attempt_inner(
             },
         }
 
+        // Upstream success can still fail local Thread persistence. Account the
+        // observed tokens first, but never publish a successful client response.
+        if let Some(error) = claude_thread_commit_error {
+            return Err(error);
+        }
         let mut response = Response::new(Body::from(bytes));
         *response.status_mut() = status;
         if let Some(content_type) = content_type {
@@ -30307,9 +30378,33 @@ struct StreamForwardState {
 struct ClaudeThreadAliasWrite {
     scope: ClaudeThreadAliasScope,
     aliases: BTreeMap<String, String>,
+    durable_scope: String,
+    betas: String,
+    policy: String,
 }
 
 impl ClaudeThreadAliasWrite {
+    async fn commit(self, state: &ServerState, message_id: &str) -> Result<(), ProxyError> {
+        let _memory = crate::infra::resident_memory::process_resident_memory()
+            .reserve(self.retained_bytes().saturating_mul(2))
+            .ok_or_else(super::claude_thread_profile::unavailable)?;
+        let aliases = self.aliases.clone();
+        let profile = super::claude_thread_profile::ClaudeThreadProfile {
+            betas: self.betas,
+            policy: self.policy,
+            aliases: self.aliases,
+        };
+        if state
+            .claude_thread_profile_commit(self.durable_scope, message_id.to_string(), profile)
+            .await
+        {
+            state.cache_claude_thread_aliases(self.scope, message_id, aliases);
+            Ok(())
+        } else {
+            Err(super::claude_thread_profile::unavailable())
+        }
+    }
+
     fn retained_bytes(&self) -> usize {
         [
             &self.scope.share_id,
@@ -30318,6 +30413,9 @@ impl ClaudeThreadAliasWrite {
             &self.scope.provider_id,
             &self.scope.runtime_fingerprint,
             &self.scope.account_id,
+            &self.durable_scope,
+            &self.betas,
+            &self.policy,
         ]
         .iter()
         .fold(0usize, |bytes, value| {
@@ -30329,13 +30427,6 @@ impl ClaudeThreadAliasWrite {
                 .saturating_add(original.capacity())
                 .saturating_add(std::mem::size_of::<String>() * 2)
         }))
-    }
-}
-
-fn claude_thread_state_not_found() -> ProxyError {
-    ProxyError {
-        status: StatusCode::NOT_FOUND,
-        message: "No Claude thread state was found for previous_message_id; replay the full conversation with thread create".to_string(),
     }
 }
 
@@ -30936,9 +31027,12 @@ impl StreamForwardState {
         }
     }
 
-    async fn finalize_terminal_usage(&mut self, allow_eof_without_semantic_terminal: bool) -> bool {
+    async fn finalize_terminal_usage(
+        &mut self,
+        allow_eof_without_semantic_terminal: bool,
+    ) -> Result<bool, ProxyError> {
         if self.terminal_usage_published {
-            return true;
+            return Ok(true);
         }
 
         let semantic_terminal = self
@@ -30966,7 +31060,7 @@ impl StreamForwardState {
             && fallback_terminal.is_none()
             && (!allow_eof_without_semantic_terminal || has_semantic_inspector)
         {
-            return false;
+            return Ok(false);
         }
 
         if matches!(anthropic_terminal, Some(AnthropicTerminal::Success)) {
@@ -30976,8 +31070,7 @@ impl StreamForwardState {
                     .as_ref()
                     .and_then(AnthropicSseInspector::message_id),
             ) {
-                self.state
-                    .cache_claude_thread_aliases(write.scope, message_id, write.aliases);
+                write.commit(&self.state, message_id).await?;
             }
         }
 
@@ -31163,7 +31256,7 @@ impl StreamForwardState {
             .store(false, Ordering::Relaxed);
         drop(self.account_in_flight_guard.take());
         drop(self.share_invocation_guard.take());
-        true
+        Ok(true)
     }
 
     fn next_timeout_kind(&self) -> StreamTimeoutKind {
@@ -32395,18 +32488,7 @@ fn claude_session_id_from_body(body: &[u8]) -> Option<String> {
 }
 
 fn parse_session_from_user_id(user_id: &str) -> Option<String> {
-    if let Ok(value) = serde_json::from_str::<Value>(user_id) {
-        if let Some(session_id) = value
-            .get("session_id")
-            .and_then(Value::as_str)
-            .and_then(validated_session_id)
-        {
-            return Some(session_id);
-        }
-    }
-    user_id
-        .split_once("_session_")
-        .and_then(|(_, session_id)| validated_session_id(session_id))
+    crate::domain::claude_identity::session_from_metadata_user_id(user_id)
 }
 
 fn validated_session_id(value: &str) -> Option<String> {
@@ -32671,7 +32753,7 @@ fn stream_terminal_error_frame(
             })
         ))),
         ProxyRoute::ClaudeMessages => Some(Bytes::from(format!(
-            "event: error\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+            "event: error\ndata: {}\n\n",
             json!({
                 "type": "error",
                 "error": error,
@@ -36778,17 +36860,31 @@ mod tests {
         let requests_for_route = Arc::clone(&requests);
         let first_alias = Arc::new(StdMutex::new(None::<String>));
         let first_alias_for_route = Arc::clone(&first_alias);
+        let first_betas = Arc::new(StdMutex::new(None::<String>));
+        let first_betas_for_route = Arc::clone(&first_betas);
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
         let app = axum::Router::new().route(
             "/v1/messages",
-            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            axum::routing::post(move |wire_headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
                 let requests = Arc::clone(&requests_for_route);
                 let first_alias = Arc::clone(&first_alias_for_route);
+                let first_betas = Arc::clone(&first_betas_for_route);
                 async move {
                     let index = requests.fetch_add(1, Ordering::SeqCst);
+                    let beta = wire_headers.get("anthropic-beta").unwrap().to_str().unwrap();
+                    let mut resigned = Bytes::from(body.to_string());
+                    super::super::claude_oauth::resign_thread_body(&mut resigned).unwrap();
+                    assert_eq!(serde_json::from_slice::<Value>(&resigned).unwrap(), body, "alias restore must precede final CCH");
+                    if index == 0 {
+                        assert!(beta.contains("cache-diagnosis-2026-04-07"));
+                        *first_betas.lock().unwrap() = Some(beta.to_string());
+                    } else {
+                        assert_eq!(Some(beta), first_betas.lock().unwrap().as_deref());
+                        assert_eq!(wire_headers.get("authorization").unwrap(), "Bearer trusted-refresh-access");
+                    }
                     let alias = if index == 0 {
                         let alias = body
                             .pointer("/tools/0/name")
@@ -36841,6 +36937,7 @@ mod tests {
         let create = Bytes::from(
             json!({
                 "model":"claude-sonnet-4-6", "max_tokens":16, "thread":{"type":"create"},
+                "diagnostics":{},
                 "messages":[{"role":"user","content":"first"}],
                 "tools":[{"name":"mcp__bad/name","input_schema":{"type":"object"}}]
             })
@@ -36885,7 +36982,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         let account_id = "claude-thread-alias-nonstream-account";
         state
@@ -36908,7 +37005,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         state
             .mutate_accounts_immediate(|accounts| {
@@ -36921,6 +37018,86 @@ mod tests {
             })
             .await
             .unwrap();
+        // Authorized refresh retains the durable owner even though the old
+        // in-memory alias scope (credential generation) is no longer usable.
+        state
+            .mutate_accounts_immediate(|accounts| {
+                accounts
+                    .mark_refresh_success(
+                        account_id,
+                        crate::domain::accounts::store::AccountRefreshUpdate {
+                            access_token: Some("trusted-refresh-access".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        let restart_dir = state.config_dir.clone();
+        state.begin_shutdown();
+        let released = Arc::downgrade(&state);
+        drop(state);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while released.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old request and persistence owners must release before restart");
+        let state = crate::state::ServerStateInner::load(
+            crate::cli::Cli {
+                host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 0,
+                config_dir: Some(restart_dir),
+                web_dist_dir: None,
+                log_level: "warn".into(),
+                command: None,
+            },
+            Arc::new(crate::logging::LogCapture::new(
+                crate::logging::RING_BUFFER_CAPACITY,
+            )),
+        )
+        .unwrap();
+        // Test-only loopback endpoints are intentionally not persisted.
+        // Restore the same reviewed runtime before exercising the snapshot.
+        state
+            .override_provider_runtime_endpoint_for_test(
+                AppKind::Claude,
+                &provider_id,
+                format!("http://{address}"),
+            )
+            .await
+            .unwrap();
+        let mut new_capability: Value = serde_json::from_slice(&continue_body).unwrap();
+        new_capability["speed"] = json!("fast");
+        let error = forward(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            None,
+            headers.clone(),
+            Bytes::from(new_capability.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let mut incompatible_headers = headers.clone();
+        incompatible_headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("fast-mode-2026-02-01"),
+        );
+        let error = forward(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            None,
+            incompatible_headers,
+            continue_body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         let response = forward(
             state,
             ProxyRoute::ClaudeMessages,
@@ -37015,7 +37192,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(requests.load(Ordering::SeqCst), 0);
 
         request["messages"][0]["content"][0] = json!({
@@ -37033,7 +37210,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(requests.load(Ordering::SeqCst), 0);
 
         request["messages"][0]["content"][0] = json!({
@@ -37042,6 +37219,19 @@ mod tests {
         request["tools"].as_array_mut().unwrap().push(json!({
             "name":"mcp__old/name","input_schema":{"type":"object"}
         }));
+        // Full declarations cannot substitute for the missing beta snapshot.
+        let error = forward(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            None,
+            headers.clone(),
+            Bytes::from(request.to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        request["thread"] = json!({"type":"create"});
         let response = forward(
             state,
             ProxyRoute::ClaudeMessages,
@@ -37101,7 +37291,10 @@ mod tests {
         )
         .await;
         let headers = deepseek_forwarder_headers(share_id, "session-one");
-        for name in ["mcp__first/name", "mcp__second/name"] {
+        for (index, name) in ["mcp__first/name", "mcp__second/name"]
+            .into_iter()
+            .enumerate()
+        {
             let body = Bytes::from(
                 json!({
                     "model":"claude-sonnet-4-6", "max_tokens":16,
@@ -37118,8 +37311,12 @@ mod tests {
                 headers.clone(),
                 body,
             )
-            .await
-            .unwrap();
+            .await;
+            if index == 1 {
+                assert_eq!(response.unwrap_err().status, StatusCode::CONFLICT);
+                continue;
+            }
+            let response = response.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
                 .await
@@ -37194,6 +37391,7 @@ mod tests {
             json!({
                 "model":"claude-sonnet-4-6", "max_tokens":16,
                 "thread":{"type":"create"},
+                "betas":["inline-tools-2026-09-15"],
                 "messages":[{"role":"user","content":"first"}],
                 "tools":[{"name":"mcp__old/name","input_schema":{"type":"object"}}]
             }),
@@ -37364,6 +37562,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_thread_nonstream_snapshot_failure_accounts_observed_usage_without_success() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/v1/messages", axum::routing::post(|| async {
+            axum::Json(json!({
+                "id":"msg_uncommitted", "type":"message", "role":"assistant", "model":"claude-fable-5-2",
+                "content":[{"type":"text","text":"ok"}], "stop_reason":"end_turn",
+                "usage":{"input_tokens":7,"output_tokens":3}
+            }))
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = forwarder_test_state("claude-thread-nonstream-persistence-failure");
+        let provider_id = install_claude_oauth_forwarder_test_provider(
+            &state,
+            "claude-thread-nonstream-persistence-failure",
+            format!("http://{address}"),
+        )
+        .await;
+        let share_id = "claude-thread-nonstream-persistence-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Claude,
+            ProviderType::ClaudeOAuth,
+            &provider_id,
+        )
+        .await;
+        std::fs::create_dir(state.config_dir.join("claude-thread-profiles.sqlite3")).unwrap();
+        let error = forward(
+            state.clone(),
+            ProxyRoute::ClaudeMessages,
+            None,
+            deepseek_forwarder_headers(share_id, "nonstream-session"),
+            Bytes::from(
+                json!({
+                    "model":"claude-fable-5-2", "max_tokens":16, "thread":{"type":"create"},
+                    "messages":[{"role":"user","content":"first"}]
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        let usage = state.usage_snapshot().await;
+        let log = usage
+            .logs
+            .last()
+            .expect("observed upstream usage must not be lost");
+        assert_eq!(log.input_tokens, Some(7));
+        assert_eq!(log.output_tokens, Some(3));
+        assert_eq!(log.status_code, StatusCode::CONFLICT.as_u16());
+        assert!(log
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Thread")));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn claude_thread_interrupted_stream_or_failed_snapshot_never_publishes_success() {
+        for complete in [false, true] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let requests_for_route = requests.clone();
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = axum::Router::new().route("/v1/messages", axum::routing::post(move || {
+                let requests = requests_for_route.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let mut sse = format!(
+                        "event: message_start\ndata: {}\n\nevent: content_block_start\ndata: {}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n",
+                        json!({"type":"message_start","message":{"id":"msg_not_publishable","type":"message","role":"assistant","model":"claude-fable-5-2","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}),
+                    );
+                    if complete { sse.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"); }
+                    Response::builder().status(StatusCode::OK).header(CONTENT_TYPE,"text/event-stream").body(Body::from(sse)).unwrap()
+                }
+            }));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let state = forwarder_test_state(if complete {
+                "claude-thread-cache-failed"
+            } else {
+                "claude-thread-interrupted"
+            });
+            let provider_id = install_claude_oauth_forwarder_test_provider(
+                &state,
+                "claude-thread-terminal",
+                format!("http://{address}"),
+            )
+            .await;
+            let share_id = "claude-thread-terminal-share";
+            install_antigravity_test_share(
+                &state,
+                share_id,
+                AppKind::Claude,
+                ProviderType::ClaudeOAuth,
+                &provider_id,
+            )
+            .await;
+            if complete {
+                // Deterministic local I/O failure at success commit, not an
+                // upstream error or an artificial live acceptance receipt.
+                std::fs::create_dir(state.config_dir.join("claude-thread-profiles.sqlite3"))
+                    .unwrap();
+            }
+            let headers = deepseek_forwarder_headers(share_id, "terminal-session");
+            let create = Bytes::from(json!({"model":"claude-fable-5-2","max_tokens":16,"stream":true,"thread":{"type":"create"},"messages":[{"role":"user","content":"first"}]}).to_string());
+            let response = forward(
+                state.clone(),
+                ProxyRoute::ClaudeMessages,
+                None,
+                headers.clone(),
+                create,
+            )
+            .await
+            .unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let downstream = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(downstream.contains("event: error"), "{downstream}");
+            assert!(!downstream.contains("event: message_stop"), "{downstream}");
+            // Failure itself is terminal. Do not append a success-shaped stop.
+            let mut inspector = AnthropicSseInspector::default();
+            inspector.push(downstream.as_bytes()).unwrap();
+            assert!(
+                matches!(inspector.terminal(), Some(AnthropicTerminal::Error(_))),
+                "{downstream}"
+            );
+            let continuation = Bytes::from(json!({"model":"claude-fable-5-2","max_tokens":16,"thread":{"type":"continue","previous_message_id":"msg_not_publishable"},"messages":[{"role":"user","content":"continue"}]}).to_string());
+            let error = forward(
+                state,
+                ProxyRoute::ClaudeMessages,
+                None,
+                headers,
+                continuation,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn claude_thread_alias_provider_error_does_not_commit_state() {
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_for_route = Arc::clone(&requests);
@@ -37433,7 +37782,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
@@ -41866,7 +42215,13 @@ mod tests {
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("event: error"), "{body}");
-        assert!(body.contains("event: message_stop"), "{body}");
+        assert!(!body.contains("event: message_stop"), "{body}");
+        let mut inspector = AnthropicSseInspector::default();
+        inspector.push(body.as_bytes()).unwrap();
+        assert!(matches!(
+            inspector.terminal(),
+            Some(AnthropicTerminal::Error(_))
+        ));
         assert!(body.contains("embedded stream failure"), "{body}");
         assert!(!body.contains("event: message_start"), "{body}");
         assert!(!body.contains("event: message_delta"), "{body}");
@@ -51197,6 +51552,11 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
                 br#"{"metadata":{"user_id":"{\"device_id\":\"device\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}"}}"#
             )
             .as_deref(),
+            None
+        );
+        let modern = json!({"metadata":{"user_id":json!({"device_id":"f".repeat(64),"account_uuid":"","session_id":"550e8400-e29b-41d4-a716-446655440000"}).to_string()}}).to_string();
+        assert_eq!(
+            claude_session_id_from_body(modern.as_bytes()).as_deref(),
             Some("550e8400-e29b-41d4-a716-446655440000")
         );
 
@@ -52420,7 +52780,13 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok())
             .unwrap();
         assert!(claude.contains("event: error"));
-        assert!(claude.contains("event: message_stop"));
+        assert!(!claude.contains("event: message_stop"));
+        let mut inspector = AnthropicSseInspector::default();
+        inspector.push(claude.as_bytes()).unwrap();
+        assert!(matches!(
+            inspector.terminal(),
+            Some(AnthropicTerminal::Error(_))
+        ));
     }
 
     #[test]

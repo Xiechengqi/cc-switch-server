@@ -2024,11 +2024,13 @@ fn qoder_late_error_after_terminal_never_exposes_success_before_failure() {
                         !body[..error_at].contains("event: message_delta"),
                         "{name}: {body}"
                     );
-                    assert!(
-                        body.find("event: message_stop")
-                            .is_some_and(|stop_at| stop_at > error_at),
-                        "{name}: {body}"
-                    );
+                    assert!(!body.contains("event: message_stop"), "{name}: {body}");
+                    let mut inspector = AnthropicSseInspector::default();
+                    inspector.push(body.as_bytes()).unwrap();
+                    assert!(matches!(
+                        inspector.terminal(),
+                        Some(AnthropicTerminal::Error(_))
+                    ));
                 }
                 let usage = state.usage_snapshot().await;
                 let log = usage.logs.last().expect("Qoder usage log");

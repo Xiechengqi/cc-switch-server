@@ -47,6 +47,7 @@ pub(crate) struct PreparedProviderRequest {
     pub headers: Vec<(String, String)>,
     pub session_id: Option<String>,
     pub thread_mode: Option<super::claude_thread_alias::ClaudeThreadMode>,
+    pub thread_declared_betas: Vec<String>,
 }
 
 impl std::fmt::Debug for ProviderExecution {
@@ -418,6 +419,7 @@ impl ProviderExecution {
             headers,
             session_id: contract.session_id,
             thread_mode: contract.thread_mode,
+            thread_declared_betas: contract.thread_declared_betas,
         })
     }
 

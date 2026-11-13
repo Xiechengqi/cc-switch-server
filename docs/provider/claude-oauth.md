@@ -2,7 +2,21 @@
 
 本文描述 cc-switch-server 对 Claude OAuth 的生产边界、运行时约束和验收方式。目标是把一个明确绑定的 Claude OAuth 账号稳定暴露为 Anthropic Messages API，不提供账号池、负载均衡或跨账号故障转移。
 
-## R5 离线协议差分
+## Fable 5.2 / Claude Code 2.1.321
+
+当前 wire profile 为 `claude-code-2.1.321-audited-2026-11-13`，公开 npm 原生包完整性、静态标识与只读参考捕获分别记录在 wire-profile / reference-delta 合同。能力表明确包含 `claude-fable-5-2`；模型目录不执行网络探测，也不授予账号上游 entitlement。
+
+- 原生识别同时校验新版 JSON 编码 `metadata.user_id` 与旧 `_session_` 格式；UA 单独不能确认原生客户端。header/body 会话身份冲突拒绝。
+- 已审计 preserved-thinking 模型回放签名历史时，仅在合法 thinking 模式且调用者没有显式策略时补 `prefix_mismatch_behavior=drop_block`；不伪造签名，不清空全部历史。
+- Claude OAuth 的 OpenAI/Responses 适配按模型能力保留 `xhigh`、system 角色及文本/cache 分块；其他上游保留原规则。中途 system 必须能放在合法 user/assistant 边界，无法无损放置时明确拒绝。
+- Thread 的实际成功 beta、工具别名和政策摘要保存在 `claude-thread-profiles.sqlite3`。它是可丢弃的协议恢复缓存，不是消息数据库；不存 token、prompt、工具参数或 thinking。默认 24h，最多 1024 项/8 MiB payload、单项 64 KiB，SQLite 文件页上限 16 MiB，I/O 在 blocking worker 完成。缓存不参与账号选择，也不纳入配置备份。
+- Thread 绑定 Share、调用者、session、Provider revision/runtime、账号 durable owner/auth identity generation、上游 URL 和模型。受控同账号 token refresh 可保持命名空间；删除重建、身份/绑定变化不能继承。仅在语义成功终态后提交；未知/过期/政策冲突返回 409，需完整历史重新 `thread create`。旧版本仅内存的 Thread 不自动升级，回滚或 wire profile 变化也可能要求重建。
+- 本地流式错误以 `event:error` 终止，不再附加成功形态的 `message_stop`。快照提交失败不能发布成功响应，但已观察到的上游用量仍须记录。
+- 搜索历史兼容仅清理失效搜索引用，保留有效结果及其他 citation。非法 schema property 名默认本地拒绝；`CC_SWITCH_CLAUDE_SCHEMA_DESCRIPTION_FALLBACK=true` 只对非 strict 工具显式启用描述式兼容，`strict=true` 永不静默放宽。
+
+真实验收必须单独运行 `node scripts/smoke/claude-real-receipt.mjs --operation fable_5_2`，提供 `.env.example` 中独立的 Fable 5.2 Provider/Share/model/receipt，以及真实账号、控制面和 Router Share 输入。该 operation 使用明确的 Max 20x 测试账号，不代表声明其他套餐没有权益。receipt 要覆盖工具/逐轮控制、现代 metadata、thinking binding、Thread/刷新/重启/断网/compact，旧 5.1 receipt 与单轮 ping 均不能替代。所有 fixture 仍只证明合同，真实接受性保持 live_pending。
+
+## R5 离线协议差分（历史基线）
 
 `assets/contract/r5-claude-oauth.json` 固定 CLIProxyAPI `681ce41b` 的 committed-source 摘要和本仓合成输入。实际转发样例覆盖 native leading/mid-conversation effort、空白 thinking、缓存 eviction/diagnostics、两轮工具别名业务数据不透明性，以及四种兼容路由的 JSON/SSE refusal；复用已有独立 CountTokens beta、限流分类、终态与取消所有权合同。此处只有 `claude.official_oauth` 是正式 Registry Profile，兼容入口覆盖不等于增加 Bundle Surface 或账号权限。
 
@@ -66,11 +80,11 @@ OAuth endpoint fallback 只用于明确的 connect-stage 网络失败（请求�
 
 ## Wire profile、控制面与模型目录
 
-Claude OAuth wire 身份固定在脱敏合同 `assets/contract/claude-oauth-wire-profile.json`，当前 profile 为 `claude-code-2.1.280-audited-2026-09-23`：Claude Code `2.1.280`、Stainless `0.112.1`、Node `v26.3.0` 和 Axios `1.15.2`。该版本来自 2026-09-23 官方 npm latest Linux x64 native binary 的静态审计，冻结 binary SHA-256；审计没有使用真实凭据或访问 Anthropic，合同没有保存 token、账号标识、原始请求正文、定价或 provider fallback，真实订阅账号验证仍为 pending。usage 使用 `claude-code/2.1.280`，bootstrap/inference 使用 CLI identity，profile、roles 和 token endpoint 使用 Axios identity。默认身份可用 `CC_SWITCH_CLI_UA_VERSION` 或完整 `CC_SWITCH_CLI_UA` 紧急覆盖；候选版本必须不低于内建 profile，合法完整 UA 优先，旧值或无效值会被拒绝并 fail closed 到固定 profile。启动日志与 profile gauge 会显示最终版本、来源和是否拒绝了旧覆盖。
+Claude OAuth wire 身份固定在脱敏合同 `assets/contract/claude-oauth-wire-profile.json`，当前 profile 为 `claude-code-2.1.321-audited-2026-11-13`：Claude Code `2.1.321`、Stainless `0.128.0`、Node `v26.12.1` 和 Axios `1.15.2`。2026-11-13 核对官方 npm Linux x64 archive integrity、binary SHA-256 和公开静态标识；请求顺序语义另由冻结的只读参考捕获测试交叉印证，不宣称完成二进制协议反编译或新的真实捕获。审计没有使用真实凭据或访问 Anthropic；合同不保存真实账号标识或原始请求正文，真实订阅账号验证仍为 pending。usage 使用 `claude-code/2.1.321`，bootstrap/inference 使用 CLI identity，profile、roles 和 token endpoint 使用 Axios identity。默认身份可用 `CC_SWITCH_CLI_UA_VERSION` 或完整 `CC_SWITCH_CLI_UA` 紧急覆盖；候选版本必须不低于内建 profile，合法完整 UA 优先，旧值或无效值会被拒绝并 fail closed 到固定 profile。启动日志与 profile gauge 会显示最终版本、来源和是否拒绝了旧覆盖。
 
 `node scripts/audit/audit-claude-wire-profile.mjs` 默认离线校验合同、Rust 常量和 `.env.example` 的一致性；scheduled/人工升级审计可显式运行 `node scripts/audit/audit-claude-wire-profile.mjs --check-npm` 对比 npm `latest` dist-tag并记录 `stable`。Server 运行时不会访问 npm，也不会因审计网络不可用影响反代。`.env.example` 故意将两个 identity override 留空，避免旧部署配置永久压过更新后的内建 profile。
 
-2.1.280 billing 的 `cc_version` 使用 `<公开版本>.<三位 prompt fingerprint>`。fingerprint 在任何 system→message 迁移前从原始请求第一条真实 user text 取样，按 JavaScript UTF-16 code unit 索引 4、7、20（缺位补 `0`），拼接 salt `59cf53e54c78` 和有效 CLI version 后计算 SHA-256，取前三位 hex；`ping` 的 2.1.280 golden 是 `d7b`，历史 2.1.258 golden `1e2` 继续保留用于算法回归。billing block 不带 `cache_control`，后续 identity/prompt block继续承担缓存断点。CCH 仍按官方 `cch=00000` 占位行为生成，seed 为 `0x4D659218E32A3268`；签名在日期、工具、thinking、cache-control 等 body rewrite 全部完成后计算，所有 `model` 字符串递归置空，并递归排除 `max_tokens`、`fallbacks`、`fallback_credit_token`。2.1.280 golden CCH 为 `daec4`，历史 2.1.258 golden `8d393` 继续保留。紧急回滚可设置 `CC_SWITCH_CLAUDE_CCH_POLICY=disabled`，此时 billing block 中的 CCH 成员会被移除，不会回退到旧 seed。
+Billing 的 `cc_version` 使用 `<公开版本>.<三位 prompt fingerprint>`。fingerprint 在任何 system→message 迁移前从原始请求第一条真实 user text 取样，按 JavaScript UTF-16 code unit 索引 4、7、20（缺位补 `0`），拼接 salt `59cf53e54c78` 和有效 CLI version 后计算 SHA-256，取前三位 hex；2.1.321 的 `ping` golden 是 `cf7`、`say ok` 是 `20d`，历史 2.1.280/2.1.258 的 `d7b`/`1e2` 继续保留。billing block 不带 `cache_control`，后续 identity/prompt block 继续承担缓存断点。CCH 按 `cch=00000` 占位生成，seed 为 `0x4D659218E32A3268`；签名在日期、工具别名恢复、thinking、cache-control 等 body rewrite 全部完成后计算，所有 `model` 字符串递归置空，并递归排除 `max_tokens`、`fallbacks`、`fallback_credit_token`。2.1.321 合成 golden CCH 为 `a7426`，历史 `daec4`/`8d393` 继续保留；这不是新真实捕获。紧急回滚可设置 `CC_SWITCH_CLAUDE_CCH_POLICY=disabled`，此时 billing block 中的 CCH 成员会被移除，不会回退到旧 seed。
 
 quota refresh 并行获取 usage、profile、bootstrap 和 `/api/oauth/claude_cli/roles`。四路 enrichment 都有超时和有界响应读取；roles/profile/bootstrap 失败只影响辅助证据，不覆盖已经成功的 token 或 usage quota，也不在日志、指标或公开 API 中暴露原始 OAuth body。
 
@@ -78,6 +92,7 @@ Claude Max 倍率按 usage、bootstrap、profile 和 canonical cache 的固定�
 
 Claude OAuth 模型发现不调用 Anthropic，也不会为了列模型刷新 token。管理 discovery 和 Share `GET /v1/models?app=claude` 都使用同一份版本化静态目录：
 
+- `claude-fable-5-2`
 - `claude-opus-4-6`
 - `claude-sonnet-4-6`
 - `claude-haiku-4-5-20251001`
@@ -92,7 +107,7 @@ Share 响应同时公开 `source=claude_code_wire_profile`、`stale=false` 和 c
 
 ## 请求分类、beta 与缓存
 
-客户端分类采用 fail-closed 多信号：精确 Claude CLI User-Agent、`x-app=cli`、metadata/session 关系和 beta/body profile 必须共同成立，才进入 Native CLI、SDK CLI、VSCode 或 helper 最小修改路径。UA 或 billing 单信号不能伪装成 native；不确定请求按第三方 Anthropic 客户端处理。确认的 native/helper 请求不会被补入 `tools: []`、默认 `max_tokens`、thinking 或 identity block，只保留 credential-scoped OAuth/extended-cache beta 与最终 CCH。可用 `CC_SWITCH_CLAUDE_NATIVE_PASSTHROUGH=disabled` 强制回到第三方规范化路径。
+客户端分类采用 fail-closed 多信号：精确 Claude CLI User-Agent、`x-app=cli|cli-bg`、metadata/session 关系和 beta/body profile 必须共同成立，才进入 Native CLI、SDK CLI、VSCode 或 helper 最小修改路径。UA 或 billing 单信号不能伪装成 native；不确定请求按第三方 Anthropic 客户端处理。确认的 native/helper 请求不会被补入 `tools: []`、默认 `max_tokens` 或 identity block；必要的 signed-history thinking binding、schema 校验、失效搜索引用清理、credential-scoped beta 与最终 CCH 仍生效。可用 `CC_SWITCH_CLAUDE_NATIVE_PASSTHROUGH=disabled` 强制回到第三方规范化路径。
 
 确认的 native 请求若在历史开头带 system/developer 文本 turn，会把可提升的文本块移到顶层 `system`，但同一原消息上的 `output_config` 等消息级字段及非文本内容块必须留在原位置；纯文本且无其他字段的原消息才可删除。混合消息拆分在最终 CCH 前完成，避免努力档位或未来扩展块因文本提升而静默丢失。该本地保真规则不表示 Anthropic 已验证接受所有未来块形状；未获支持的形状仍由上游判定。
 
@@ -123,7 +138,9 @@ Claude 凭据显式区分 `refreshable_oauth` 与 `access_only_setup_token`。OA
 - `CC_SWITCH_CLAUDE_DATELINE_NORMALIZATION=enabled` 只规范 system text 和 `<system-reminder>` 内已验证的日期指纹，不修改普通用户正文、assistant 正文或 tool input/result。
 - `CC_SWITCH_CLAUDE_CUSTOM_TOOL_ALIAS` 默认开启，但只 alias 不符合 `^[A-Za-z0-9_-]{1,64}$` 的普通 custom/MCP 名称；合法自定义名称逐字节保留，Claude Code 内建名称继续使用既有 canonical case，server tool 原样保留。映射仅存在于当前请求，declaration、forced choice、历史 `tool_use` / `tool_reference`（含 `tool_result.content[]` 与 `tool_search_tool_result.content.tool_references[]` 中的协议引用）及 JSON/SSE 响应共用同一可逆 map；普通文本和工具 `input` 不递归改写。最多 128 项，大小写或 wire alias 碰撞直接拒绝。事故回滚可设为 `disabled`，此时非法名称会保持原样且由上游决定是否接受。
 
-显式 session 的 Claude Messages `thread` 续接还可在进程内短时保存上一条成功响应的工具别名。缓存按 Share、用户、session、Provider revision/runtime、Account ID/实例/代次及实际出站 Bearer 与账号凭据摘要隔离；同 ID 重建账号或同代次直接更换 token 不会读取旧别名。缺少必需历史状态时发网前返回 404：即使本轮声明了新工具，只要历史 `tool_use`、协议 `tool_reference`、`tool_choice` 或工具增删引用了未声明且需要别名／内建工具大小写归一的名称，仍须取得旧状态；这也包括 `tool_addition.tool_definition.definition.name` 的非 server 内联定义，server 工具不因此被拦截。完整声明及无需改名的合法名称保持原路径。顶层和 `tool_result`/`tool_search_tool_result` 中的协议 `tool_reference` 共用别名恢复，普通文本与工具 `input` 保持不透明。检测在构建临时声明集合前限制至 128 项，同原有 alias 上限一致。同一精确作用域的上游 message ID 若被不同别名映射重复使用，缓存会标记冲突直到原 TTL 到期；后续续接即使带完整工具声明，也在发网前返回 409，而不在两个映射间任选其一。此缓存不承诺跨进程恢复，也不能代替真实 Anthropic 续线程验收。
+显式 session 的 Claude Messages `thread` 续接使用本文开头说明的持久协议快照，并保留原有进程内别名缓存作为一致性校验。所有 continue 都须取得上一条成功响应的精确 beta/政策/别名快照，即使本轮带完整声明或全部名称合法也不能绕过；缺失、过期、身份变化、政策冲突或新能力不在旧 beta 集合中时，发网前返回 409 并要求完整历史重新 create，不尝试换账号或静默降级。受控同账号 token refresh 及进程重启可恢复；同 ID 删除重建账号或未经受控刷新直接更换凭据不能继承旧状态。
+
+顶层和 `tool_result`/`tool_search_tool_result` 中的协议 `tool_reference`、`tool_choice`、工具增删及非 server 内联定义共用别名恢复，普通文本与工具 `input` 保持不透明。别名最多 128 项；同一精确作用域的上游 message ID 若被不同 beta/政策/别名快照重复使用，会持久标记冲突直到原 TTL 到期，后续续接在发网前拒绝。快照写入失败不会向调用方发布成功终态。该恢复缓存不能代替真实 Anthropic 续线程、断网或 compact 验收。
 
 没有上游拒绝证据，因此 TLS ClientHello/header-order 模拟仍不实现；当前继续使用 rustls transport。
 
@@ -206,7 +223,7 @@ Prometheus 标签禁止包含账号 ID、Provider ID 或 request ID；这些实�
 
 ## 真实账号验收
 
-真实验收分为 `oauth_inference`、`max_5x_plan`、`max_20x_plan` 和 `fable_5_1` 四个互相独立的 operation。`claude-oauth-real.mjs` 仍可先做低成本 probe，但 probe 输出不能提升 live 状态：
+真实验收分为 `oauth_inference`、`max_5x_plan`、`max_20x_plan`、`fable_5_1`、`opus_5_5` 和 `fable_5_2` 六个互相独立的 operation。`claude-oauth-real.mjs` 仍可先做低成本 probe，但 probe 输出不能提升 live 状态：
 
 ```bash
 SERVER_URL='https://server.example.com' \
@@ -243,25 +260,25 @@ CLAUDE_OAUTH_INFERENCE_REAL_RECEIPT_FILE='/private/claude-oauth-inference.json' 
 node scripts/smoke/claude-real-receipt.mjs --operation oauth_inference
 ```
 
-其他 operation 使用 `.env.example` 中各自的 Max 5x、Max 20x、Fable 5.1 和 Opus 5.5 变量。validator 先核对当前 Git commit、唯一 Claude OAuth Account generation、`oauth.claude_messages` Provider、明确 Share binding 和精确模型；计划 operation 还会强制刷新并绑定 fresh canonical plan projection。`oauth_inference` 因要求同账号首次 401 恢复，Max 5x/20x 与 Fable 5.1 因要求套餐证据，均只接受控制面明确投影为 `refreshable_oauth` 且持有 refresh token 的 Account；验收开始和结束都复核，缺能力字段或凭据丢失即失败。Opus 5.5 没有上述恢复/套餐检查，仍可用 `access_only_setup_token` 单独验收，不能把前四项的凭据门槛无条件套给它。Fable 5.1 必须使用精确 `claude-fable-5-1` 和 Max 20x 计划，不能由普通模型或 Max 20x 计划解析结果替代。
+其他 operation 使用 `.env.example` 中各自的 Max 5x、Max 20x、Fable 5.1、Opus 5.5 和 Fable 5.2 变量。validator 先核对当前 Git commit、唯一 Claude OAuth Account generation、`oauth.claude_messages` Provider、明确 Share binding 和精确模型；计划 operation 还会强制刷新并绑定 fresh canonical plan projection。`oauth_inference` 因要求同账号首次 401 恢复，Max 5x/20x 与 Fable 5.1/5.2 因要求套餐或刷新证据，均只接受控制面明确投影为 `refreshable_oauth` 且持有 refresh token 的 Account；验收开始和结束都复核，缺能力字段或凭据丢失即失败。Opus 5.5 没有上述恢复/套餐检查，仍可用 `access_only_setup_token` 单独验收，不能把其他 operation 的凭据门槛无条件套给它。Fable 5.1/5.2 分别要求精确模型及独立 receipt，使用明确的 Max 20x 测试账号；不能由普通模型、另一个 Fable 版本或仅有计划解析结果替代，也不据此判定其他套餐没有模型权益。
 
-Share 控制面投影的 `bindings` 已包含 `share.app` 主条目，不把主字段再当作额外绑定。五项 validator 均要求 Claude App 在原始 `bindings` 中恰好一条匹配所选 Provider，并核对主字段与其对应的唯一条目一致；Share 还须明确 `enabled=true/status=active`。重复、冲突或停用时在模型目录请求前失败关闭。此项只约束验收证据，不改变生产 Share 路由，也不使控制面多次读取成为原子快照。
+Share 控制面投影的 `bindings` 已包含 `share.app` 主条目，不把主字段再当作额外绑定。六项 validator 均要求 Claude App 在原始 `bindings` 中恰好一条匹配所选 Provider，并核对主字段与其对应的唯一条目一致；Share 还须明确 `enabled=true/status=active`。重复、冲突或停用时在模型目录请求前失败关闭。此项只约束验收证据，不改变生产 Share 路由，也不使控制面多次读取成为原子快照。
 
-五项 validator 还要求控制面按真实 `ProviderView` 明确给出顶层 `revision` 与 runtime `providerRevision`：两者均为非负安全整数且相等；Share `configRevision` 也必须明确为非负安全整数，runtime `runtimeFingerprint` 必须是非空白字符串。旧 mock 的虚构顶层 `providerRevision`、缺失或冲突的真实两份 revision 不能补齐 receipt 作用域；字段不完整时在模型目录请求前拒绝。此检查只保证本地证据作用域的字段完整性，不证明厂商接受性或跨 API 原子快照。
+六项 validator 还要求控制面按真实 `ProviderView` 明确给出顶层 `revision` 与 runtime `providerRevision`：两者均为非负安全整数且相等；Share `configRevision` 也必须明确为非负安全整数，runtime `runtimeFingerprint` 必须是非空白字符串。旧 mock 的虚构顶层 `providerRevision`、缺失或冲突的真实两份 revision 不能补齐 receipt 作用域；字段不完整时在模型目录请求前拒绝。此检查只保证本地证据作用域的字段完整性，不证明厂商接受性或跨 API 原子快照。
 
-五项 receipt 的 `recordedAt` 均须在最终接受时仍处于 24 小时窗口；Max 5x、Max 20x、Fable 5.1 的 canonical plan `observedAt` 还须处于 15 分钟窗口。validator 在末次 Account/Provider/Share 复核后，以同一时刻再次检查两类证据，期间过期即拒绝。Opus 5.5 和普通 OAuth inference 不会被套上套餐时间门槛。这只是私有验收时效规则，不改变生产 Claude wire，也不是跨 API 原子快照。
+六项 receipt 的 `recordedAt` 均须在最终接受时仍处于 24 小时窗口；Max 5x、Max 20x、Fable 5.1/5.2 的 canonical plan `observedAt` 还须处于 15 分钟窗口。validator 在末次 Account/Provider/Share 复核后，以同一时刻再次检查两类证据，期间过期即拒绝。Opus 5.5 和普通 OAuth inference 不会被套上套餐时间门槛。这只是私有验收时效规则，不改变生产 Claude wire，也不是跨 API 原子快照。
 
 私有 receipt 在任何控制面请求前由只读描述符限量读取；读取前后还比较同一文件的 dev/inode、链接数、大小、权限及纳秒级 mtime/ctime。普通等长原位改写即使发生在首次读取后、EOF 检查前，也会失败关闭。这是文件快照稳定性门槛，不保证元数据可复原的并发对手面前具有原子视图，也不证明部署 commit 与本地 HEAD 一致。
 
 最终接受前还会重新解析配置的 receipt 路径，并与读取时保存的文件指纹比较 dev/inode、链接数、大小、权限及纳秒级 mtime/ctime。若控制面校验期间路径换成另一文件，或原文件被等长原位改写并留下元数据变化，验收失败关闭。这不是跨 API 与文件系统的原子事务；恶意元数据复原及最终检查后的变化仍需由受控私有文件位置和运行环境防护。
 
-最终文件复核还会通过 `O_NOFOLLOW` 只读描述符重新读取至多 1 MiB 的完整 receipt 原始字节及 EOF，并与最初验收的字节逐一比较；读前、读后及配置路径的文件身份也继续复核。五个 operation 的对抗 fixture 在控制面请求期间等长改写文件、让末次元数据读取返回旧值时，旧流程会错误接受，现在全部脱敏拒绝。元数据伪装只用于验证内容不能由元数据替代，并不表示普通用户能恢复真实 `ctime`；末次检查后的并发变化及跨 API 原子性仍不由此保证，离线 fixture 也不能提升真实 Anthropic 接受性。
+最终文件复核还会通过 `O_NOFOLLOW` 只读描述符重新读取至多 1 MiB 的完整 receipt 原始字节及 EOF，并与最初验收的字节逐一比较；读前、读后及配置路径的文件身份也继续复核。各 operation 的对抗 fixture 在控制面请求期间等长改写文件、让末次元数据读取返回旧值时，旧流程会错误接受，现在全部脱敏拒绝。元数据伪装只用于验证内容不能由元数据替代，并不表示普通用户能恢复真实 `ctime`；末次检查后的并发变化及跨 API 原子性仍不由此保证，离线 fixture 也不能提升真实 Anthropic 接受性。
 
-五项模型目录验收都以 `app=claude`、`expectedShareId` 与 `expectedProviderId` 请求签名 Router ingress 的 `/v1/models`。Server 先按实际签名 Share 选择 Provider，再拒绝与所选 operation 预期不符的目录；普通 `providerId` 查询参数不承担选择作用。此门槛只证明目录路由绑定，静态 Claude 模型目录命中不等于订阅 entitlement，也不使目录与后续请求成为原子快照。
+六项模型目录验收都以 `app=claude`、`expectedShareId` 与 `expectedProviderId` 请求签名 Router ingress 的 `/v1/models`。Server 先按实际签名 Share 选择 Provider，再拒绝与所选 operation 预期不符的目录；普通 `providerId` 查询参数不承担选择作用。此门槛只证明目录路由绑定，静态 Claude 模型目录命中不等于订阅 entitlement，也不使目录与后续请求成为原子快照。
 
-五项私有 validator 还要求初次目录明确为 `source=claude_code_wire_profile`、`stale=false`，且 `fetchedAtMs` 为有效的正整数 capture 时间；末次 Account/Provider/Share 绑定复核后，经同一签名 Share/Provider 栅栏再读取目录。两次完整 `data` 的所有模型 ID 均须为非空字符串、无首尾空白且唯一，选定模型各恰好出现一次；目录按 ID 确定性排序后计算摘要，因此纯行重排可接受，能力字段等内容变化仍拒绝。两次来源、stale、capture 时间与摘要须相同；模型增删或元数据漂移会拒绝 receipt。静态 capture 时间不套用动态目录 TTL；本检查只保证一次验收内的目录稳定性，目录摘要不写入现有 schema-v1 receipt，也不能证明真实 Anthropic entitlement 或跨 API 原子性。
+六项私有 validator 还要求初次目录明确为 `source=claude_code_wire_profile`、`stale=false`，且 `fetchedAtMs` 为有效的正整数 capture 时间；末次 Account/Provider/Share 绑定复核后，经同一签名 Share/Provider 栅栏再读取目录。两次完整 `data` 的所有模型 ID 均须为非空字符串、无首尾空白且唯一，选定模型各恰好出现一次；目录按 ID 确定性排序后计算摘要，因此纯行重排可接受，能力字段等内容变化仍拒绝。两次来源、stale、capture 时间与摘要须相同；模型增删或元数据漂移会拒绝 receipt。静态 capture 时间不套用动态目录 TTL；本检查只保证一次验收内的目录稳定性，目录摘要不写入现有 schema-v1 receipt，也不能证明真实 Anthropic entitlement 或跨 API 原子性。
 
-四个主体 operation 加 Opus 5.5 扩展分别判断输入并维持五份独立 receipt。输入不全时 validator 输出 `blocked_inputs/live_pending`；fixture 模式只能验证合同并输出 `contract_verified/live_pending`。任何一个 operation 的通过都不能提升其他项，也绝不能把 SKIP、fixture 或 probe 结果记为真实通过。
+六个 operation 分别判断输入并维持独立 receipt。输入不全时 validator 输出 `blocked_inputs/live_pending`；fixture 模式只能验证合同并输出 `contract_verified/live_pending`。任何一个 operation 的通过都不能提升其他项，也绝不能把 SKIP、fixture 或 probe 结果记为真实通过。
 
 ## 非目标与剩余外部风险
 

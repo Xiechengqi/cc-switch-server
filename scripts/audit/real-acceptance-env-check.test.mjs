@@ -130,6 +130,10 @@ function runEnvCheck(overrides) {
       CC_SWITCH_CLAUDE_FABLE_5_1_SHARE_ID: "",
       CC_SWITCH_CLAUDE_FABLE_5_1_MODEL: "",
       CLAUDE_FABLE_5_1_REAL_RECEIPT_FILE: "",
+      CC_SWITCH_CLAUDE_FABLE_5_2_PROVIDER_ID: "",
+      CC_SWITCH_CLAUDE_FABLE_5_2_SHARE_ID: "",
+      CC_SWITCH_CLAUDE_FABLE_5_2_MODEL: "",
+      CLAUDE_FABLE_5_2_REAL_RECEIPT_FILE: "",
       ANTIGRAVITY_OAUTH_TEST_ACCOUNT: "",
       CC_SWITCH_ANTIGRAVITY_OAUTH_SHARE_ID: "",
       CC_SWITCH_ANTIGRAVITY_OAUTH_CLAUDE_PROVIDER_ID: "",
@@ -224,6 +228,7 @@ test("Claude operation receipts and Grok external input gates remain isolated", 
   assert.equal(grokReady.checks.claudeMax5xGateStatus, "blocked-inputs");
   assert.equal(grokReady.checks.claudeMax20xGateStatus, "blocked-inputs");
   assert.equal(grokReady.checks.claudeFable51GateStatus, "blocked-inputs");
+  assert.equal(grokReady.checks.claudeFable52GateStatus, "blocked-inputs");
 
   const maxReady = runEnvCheck({
     SERVER_URL: "https://server.example.test",
@@ -246,8 +251,38 @@ test("Claude operation receipts and Grok external input gates remain isolated", 
   assert.equal(maxReady.checks.claudeMax5xGateStatus, "inputs-ready");
   assert.equal(maxReady.checks.claudeMax20xGateStatus, "inputs-ready");
   assert.equal(maxReady.checks.claudeFable51GateStatus, "blocked-inputs");
+  assert.equal(maxReady.checks.claudeFable52GateStatus, "blocked-inputs");
   assert.equal(maxReady.longTailInputsPresent.claudeMax5xProviderId, true);
   assert.equal(maxReady.longTailInputsPresent.claudeMax20xReceiptFile, true);
+});
+
+test("Fable 5.2 gate cannot reuse Fable 5.1 scope or receipt inputs", () => {
+  const common = {
+    SERVER_URL: "https://server.example.test",
+    CC_SWITCH_SERVER_TOKEN: "server-token",
+    CC_SWITCH_SHARE_URL: "https://share.example.test",
+    ROUTER_API_TOKEN: "router-token",
+    CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT: "max-20x-test-account",
+  };
+  const oldOnly = runEnvCheck({
+    ...common,
+    CC_SWITCH_CLAUDE_FABLE_5_1_PROVIDER_ID: "fable51-provider",
+    CC_SWITCH_CLAUDE_FABLE_5_1_SHARE_ID: "fable51-share",
+    CC_SWITCH_CLAUDE_FABLE_5_1_MODEL: "claude-fable-5-1",
+    CLAUDE_FABLE_5_1_REAL_RECEIPT_FILE: "/tmp/fable51.json",
+  });
+  assert.equal(oldOnly.checks.claudeFable51GateStatus, "inputs-ready");
+  assert.equal(oldOnly.checks.claudeFable52GateStatus, "blocked-inputs");
+  const current = runEnvCheck({
+    ...common,
+    CC_SWITCH_CLAUDE_FABLE_5_2_PROVIDER_ID: "fable52-provider",
+    CC_SWITCH_CLAUDE_FABLE_5_2_SHARE_ID: "fable52-share",
+    CC_SWITCH_CLAUDE_FABLE_5_2_MODEL: "claude-fable-5-2",
+    CLAUDE_FABLE_5_2_REAL_RECEIPT_FILE: "/tmp/fable52.json",
+  });
+  assert.equal(current.checks.claudeFable52GateStatus, "inputs-ready");
+  assert.equal(current.checks.claudeFable51GateStatus, "blocked-inputs");
+  assert.equal(current.longTailInputsPresent.claudeFable52ReceiptFile, true);
 });
 
 test("Grok inference, media, and compaction receipts remain independently gated", () => {

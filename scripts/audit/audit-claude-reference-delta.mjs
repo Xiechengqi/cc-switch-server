@@ -605,6 +605,57 @@ const expectedOperations = [
   },
 ];
 const acceptance = baseline.realAcceptance;
+expectedOperations.push({
+  operation: "fable_5_2",
+  requiredChecks: [
+    "bound_account_provider_share", "fresh_max_20x_plan", "exact_fable_5_2_model",
+    "count_tokens", "messages_nonstream_usage", "messages_stream_terminal",
+    "dynamic_thinking", "tool_roundtrip", "per_turn_control", "per_turn_timing",
+    "modern_cli_metadata", "thinking_prefix_binding", "thread_beta_stability",
+    "thread_restart_recovery", "thread_token_refresh_isolation",
+    "network_interruption_resume", "compacted_history_resume", "fable_7d_oi_scope",
+    "no_model_fallback", "decoy_zero_requests", "secret_scan",
+  ],
+  requiredBodyHashes: [
+    "count_tokens", "messages_nonstream", "messages_stream", "thinking",
+    "tool_roundtrip", "per_turn_controls", "thread_create", "thread_continue",
+    "reconnect", "compacted_history",
+  ],
+});
+const fable52 = baseline.fable52Extension;
+assert(
+  fable52?.wireProfile === "claude-code-2.1.321-audited-2026-11-13" &&
+    fable52?.liveState === "live_pending" && fable52?.operation === "fable_5_2",
+  "Fable 5.2 evidence boundary changed",
+);
+assert(
+  commitPattern.test(fable52?.reference?.commit) &&
+    commitPattern.test(fable52?.reference?.tree) && fable52.reference.files.length >= 7,
+  "Fable 5.2 source snapshot is incomplete",
+);
+if (checkSources) {
+  assert(
+    gitTree(sourceRootById.get("cliproxyapi"), fable52.reference.commit) === fable52.reference.tree,
+    "Fable 5.2 committed source tree drifted",
+  );
+}
+for (const file of fable52.reference.files) {
+  assertSafePath(file.path, "Fable 5.2 source");
+  assert(digestPattern.test(file.sha256), "Fable 5.2 source digest missing");
+  if (checkSources) {
+    assert(
+      sha256(gitFile(sourceRootById.get("cliproxyapi"), fable52.reference.commit, file.path, null)) === file.sha256,
+      "Fable 5.2 committed source drift",
+    );
+  }
+}
+for (const evidence of fable52.localTests) {
+  assertSafePath(evidence.path, "Fable 5.2 local test");
+  assert(
+    fs.readFileSync(path.join(root, evidence.path), "utf8").includes(`fn ${evidence.anchor}(`),
+    "Fable 5.2 local test missing",
+  );
+}
 assert(
   acceptance?.receiptSchemaVersion === 1 && acceptance?.harnessRevision === 1,
   "Claude real-acceptance receipt schema changed",

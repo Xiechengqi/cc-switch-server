@@ -6185,6 +6185,83 @@ impl ServerStateInner {
         result
     }
 
+    pub(crate) async fn claude_thread_profile_scope(
+        &self,
+        scope: &crate::proxy::claude_thread_alias::ClaudeThreadAliasScope,
+    ) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let accounts = self.accounts.read().await;
+        let account = accounts
+            .accounts
+            .iter()
+            .find(|account| account.id == scope.account_id)?;
+        if accounts.account_incarnation(&scope.account_id) != Some(scope.account_incarnation)
+            || account.auth_identity_generation != scope.auth_identity_generation
+            || account.needs_relogin
+        {
+            return None;
+        }
+        let owner = accounts.claude_thread_owner_id(&scope.account_id)?;
+        let encoded = serde_json::to_vec(&(
+            &scope.share_id,
+            &scope.principal,
+            &scope.session_id,
+            &scope.provider_id,
+            scope.provider_revision,
+            &scope.runtime_fingerprint,
+            &scope.account_id,
+            scope.auth_identity_generation,
+            owner,
+        ))
+        .ok()?;
+        Some(hex::encode(Sha256::digest(encoded)))
+    }
+
+    pub(crate) async fn claude_thread_profile_load(
+        &self,
+        scope: String,
+        message_id: String,
+        memory: Option<crate::proxy::request_memory::RequestMemoryBudget>,
+    ) -> Result<Option<crate::proxy::claude_thread_profile::LoadedProfile>, crate::proxy::ProxyError>
+    {
+        let dir = self.config_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::proxy::claude_thread_profile::load(
+                &dir,
+                &scope,
+                &message_id,
+                crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+                memory,
+            )
+        })
+        .await
+        .map_err(|_| crate::proxy::claude_thread_profile::unavailable())?
+    }
+
+    pub(crate) async fn claude_thread_profile_commit(
+        &self,
+        scope: String,
+        message_id: String,
+        profile: crate::proxy::claude_thread_profile::ClaudeThreadProfile,
+    ) -> bool {
+        let dir = self.config_dir.clone();
+        let committed = tokio::task::spawn_blocking(move || {
+            crate::proxy::claude_thread_profile::save(
+                &dir,
+                &scope,
+                &message_id,
+                &profile,
+                crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+            )
+        })
+        .await
+        .is_ok_and(|result| result.unwrap_or(false));
+        if !committed {
+            tracing::warn!("Claude Thread protocol snapshot could not be committed; full-history replay required");
+        }
+        committed
+    }
+
     pub(crate) fn claude_thread_alias_lookup_with<T>(
         &self,
         scope: &crate::proxy::claude_thread_alias::ClaudeThreadAliasScope,

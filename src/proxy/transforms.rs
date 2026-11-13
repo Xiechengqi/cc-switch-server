@@ -2,7 +2,7 @@
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use super::gemini_grounding::{scalar_range_for_cited_text, GroundingAccumulator, TextMapping};
 use super::reasoning_bridge::{
@@ -1019,6 +1019,191 @@ impl StreamFrame {
 }
 
 pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> {
+    openai_chat_to_anthropic_with_policy(input, false)
+}
+
+#[cfg(test)]
+mod claude_fable52_tests {
+    use super::*;
+    #[test]
+    fn oauth_fable52_preserves_effort_system_position_and_cache_blocks_only_on_reviewed_path() {
+        let input = json!({"model":"claude-fable-5-2","reasoning_effort":"xhigh","messages":[
+            {"role":"system","content":[{"type":"text","text":"first","cache_control":{"type":"ephemeral"}},{"type":"text","text":"second"}]},
+            {"role":"user","content":"hello"},{"role":"system","content":"new instructions"}
+        ]});
+        let output = openai_chat_to_claude_oauth(&input).unwrap();
+        assert_eq!(output["output_config"]["effort"], "xhigh");
+        assert_eq!(output["system"].as_array().unwrap().len(), 2);
+        assert!(output["system"][0].get("cache_control").is_some());
+        assert_eq!(output["messages"][1]["role"], "system");
+        let legacy = openai_chat_to_anthropic(&input).unwrap();
+        assert_eq!(legacy["output_config"]["effort"], "max");
+        assert!(legacy["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["role"] != "system"));
+        let responses = json!({"model":"claude-fable-5-2","reasoning":{"effort":"xhigh"},"input":[
+            {"role":"user","content":"hello"},{"role":"developer","content":[{"type":"input_text","text":"changed","cache_control":{"type":"ephemeral"}}]}
+        ]});
+        let output = openai_responses_to_claude_oauth(&responses).unwrap();
+        assert_eq!(output["output_config"]["effort"], "xhigh");
+        assert_eq!(output["messages"][1]["role"], "system");
+        assert!(output["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_some());
+    }
+
+    #[test]
+    fn oauth_system_queue_never_demotes_or_loses_instructions_and_keeps_strict_tools() {
+        for responses in [false, true] {
+            let field = if responses { "input" } else { "messages" };
+            let convert = if responses {
+                openai_responses_to_claude_oauth
+            } else {
+                openai_chat_to_claude_oauth
+            };
+            let mut input = json!({"model":"claude-fable-5-2"});
+            input[field] = json!([
+                {"role":"user","content":"first"}, {"role":"assistant","content":"answer"},
+                {"role":"system","content":"after assistant"},
+                {"role":"developer","content":"second instruction"},
+                {"role":"user","content":"second"},
+                {"role":"system","content":"after user"},
+                {"role":"developer","content":"adjacent instruction"}
+            ]);
+            input["tools"] = if responses {
+                json!([{"type":"function","name":"strict_tool","parameters":{"type":"object","properties":{"bad name":{"type":"string"}}},"strict":true}])
+            } else {
+                json!([{"type":"function","function":{"name":"strict_tool","parameters":{"type":"object","properties":{"bad name":{"type":"string"}}},"strict":true}}])
+            };
+            let output = convert(&input).unwrap();
+            assert_eq!(output["messages"][3]["role"], "system");
+            let texts = output["messages"][3]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|block| block["text"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                texts,
+                [
+                    "after assistant",
+                    "second instruction",
+                    "after user",
+                    "adjacent instruction"
+                ]
+            );
+            assert_eq!(output["tools"][0]["strict"], true);
+            input[field].as_array_mut().unwrap().truncate(4);
+            assert!(
+                convert(&input).is_err(),
+                "unplaceable instruction must not be silently demoted"
+            );
+        }
+    }
+}
+
+pub(crate) fn openai_chat_to_claude_oauth(input: &Value) -> Result<Value, TransformError> {
+    let mut output =
+        openai_chat_to_anthropic_with_policy(input, claude_oauth_system_policy(input))?;
+    preserve_claude_tool_strictness(input, &mut output);
+    Ok(output)
+}
+
+fn preserve_claude_tool_strictness(input: &Value, output: &mut Value) {
+    let strict: HashMap<&str, bool> = input
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let function = tool.get("function").unwrap_or(tool);
+            Some((
+                function.get("name")?.as_str()?,
+                function
+                    .get("strict")
+                    .or_else(|| tool.get("strict"))?
+                    .as_bool()?,
+            ))
+        })
+        .collect();
+    for tool in output
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(value) = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| strict.get(name))
+        {
+            tool["strict"] = json!(value);
+        }
+    }
+}
+
+fn claude_oauth_system_policy(input: &Value) -> bool {
+    input
+        .get("model")
+        .and_then(Value::as_str)
+        .and_then(crate::domain::claude_models::claude_model_capability)
+        .is_some_and(|capability| capability.mid_conversation_system)
+}
+
+fn claude_system_blocks(value: &Value) -> Result<Vec<Value>, TransformError> {
+    match value {
+        Value::String(text) => Ok(vec![json!({"type":"text", "text":text})]),
+        Value::Array(parts) => parts
+            .iter()
+            .map(|part| {
+                if !matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("text" | "input_text" | "output_text")
+                ) {
+                    return Err(TransformError::new("Claude system instructions support text blocks only; refusing to drop non-text content"));
+                }
+                let text = part.get("text").and_then(Value::as_str).ok_or_else(|| TransformError::new("Claude system text block must contain a string"))?;
+                let mut block = json!({"type":"text","text":text});
+                if let Some(cache) = part.get("cache_control") {
+                    block["cache_control"] = cache.clone();
+                }
+                Ok(block)
+            })
+            .collect(),
+        Value::Null => Ok(Vec::new()),
+        _ => Err(TransformError::new("Claude system instructions must be text or text blocks")),
+    }
+}
+
+fn emit_pending_claude_system(messages: &mut Vec<Value>, pending: &mut Vec<Value>) {
+    if messages
+        .last()
+        .is_some_and(|message| message["role"] == "system")
+    {
+        if let Some(content) = messages
+            .last_mut()
+            .and_then(|message| message.get_mut("content"))
+            .and_then(Value::as_array_mut)
+        {
+            content.append(pending);
+        }
+        return;
+    }
+    if !pending.is_empty()
+        && messages
+            .last()
+            .is_some_and(|message| message["role"] == "user")
+    {
+        messages.push(json!({"role":"system","content":std::mem::take(pending)}));
+    }
+}
+
+fn openai_chat_to_anthropic_with_policy(
+    input: &Value,
+    preserve_system: bool,
+) -> Result<Value, TransformError> {
     let messages = input
         .get("messages")
         .and_then(Value::as_array)
@@ -1026,6 +1211,8 @@ pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> 
     let mut output_messages = Vec::new();
     let mut system_parts = Vec::new();
     let mut leading_system = true;
+    let mut system_blocks = Vec::new();
+    let mut pending_system = Vec::new();
 
     for message in messages {
         let role = message
@@ -1033,7 +1220,14 @@ pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> 
             .and_then(Value::as_str)
             .unwrap_or("user");
         if matches!(role, "system" | "developer") {
-            if leading_system {
+            if preserve_system {
+                if leading_system {
+                    system_blocks.extend(claude_system_blocks(&message["content"])?);
+                } else {
+                    pending_system.extend(claude_system_blocks(&message["content"])?);
+                    emit_pending_claude_system(&mut output_messages, &mut pending_system);
+                }
+            } else if leading_system {
                 collect_text_like(&message["content"], &mut system_parts);
             } else if let Some(message) = demoted_system_message(message.get("content")) {
                 output_messages.push(message);
@@ -1042,12 +1236,22 @@ pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> 
         }
         leading_system = false;
         output_messages.extend(openai_chat_message_to_anthropic(message, role)?);
+        emit_pending_claude_system(&mut output_messages, &mut pending_system);
+    }
+    if !pending_system.is_empty() {
+        return Err(TransformError::new(
+            "Claude mid-conversation system instructions require a following user turn",
+        ));
     }
     if let Some(instruction) = input
         .get("response_format")
         .and_then(claude_structured_output_instruction)
     {
-        system_parts.push(instruction);
+        if preserve_system {
+            system_blocks.push(json!({"type":"text","text":instruction}));
+        } else {
+            system_parts.push(instruction);
+        }
     }
 
     merge_adjacent_anthropic_messages(&mut output_messages);
@@ -1069,6 +1273,9 @@ pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> 
     if !system_parts.is_empty() {
         output.insert("system".to_string(), Value::String(system_parts.join("\n")));
     }
+    if !system_blocks.is_empty() {
+        output.insert("system".to_string(), Value::Array(system_blocks));
+    }
     output.insert("messages".to_string(), Value::Array(output_messages));
     copy_bool(input, &mut output, "stream");
     copy_object(input, &mut output, "metadata");
@@ -1080,13 +1287,32 @@ pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> 
         &mut output,
         &["max_completion_tokens", "max_tokens", "max_output_tokens"],
     );
-    apply_openai_reasoning_to_anthropic(input, &mut output, thinking_history_is_valid)?;
+    apply_openai_reasoning_to_anthropic(
+        input,
+        &mut output,
+        thinking_history_is_valid,
+        preserve_system,
+    )?;
     apply_openai_tool_controls_to_anthropic(input, &mut output, None)?;
 
     Ok(Value::Object(output))
 }
 
 pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformError> {
+    openai_responses_to_anthropic_with_policy(input, false)
+}
+
+pub(crate) fn openai_responses_to_claude_oauth(input: &Value) -> Result<Value, TransformError> {
+    let mut output =
+        openai_responses_to_anthropic_with_policy(input, claude_oauth_system_policy(input))?;
+    preserve_claude_tool_strictness(input, &mut output);
+    Ok(output)
+}
+
+fn openai_responses_to_anthropic_with_policy(
+    input: &Value,
+    preserve_system: bool,
+) -> Result<Value, TransformError> {
     validate_response_tool_type_collisions(input)?;
     validate_anthropic_tool_search_execution(input)?;
     super::responses_phase::observe_items(input, "input", "messages", "request");
@@ -1105,6 +1331,10 @@ pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformEr
         &["max_output_tokens", "max_completion_tokens", "max_tokens"],
     );
     let mut system_parts = Vec::new();
+    let mut system_blocks = Vec::new();
+    if preserve_system {
+        system_blocks.extend(claude_system_blocks(&input["instructions"])?);
+    }
     append_response_system_text(input.get("instructions"), &mut system_parts);
     if let Some(items) = input.get("input").and_then(Value::as_array) {
         for item in items.iter().take_while(|item| {
@@ -1113,7 +1343,11 @@ pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformEr
                 Some("system" | "developer")
             )
         }) {
-            append_response_system_text(item.get("content"), &mut system_parts);
+            if preserve_system {
+                system_blocks.extend(claude_system_blocks(&item["content"])?);
+            } else {
+                append_response_system_text(item.get("content"), &mut system_parts);
+            }
         }
     }
     if let Some(instruction) = input
@@ -1121,9 +1355,17 @@ pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformEr
         .or_else(|| input.get("response_format"))
         .and_then(claude_structured_output_instruction)
     {
-        system_parts.push(instruction);
+        if preserve_system {
+            system_blocks.push(json!({"type":"text","text":instruction}));
+        } else {
+            system_parts.push(instruction);
+        }
     }
-    if !system_parts.is_empty() {
+    if preserve_system {
+        if !system_blocks.is_empty() {
+            output.insert("system".to_string(), Value::Array(system_blocks));
+        }
+    } else if !system_parts.is_empty() {
         output.insert(
             "system".to_string(),
             Value::String(system_parts.join("\n\n")),
@@ -1138,13 +1380,17 @@ pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformEr
         })),
         Some(Value::Array(items)) => {
             let mut leading_system = true;
+            let mut pending_system = Vec::new();
             for item in items {
                 if matches!(
                     item.get("role").and_then(Value::as_str),
                     Some("system" | "developer")
                 ) {
                     if !leading_system {
-                        if let Some(message) = demoted_system_message(item.get("content")) {
+                        if preserve_system {
+                            pending_system.extend(claude_system_blocks(&item["content"])?);
+                            emit_pending_claude_system(&mut messages, &mut pending_system);
+                        } else if let Some(message) = demoted_system_message(item.get("content")) {
                             messages.push(message);
                         }
                     }
@@ -1152,6 +1398,12 @@ pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformEr
                 }
                 leading_system = false;
                 messages.extend(openai_response_item_to_anthropic(item, &tool_context)?);
+                emit_pending_claude_system(&mut messages, &mut pending_system);
+            }
+            if !pending_system.is_empty() {
+                return Err(TransformError::new(
+                    "Claude mid-conversation system instructions require a following user turn",
+                ));
             }
         }
         _ => return Err(TransformError::new("openai responses input is required")),
@@ -1170,7 +1422,12 @@ pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformEr
     ensure_leading_anthropic_user_message(&mut messages);
     let thinking_history_is_valid = trailing_turn_supports_thinking(&messages);
     output.insert("messages".to_string(), Value::Array(messages));
-    apply_openai_reasoning_to_anthropic(input, &mut output, thinking_history_is_valid)?;
+    apply_openai_reasoning_to_anthropic(
+        input,
+        &mut output,
+        thinking_history_is_valid,
+        preserve_system,
+    )?;
     apply_openai_tool_controls_to_anthropic(input, &mut output, Some(&tool_context))?;
 
     Ok(Value::Object(output))
@@ -5088,6 +5345,15 @@ fn anthropic_message_has_content(message: &Value) -> bool {
 }
 
 fn trailing_turn_supports_thinking(messages: &[Value]) -> bool {
+    // Reviewed Claude OAuth models allow system instructions after a user
+    // turn. They do not change the underlying user/tool replay boundary.
+    let Some(last_dialogue) = messages
+        .iter()
+        .rposition(|message| message["role"] != "system")
+    else {
+        return false;
+    };
+    let messages = &messages[..=last_dialogue];
     let Some(last) = messages.last() else {
         return false;
     };
@@ -6833,6 +7099,7 @@ fn apply_openai_reasoning_to_anthropic(
     input: &Value,
     output: &mut Map<String, Value>,
     thinking_history_is_valid: bool,
+    preserve_effort: bool,
 ) -> Result<(), TransformError> {
     let reasoning_effort = input
         .pointer("/reasoning/effort")
@@ -6850,7 +7117,15 @@ fn apply_openai_reasoning_to_anthropic(
     let adaptive_by_default = super::thinking::adaptive_thinking_is_default(model);
     let cannot_disable_thinking = super::thinking::thinking_cannot_be_disabled(model);
     let explicitly_disabled = reasoning_effort.is_some_and(reasoning_explicitly_disabled);
-    let mapped_effort = reasoning_effort.and_then(openai_effort_to_anthropic);
+    let mapped_effort = if preserve_effort
+        && reasoning_effort == Some("xhigh")
+        && crate::domain::claude_models::claude_model_capability(model)
+            .is_some_and(|capability| capability.effort_levels.contains(&"xhigh"))
+    {
+        Some("xhigh")
+    } else {
+        reasoning_effort.and_then(openai_effort_to_anthropic)
+    };
     let adaptive_should_think = adaptive_model && (adaptive_by_default || mapped_effort.is_some());
     let mut thinking_enabled = false;
 

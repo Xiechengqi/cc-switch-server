@@ -4339,7 +4339,8 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
     let body = body_text(response).await;
     assert!(body.contains("msg-truncated"));
     assert!(body.contains("cc_switch_stream_error"));
-    assert!(body.contains("event: message_stop"));
+    assert!(body.contains("event: error"));
+    assert!(!body.contains("event: message_stop"));
 }
 
 #[tokio::test]
@@ -5457,7 +5458,8 @@ async fn claude_stream_failure_after_first_event_does_not_replay_on_next_provide
     let body = body_text(response).await;
     assert!(body.contains("msg-before-break"));
     assert!(body.contains("upstream_stream_break"));
-    assert!(body.contains("event: message_stop"));
+    assert!(body.contains("event: error"));
+    assert!(!body.contains("event: message_stop"));
     assert!(!body.contains("must-not-replay"));
     assert_eq!(broken_requests.load(Ordering::SeqCst), 1);
     assert_eq!(fallback_requests.load(Ordering::SeqCst), 0);

@@ -3,7 +3,66 @@
   "schemaVersion": 2,
   "legacySchemaVersion": 1,
   "capturedAt": "2026-09-18T00:00:00Z",
-  "updatedAt": "2026-10-27T00:00:00Z",
+  "updatedAt": "2026-11-13T00:00:00Z",
+  "fable52Extension": {
+    "reference": {
+      "sourceId": "cliproxyapi",
+      "commit": "1aaf56bc6a0fc6fce19049ba7ae8554c882304a6",
+      "tree": "ecb704328e511b3e5c3626b9b6e621f44c827d6b",
+      "files": [
+        {
+          "path": "internal/runtime/executor/claude_executor_request.go",
+          "sha256": "428877930da81399d237bdb1e0dca77c35cbdeb4640773d2879e31c25fb1d8f4"
+        },
+        {
+          "path": "internal/runtime/executor/claude_executor_cli_2321_test.go",
+          "sha256": "8d4164a15cb988e2511a333218901ed772fb7bac61d0bae2a62153033f89664f"
+        },
+        {
+          "path": "internal/runtime/executor/helps/cloak_utils.go",
+          "sha256": "1051c004e297ac5e1a8ec98a35ab10c54f9c0ae4bcd26ced3873bfb574f9c0a5"
+        },
+        {
+          "path": "internal/runtime/executor/helps/claude_thread.go",
+          "sha256": "1bd7194281733f041f3fbd46cf8cd960595ad7f0608bbaf2bfe4ed4f09a306f9"
+        },
+        {
+          "path": "internal/translator/claude/openai/responses/claude_openai-responses_request.go",
+          "sha256": "8e1ec7a43125501d2748869a4aca4fe77d0631d99e85439256aaa26f20b1ba14"
+        },
+        {
+          "path": "internal/runtime/executor/helps/claude_web_search_results.go",
+          "sha256": "6aeb591da3a3b1978b5ec609f43222dd94273dfff1247de393e640e575cb94b6"
+        },
+        {
+          "path": "internal/runtime/executor/helps/claude_tool_property_names.go",
+          "sha256": "0a6068079d12b39b1c1d2a8120344151f8f6faa42d2da2bc9f6394ab939be68b"
+        }
+      ]
+    },
+    "wireProfile": "claude-code-2.1.321-audited-2026-11-13",
+    "operation": "fable_5_2",
+    "liveState": "live_pending",
+    "scope": "fixed Provider / Account; no model or account fallback",
+    "localTests": [
+      {
+        "path": "src/proxy/claude_client_detection.rs",
+        "anchor": "fable52_modern_metadata_recognizes_measured_entrypoints_not_ua_alone"
+      },
+      {
+        "path": "src/proxy/claude_compat.rs",
+        "anchor": "fable52_binding_is_narrow_and_respects_explicit_policy"
+      },
+      {
+        "path": "src/proxy/claude_thread_profile.rs",
+        "anchor": "thread_profile_survives_reopen_and_fails_closed_on_conflict_expiry_or_scope"
+      },
+      {
+        "path": "src/proxy/transforms.rs",
+        "anchor": "oauth_fable52_preserves_effort_system_position_and_cache_blocks_only_on_reviewed_path"
+      }
+    ]
+  },
   "policy": {
     "externalSources": "read_only_optional_audit_input_never_runtime_dependency",
     "scope": "one fixed Provider and one fixed Account; no pool; no rotation; no cross-account fallback; no cross-Provider fallback",
@@ -283,6 +342,46 @@
     ]
   },
   "realAcceptanceExtensions": [
+    {
+      "operation": "fable_5_2",
+      "status": "live_pending",
+      "receipt": null,
+      "requiredChecks": [
+        "bound_account_provider_share",
+        "fresh_max_20x_plan",
+        "exact_fable_5_2_model",
+        "count_tokens",
+        "messages_nonstream_usage",
+        "messages_stream_terminal",
+        "dynamic_thinking",
+        "tool_roundtrip",
+        "per_turn_control",
+        "per_turn_timing",
+        "modern_cli_metadata",
+        "thinking_prefix_binding",
+        "thread_beta_stability",
+        "thread_restart_recovery",
+        "thread_token_refresh_isolation",
+        "network_interruption_resume",
+        "compacted_history_resume",
+        "fable_7d_oi_scope",
+        "no_model_fallback",
+        "decoy_zero_requests",
+        "secret_scan"
+      ],
+      "requiredBodyHashes": [
+        "count_tokens",
+        "messages_nonstream",
+        "messages_stream",
+        "thinking",
+        "tool_roundtrip",
+        "per_turn_controls",
+        "thread_create",
+        "thread_continue",
+        "reconnect",
+        "compacted_history"
+      ]
+    },
     {
       "operation": "opus_5_5",
       "status": "live_pending",
@@ -1040,7 +1139,7 @@
         },
         {
           "path": "src/proxy/claude_oauth.rs",
-          "anchors": ["PER_TURN_CONTROL_BETA", "PER_TURN_TIMING_BETA", "opus_5_5_betas_follow_the_2_1_280_wire_order_and_shape_gates", "native_passthrough_accepts_the_audited_2_1_280_beta_set"]
+          "anchors": ["PER_TURN_CONTROL_BETA", "PER_TURN_TIMING_BETA", "opus_5_5_betas_follow_the_2_1_321_wire_order_and_shape_gates", "native_passthrough_accepts_the_audited_2_1_280_beta_set"]
         },
         {
           "path": "src/proxy/thinking.rs",

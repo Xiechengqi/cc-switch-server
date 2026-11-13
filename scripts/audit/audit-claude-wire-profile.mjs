@@ -31,8 +31,8 @@ function fail(message) {
 if (!/^\d+\.\d+\.\d+$/.test(version ?? "")) {
   fail("versions.claudeCode must be a three-part numeric version");
 }
-if (profile.schemaVersion !== 4) {
-  fail("schemaVersion must be 4 for the capability-driven 2.1.280 profile");
+if (profile.schemaVersion !== 5) {
+  fail("schemaVersion must be 5 for the Fable 5.2 / 2.1.321 profile");
 }
 
 const captureDate = profile?.capturedAt?.slice(0, 10);
@@ -105,7 +105,8 @@ for (const vector of fingerprint?.goldenVectors ?? []) {
 }
 for (const [goldenVersion, expectedFingerprint] of [
   ["2.1.258", "1e2"],
-  [version, "d7b"],
+  ["2.1.280", "d7b"],
+  [version, "cf7"],
 ]) {
   if (
     !fingerprint?.goldenVectors?.some(
@@ -125,9 +126,14 @@ for (const [goldenProfile, signature, billing] of [
     "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=sdk-cli; cch=00000;",
   ],
   [
-    `${version}-prompt-ping`,
+    "2.1.280-prompt-ping",
     "daec4",
-    `x-anthropic-billing-header: cc_version=${version}.d7b; cc_entrypoint=sdk-cli; cch=00000;`,
+    "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=sdk-cli; cch=00000;",
+  ],
+  [
+    "2.1.321-prompt-ping",
+    "a7426",
+    "x-anthropic-billing-header: cc_version=2.1.321.cf7; cc_entrypoint=sdk-cli; cch=00000;",
   ],
 ]) {
   const cchGolden = profile?.cch?.goldenVectors?.find(
@@ -142,6 +148,7 @@ for (const [goldenProfile, signature, billing] of [
   }
 }
 const required280Betas = [
+  "message-threads-2026-08-12",
   "per-turn-control-2026-07-01",
   "timing-2026-09-09",
   "mid-conversation-tool-changes-2026-07-01",
@@ -197,9 +204,26 @@ if (
 }
 if (
   profile?.provenance?.officialLinuxX64BinarySha256 !==
-  "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b"
+  "426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f"
 ) {
-  fail("official Claude Code 2.1.280 Linux x64 binary digest drifted");
+  fail("official Claude Code 2.1.321 Linux x64 binary digest drifted");
+}
+const fable52 = profile?.modelCatalog?.capabilitiesByModel?.["claude-fable-5-2"];
+if (
+  !profile.modelCatalog.models.includes("claude-fable-5-2") ||
+  fable52?.contextWindow !== 1_000_000 || fable52?.maxOutputTokens !== 128_000 ||
+  fable52?.perTurnEffort !== true || fable52?.perTurnTiming !== true ||
+  JSON.stringify(fable52?.effortLevels) !== '["low","medium","high","xhigh","max"]' ||
+  !modelDomainSource.includes('id: "claude-fable-5-2"')
+) {
+  fail("Fable 5.2 capability contract drifted");
+}
+if (!profile.previousAudits?.some((audit) =>
+  audit.profileId === "claude-code-2.1.280-audited-2026-09-23" &&
+  audit.provenance.officialLinuxX64BinarySha256 ===
+    "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b"
+)) {
+  fail("historical official audit provenance was lost");
 }
 if (profile.provenance?.realAccountVerification !== "pending") {
   fail("real-account evidence must stay explicitly pending until a live receipt exists");

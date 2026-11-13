@@ -1,25 +1,25 @@
 {
   "format": "cc-switch-claude-oauth-wire-profile",
-  "schemaVersion": 4,
-  "profileId": "claude-code-2.1.280-audited-2026-09-23",
-  "capturedAt": "2026-09-23T00:00:00Z",
+  "schemaVersion": 5,
+  "profileId": "claude-code-2.1.321-audited-2026-11-13",
+  "capturedAt": "2026-11-13T00:00:00Z",
   "versions": {
-    "claudeCode": "2.1.280",
-    "stainlessSdk": "0.112.1",
-    "node": "v26.3.0",
+    "claudeCode": "2.1.321",
+    "stainlessSdk": "0.128.0",
+    "node": "v26.12.1",
     "axios": "1.15.2"
   },
   "endpointIdentities": {
-    "usage": "claude-code/2.1.280",
-    "bootstrap": "claude-cli/2.1.280 (external, cli)",
+    "usage": "claude-code/2.1.321",
+    "bootstrap": "claude-cli/2.1.321 (external, cli)",
     "profile": "axios/1.15.2",
     "roles": "axios/1.15.2",
     "token": "axios/1.15.2",
     "inference": {
-      "userAgent": "claude-cli/2.1.280 (external, cli)",
-      "xStainlessPackageVersion": "0.112.1",
+      "userAgent": "claude-cli/2.1.321 (external, cli)",
+      "xStainlessPackageVersion": "0.128.0",
       "xStainlessRuntime": "node",
-      "xStainlessRuntimeVersion": "v26.3.0"
+      "xStainlessRuntimeVersion": "v26.12.1"
     }
   },
   "tokenEndpointOrder": [
@@ -34,13 +34,35 @@
     "promptFingerprint": {
       "algorithm": "sha256_salted_selected_utf16_code_units",
       "salt": "59cf53e54c78",
-      "utf16CodeUnitIndices": [4, 7, 20],
+      "utf16CodeUnitIndices": [
+        4,
+        7,
+        20
+      ],
       "missingCodeUnit": "0",
       "digestHexCharacters": 3,
       "promptSource": "first_user_text_before_system_migration",
       "goldenVectors": [
-        {"prompt": "ping", "version": "2.1.258", "fingerprint": "1e2"},
-        {"prompt": "ping", "version": "2.1.280", "fingerprint": "d7b"}
+        {
+          "prompt": "ping",
+          "version": "2.1.258",
+          "fingerprint": "1e2"
+        },
+        {
+          "prompt": "ping",
+          "version": "2.1.280",
+          "fingerprint": "d7b"
+        },
+        {
+          "prompt": "ping",
+          "version": "2.1.321",
+          "fingerprint": "cf7"
+        },
+        {
+          "prompt": "say ok",
+          "version": "2.1.321",
+          "fingerprint": "20d"
+        }
       ]
     }
   },
@@ -49,24 +71,58 @@
     "seedHex": "4d659218e32a3268",
     "signedAfterBodyNormalization": true,
     "modelValuesBlanked": true,
-    "excludedKeys": ["max_tokens", "fallbacks", "fallback_credit_token"],
+    "excludedKeys": [
+      "max_tokens",
+      "fallbacks",
+      "fallback_credit_token"
+    ],
     "goldenVectors": [
       {
         "profile": "2.1.258-prompt-ping",
         "signature": "8d393",
         "syntheticBody": {
           "model": "model-a",
-          "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "ping"
+                }
+              ]
+            }
+          ],
           "system": [
-            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=sdk-cli; cch=00000;"},
-            {"type": "text", "text": "system-x"}
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.258.1e2; cc_entrypoint=sdk-cli; cch=00000;"
+            },
+            {
+              "type": "text",
+              "text": "system-x"
+            }
           ],
           "tools": [],
-          "metadata": {"user_id": "meta-x"},
+          "metadata": {
+            "user_id": "meta-x"
+          },
           "max_tokens": 1,
-          "thinking": {"type": "adaptive", "display": "omitted"},
-          "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
-          "output_config": {"effort": "high"},
+          "thinking": {
+            "type": "adaptive",
+            "display": "omitted"
+          },
+          "context_management": {
+            "edits": [
+              {
+                "type": "clear_thinking_20251015",
+                "keep": "all"
+              }
+            ]
+          },
+          "output_config": {
+            "effort": "high"
+          },
           "stream": true
         }
       },
@@ -75,17 +131,96 @@
         "signature": "daec4",
         "syntheticBody": {
           "model": "model-a",
-          "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "ping"
+                }
+              ]
+            }
+          ],
           "system": [
-            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=sdk-cli; cch=00000;"},
-            {"type": "text", "text": "system-x"}
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.280.d7b; cc_entrypoint=sdk-cli; cch=00000;"
+            },
+            {
+              "type": "text",
+              "text": "system-x"
+            }
           ],
           "tools": [],
-          "metadata": {"user_id": "meta-x"},
+          "metadata": {
+            "user_id": "meta-x"
+          },
           "max_tokens": 1,
-          "thinking": {"type": "adaptive", "display": "omitted"},
-          "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
-          "output_config": {"effort": "high"},
+          "thinking": {
+            "type": "adaptive",
+            "display": "omitted"
+          },
+          "context_management": {
+            "edits": [
+              {
+                "type": "clear_thinking_20251015",
+                "keep": "all"
+              }
+            ]
+          },
+          "output_config": {
+            "effort": "high"
+          },
+          "stream": true
+        }
+      },
+      {
+        "profile": "2.1.321-prompt-ping",
+        "signature": "a7426",
+        "syntheticBody": {
+          "model": "model-a",
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "ping"
+                }
+              ]
+            }
+          ],
+          "system": [
+            {
+              "type": "text",
+              "text": "x-anthropic-billing-header: cc_version=2.1.321.cf7; cc_entrypoint=sdk-cli; cch=00000;"
+            },
+            {
+              "type": "text",
+              "text": "system-x"
+            }
+          ],
+          "tools": [],
+          "metadata": {
+            "user_id": "meta-x"
+          },
+          "max_tokens": 1,
+          "thinking": {
+            "type": "adaptive",
+            "display": "omitted"
+          },
+          "context_management": {
+            "edits": [
+              {
+                "type": "clear_thinking_20251015",
+                "keep": "all"
+              }
+            ]
+          },
+          "output_config": {
+            "effort": "high"
+          },
           "stream": true
         }
       }
@@ -133,6 +268,19 @@
     "tlsHeaderOrderImpersonation": {
       "implemented": false,
       "reason": "no reproducible upstream rejection evidence"
+    },
+    "schemaDescriptionFallback": {
+      "environment": "CC_SWITCH_CLAUDE_SCHEMA_DESCRIPTION_FALLBACK",
+      "default": false,
+      "strictSchemas": "reject_never_weaken"
+    },
+    "threadProfiles": {
+      "storage": "claude-thread-profiles.sqlite3",
+      "ttlSeconds": 86400,
+      "maxEntries": 1024,
+      "maxPayloadBytes": 8388608,
+      "scope": "fixed_share_principal_session_provider_revision_runtime_account_durable_owner_auth_generation_upstream_model",
+      "successfulTerminalOnly": true
     }
   },
   "betaMatrices": {
@@ -142,9 +290,9 @@
         "oauth-2025-04-20",
         "interleaved-thinking-2025-05-14",
         "redact-thinking-2026-02-12",
-        "thinking-token-count-2026-05-13",
         "context-management-2025-06-27",
         "prompt-caching-scope-2026-01-05",
+        "thinking-token-count-2026-05-13",
         "effort-2025-11-24",
         "extended-cache-ttl-2025-04-11"
       ],
@@ -166,7 +314,9 @@
         "thinking-resumption-2026-07-17",
         "fast-mode-2026-02-01",
         "prompt-caching-evict-2026-05-12",
-        "cache-diagnosis-2026-04-07"
+        "cache-diagnosis-2026-04-07",
+        "message-threads-2026-08-12",
+        "afk-mode-2026-01-31"
       ],
       "shapeRules": {
         "thinkingDisplayUpdates": {
@@ -179,7 +329,10 @@
             "tool_search_tool_regex_20251119",
             "tool_search_tool_bm25_20251119"
           ],
-          "booleanPaths": ["defer_loading", "custom.defer_loading"],
+          "booleanPaths": [
+            "defer_loading",
+            "custom.defer_loading"
+          ],
           "ordinaryToolsEnable": false
         }
       },
@@ -191,7 +344,8 @@
       "auditedClientCompatibility": [
         "prompt-caching-2024-07-31",
         "token-efficient-tools-2025-02-19"
-      ]
+      ],
+      "orderedAssembly": "2.1.321: thinking-token-count after advisor; effort before safeguards; mid-conversation-system explicit only; thread beta body-gated; quota probe omits CLI/thinking-token-count"
     },
     "countTokens": {
       "always": [
@@ -201,7 +355,10 @@
         "context-management-2025-06-27",
         "token-counting-2024-11-01"
       ],
-      "shapeGated": ["context-1m-2025-08-07", "advisor-tool-2026-03-01"],
+      "shapeGated": [
+        "context-1m-2025-08-07",
+        "advisor-tool-2026-03-01"
+      ],
       "generationOnlyBetasAllowed": false,
       "auditedClientCompatibility": [
         "prompt-caching-2024-07-31",
@@ -231,17 +388,221 @@
       ]
     },
     "capabilitiesByModel": {
-      "claude-opus-5-5": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": true, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": true, "perTurnTiming": true, "webSearch": true},
-      "claude-fable-5-1": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": true, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": true, "perTurnTiming": true, "webSearch": true},
-      "claude-fable-5": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": true, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
-      "claude-opus-5": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": false, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
-      "claude-opus-4-8": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": false, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
-      "claude-sonnet-5": {"contextWindow": 1000000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "xhigh", "max"], "dynamicThinking": true, "rejectsDisabledThinking": false, "midConversationSystem": true, "midConversationToolChanges": true, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
-      "claude-opus-4-6": {"contextWindow": 200000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "max"], "dynamicThinking": true, "rejectsDisabledThinking": false, "midConversationSystem": false, "midConversationToolChanges": false, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
-      "claude-sonnet-4-6": {"contextWindow": 200000, "maxOutputTokens": 128000, "inputModalities": ["text", "image"], "effortLevels": ["low", "medium", "high", "max"], "dynamicThinking": true, "rejectsDisabledThinking": false, "midConversationSystem": false, "midConversationToolChanges": false, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true},
-      "claude-haiku-4-5-20251001": {"contextWindow": 200000, "maxOutputTokens": 64000, "inputModalities": ["text", "image"], "effortLevels": [], "dynamicThinking": false, "rejectsDisabledThinking": false, "midConversationSystem": false, "midConversationToolChanges": false, "perTurnEffort": false, "perTurnTiming": false, "webSearch": true}
+      "claude-opus-5-5": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "inputModalities": [
+          "text",
+          "image"
+        ],
+        "effortLevels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "dynamicThinking": true,
+        "rejectsDisabledThinking": true,
+        "midConversationSystem": true,
+        "midConversationToolChanges": true,
+        "perTurnEffort": true,
+        "perTurnTiming": true,
+        "webSearch": true
+      },
+      "claude-fable-5-1": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "inputModalities": [
+          "text",
+          "image"
+        ],
+        "effortLevels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "dynamicThinking": true,
+        "rejectsDisabledThinking": true,
+        "midConversationSystem": true,
+        "midConversationToolChanges": true,
+        "perTurnEffort": true,
+        "perTurnTiming": true,
+        "webSearch": true
+      },
+      "claude-fable-5": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "inputModalities": [
+          "text",
+          "image"
+        ],
+        "effortLevels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "dynamicThinking": true,
+        "rejectsDisabledThinking": true,
+        "midConversationSystem": true,
+        "midConversationToolChanges": true,
+        "perTurnEffort": false,
+        "perTurnTiming": false,
+        "webSearch": true
+      },
+      "claude-opus-5": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "inputModalities": [
+          "text",
+          "image"
+        ],
+        "effortLevels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "dynamicThinking": true,
+        "rejectsDisabledThinking": false,
+        "midConversationSystem": true,
+        "midConversationToolChanges": true,
+        "perTurnEffort": false,
+        "perTurnTiming": false,
+        "webSearch": true
+      },
+      "claude-opus-4-8": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "inputModalities": [
+          "text",
+          "image"
+        ],
+        "effortLevels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "dynamicThinking": true,
+        "rejectsDisabledThinking": false,
+        "midConversationSystem": true,
+        "midConversationToolChanges": true,
+        "perTurnEffort": false,
+        "perTurnTiming": false,
+        "webSearch": true
+      },
+      "claude-sonnet-5": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "inputModalities": [
+          "text",
+          "image"
+        ],
+        "effortLevels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "dynamicThinking": true,
+        "rejectsDisabledThinking": false,
+        "midConversationSystem": true,
+        "midConversationToolChanges": true,
+        "perTurnEffort": false,
+        "perTurnTiming": false,
+        "webSearch": true
+      },
+      "claude-opus-4-6": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 128000,
+        "inputModalities": [
+          "text",
+          "image"
+        ],
+        "effortLevels": [
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "dynamicThinking": true,
+        "rejectsDisabledThinking": false,
+        "midConversationSystem": false,
+        "midConversationToolChanges": false,
+        "perTurnEffort": false,
+        "perTurnTiming": false,
+        "webSearch": true
+      },
+      "claude-sonnet-4-6": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 128000,
+        "inputModalities": [
+          "text",
+          "image"
+        ],
+        "effortLevels": [
+          "low",
+          "medium",
+          "high",
+          "max"
+        ],
+        "dynamicThinking": true,
+        "rejectsDisabledThinking": false,
+        "midConversationSystem": false,
+        "midConversationToolChanges": false,
+        "perTurnEffort": false,
+        "perTurnTiming": false,
+        "webSearch": true
+      },
+      "claude-haiku-4-5-20251001": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 64000,
+        "inputModalities": [
+          "text",
+          "image"
+        ],
+        "effortLevels": [],
+        "dynamicThinking": false,
+        "rejectsDisabledThinking": false,
+        "midConversationSystem": false,
+        "midConversationToolChanges": false,
+        "perTurnEffort": false,
+        "perTurnTiming": false,
+        "webSearch": true
+      },
+      "claude-fable-5-2": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 128000,
+        "inputModalities": [
+          "text",
+          "image"
+        ],
+        "effortLevels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "dynamicThinking": true,
+        "rejectsDisabledThinking": true,
+        "midConversationSystem": true,
+        "midConversationToolChanges": true,
+        "perTurnEffort": true,
+        "perTurnTiming": true,
+        "webSearch": true
+      }
     },
     "models": [
+      "claude-fable-5-2",
       "claude-opus-5-5",
       "claude-fable-5-1",
       "claude-fable-5",
@@ -254,10 +615,31 @@
     ]
   },
   "provenance": {
-    "kind": "sanitized_npm_latest_native_binary_static_and_loopback_audit",
+    "kind": "official_npm_integrity_and_native_binary_static_identifiers_plus_reviewed_reference_captures",
     "containsSecrets": false,
-    "officialLinuxX64BinarySha256": "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b",
+    "officialLinuxX64BinarySha256": "426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f",
+    "officialNpmIntegrity": "sha512-lW+MhUThnU2hr6QnQ9xgD8c6OWAJbYNpiMzIQ4OJaLxcByTs53v7wV/2IzGspBbcMhnxFox1vvoltuWym/h6uw==",
+    "referenceCommit": "1aaf56bc",
     "realAccountVerification": "pending",
-    "notes": "Audited from the official npm latest Claude Code 2.1.280 Linux x64 native binary on 2026-09-23. Static inspection confirmed the public identity versions, prompt-derived billing salt, retained CCH normalization identifiers, Opus 5.5 model catalog capability data, and the ordered feature-gated beta names without using a real credential or contacting Anthropic. CLIProxyAPI 24303543, 779bf317 and bd584a75 were read-only cross-evidence. Values retain only public endpoint, version, header-family, beta-policy, model capability, fingerprint, checksum, and CCH normalization identifiers required by the Server contract. Tokens, account identifiers, raw request bodies, raw response bodies, pricing, provider fallbacks, and private build metadata are excluded. Real subscription-account verification remains pending."
-  }
+    "notes": "Official npm 2.1.321 Linux x64 archive integrity was checked before static inspection, without executing the binary or using credentials. Public version, SDK/runtime/Axios, Fable 5.2, billing salt, Thread and thinking-binding identifiers were found. Ordered request semantics are cross-evidenced by CLIProxyAPI b4e7dbd2/6db7d4b8/02ec93d0 committed source and sanitized 2.1.321 capture regression tests. The 2.1.280 provenance and synthetic checksum vectors are retained as history; no claim of a new live capture or subscription entitlement."
+  },
+  "previousAudits": [
+    {
+      "profileId": "claude-code-2.1.280-audited-2026-09-23",
+      "capturedAt": "2026-09-23T00:00:00Z",
+      "versions": {
+        "claudeCode": "2.1.280",
+        "stainlessSdk": "0.112.1",
+        "node": "v26.3.0",
+        "axios": "1.15.2"
+      },
+      "provenance": {
+        "kind": "sanitized_npm_latest_native_binary_static_and_loopback_audit",
+        "containsSecrets": false,
+        "officialLinuxX64BinarySha256": "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b",
+        "realAccountVerification": "pending",
+        "notes": "Audited from the official npm latest Claude Code 2.1.280 Linux x64 native binary on 2026-09-23. Static inspection confirmed the public identity versions, prompt-derived billing salt, retained CCH normalization identifiers, Opus 5.5 model catalog capability data, and the ordered feature-gated beta names without using a real credential or contacting Anthropic. CLIProxyAPI 24303543, 779bf317 and bd584a75 were read-only cross-evidence. Values retain only public endpoint, version, header-family, beta-policy, model capability, fingerprint, checksum, and CCH normalization identifiers required by the Server contract. Tokens, account identifiers, raw request bodies, raw response bodies, pricing, provider fallbacks, and private build metadata are excluded. Real subscription-account verification remains pending."
+      }
+    }
+  ]
 }

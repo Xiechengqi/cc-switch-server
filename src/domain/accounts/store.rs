@@ -52,6 +52,9 @@ pub struct AccountStore {
     // estimate, but replaced when an account is deleted and recreated.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) kiro_prompt_cache_owner_ids: BTreeMap<String, String>,
+    // Durable protocol namespace; rotation preserves it, delete/recreate does not.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) claude_thread_owner_ids: BTreeMap<String, String>,
     // In-flight requests do not survive a process restart. This non-persistent
     // generation distinguishes delete/recreate with the same ID and credentials.
     #[serde(skip)]
@@ -83,6 +86,62 @@ fn legacy_kiro_prompt_cache_owner_id(account: &Account) -> String {
 
 fn valid_kiro_prompt_cache_owner_id(value: &str) -> bool {
     value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn claude_thread_credential_fingerprint(account: &Account) -> String {
+    struct FingerprintWriter(Sha256);
+    impl std::io::Write for FingerprintWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut digest = FingerprintWriter(Sha256::new());
+    serde_json::to_writer(
+        &mut digest,
+        &(
+            &account.access_token,
+            &account.refresh_token,
+            &account.id_token,
+            &account.token_type,
+            &account.api_key,
+            &account.extra_headers,
+            &account.profile,
+            &account.email,
+            account.expires_at,
+        ),
+    )
+    .expect("serializable Claude credential tuple");
+    hex::encode(digest.0.finalize())
+}
+
+fn claude_thread_owner_record(account: &Account, owner: &str) -> String {
+    format!("{owner}:{}", claude_thread_credential_fingerprint(account))
+}
+
+fn legacy_claude_thread_owner_record(account: &Account) -> String {
+    let digest = Sha256::digest(format!(
+        "cc-switch-server:claude-thread-owner:legacy:v1\0{}",
+        account.id
+    ));
+    claude_thread_owner_record(account, &hex::encode(&digest[..16]))
+}
+
+fn new_claude_thread_owner_record(account: &Account) -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    claude_thread_owner_record(account, &hex::encode(bytes))
+}
+
+fn valid_claude_thread_owner_record(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(owner, fingerprint)| {
+        valid_kiro_prompt_cache_owner_id(owner)
+            && fingerprint.len() == 64
+            && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -939,7 +998,19 @@ impl AccountStore {
                     account.id == *id && uses_kiro_prompt_cache_owner(account.provider_type)
                 })
         });
+        store.claude_thread_owner_ids.retain(|id, owner| {
+            valid_claude_thread_owner_record(owner)
+                && store.accounts.iter().any(|account| {
+                    account.id == *id && account.provider_type == ProviderType::ClaudeOAuth
+                })
+        });
         for account in &store.accounts {
+            if account.provider_type == ProviderType::ClaudeOAuth {
+                store
+                    .claude_thread_owner_ids
+                    .entry(account.id.clone())
+                    .or_insert_with(|| legacy_claude_thread_owner_record(account));
+            }
             if uses_kiro_prompt_cache_owner(account.provider_type) {
                 store
                     .kiro_prompt_cache_owner_ids
@@ -1014,6 +1085,21 @@ impl AccountStore {
                 .entry(account.id.clone())
                 .or_insert_with(next_account_incarnation);
             let previous = existing.clone();
+            if account.provider_type == ProviderType::ClaudeOAuth {
+                if previous.provider_type == ProviderType::ClaudeOAuth
+                    && claude_thread_credential_fingerprint(&previous)
+                        == claude_thread_credential_fingerprint(&account)
+                {
+                    self.claude_thread_owner_ids
+                        .entry(account.id.clone())
+                        .or_insert_with(|| legacy_claude_thread_owner_record(&previous));
+                } else {
+                    self.claude_thread_owner_ids
+                        .insert(account.id.clone(), new_claude_thread_owner_record(&account));
+                }
+            } else {
+                self.claude_thread_owner_ids.remove(&account.id);
+            }
             if uses_kiro_prompt_cache_owner(account.provider_type) {
                 if account.provider_type == previous.provider_type {
                     self.kiro_prompt_cache_owner_ids
@@ -1063,6 +1149,10 @@ impl AccountStore {
             initialize_account_generations(&mut account);
             self.account_incarnations
                 .insert(account.id.clone(), next_account_incarnation());
+            if account.provider_type == ProviderType::ClaudeOAuth {
+                self.claude_thread_owner_ids
+                    .insert(account.id.clone(), new_claude_thread_owner_record(&account));
+            }
             if uses_kiro_prompt_cache_owner(account.provider_type) {
                 self.kiro_prompt_cache_owner_ids
                     .insert(account.id.clone(), new_kiro_prompt_cache_owner_id());
@@ -1319,6 +1409,7 @@ impl AccountStore {
         let deleted = self.accounts.len() != before;
         if deleted {
             self.account_incarnations.remove(account_id);
+            self.claude_thread_owner_ids.remove(account_id);
             self.kiro_prompt_cache_owner_ids.remove(account_id);
             self.buddy_checkins.remove(account_id);
         }
@@ -1330,6 +1421,17 @@ impl AccountStore {
 
     pub(crate) fn account_incarnation(&self, account_id: &str) -> Option<u64> {
         self.account_incarnations.get(account_id).copied()
+    }
+
+    pub(crate) fn claude_thread_owner_id(&self, account_id: &str) -> Option<&str> {
+        let account = self.accounts.iter().find(|account| {
+            account.id == account_id && account.provider_type == ProviderType::ClaudeOAuth
+        })?;
+        let (owner, fingerprint) = self
+            .claude_thread_owner_ids
+            .get(account_id)?
+            .split_once(':')?;
+        (fingerprint == claude_thread_credential_fingerprint(account)).then_some(owner)
     }
 
     pub(crate) fn kiro_prompt_cache_owner_id(&self, account_id: &str) -> Option<&str> {
@@ -1446,6 +1548,23 @@ impl AccountStore {
         advance_account_generations(&previous, account);
         record_observation_drafts(account, update.capability_observations);
         let account = account.clone();
+        if account.provider_type == ProviderType::ClaudeOAuth {
+            let previous_record = self
+                .claude_thread_owner_ids
+                .get(account_id)
+                .cloned()
+                .unwrap_or_else(|| legacy_claude_thread_owner_record(&previous));
+            let record = if let Some((owner, _)) =
+                previous_record.split_once(':').filter(|(_, fingerprint)| {
+                    *fingerprint == claude_thread_credential_fingerprint(&previous)
+                }) {
+                claude_thread_owner_record(&account, owner)
+            } else {
+                new_claude_thread_owner_record(&account)
+            };
+            self.claude_thread_owner_ids
+                .insert(account_id.to_string(), record);
+        }
         if self
             .buddy_checkins
             .get(account_id)
@@ -3133,6 +3252,49 @@ mod tests {
             );
             std::fs::remove_dir_all(config_dir).unwrap();
         }
+    }
+
+    #[test]
+    fn claude_thread_owner_survives_trusted_refresh_and_restart_not_direct_edits_or_recreate() {
+        let dir = account_store_test_dir("claude-thread-owner");
+        let mut store = AccountStore::default();
+        let mut input = fixture_input(ProviderType::ClaudeOAuth);
+        input.id = Some("claude-thread-owner".into());
+        input.access_token = Some("first-secret".into());
+        let account = store.upsert(input.clone());
+        let owner = store
+            .claude_thread_owner_id(&account.id)
+            .unwrap()
+            .to_string();
+        let updated = store
+            .mark_refresh_success(
+                &account.id,
+                AccountRefreshUpdate {
+                    access_token: Some("rotated-secret".into()),
+                    ..AccountRefreshUpdate::default()
+                },
+            )
+            .unwrap();
+        assert!(updated.token_refresh_generation > account.token_refresh_generation);
+        assert_eq!(
+            store.claude_thread_owner_id(&account.id),
+            Some(owner.as_str())
+        );
+        store.save(&dir).unwrap();
+        let mut store = AccountStore::load_or_default(&dir).unwrap();
+        assert_eq!(
+            store.claude_thread_owner_id(&account.id),
+            Some(owner.as_str())
+        );
+        store.accounts[0].access_token = Some("untrusted-same-generation-secret".into());
+        assert!(store.claude_thread_owner_id(&account.id).is_none());
+        assert!(store.delete(&account.id));
+        store.upsert(input);
+        assert_ne!(
+            store.claude_thread_owner_id(&account.id),
+            Some(owner.as_str())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

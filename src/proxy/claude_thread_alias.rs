@@ -406,6 +406,7 @@ pub(crate) fn restore_request_names(
         Bytes::from(serde_json::to_vec(&value).map_err(|_| {
             ProxyError::bad_request("cannot encode Claude thread continuation body")
         })?);
+    super::claude_oauth::resign_thread_body(body)?;
     Ok(())
 }
 

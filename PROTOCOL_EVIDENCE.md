@@ -3203,3 +3203,23 @@ Server 在 Buddy 共用 SSE 解码器中按本次生成请求的工具 schema �
 ### 2026-11-12 图片数量策略 CI 契约同步
 
 997eb2e 遗漏独立 reference-delta 审计：imageInputExtension 仍声明 images=16，localEvidence 引用旧测试名，导致 CI 的 audit-codebuddy-reference-delta.mjs 失败。现以 images=null 和明确的 upstream_enforced_no_local_count_ceiling 策略描述无本地数量上限，同步新测试锚点；审计继续要求原有解码字节/URL/内存保护，并检查 Buddy 不再引用共享数量常量。外部冻结证据、Driver revision 与 live_pending 验收边界不变。
+
+## 2026-11-13 Claude Fable 5.2 协议增量
+
+实施基线为 Server `d077184`，只读参考 CLIProxyAPI `1aaf56bc`。重点证据为 `b4e7dbd2` 的 CLI 2.1.321 wire profile、`6db7d4b8` 的 Fable 5.2 preserved thinking 与逐轮门控、`02ec93d0` 的 Thread beta 快照、`27762819` 的 Responses system 保真、`9acf81d3` 的搜索引用闭包；并核对 `helps/cloak_utils.go` 的 JSON 编码 metadata.user_id。参考仓库不是构建、测试、发布或运行时输入，不修改既有冻结历史。官方 npm registry 已确认 2.1.321 包及其公开完整性元数据，原生二进制静态核验与本仓回归另行记录。
+
+范围：单个固定 Provider / Account 的原生身份、Fable 5.2 能力、完整 wire profile、签名 thinking 前缀兼容、Thread 协议最小状态恢复，以及模型能力门控的转换保真。不新增账号池、账号/模型切换、无条件重放、签名伪造、外仓 KV 或 TLS 模拟。缺失/冲突额度证据保留现有保守分类；模型能力不等于套餐 entitlement。非法 schema 不默认削弱 strict 约束。
+
+实施：能力单一来源增加精确 Fable 5.2（1M context / 128K output / 五档 effort / adaptive / 逐轮控制与 timing），Fable 单账号容量分类扩至 5/5.1/5.2，未知型号不自动继承。wire profile 整体更新至 CLI 2.1.321、SDK 0.128.0、Node v26.12.1、Axios 1.15.2，并同步 feature-gated beta 顺序、CountTokens 隔离、现代 JSON metadata、cli-bg/sdk-ts 识别及 header/body 会话一致性。官方 npm archive integrity 已核对，原生二进制 SHA-256 为 `426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f`；只做静态检查，没有执行二进制或访问真实 Anthropic。历史 provenance/golden 保留，新 CCH `a7426` 明确为合成向量，不冒充新的真实捕获。
+
+Thread 只持久化协议 betas、政策摘要和工具别名，不保存 token、prompt、参数或 thinking；SQLite 缓存权限 0600，24h / 1024 项 / 8 MiB payload / 单项 64 KiB / 文件页上限 16 MiB，读取先校验长度并计入内存预算。域方法封装 blocking I/O，作用域绑定 Share、principal、session、Provider revision/runtime、账号 durable owner/auth identity、上游 URL 和模型。受控同账号刷新和真正重启可恢复；直接更换凭据、删除重建、作用域变化、冲突/过期或新增不兼容 beta 均不能继承。所有 continue 都要求成功快照，缺失时出站前 409，旧内存 Thread 需完整历史重新 create。保留完整上下文，不以自动重放或 fallback 掩盖未知状态。
+
+兼容增强只作用于 Claude OAuth：已审计签名历史按合法 thinking / 显式策略补窄范围 prefix binding，搜索引用按失效依赖闭包清理，OpenAI/Responses 转换按模型能力保留 system/cache 分块和 xhigh。无法合法放置的中途指令明确拒绝，不静默降为 user。schema 遍历仅限 schema 位置并有深度界限；非 strict 描述式兼容必须显式开启，strict 永不静默放宽。Fable 5.2 的真实 receipt、独立输入和验收手册已同步，不复用 5.1 或 Opus receipt；Max 20x 是该 operation 的明确测试账号选择，不是对其他套餐 entitlement 的否定。
+
+整体 review 已修正：工具别名恢复后必须重签最终 CCH；上游中断或快照提交失败不能发布成功终态；Claude 本地流式 error 自身即为终态，不再附加 message_stop；非流式快照提交失败仍记录已观察到的实际用量。CodeBuddy、Qoder 和 Antigravity 的共享 Claude 错误回归同步使用完整语义观察器验证，无成功 stop；重启夹具重新设置不落盘的 test-only loopback endpoint，未放宽生产 endpoint 或作用域约束。新增 owner 持久化已核对加密账号快照和 SQLite canonical load；Provider writer 证据由生成器更新并验证，不手改摘要。
+
+最终冻结 Rust 源摘要（src/tests，含新增文件）为 `14c5ef0686f7441831a55d6e0f6837bc12d65b6756053929e025834ffda00066`，完整 all-targets 测试至 check/Clippy/build/smoke 后保持一致。`RUST_MIN_STACK=67108864 cargo test --all-targets --no-fail-fast`：库 4407 passed / 2 failed / 3 ignored；API 集成 138 项、两个独立 fixture 各 1 项通过。两项失败仍为本文件 2026-11-12 已记录的额度状态基线：tariff ACK schema 预期 5 实际 6，以及 signed conversion 的 tampered 设置拒绝断言；未修改无关实现或放宽断言，完整 Rust 全套仍不能宣称通过。本轮 Claude 新增及受影响回归全部通过。
+
+`cargo check`、严格 all-targets Clippy（warnings denied）、build、cargo fmt 及全部独立 Rust 文件 rustfmt、原脚本本地启动 HTTP smoke 通过。本轮完整 static-checks 通过（含 Web typecheck / 396 项测试）；最后 Rust 收尾后另行复核上述编译/格式门禁，完整 Node 审计再次 2205 passed、smoke 脚本测试 13 passed。wire-profile、reference-delta（含 committed external object/tree/SHA 验证）、Provider coverage/UI matrix、Phase 0 合同及文档索引通过。离线 readiness 使用 RUN_TESTS=0 / RUN_REAL=0 / RUN_DEPLOYMENT_TESTS=0，实际为 failures=0、blocked_inputs；缺真实输入、内部 local-contracts-unverified 与 deployment-not-tested 保留，不能等同发布通过。
+
+本轮离线实现与整体 review 完成；全部真实 operation 仍为 live_pending。旧 5.1 receipt、合成样例和 loopback 不能证明真实 Anthropic 接受性，尚不能承诺生产断网/compact 后的实际 CLI 续接成功。未提交、推送、部署、调用生产推理或修改参考仓库。

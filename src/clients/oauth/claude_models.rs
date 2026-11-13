@@ -6,7 +6,7 @@ pub use crate::domain::claude_models::{
     claude_model_capability, ClaudeModelCapability, CLAUDE_MODEL_CAPABILITIES, CLAUDE_MODEL_IDS,
 };
 
-pub const CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS: i64 = 1_790_121_600_000;
+pub const CLAUDE_MODEL_CATALOG_CAPTURED_AT_MS: i64 = 1_794_528_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeModelCatalog {
@@ -50,6 +50,7 @@ mod tests {
         assert_eq!(
             catalog.models,
             vec![
+                "claude-fable-5-2",
                 "claude-opus-5-5",
                 "claude-fable-5-1",
                 "claude-fable-5",
@@ -121,11 +122,16 @@ mod tests {
     fn fable_family_matching_is_strict() {
         assert!(is_claude_fable_5_model("claude-fable-5"));
         assert!(is_claude_fable_5_model("claude-fable-5-1"));
+        assert!(is_claude_fable_5_model("claude-fable-5-2"));
+        assert!(is_claude_fable_5_model("claude-fable-5-2:thinking[1m]"));
+        assert!(is_claude_fable_5_model("claude-fable-5-2-thinking"));
         assert!(is_claude_fable_5_model("claude-fable-5-thinking"));
         assert!(is_claude_fable_5_model("claude-fable-5-1-thinking"));
         assert!(!is_claude_fable_5_model("claude-fable-5-preview"));
         assert!(!is_claude_fable_5_model("claude-fable-5-1-preview"));
         assert!(!is_claude_fable_5_model("claude-fable-50"));
+        assert!(!is_claude_fable_5_model("claude-fable-5-20"));
+        assert!(!is_claude_fable_5_model("claude-fable-5-2-preview"));
         assert!(!is_claude_fable_5_model("vendor/claude-fable-5"));
         assert!(!is_claude_fable_5_model("claude-opus-5"));
     }

@@ -18,17 +18,17 @@ pub enum ClaudeFableEligibility {
 
 pub const CLAUDE_FABLE_MODEL_FAMILY: &str = "claude-fable-5";
 pub const CLAUDE_FABLE_5_1_MODEL: &str = "claude-fable-5-1";
+pub const CLAUDE_FABLE_5_2_MODEL: &str = "claude-fable-5-2";
 
 pub fn is_claude_fable_5_model(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
+    let normalized = normalized
+        .trim_end_matches("[1m]")
+        .trim_end_matches(":thinking")
+        .trim_end_matches("-thinking");
     matches!(
-        normalized.as_str(),
-        CLAUDE_FABLE_MODEL_FAMILY
-            | CLAUDE_FABLE_5_1_MODEL
-            | "claude-fable-5-thinking"
-            | "claude-fable-5:thinking"
-            | "claude-fable-5-1-thinking"
-            | "claude-fable-5-1:thinking"
+        normalized,
+        CLAUDE_FABLE_MODEL_FAMILY | CLAUDE_FABLE_5_1_MODEL | CLAUDE_FABLE_5_2_MODEL
     )
 }
 
