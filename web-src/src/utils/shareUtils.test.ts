@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   formatShareLimitInput,
+  formatShareTokens,
   getShareDisplayStatus,
   isUnlimitedParallelLimit,
   isUnlimitedTokenLimit,
@@ -90,4 +91,24 @@ describe("account quota roundtrip", () => {
     "does not normalize malformed boundaries into usable quota: %j", (invalid) => {
       expect(normalizeShareRecord(record(invalid))?.userGrants?.["u@example.com"].accountQuotaCycle).toBeUndefined();
     });
+});
+
+describe("formatShareTokens", () => {
+  it("chooses the unit after rounding", () => {
+    expect(formatShareTokens(999_950, "en")).toBe("1.00M");
+    expect(formatShareTokens(999_999_999, "en")).toBe("1.00B");
+    expect(formatShareTokens(99_999_500, "zh")).toBe("1.00 亿");
+    expect(formatShareTokens(99_995_000, "zh")).toBe("9999.5 万");
+    expect(formatShareTokens(46_052_134, "zh-CN")).toBe("4605.2 万");
+  });
+
+  it("uses the UI language's units and grouping", () => {
+    expect(formatShareTokens(150_000_000, "ja")).toBe("1.50 億");
+    expect(formatShareTokens(150_000_000, "zh-TW")).toBe("1.50 億");
+    expect(formatShareTokens(12_000, "zh-TW")).toBe("1.2 萬");
+    expect(formatShareTokens(1_500, "en")).toBe("1.5K");
+    expect(formatShareTokens(9_999, "zh")).toBe((9_999).toLocaleString("zh"));
+    expect(formatShareTokens(0, "en")).toBe("0");
+    expect(formatShareTokens(null, "en")).toBe("0");
+  });
 });

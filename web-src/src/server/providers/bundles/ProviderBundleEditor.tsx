@@ -40,6 +40,7 @@ import { resolveBundleIcon } from "./bundleIcon";
 
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ProviderIconControl } from "@/components/providers/ProviderIconControl";
+import { ShareSubheading } from "@/components/providers/ShareSubheading";
 import { ShareUserGrantsEditor } from "@/components/providers/ShareUserGrantsEditor";
 import { CodexBankedResetPanel } from "@/components/providers/forms/CodexBankedResetPanel";
 import { ManagedAccountSection } from "@/components/providers/forms/ManagedAccountSection";
@@ -115,10 +116,12 @@ import {
   isValidShareEmail,
   SHARE_TOKEN_PRESETS,
 } from "@/utils/shareFormUtils";
-import { DEFAULT_PARALLEL_LIMIT } from "@/utils/shareUtils";
+import { DEFAULT_PARALLEL_LIMIT, formatShareTokens } from "@/utils/shareUtils";
 import {
   BUNDLE_SHARE_EXPIRY_PRESETS,
   createBundleShareDraft,
+  shareLimitInput,
+  shareLimitState,
   isValidShareSlug,
   bundleShareGrantHandlers,
   saveBundleShare,
@@ -1025,8 +1028,8 @@ function SurfaceEditor({
 }
 
 function positiveShareLimit(value: string): number | undefined {
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+  const parsed = shareLimitInput(value);
+  return typeof parsed === "number" ? parsed : undefined;
 }
 
 function defaultBundleUserPolicy(
@@ -1035,14 +1038,71 @@ function defaultBundleUserPolicy(
   const expiryPreset = BUNDLE_SHARE_EXPIRY_PRESETS.find(
     (preset) => preset.value === draft.expiry,
   );
+  const currentExpiry = draft.expiry === "current" && draft.baseline
+    ? Date.parse(draft.baseline.expiresAt)
+    : Number.NaN;
   return {
     parallelLimit: positiveShareLimit(draft.parallelLimit),
     tokenLimit: positiveShareLimit(draft.tokenLimit),
     tokenPeriod: "lifetime",
     expiresAt: expiryPreset
       ? Date.now() + expiryPreset.seconds * 1000
-      : undefined,
+      : Number.isFinite(currentExpiry) ? currentExpiry : undefined,
   };
+}
+
+/**
+ * Private or public, as one choice. Public means any signed-in Router user may
+ * call with their own token; it is never anonymous.
+ */
+function ShareAccessModeField({ value, onChange, disabled }: {
+  value: boolean; onChange: (freeAccess: boolean) => void; disabled?: boolean;
+}) {
+  const { t } = useTranslation();
+  const options = [
+    { id: false, label: t("share.freeAccess.private") },
+    { id: true, label: t("share.freeAccess.public") },
+  ];
+  return (
+    <div className="space-y-1.5">
+      <div
+        role="radiogroup"
+        aria-labelledby="bundle-share-access-title"
+        className="inline-grid h-9 grid-cols-2 gap-0.5 rounded-md border border-border-default bg-muted/40 p-0.5"
+        onKeyDown={(event) => {
+          if (disabled || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+          event.preventDefault();
+          onChange(!value);
+          (event.currentTarget.querySelector(`[data-access="${!value}"]`) as HTMLButtonElement | null)?.focus();
+        }}
+      >
+        {options.map((option) => {
+          const selected = option.id === value;
+          return (
+            <button
+              key={String(option.id)}
+              type="button"
+              role="radio"
+              data-access={String(option.id)}
+              aria-checked={selected}
+              tabIndex={selected ? 0 : -1}
+              disabled={disabled}
+              onClick={() => onChange(option.id)}
+              className={cn(
+                "rounded px-4 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
+                selected ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {option.label}
+            </button>
+          );
+        })}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        {value ? t("share.freeAccess.publicHint") : t("share.freeAccess.privateHint")}
+      </p>
+    </div>
+  );
 }
 
 function BundleShareEditor({
@@ -1066,7 +1126,7 @@ function BundleShareEditor({
   showGrokMedia: boolean;
   disabled?: boolean;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const routerManagedEmails = useMemo(
     () =>
       new Set(
@@ -1110,6 +1170,17 @@ function BundleShareEditor({
   } = bundleShareGrantHandlers(onChange);
   const updateDraft = (patch: Partial<ProviderBundleShareDraft>) =>
     onChange((current) => ({ ...current, ...patch }));
+  const tokenLimitValue = shareLimitState(draft.tokenLimit, draft.baseline?.tokenLimit);
+  const tokenLimitInvalid = tokenLimitValue === "invalid";
+  const parallelLimitState = shareLimitState(draft.parallelLimit, draft.baseline?.parallelLimit);
+  const parallelLimitInvalid = parallelLimitState === "invalid";
+  // A stored 0 still saves untouched; it is flagged so the owner fixes it.
+  const tokenLimitLegacy = tokenLimitValue === "legacy";
+  const parallelLimitLegacy = parallelLimitState === "legacy";
+  const currentExpiryParsed = draft.baseline && draft.baseline.expiry === "current"
+    ? Date.parse(draft.baseline.expiresAt)
+    : Number.NaN;
+  const currentExpiryMs = Number.isFinite(currentExpiryParsed) ? currentExpiryParsed : undefined;
 
   return (
     <Section
@@ -1146,6 +1217,7 @@ function BundleShareEditor({
                   variant="ghost"
                   className="h-8 w-8 shrink-0"
                   title={t("common.copy")}
+                  aria-label={t("common.copy")}
                   onClick={() => void copyText(shareUrl)}
                 >
                   <Copy className="h-4 w-4" />
@@ -1182,27 +1254,6 @@ function BundleShareEditor({
                 })}
               </p>
             ) : null}
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="bundle-share-free-access">
-              {t("share.freeAccess.label", {
-                defaultValue: "公开免费使用",
-              })}
-            </Label>
-            <div className="flex min-h-10 items-center gap-2 rounded-lg border border-border/60 px-3">
-              <Checkbox
-                id="bundle-share-free-access"
-                checked={draft.freeAccess}
-                onCheckedChange={(checked) =>
-                  updateDraft({ freeAccess: checked === true })
-                }
-              />
-              <span className="text-sm">
-                {t("share.freeAccess.short", {
-                  defaultValue: "任意已登录 Router 用户可免费调用",
-                })}
-              </span>
-            </div>
           </div>
           <div className="space-y-2 md:col-span-2">
             <Label>
@@ -1247,134 +1298,185 @@ function BundleShareEditor({
               />
             </div>
           ) : null}
-          <ShareUserGrantsEditor
-            shareId={draft.baseline?.shareId}
-            configRevision={draft.baseline?.configRevision}
-            disabled={disabled}
-            value={displayedUserGrants}
-            ownerEmail={normalizedOwnerEmail}
-            defaultPolicy={defaultUserPolicy}
-            protectedEmails={protectedGrantEmails}
-            usageEdits={draft.userUsageEdits}
-            savedGrants={draft.baseline?.userGrants ?? {}}
-            valueUsageInitializations={draft.userValueUsageInitializations}
-            onValueUsageInitializationsChange={updateValueUsageInitializations}
-            onUsageEditsChange={updateUserUsageEdits}
-            onChange={updateUserGrants}
-          />
-          <div className="grid gap-4 md:col-span-2 md:grid-cols-3">
-            <div className="space-y-2">
-              <Label>
-                {t("provider.share.tokenLimit", { defaultValue: "Token 限额" })}
-              </Label>
-              <Input
-                type="number"
-                min={0}
-                placeholder={t("share.unlimited", { defaultValue: "无上限" })}
-                value={draft.tokenLimit}
-                onChange={(event) =>
-                  updateDraft({ tokenLimit: event.target.value })
-                }
-              />
-              <div className="flex flex-wrap gap-1.5">
-                <Button
-                  type="button"
-                  variant={draft.tokenLimit === "" ? "secondary" : "outline"}
-                  size="sm"
-                  className="h-7 px-2 text-xs"
-                  onClick={() => updateDraft({ tokenLimit: "" })}
-                >
-                  {t("share.unlimited", { defaultValue: "无上限" })}
-                </Button>
-                {SHARE_TOKEN_PRESETS.map((preset) => (
+          {/* Outside in: who may call, the Share-wide limits, then each user's own. */}
+          <div className="space-y-3 border-t border-border-default/70 pt-4 md:col-span-2">
+            <ShareSubheading id="bundle-share-access-title" title={t("share.freeAccess.title")} />
+            <ShareAccessModeField
+              value={draft.freeAccess}
+              disabled={disabled}
+              onChange={(freeAccess) => updateDraft({ freeAccess })}
+            />
+          </div>
+          <div className="space-y-3 border-t border-border-default/70 pt-4 md:col-span-2">
+            <ShareSubheading
+              title={t("provider.share.limitsTitle")}
+              description={t("provider.share.limitsHint")}
+            />
+            <div className="grid gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <Label htmlFor="bundle-share-token-limit">{t("share.tokenLimit")}</Label>
+                <Input
+                  id="bundle-share-token-limit"
+                  type="number"
+                  min={1}
+                  step={1}
+                  placeholder={t("share.unlimited")}
+                  aria-invalid={tokenLimitInvalid || undefined}
+                  aria-describedby="bundle-share-token-limit-note"
+                  className={cn(tokenLimitInvalid && "border-destructive")}
+                  value={draft.tokenLimit}
+                  onChange={(event) =>
+                    updateDraft({ tokenLimit: event.target.value })
+                  }
+                />
+                <div className="flex flex-wrap gap-1.5">
                   <Button
-                    key={preset}
+                    type="button"
+                    variant={draft.tokenLimit === "" ? "secondary" : "outline"}
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={() => updateDraft({ tokenLimit: "" })}
+                  >
+                    {t("share.unlimited")}
+                  </Button>
+                  {SHARE_TOKEN_PRESETS.map((preset) => (
+                    <Button
+                      key={preset}
+                      type="button"
+                      variant={
+                        draft.tokenLimit === String(preset)
+                          ? "secondary"
+                          : "outline"
+                      }
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      onClick={() => updateDraft({ tokenLimit: String(preset) })}
+                    >
+                      {formatShareTokens(preset, i18n.language)}
+                    </Button>
+                  ))}
+                </div>
+                <p
+                  id="bundle-share-token-limit-note"
+                  className={cn("text-xs", tokenLimitInvalid ? "text-destructive" : tokenLimitLegacy ? "text-warning" : "text-muted-foreground")}
+                >
+                  {tokenLimitInvalid
+                    ? t("provider.share.limitInvalid")
+                    : tokenLimitLegacy
+                      ? t("provider.share.limitLegacyZero")
+                    : typeof tokenLimitValue === "number"
+                      ? t("share.userLimit.tokenEcho", { value: formatShareTokens(tokenLimitValue, i18n.language) })
+                      : t("provider.share.tokenLimitHint")}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="bundle-share-parallel-limit">{t("share.parallelLimit")}</Label>
+                <Input
+                  id="bundle-share-parallel-limit"
+                  type="number"
+                  min={1}
+                  step={1}
+                  placeholder={t("share.unlimited")}
+                  aria-invalid={parallelLimitInvalid || undefined}
+                  aria-describedby={parallelLimitInvalid || parallelLimitLegacy ? "bundle-share-parallel-limit-error" : undefined}
+                  className={cn(parallelLimitInvalid && "border-destructive")}
+                  value={draft.parallelLimit}
+                  onChange={(event) =>
+                    updateDraft({ parallelLimit: event.target.value })
+                  }
+                />
+                <div className="flex flex-wrap gap-1.5">
+                  <Button
+                    type="button"
+                    variant={draft.parallelLimit === "" ? "secondary" : "outline"}
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={() => updateDraft({ parallelLimit: "" })}
+                  >
+                    {t("share.unlimited")}
+                  </Button>
+                  <Button
                     type="button"
                     variant={
-                      draft.tokenLimit === String(preset)
+                      draft.parallelLimit === String(DEFAULT_PARALLEL_LIMIT)
                         ? "secondary"
                         : "outline"
                     }
                     size="sm"
                     className="h-7 px-2 text-xs"
-                    onClick={() => updateDraft({ tokenLimit: String(preset) })}
+                    onClick={() =>
+                      updateDraft({
+                        parallelLimit: String(DEFAULT_PARALLEL_LIMIT),
+                      })
+                    }
                   >
-                    {preset.toLocaleString()}
+                    {DEFAULT_PARALLEL_LIMIT}
                   </Button>
-                ))}
+                </div>
+                {parallelLimitInvalid ? (
+                  <p id="bundle-share-parallel-limit-error" className="text-xs text-destructive">
+                    {t("provider.share.limitInvalid")}
+                  </p>
+                ) : parallelLimitLegacy ? (
+                  <p id="bundle-share-parallel-limit-error" className="text-xs text-warning">
+                    {t("provider.share.limitLegacyZero")}
+                  </p>
+                ) : null}
               </div>
-            </div>
-            <div className="space-y-2">
-              <Label>
-                {t("provider.share.parallelLimit", {
-                  defaultValue: "并发限额",
-                })}
-              </Label>
-              <Input
-                type="number"
-                min={1}
-                placeholder={t("share.unlimited", { defaultValue: "无上限" })}
-                value={draft.parallelLimit}
-                onChange={(event) =>
-                  updateDraft({ parallelLimit: event.target.value })
-                }
-              />
-              <div className="flex flex-wrap gap-1.5">
-                <Button
-                  type="button"
-                  variant={draft.parallelLimit === "" ? "secondary" : "outline"}
-                  size="sm"
-                  className="h-7 px-2 text-xs"
-                  onClick={() => updateDraft({ parallelLimit: "" })}
-                >
-                  {t("share.unlimited", { defaultValue: "无上限" })}
-                </Button>
-                <Button
-                  type="button"
-                  variant={
-                    draft.parallelLimit === String(DEFAULT_PARALLEL_LIMIT)
-                      ? "secondary"
-                      : "outline"
-                  }
-                  size="sm"
-                  className="h-7 px-2 text-xs"
-                  onClick={() =>
+              <div className="space-y-2">
+                <Label id="bundle-share-expiry-label">{t("share.expiration")}</Label>
+                <Select
+                  value={draft.expiry}
+                  onValueChange={(expiry) =>
                     updateDraft({
-                      parallelLimit: String(DEFAULT_PARALLEL_LIMIT),
+                      expiry: expiry as ProviderBundleShareDraft["expiry"],
                     })
                   }
                 >
-                  {DEFAULT_PARALLEL_LIMIT}
-                </Button>
+                  <SelectTrigger aria-labelledby="bundle-share-expiry-label" aria-describedby="bundle-share-expiry-hint">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {currentExpiryMs != null ? (
+                      <SelectItem value="current">
+                        {currentExpiryMs <= Date.now()
+                          ? t("provider.share.expiryEnded", { date: new Date(currentExpiryMs).toLocaleString(i18n.language) })
+                          : t("provider.share.expiryCurrent", { date: new Date(currentExpiryMs).toLocaleString(i18n.language) })}
+                      </SelectItem>
+                    ) : null}
+                    <SelectItem value="permanent">
+                      {t("share.expiry.permanent")}
+                    </SelectItem>
+                    {BUNDLE_SHARE_EXPIRY_PRESETS.map((preset) => (
+                      <SelectItem key={preset.value} value={preset.value}>
+                        {t("provider.share.expiryFromNow", { duration: t(preset.labelKey) })}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p id="bundle-share-expiry-hint" className="text-xs text-muted-foreground">
+                  {t("provider.share.expiryHint")}
+                </p>
               </div>
             </div>
-            <div className="space-y-2">
-              <Label>
-                {t("provider.share.expiry", { defaultValue: "有效期" })}
-              </Label>
-              <Select
-                value={draft.expiry}
-                onValueChange={(expiry) =>
-                  updateDraft({
-                    expiry: expiry as ProviderBundleShareDraft["expiry"],
-                  })
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="permanent">
-                    {t("share.expiry.permanent", { defaultValue: "永久有效" })}
-                  </SelectItem>
-                  {BUNDLE_SHARE_EXPIRY_PRESETS.map((preset) => (
-                    <SelectItem key={preset.value} value={preset.value}>
-                      {t(preset.labelKey)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+          </div>
+          <div className="border-t border-border-default/70 pt-4 md:col-span-2">
+            <ShareUserGrantsEditor
+              shareId={draft.baseline?.shareId}
+              configRevision={draft.baseline?.configRevision}
+              disabled={disabled}
+              freeAccess={draft.freeAccess}
+              value={displayedUserGrants}
+              ownerEmail={normalizedOwnerEmail}
+              defaultPolicy={defaultUserPolicy}
+              protectedEmails={protectedGrantEmails}
+              usageEdits={draft.userUsageEdits}
+              savedGrants={draft.baseline?.userGrants ?? {}}
+              valueUsageInitializations={draft.userValueUsageInitializations}
+              onValueUsageInitializationsChange={updateValueUsageInitializations}
+              onUsageEditsChange={updateUserUsageEdits}
+              onChange={updateUserGrants}
+            />
           </div>
         </div>
       ) : null}
@@ -3103,7 +3205,7 @@ export function ProviderBundleEditor({
               existingShare.configRevision ? (
               <div
                 role="alert"
-                className="mb-3 flex items-center gap-3 text-sm text-amber-700"
+                className="mb-3 flex items-center gap-3 text-sm text-warning"
               >
                 <span>{t("share.userLimit.remoteChanged")}</span>
                 <Button

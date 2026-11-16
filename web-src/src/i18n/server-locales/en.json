@@ -393,7 +393,7 @@
       "description": "Description",
       "enable": "Share",
       "enableShare": "Enable remote sharing",
-      "expiry": "Expiration",
+      "expiry": "Expires",
       "parallelLimit": "Concurrency limit",
       "removeBindingError": "Failed to stop remote sharing: {{error}}",
       "removeBindingSuccess": "Remote sharing stopped for this app",
@@ -406,7 +406,16 @@
       "sectionTitle": "Remote Share",
       "sharing": "Sharing",
       "stop": "Click to stop sharing",
-      "tokenLimit": "Token limit"
+      "tokenLimit": "Token limit",
+      "limitsTitle": "Share-wide limits",
+      "limitsHint": "Applies to all users combined. Tokens count lifetime usage; once used up the whole Share pauses, the owner included. New users start with these values.",
+      "limitInvalid": "Use a whole number from 1; leave empty for unlimited.",
+      "limitLegacyZero": "The saved value is 0, which stops the Share at its first request. It saves unchanged if left alone; use a whole number from 1, or leave empty for unlimited.",
+      "tokenLimitHint": "Enter whole Tokens.",
+      "expiryCurrent": "Keep current: {{date}}",
+      "expiryEnded": "Expired on {{date}}",
+      "expiryFromNow": "{{duration}} from now",
+      "expiryHint": "Picking a duration counts it from the moment you save."
     },
     "sortUpdateFailed": "Failed to update sort order",
     "sortUpdated": "Sort order updated",
@@ -1106,15 +1115,16 @@
       "thirtyDays": "30 days"
     },
     "freeAccess": {
-      "label": "Public free access",
+      "title": "Access",
       "private": "Private",
       "public": "Public free",
-      "short": "Any signed-in Router user can invoke for free"
+      "short": "Any signed-in Router user can invoke for free",
+      "publicHint": "Any signed-in Router user can call with their own Router API token. It is not anonymous.",
+      "privateHint": "Only the users listed below can call this Share."
     },
     "id": "ID",
     "lastUsedAt": "Last Used",
     "listCount": "{{count}} share(s)",
-    "manageInProviderHint": "Open the bound Provider editor to change sharing settings.",
     "never": "Never",
     "openShareSettings": "Open share settings",
     "ownerChange": {
@@ -1132,8 +1142,8 @@
       "success": "Share owner changed to {{email}}",
       "title": "Change Owner Email"
     },
-    "ownerEmail": "Owner Email",
-    "parallelLimit": "Max Concurrency",
+    "ownerEmail": "Owner email",
+    "parallelLimit": "Concurrency limit",
     "permanent": "Permanent",
     "readOnlyOverviewHint": "This is a read-only overview. Open the bound Provider editor to change sharing settings.",
     "remotePort": "Remote Port",
@@ -1207,7 +1217,7 @@
       "updateTokenLimitError": "Failed to update token limit: {{error}}",
       "updateTokenLimitSuccess": "Token limit updated"
     },
-    "tokenLimit": "Token Limit",
+    "tokenLimit": "Token limit",
     "tokensUsed": "Tokens Used",
     "transportState": "Transport State",
     "tunnel": {
@@ -1287,7 +1297,7 @@
         "start": "With complete evidence, saving applies the target unit immediately and carries all usage and in-flight reservations in the target window.",
         "notReady": "Requires Router v10, committed SQLite storage and an acknowledged executable tariff.",
         "pending": "Awaiting authoritative usage",
-        "unitUsdShort": "$",
+        "unitUsdShort": "US$",
         "limit": "USD-equivalent limit",
         "amountPlaceholder": "10.00",
         "amountError": {
@@ -1319,16 +1329,17 @@
           "pricing_unavailable": "No acknowledged tariff prices this Share's models yet.",
           "storage_unavailable": "Server metering storage is unavailable.",
           "router_upgrade_required": "Upgrade Router and Server to use USD quotas.",
-          "blocked_needs_reconcile": "This user's USD usage needs reconciling first (Apply now in the usage column).",
+          "blocked_needs_reconcile": "This user's USD usage needs reconciling first (reconcile it in the Used column).",
           "invalid_policy": "This limit or period isn't valid for a USD quota.",
           "resource_upgrade_required": "Upgrade Router and Server and activate the resource tariff.",
           "history_incomplete": "Historical request evidence is incomplete or unpriced. Repair evidence or prices before converting.",
           "history_preparing": "Preparing request history. The current policy remains active.",
           "conversion_upgrade_required": "Upgrade Router and Server for immediate quota unit conversion.",
-          "pending_evidence_missing": "An in-flight request has no trustworthy bound in the target unit. Wait for settlement before converting."
+          "pending_evidence_missing": "An in-flight request has no trustworthy bound in the target unit. Wait for settlement before converting.",
+          "unknown": "This user's USD usage can't be confirmed right now"
         },
         "rowReason": "{{email}}: {{reason}}",
-        "usageEditUnavailable": "Consumed tokens can't be set for USD-quota users. Use Apply now in their usage column instead.",
+        "usageEditUnavailable": "Users with a USD quota can't have consumed Tokens set; reconcile their usage in the Used column.",
         "error": {
           "targetInvalid": "The target can't be below observed usage or outside the supported range.",
           "unavailable": "USD metering is unavailable on this Server. Check readiness and retry.",
@@ -1366,20 +1377,76 @@
         "preparationProgress": "Preparing history · {{count}} requests examined",
         "evidence": "Evidence: {{tokens}} Tokens · {{requests}} requests · {{missing}} unresolved attempts",
         "pricingBasis": "Frozen request prices; reconstructed entries use tariff {{revision}}",
-        "originalPrices": "Original frozen prices"
+        "originalPrices": "Original frozen prices",
+        "saveFirst": "Save the Share before using USD-equivalent quotas",
+        "equivalentAmount": "{{amount}} equiv."
       },
       "accountReset": {
         "label": "Account reset cycle",
-        "ready": "Account cycle ready",
-        "unavailable": "Account cycle unavailable: {{reason}}",
         "pending": "Waiting for account cycle / verified history",
         "noEnd": "Next reset not yet confirmed",
         "observed": "Last observation",
         "caveat": "Public announcements follow announcement time, not per-account execution. External resets without evidence cannot be guaranteed detectable. Confirmed cycles are retained during temporary failures.",
         "preview": "Expected usage (not a reset). Check each user, then apply again:",
         "exceeded": "At or over the limit",
-        "saveFirst": "Save the Share before initializing its account cycle.",
-        "notReady": "Account cycle is not ready; keep the existing period."
+        "saveFirst": "Save the Share before using account reset periods",
+        "notReady": "Account cycle is not ready; keep the existing period.",
+        "status": {
+          "ready": "Ready",
+          "initializing": "Collecting a full cycle of usage history",
+          "stale": "Cycle out of date; waiting for a new upstream observation",
+          "error": "Sync failed",
+          "needsReconcile": "Needs reconciling"
+        },
+        "reason": {
+          "historyIncomplete": "Recording began after this cycle started; wait for the next full cycle",
+          "cycleExpired": "The last cycle has ended and no new cycle has been observed yet",
+          "notReady": "The account cycle is not ready; keep the current period",
+          "routerUpgradeRequired": "The Router must be upgraded before account reset periods can be used",
+          "unsupported": "The account behind this Share does not support account reset periods",
+          "ledgerCapacityLimit": "The quota ledger is full; no more account-cycle users can be added for now",
+          "ledgerUnavailable": "The quota ledger is unavailable; try again shortly",
+          "cycleConflict": "The account cycle changed; reopen and save again",
+          "quotaExhausted": "This cycle's quota is used up",
+          "unknown": "The account cycle is unavailable",
+          "identityUnverified": "The upstream account identity can't be confirmed",
+          "quotaBoundaryUnavailable": "The upstream does not report when its quota resets",
+          "multipleQuotaScopes": "This account has several quota scopes, so no single cycle applies",
+          "nonRecurringPackage": "This account's quota is a one-off package that never resets",
+          "profileUnsupported": "This Provider type does not support account cycles",
+          "quotaProviderMissing": "No quota source was found",
+          "quotaScopeUnproven": "The quota scope can't be confirmed"
+        },
+        "basis": {
+          "upstreamWindow": "upstream window",
+          "derivedFromWindow": "derived from the upstream window",
+          "knownNaturalBoundary": "known natural boundary",
+          "publicAnnouncement": "official announcement",
+          "redeemConfirmation": "redemption confirmation",
+          "unknown": "unknown source"
+        },
+        "bucket": {
+          "shared_weekly": "Weekly shared quota",
+          "generic": "Account cycle",
+          "agentic_subscription_base": "Subscription base quota",
+          "included_plan_credits": "Included plan credits",
+          "premium_monthly": "Premium quota (monthly)"
+        },
+        "details": "Account cycle details",
+        "basisLine": "Based on: {{basis}}",
+        "observedLine": "Last observed: {{time}}",
+        "code": "Diagnostic code: {{code}}",
+        "retry": "Retry",
+        "loading": "Checking status",
+        "loadFailed": "Couldn't read the status",
+        "cycleRange": "{{start}} to {{end}}",
+        "cycleEnded": "{{start}} to {{end}} (ended)",
+        "cycleOpen": "From {{start}}; next reset not yet known",
+        "capacityWarning": "The quota ledger is nearly full ({{count}}/{{limit}}); no more account-cycle users can be added",
+        "rowReason": "{{email}}: {{reason}}",
+        "optionUnavailable": "{{label}} ({{reason}})",
+        "optionNotReady": "not ready",
+        "optionSaveFirst": "available after saving the Share"
       },
       "remoteChanged": "Share settings changed remotely. Reload to discard this Share draft and use the latest settings.",
       "reloadShare": "Reload Share",
@@ -1401,7 +1468,7 @@
       "invalidPolicy": "Limits must be positive integers and times must be valid.",
       "invalidUsage": "Consumed tokens must be an integer greater than or equal to 0.",
       "newConsumedHint": "You may enter 0. Leave it blank to avoid creating a manual baseline.",
-      "period": "Token period",
+      "period": "Quota period",
       "periodDay": "Daily",
       "periodLifetime": "Lifetime",
       "periodMonth": "Calendar month",
@@ -1413,7 +1480,25 @@
       "savedQuotaHint": "Server-side window: {{start}} to {{end}}; manual correction {{offset}}.",
       "selectAll": "Select all editable users",
       "selectUser": "Select {{email}}",
-      "title": "Authorized users and quotas"
+      "title": "Authorized users and quotas",
+      "duration": {
+        "daysHours": "{{days}}d {{hours}}h",
+        "hoursMinutes": "{{hours}}h {{minutes}}m",
+        "minutes": "{{minutes}}m"
+      },
+      "tokenEcho": "≈ {{value}}",
+      "email": "Email",
+      "quota": "Quota",
+      "used": "Used (this period)",
+      "actions": "Actions",
+      "role": {
+        "owner": "Owner",
+        "market": "Market seat"
+      },
+      "privateHint": "Only the users listed here can call this Share, each within their own quota.",
+      "publicHint": "In public mode this list only sets personal limits; removing someone drops their limit but does not stop them calling.",
+      "expiryHint": "Leave empty for no expiry; local time.",
+      "batchPeriodHint": "Check \"{{label}}\" to change the period."
     },
     "validation": {
       "invalidEmail": "Invalid email address",
@@ -1453,6 +1538,13 @@
       "expiresAtAsc": "Expiring first",
       "tokensUsedDesc": "Most tokens used",
       "nameAsc": "Name A–Z"
+    },
+    "health": {
+      "unknown": "Health unknown",
+      "healthy": "Healthy",
+      "degraded": "Degraded",
+      "unhealthy": "Unhealthy",
+      "confirmationPending": "Health being confirmed"
     }
   },
   "streamCheck": {

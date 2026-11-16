@@ -26,6 +26,8 @@ import {
   MalformedValueQuotaGrantError,
   saveBundleShare,
   shareForBundle,
+  shareLimitInput,
+  shareLimitState,
   toggleBundleShare,
 } from "./bundleShare";
 
@@ -225,7 +227,7 @@ describe("Provider Bundle sharing", () => {
     expect(isValidShareSlug("router")).toBe(false);
   });
 
-  it("maps every quick expiry preset to and from an absolute timestamp", async () => {
+  it("keeps a saved expiry exactly and counts every preset from the save", async () => {
     vi.useFakeTimers();
     const now = new Date("2026-08-04T12:00:00Z");
     vi.setSystemTime(now);
@@ -235,10 +237,17 @@ describe("Provider Bundle sharing", () => {
       const expiresAt = new Date(
         now.getTime() + preset.seconds * 1000,
       ).toISOString();
-      expect(
-        createBundleShareDraft(share({ claude: "bundle-1" }, 1, expiresAt))
-          .expiry,
-      ).toBe(preset.value);
+      // A saved date is shown as itself, not rounded to the nearest preset.
+      const saved = share({ claude: "bundle-1" }, 1, "2026-08-05T03:21:00Z");
+      const kept = createBundleShareDraft(saved);
+      expect(kept.expiry).toBe("current");
+      await saveBundleShare("bundle-1", kept, saved);
+      expect(shareApiMock.saveProviderBundleShare.mock.calls.at(-1)?.[0].expiresAt).toBe(saved.expiresAt);
+      // Choosing the same duration again renews from now.
+      const renewed = createBundleShareDraft(saved);
+      renewed.expiry = preset.value;
+      await saveBundleShare("bundle-1", renewed, saved);
+      expect(shareApiMock.saveProviderBundleShare.mock.calls.at(-1)?.[0].expiresAt).toBe(expiresAt);
 
       const draft = createBundleShareDraft();
       draft.expiry = preset.value;
@@ -253,6 +262,38 @@ describe("Provider Bundle sharing", () => {
     expect(
       shareApiMock.saveProviderBundleShare.mock.calls.at(-1)?.[0].expiresAt,
     ).toBe(PERMANENT_EXPIRES_AT);
+  });
+
+  it("refuses a zero Share-wide limit instead of saving a Share that stops at once", async () => {
+    for (const field of ["tokenLimit", "parallelLimit"] as const) {
+      const draft = createBundleShareDraft();
+      draft[field] = "0";
+      await expect(saveBundleShare("bundle-1", draft)).rejects.toThrow();
+    }
+    expect(shareLimitInput("")).toBe("unlimited");
+    expect(shareLimitInput("0")).toBe("invalid");
+    expect(shareLimitInput("1.5")).toBe("invalid");
+    expect(shareLimitInput(" 12 ")).toBe(12);
+  });
+
+  it("saves a stored zero limit untouched but refuses one typed anew", async () => {
+    shareApiMock.saveProviderBundleShare.mockResolvedValue(undefined);
+    const stored = { ...share({ claude: "bundle-1" }, 3), tokenLimit: 0, parallelLimit: 0 };
+    const draft = createBundleShareDraft(stored);
+    expect(shareLimitState(draft.tokenLimit, draft.baseline?.tokenLimit)).toBe("legacy");
+    // Untouched: saves the stored 0s as they are.
+    await saveBundleShare("bundle-1", draft, stored);
+    expect(shareApiMock.saveProviderBundleShare.mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({ tokenLimit: 0, parallelLimit: 0 }));
+    // The list's quick enable goes through the same untouched draft.
+    await enableBundleShare("bundle-1", { ...stored, status: "paused" });
+    expect(shareApiMock.saveProviderBundleShare.mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({ enabled: true, tokenLimit: 0 }));
+    // Edited away and back to 0, or 0 typed into a field that held another value, is refused.
+    const edited = createBundleShareDraft({ ...stored, tokenLimit: 5 });
+    edited.tokenLimit = "0";
+    expect(shareLimitState(edited.tokenLimit, edited.baseline?.tokenLimit)).toBe("invalid");
+    await expect(saveBundleShare("bundle-1", edited, stored)).rejects.toThrow();
   });
 
   it("finds one Share through any Bundle Surface binding", () => {

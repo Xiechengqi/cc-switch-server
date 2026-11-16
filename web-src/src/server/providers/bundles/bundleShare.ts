@@ -28,6 +28,9 @@ export interface ProviderBundleShareDraft {
     userGrants: ShareUserGrantMap;
     expiry: ProviderBundleShareExpiry;
     expiresAt: string;
+    /** The Share-wide limits as loaded, so an untouched stored value saves as is. */
+    tokenLimit: string;
+    parallelLimit: string;
   };
   enabled: boolean;
   subdomain: string;
@@ -68,8 +71,12 @@ export const BUNDLE_SHARE_EXPIRY_PRESETS = [
   },
 ] as const;
 
+/**
+ * `current` keeps the saved expiry exactly; a preset always counts from the
+ * moment of saving, so picking one renews the Share.
+ */
 export type ProviderBundleShareExpiry =
-  "permanent" | (typeof BUNDLE_SHARE_EXPIRY_PRESETS)[number]["value"];
+  "permanent" | "current" | (typeof BUNDLE_SHARE_EXPIRY_PRESETS)[number]["value"];
 
 const RESERVED_SHARE_SLUGS = new Set([
   "admin",
@@ -103,16 +110,11 @@ export function createBundleShareDraft(
   share?: ShareRecord,
 ): ProviderBundleShareDraft {
   const expiresAt = share?.expiresAt ? Date.parse(share.expiresAt) : Number.NaN;
-  const remaining = expiresAt - Date.now();
-  const expiry =
+  // A saved finite expiry is shown as the real date, never rounded to a preset.
+  const expiry: ProviderBundleShareExpiry =
     !Number.isFinite(expiresAt) || expiresAt >= Date.parse(PERMANENT_EXPIRES_AT)
       ? "permanent"
-      : BUNDLE_SHARE_EXPIRY_PRESETS.reduce((closest, preset) =>
-          Math.abs(preset.seconds * 1000 - remaining) <
-          Math.abs(closest.seconds * 1000 - remaining)
-            ? preset
-            : closest,
-        ).value;
+      : "current";
   const canonicalUserGrants = share?.userGrants ?? {};
   const shareToEmails = normalizeShareEmails(
     Object.values(canonicalUserGrants)
@@ -129,6 +131,8 @@ export function createBundleShareDraft(
         ? expiresAt
         : undefined,
   };
+  const tokenLimit = share && share.tokenLimit >= 0 ? String(share.tokenLimit) : "";
+  const parallelLimit = share && share.parallelLimit >= 0 ? String(share.parallelLimit) : "";
   return {
     baseline: share ? {
       shareId: share.id,
@@ -138,6 +142,8 @@ export function createBundleShareDraft(
       }) },
       expiry,
       expiresAt: share.expiresAt,
+      tokenLimit,
+      parallelLimit,
     } : undefined,
     enabled: Boolean(
       share && share.status !== "paused" && share.status !== "deleted",
@@ -145,9 +151,8 @@ export function createBundleShareDraft(
     subdomain: share?.shareSlug ?? "",
     description: share?.description ?? "",
     freeAccess: share?.freeAccess ?? false,
-    tokenLimit: share && share.tokenLimit >= 0 ? String(share.tokenLimit) : "",
-    parallelLimit:
-      share && share.parallelLimit >= 0 ? String(share.parallelLimit) : "",
+    tokenLimit,
+    parallelLimit,
     expiry,
     userGrants: share
       ? buildShareUserGrants({
@@ -204,6 +209,44 @@ export function bundleShareGrantHandlers(
   };
 }
 
+/**
+ * A Share-wide Token or concurrency limit as typed: empty is unlimited, a
+ * whole number from 1 is the limit, and anything else (0 included) is
+ * invalid. 0 would stop the Share at its first request, so it is refused
+ * rather than read as "unlimited" in one place and "none" in another.
+ */
+export function shareLimitInput(value: string): number | "unlimited" | "invalid" {
+  const trimmed = value.trim();
+  if (!trimmed) return "unlimited";
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : "invalid";
+}
+
+/**
+ * `shareLimitInput` against the value the Share was loaded with. A stored 0,
+ * saved before 0 was refused, is "legacy": shown as needing a fix but saved
+ * unchanged, so an untouched Share (and the list's quick enable) still saves.
+ * Only an edited value has to be valid.
+ */
+export function shareLimitState(
+  value: string,
+  saved?: string,
+): number | "unlimited" | "invalid" | "legacy" {
+  const parsed = shareLimitInput(value);
+  if (parsed !== "invalid" || saved === undefined || value.trim() !== saved.trim()) return parsed;
+  const stored = Number(saved.trim());
+  return Number.isSafeInteger(stored) && stored >= 0 ? "legacy" : parsed;
+}
+
+function shareLimitValue(value: string, fallback: number, saved?: string): number {
+  const parsed = shareLimitState(value, saved);
+  if (parsed === "invalid") {
+    throw new Error(i18n.t("provider.share.limitInvalid"));
+  }
+  if (parsed === "legacy") return Number(value.trim());
+  return parsed === "unlimited" ? fallback : parsed;
+}
+
 function limitValue(value: string, fallback: number): number {
   if (!value.trim()) return fallback;
   const parsed = Number(value);
@@ -214,7 +257,7 @@ function limitValue(value: string, fallback: number): number {
 }
 
 function expiresAt(draft: ProviderBundleShareDraft): string {
-  if (draft.baseline && draft.expiry === draft.baseline.expiry) return draft.baseline.expiresAt;
+  if (draft.expiry === "current") return draft.baseline?.expiresAt ?? PERMANENT_EXPIRES_AT;
   if (draft.expiry === "permanent") return PERMANENT_EXPIRES_AT;
   const preset = BUNDLE_SHARE_EXPIRY_PRESETS.find(
     (candidate) => candidate.value === draft.expiry,
@@ -235,10 +278,11 @@ export async function saveBundleShare(
   if (draft.enabled && subdomain && !isValidShareSlug(subdomain)) {
     throw new Error("Share slug is invalid");
   }
-  const tokenLimit = limitValue(draft.tokenLimit, UNLIMITED_TOKEN_LIMIT);
-  const parallelLimit = limitValue(
+  const tokenLimit = shareLimitValue(draft.tokenLimit, UNLIMITED_TOKEN_LIMIT, draft.baseline?.tokenLimit);
+  const parallelLimit = shareLimitValue(
     draft.parallelLimit,
     UNLIMITED_PARALLEL_LIMIT,
+    draft.baseline?.parallelLimit,
   );
   const expiry = expiresAt(draft);
   const userGrants = Object.keys(draft.userGrants).length

@@ -232,7 +232,8 @@ export function valueStatusReason(status: ValueStatus | undefined): ValueMessage
   const known = valueReasonCode(code);
   if (known) return { key: `share.userLimit.valueQuota.reasonCode.${known}` };
   if (code === "price_unavailable") return { key: "share.userLimit.valueQuota.reasonCode.pricing_unavailable" };
-  return { raw: code };
+  // An unknown code is diagnostics, not a sentence: say what it means for the user.
+  return { key: "share.userLimit.valueQuota.reasonCode.unknown" };
 }
 /** Dates follow the UI language rather than the browser default. */
 export function formatValueTime(ms: number | null | undefined, language: string | undefined, style: "short" | "full" = "full"): string {

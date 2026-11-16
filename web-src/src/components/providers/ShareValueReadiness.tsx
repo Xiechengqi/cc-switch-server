@@ -1,10 +1,13 @@
 // Hallmark · pre-emit critique: P4 H4 E4 S5 R5 V4 · component-scope; Server UI tokens.
 import { useId, type ReactNode } from "react";
+import type { TFunction } from "i18next";
 import { ExternalLink, Info } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
+import { formatShareTokens } from "@/utils/shareUtils";
 import { SERVER_STORAGE_SETTINGS_SECTION, serverSettingsSectionUrl } from "@/lib/serverView";
 import {
   formatValueTime, valueCheckBlocker, valueErrorMessage, valueFailedChecks, valueReadinessRoots, valueReadinessSummary, VALUE_CHECK_ORDER, valueInvalidRowMessage, valueLimitLabel, valuePreviewBlocker, valueQuotaAvailability, valueRowKind,
@@ -26,7 +29,7 @@ export function ShareValueInfo({ label, children, className }: { label: string; 
   return <Popover>
     <PopoverTrigger asChild>
       <button type="button" aria-label={label}
-        className={cn("inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40", className)}>
+        className={cn("inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring", className)}>
         <Info className="h-3.5 w-3.5" aria-hidden="true" />
       </button>
     </PopoverTrigger>
@@ -39,14 +42,16 @@ export function ShareValueInfo({ label, children, className }: { label: string; 
  * screen readers then hear why, from real text rather than `title`, together
  * with the visible "USD quota unavailable" line (`readinessId`).
  */
-export function ShareValueUnitToggle({ value, onChange, usdDisabled, disabled, labelledBy, readinessId }: {
+export function ShareValueUnitToggle({ value, onChange, usdDisabled, usdBlockedReason, disabled, labelledBy, readinessId }: {
   value: ShareQuotaUnit; onChange: (unit: ShareQuotaUnit) => void; usdDisabled?: boolean; disabled?: boolean; labelledBy?: string;
   readinessId?: string;
+  /** `$` cannot be chosen at all (e.g. the Share is not saved yet); shown as visible text. */
+  usdBlockedReason?: string;
 }) {
   const { t } = useTranslation();
   const reasonId = useId();
-  const usdOff = false;
-  const needsSetup = !!usdDisabled;
+  const usdOff = !!usdBlockedReason && value !== "usdEquivalent";
+  const needsSetup = !!usdDisabled || usdOff;
   const describedBy = needsSetup ? [reasonId, readinessId].filter(Boolean).join(" ") : undefined;
   const options: Array<{ id: ShareQuotaUnit; label: string; title?: string; off?: boolean }> = [
     { id: "tokens", label: t("share.userLimit.valueQuota.tokens") },
@@ -68,17 +73,18 @@ export function ShareValueUnitToggle({ value, onChange, usdDisabled, disabled, l
         aria-label={option.title} title={option.title} tabIndex={selected ? 0 : -1} disabled={disabled || option.off}
         aria-describedby={option.off ? describedBy : undefined}
         onClick={() => onChange(option.id)}
-        className={cn("rounded px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 disabled:cursor-not-allowed disabled:opacity-50",
+        className={cn("rounded px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
           selected ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground")}>
         {option.label}
       </button>;
     })}
   </div>
-  {needsSetup ? <span id={reasonId} className="sr-only">{t("share.userLimit.valueQuota.usdDisabledReason")}</span> : null}
+  {usdOff ? <p id={reasonId} className="text-xs text-muted-foreground">{usdBlockedReason}</p>
+    : needsSetup ? <span id={reasonId} className="sr-only">{t("share.userLimit.valueQuota.usdDisabledReason")}</span> : null}
   </>;
 }
 
-const linkClass = "rounded px-1 font-medium text-blue-600 underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 disabled:opacity-50 dark:text-blue-400";
+const linkClass = "rounded px-1 font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50";
 
 /**
  * Silent when ready or unknown. When not, one line naming the first root cause
@@ -96,7 +102,7 @@ export function ShareValueReadiness({ state, id }: { state: ReturnType<typeof us
   // Any root storage cause gets the fix link. It opens beside the Share editor so its unsaved draft survives.
   const storageHref = summary && valueReadinessRoots(failed).some((check) => check.code === "sqlite_authority") ? serverSettingsSectionUrl(SERVER_STORAGE_SETTINGS_SECTION, window.location.href) : undefined;
   return <div className="flex flex-wrap items-center gap-x-1 text-xs text-muted-foreground" role="status" aria-busy={state.loading}>
-    <span id={id} className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-amber-500" />
+    <span id={id} className="inline-flex items-center gap-1.5"><span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-warning" />
       {rootCode ? t(prefix + "root." + rootCode) : t("share.userLimit.valueQuota.unavailable")}
       {rootCode && summary!.more > 0 ? <span className="font-medium">{t(prefix + "more", { count: summary!.more })}</span> : null}
     </span>
@@ -134,8 +140,12 @@ export function ShareValueLimitField({ id, unit, value, onChange, error, disable
   id: string; unit: ShareQuotaUnit; value: string; onChange: (value: string) => void; error?: string; disabled?: boolean;
   label: string; labelHidden?: boolean;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const usd = unit === "usdEquivalent";
+  // Token amounts are typed as whole Tokens; echo them in the unit the tables use.
+  const tokenCount = !usd && /^\d+$/.test(value.trim()) ? Number(value.trim()) : undefined;
+  const echo = tokenCount != null && Number.isSafeInteger(tokenCount) && tokenCount >= 10_000
+    ? t("share.userLimit.tokenEcho", { value: formatShareTokens(tokenCount, i18n.language) }) : undefined;
   return <div className="space-y-1.5">
     <div className={cn("flex items-center gap-1", labelHidden && !usd && "sr-only")}>
       <label htmlFor={id} className={cn("text-sm font-medium leading-none", labelHidden && "sr-only")}>{label}</label>
@@ -144,13 +154,14 @@ export function ShareValueLimitField({ id, unit, value, onChange, error, disable
       </ShareValueInfo> : null}
     </div>
     <div className="relative">
-      {usd ? <span aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">$</span> : null}
-      <Input id={id} type="text" inputMode="decimal" disabled={disabled} className={cn(usd && "pl-6")}
+      {usd ? <span aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">US$</span> : null}
+      <Input id={id} type="text" inputMode="decimal" disabled={disabled} className={cn(usd && "pl-11")}
         placeholder={usd ? t("share.userLimit.valueQuota.amountPlaceholder") : t("share.unlimited", { defaultValue: "无限" })}
         aria-invalid={error ? true : undefined} aria-describedby={error ? `${id}-error` : undefined}
         value={value} onChange={(event) => onChange(event.target.value)} />
     </div>
-    {error ? <p id={`${id}-error`} className="text-xs text-destructive">{error}</p> : null}
+    {error ? <p id={`${id}-error`} className="text-xs text-destructive">{error}</p>
+      : echo ? <p className="text-xs text-muted-foreground">{echo}</p> : null}
   </div>;
 }
 
@@ -167,7 +178,7 @@ function RowLine({ row, withEmail }: { row: ValuePreviewRow; withEmail?: boolean
     <span className="min-w-0 break-words">{withEmail ? <span className="font-mono">{row.email} · </span> : null}{text}</span>
     {withEmail ? null : <ShareValueInfo label={t(p + "title")}>
       <p>{t(p + hint)}</p>
-      {row.coverage ? <p>{t("share.userLimit.valueQuota.pricingBasis",{revision:row.coverage.pricingBasis?.slice(0,12) ?? t("share.userLimit.valueQuota.originalPrices")})} · {row.coverage.status?.meteringStatus}</p> : null}
+      {row.coverage ? <p>{t("share.userLimit.valueQuota.pricingBasis",{revision:row.coverage.pricingBasis?.slice(0,12) ?? t("share.userLimit.valueQuota.originalPrices")})}{row.coverage.status?.meteringStatus ? ` · ${t(meteringStateKey(row.coverage.status.meteringStatus))}` : ""}</p> : null}
       {row.meteredFromMs != null ? <p className="text-muted-foreground">{t("share.userLimit.valueQuota.meteredSince", { time: formatValueTime(row.meteredFromMs, i18n.language) })}</p> : null}
     </ShareValueInfo>}
   </span>;
@@ -209,10 +220,16 @@ export function ShareValuePreviewLine({ state, calibrations }: { state: ValuePre
   </div>;
 }
 
-function resetIn(ms: number, now: number) {
+/** A metering state in words; unknown states read as "evidence incomplete". */
+function meteringStateKey(state: string) {
+  return "share.userLimit.valueQuota.state." + (["observed", "pending", "blocked", "unavailable", "conservative", "scheduled"].includes(state) ? state : "unavailable");
+}
+/** "3 天 4 小时" / "3d 4h": the countdown in the UI language. */
+export function shareResetIn(ms: number, now: number, t: TFunction) {
   const minutes = Math.max(0, Math.floor((ms - now) / 60000));
   const days = Math.floor(minutes / 1440), hours = Math.floor((minutes % 1440) / 60);
-  return days > 0 ? `${days}d ${hours}h` : hours > 0 ? `${hours}h ${minutes % 60}m` : `${minutes % 60}m`;
+  const d = "share.userLimit.duration.";
+  return days > 0 ? t(d + "daysHours", { days, hours }) : hours > 0 ? t(d + "hoursMinutes", { hours, minutes: minutes % 60 }) : t(d + "minutes", { minutes: minutes % 60 });
 }
 /**
  * The USD row: "US$1.50 / US$10 · resets in 3d", a thin bar, and only the
@@ -232,7 +249,7 @@ export function ShareValueUsageCell({ status, limitMicros, stale, onReconcile }:
     <div className="flex min-w-0 items-center gap-0.5 font-mono text-xs">
       <span className="min-w-0 break-words">
         {status ? valueUsageLabel(status.usedPicos) : "—"} / {valueLimitLabel(limitMicros)}
-        {status?.resetsAtMs ? <span className="text-muted-foreground"> · {t(q + "resetsIn", { time: resetIn(status.resetsAtMs, now) })}</span> : null}
+        {status?.resetsAtMs ? <span className="text-muted-foreground"> · {t(q + "resetsIn", { time: shareResetIn(status.resetsAtMs, now, t) })}</span> : null}
       </span>
       <ShareValueInfo label={t(q + "details")}>
         <p className="font-medium">{t(valueStateKey(status, now))}</p>
@@ -247,14 +264,14 @@ export function ShareValueUsageCell({ status, limitMicros, stale, onReconcile }:
     </div>
     {available ? <div className="h-1 w-full overflow-hidden rounded bg-muted" role="progressbar" aria-label={t(q + "details")}
       aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(available.percent)}>
-      <div className={cn("h-full rounded", available.exhausted ? "bg-destructive" : available.nearLimit ? "bg-amber-500" : "bg-blue-500")} style={{ width: `${Math.min(100, available.percent)}%` }} />
+      <div className={cn("h-full rounded", available.exhausted ? "bg-destructive" : available.nearLimit ? "bg-warning" : "bg-primary")} style={{ width: `${Math.min(100, available.percent)}%` }} />
     </div> : null}
     {blocked ? <div className="flex flex-wrap items-center gap-x-1.5 text-[11px] font-medium text-destructive">
       <span className="inline-flex items-center gap-1"><span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-destructive" />{t(q + "needsReconcile")}</span>
-      {onReconcile ? <button type="button" onClick={onReconcile} className="rounded underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40">{t(q + "reconcile")}</button> : null}
+      {onReconcile ? <button type="button" onClick={onReconcile} className="rounded underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">{t(q + "reconcile")}</button> : null}
     </div> : !status ? <div className="text-[11px] text-muted-foreground">{t(q + "pending")}</div>
       : available?.exhausted ? <div className="text-[11px] text-destructive">{t(q + "exhausted")}</div>
-        : available?.nearLimit ? <div className="text-[11px] text-amber-600 dark:text-amber-400">{t(q + "nearLimit")}</div> : null}
+        : available?.nearLimit ? <div className="text-[11px] text-warning">{t(q + "nearLimit")}</div> : null}
     {reason ? <div className="break-words text-[11px] text-muted-foreground">{render(reason)}</div> : null}
     {delayed ? <div className="text-[11px] italic text-muted-foreground">{t(q + "syncDelayed")}</div> : null}
   </div>;
@@ -271,8 +288,9 @@ export function ShareValueScheduledLine({ limitMicros, effectiveFromMs }: { limi
 
 export function ShareValueResourceToggle({value,onChange,disabled}: {value:boolean;onChange:(value:boolean)=>void;disabled?:boolean}) {
   const {t}=useTranslation();
-  return <label className="flex items-start gap-2 text-xs text-muted-foreground">
-    <input type="checkbox" className="mt-0.5" checked={value} disabled={disabled} onChange={event=>onChange(event.target.checked)} />
-    <span>{t("share.userLimit.valueQuota.resources")}<span className="mt-1 block">{t("share.userLimit.valueQuota.resourcesHint")}</span></span>
-  </label>;
+  const id = useId();
+  return <div className="flex items-start gap-2 text-xs text-muted-foreground">
+    <Checkbox id={id} className="mt-0.5" checked={value} disabled={disabled} onCheckedChange={checked=>onChange(checked === true)} />
+    <label htmlFor={id}>{t("share.userLimit.valueQuota.resources")}<span className="mt-1 block">{t("share.userLimit.valueQuota.resourcesHint")}</span></label>
+  </div>;
 }

@@ -95,13 +95,72 @@ export function formatCompactTokenCount(value?: number | null): string {
   return String(amount);
 }
 
+/**
+ * Token counts in the UI language: 万/亿 for Chinese and Japanese, K/M/B
+ * otherwise. Every Share and quota surface uses this one rule.
+ */
+type ShareTokenUnit = { scale: number; label: string; decimals: number };
+
+/** Chinese and Japanese read Tokens in 万/億 (Simplified: 亿); others in K/M/B. */
+function shareTokenUnits(language: string): ShareTokenUnit[] {
+  const lang = language.trim().toLowerCase();
+  if (/^zh-(tw|hk|mo)\b|^zh-hant\b/.test(lang)) {
+    return [{ scale: 1e4, label: " 萬", decimals: 1 }, { scale: 1e8, label: " 億", decimals: 2 }];
+  }
+  if (lang.startsWith("zh")) {
+    return [{ scale: 1e4, label: " 万", decimals: 1 }, { scale: 1e8, label: " 亿", decimals: 2 }];
+  }
+  if (lang.startsWith("ja")) {
+    return [{ scale: 1e4, label: " 万", decimals: 1 }, { scale: 1e8, label: " 億", decimals: 2 }];
+  }
+  return [
+    { scale: 1e3, label: "K", decimals: 1 },
+    { scale: 1e6, label: "M", decimals: 2 },
+    { scale: 1e9, label: "B", decimals: 2 },
+  ];
+}
+
+/**
+ * A Token count for the Share pages, in the UI language's units. The unit is
+ * chosen after rounding, so 999,950 reads "1.00M" (not "1000.0K") and
+ * 99,999,500 reads "1.00 亿" (not "10000.0 万"). Counts below the first unit
+ * use the UI language's digit grouping, not the browser's.
+ */
+export function formatShareTokens(value: number | null | undefined, language: string): string {
+  const count = value ?? 0;
+  if (!Number.isFinite(count) || count <= 0) return "0";
+  const units = shareTokenUnits(language);
+  let index = -1;
+  for (let i = units.length - 1; i >= 0; i -= 1) {
+    if (count >= units[i].scale) { index = i; break; }
+  }
+  if (index < 0) {
+    try {
+      return Math.round(count).toLocaleString(language || undefined);
+    } catch {
+      return String(Math.round(count));
+    }
+  }
+  let unit = units[index];
+  let text = (count / unit.scale).toFixed(unit.decimals);
+  const next = units[index + 1];
+  if (next && Number(text) * unit.scale >= next.scale) {
+    unit = next;
+    text = (count / unit.scale).toFixed(unit.decimals);
+  }
+  return `${text}${unit.label}`;
+}
+
 export function formatShareTokenUsage(
   share: Pick<ShareRecord, "tokenLimit" | "tokensUsed">,
+  language?: string,
 ): string {
+  const format = (value?: number | null) =>
+    language ? formatShareTokens(value, language) : formatCompactTokenCount(value);
   if (isUnlimitedTokenLimit(share.tokenLimit)) {
-    return `${formatCompactTokenCount(share.tokensUsed)}/∞`;
+    return `${format(share.tokensUsed)}/∞`;
   }
-  return `${formatCompactTokenCount(share.tokensUsed)}/${formatCompactTokenCount(share.tokenLimit)}`;
+  return `${format(share.tokensUsed)}/${format(share.tokenLimit)}`;
 }
 
 export function getShareUsageRatio(

@@ -31,6 +31,7 @@ import { formatShareRouterDisplay } from "@/utils/shareRouter";
 import { ShareDisplayStatusBadge } from "./ShareDisplayStatusBadge";
 import { ShareRequestLogTable } from "./ShareRequestLogTable";
 import {
+  formatShareTokens,
   formatShareTokenUsage,
   formatUtcDateTime,
   getShareDisplayStatus,
@@ -78,7 +79,7 @@ export function ShareCard({
   onDisable,
   onResetUsage,
 }: ShareCardProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [connectionExpanded, setConnectionExpanded] = useState(false);
   const [settingsExpanded, setSettingsExpanded] = useState(false);
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
@@ -161,18 +162,21 @@ export function ShareCard({
                             boundProviderHealth.status === "unknown"
                             ? "bg-muted-foreground/40"
                             : boundProviderHealth.confirmation_pending
-                              ? "bg-amber-500"
+                              ? "bg-warning"
                             : boundProviderHealth.status === "healthy"
-                              ? "bg-emerald-500"
+                              ? "bg-success"
                               : boundProviderHealth.status === "degraded"
-                                ? "bg-amber-500"
-                                : "bg-red-500",
+                                ? "bg-warning"
+                                : "bg-danger",
                         )}
-                        aria-label={
-                          boundProviderHealth?.confirmation_pending
-                            ? "provider-confirmation-pending"
-                            : `provider-${boundProviderHealth?.status ?? "unknown"}`
-                        }
+                        role="img"
+                        aria-label={t(
+                          !boundProviderHealth || boundProviderHealth.probe_support === "unsupported"
+                            ? "share.health.unknown"
+                            : boundProviderHealth.confirmation_pending
+                              ? "share.health.confirmationPending"
+                              : `share.health.${boundProviderHealth.status}`,
+                        )}
                       />
                     ) : null}
                     <span className="mr-1 uppercase">{app}</span>
@@ -191,7 +195,7 @@ export function ShareCard({
                 {t("share.requestsCount")}: {share.requestsCount}
               </span>
               <span>
-                {t("share.tokensUsed")}: {formatShareTokenUsage(share)}
+                {t("share.tokensUsed")}: {formatShareTokenUsage(share, i18n.language)}
               </span>
               <span>
                 {t("share.expiresAt")}:{" "}
@@ -287,14 +291,6 @@ export function ShareCard({
           </div>
         </div>
 
-        {readOnly ? (
-          <p className="text-xs text-muted-foreground">
-            {t("share.manageInProviderHint", {
-              defaultValue: "修改分享设置请打开绑定的 Provider 编辑页。",
-            })}
-          </p>
-        ) : null}
-
         <section className="space-y-3 border-t border-border-default/70 pt-4">
           <CollapsibleSectionHeader
             title={t("share.connectInfo")}
@@ -306,6 +302,7 @@ export function ShareCard({
             <div className="grid gap-2 lg:grid-cols-3">
               <ConnectInlineValue
                 label={t("share.tunnelUrl")}
+                copyLabel={t("common.copy")}
                 value={tunnelDisplay.tunnelUrl}
                 onCopy={() =>
                   void handleCopy(
@@ -316,6 +313,7 @@ export function ShareCard({
               />
               <ConnectInlineValue
                 label={t("share.subdomain")}
+                copyLabel={t("common.copy")}
                 value={tunnelDisplay.subdomain}
                 onCopy={() =>
                   void handleCopy(
@@ -338,39 +336,38 @@ export function ShareCard({
           {settingsExpanded ? (
             <>
               {!isUnlimitedTokenLimit(share.tokenLimit) ? (
-                <div className="h-2 rounded-full bg-muted">
+                <div
+                  className="h-2 overflow-hidden rounded-full bg-muted"
+                  role="progressbar"
+                  aria-label={t("share.tokensUsed")}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round(ratio * 100)}
+                  aria-valuetext={formatShareTokenUsage(share, i18n.language)}
+                >
+                  {/* Nothing used shows an empty track, not a 4% sliver. */}
                   <div
-                    className="h-2 rounded-full bg-blue-500"
-                    style={{ width: `${Math.max(4, ratio * 100)}%` }}
+                    className={cn("h-2 rounded-full", ratio >= 1 ? "bg-danger" : ratio >= 0.8 ? "bg-warning" : "bg-primary")}
+                    style={{ width: `${ratio * 100}%` }}
                   />
                 </div>
               ) : null}
 
               <div className="grid gap-2 md:grid-cols-3">
                 <SummaryLine
-                  label={t("share.ownerEmail", {
-                    defaultValue: "Owner Email",
-                  })}
+                  label={t("share.ownerEmail")}
                   value={share.ownerEmail || "-"}
                 />
                 <SummaryLine
-                  label={t("share.authorizedUsers", {
-                    defaultValue: "授权用户",
-                  })}
+                  label={t("share.authorizedUsers")}
                   value={shareToSummary || "-"}
                 />
                 <SummaryLine
-                  label={t("share.freeAccess.label", {
-                    defaultValue: "公开免费使用",
-                  })}
+                  label={t("share.freeAccess.title")}
                   value={
                     share.freeAccess
-                      ? t("share.freeAccess.public", {
-                          defaultValue: "公开免费",
-                        })
-                      : t("share.freeAccess.private", {
-                          defaultValue: "私有",
-                        })
+                      ? t("share.freeAccess.public")
+                      : t("share.freeAccess.private")
                   }
                 />
                 <SummaryLine
@@ -382,11 +379,11 @@ export function ShareCard({
                   value={
                     isUnlimitedTokenLimit(share.tokenLimit)
                       ? t("share.unlimited")
-                      : String(share.tokenLimit)
+                      : formatShareTokens(share.tokenLimit, i18n.language)
                   }
                 />
                 <SummaryLine
-                  label={t("share.expiresAt")}
+                  label={t("share.expiration")}
                   value={
                     isPermanentExpiry(share.expiresAt)
                       ? t("share.expiry.permanentLabel")
@@ -464,12 +461,14 @@ function shareToGrantSummary(share: ShareRecord) {
 
 function ConnectInlineValue({
   label,
+  copyLabel,
   value,
   displayValue,
   action,
   onCopy,
 }: {
   label: string;
+  copyLabel: string;
   value: string;
   displayValue?: string;
   action?: ReactNode;
@@ -490,6 +489,8 @@ function ConnectInlineValue({
           size="icon"
           className="h-7 w-7 shrink-0"
           disabled={!value}
+          aria-label={`${copyLabel} · ${label}`}
+          title={copyLabel}
           onClick={onCopy}
         >
           <Copy className="h-3.5 w-3.5" />

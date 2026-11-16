@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { shareApi, type ShareUserGrant } from "@/lib/api/share";
 import { parseValueUsage, splitValueRows, valueErrorMessage, valueUsageLabel, type ValueStatus, type ValueUsageEdit } from "@/lib/share-value-quota";
-import { ShareValueInfo, useValueMessage } from "./ShareValueReadiness";
+import { useValueMessage } from "./ShareValueReadiness";
 
 /**
  * Immediate, audited reconcile; deliberately outside the staged Share save.
@@ -47,11 +47,11 @@ export function ShareValueUsageCorrection({ shareId, revision, grant, status, on
   return <div className="mt-1 max-w-md space-y-1 text-xs">
     <div className="flex flex-wrap items-center gap-2">
       <button type="button" aria-expanded={open} aria-controls={`${id}-panel`} onClick={() => { setResult(""); onOpenChange(!open); }}
-        className={`inline-flex items-center gap-1 rounded font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/40 ${blocked ? "text-destructive" : "text-muted-foreground hover:text-foreground"}`}>
+        className={`inline-flex items-center gap-1 rounded font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${blocked ? "text-destructive" : "text-muted-foreground hover:text-foreground"}`}>
         {open ? <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" /> : <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />}
         {t(q + (blocked ? "reconcile" : "correction"))}
       </button>
-      {result ? <span role="status" className="text-emerald-600 dark:text-emerald-400">{result}</span> : null}
+      {result ? <span role="status" className="text-success">{result}</span> : null}
     </div>
     {open ? <div id={`${id}-panel`} className="space-y-2 rounded-md border border-border-default bg-muted/30 p-2.5">
       <p className="text-muted-foreground">{t(q + "applyNowHint")}</p>
@@ -63,7 +63,6 @@ export function ShareValueUsageCorrection({ shareId, revision, grant, status, on
       <div className="flex flex-wrap items-center gap-2">
         <Button type="button" size="sm" disabled={working} aria-busy={working || undefined} onClick={() => void apply("set")}>{t(q + (working ? "applying" : "applyNow"))}</Button>
         <Button type="button" size="sm" variant="outline" disabled={working} onClick={() => void apply("clear")}>{t(q + "clearOffset")}</Button>
-        <ShareValueInfo label={t(q + "applyNow")}><p>{t(q + "applyNowHint")}</p></ShareValueInfo>
       </div>
       {failure ? <p className="text-destructive" role="alert">{failure}</p> : null}
     </div> : null}

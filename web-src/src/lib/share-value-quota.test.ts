@@ -152,7 +152,7 @@ describe("Share USD-equivalent quotas", () => {
     expect(valueErrorMessage({code:"value_quota_not_active"})).toEqual({key:"share.userLimit.valueQuota.error.notActive"});
     expect(valueStatusReason({...row,reasonCode:"pricing_unavailable"})).toBeUndefined();
     expect(valueStatusReason({...row,meteringStatus:"unavailable",reasonCode:"pricing_unavailable"})).toEqual({key:"share.userLimit.valueQuota.reasonCode.pricing_unavailable"});
-    expect(valueStatusReason({...row,meteringStatus:"unavailable",reasonCode:"coverage_gap"})).toEqual({raw:"coverage_gap"});
+    expect(valueStatusReason({...row,meteringStatus:"unavailable",reasonCode:"coverage_gap"})).toEqual({key:"share.userLimit.valueQuota.reasonCode.unknown"});
     const preview:ValuePreview={ready:false,configRevision:3,rows:[],invalidRows:[{email:"a@example.test",reasonCode:"invalid_policy"}]};
     expect(isValuePreview(preview,3)).toBe(true);
     expect(isValuePreview({...preview,invalidRows:[{}]},3)).toBe(false);

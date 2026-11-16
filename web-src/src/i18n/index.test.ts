@@ -36,7 +36,7 @@ const criticalKeys = [
   "settings.serverVersion.rollbackConfirmMessage",
   "share.confirmDeleteTitle",
   "share.confirmDeleteMessage",
-  "share.freeAccess.label",
+  "share.freeAccess.title",
 ] as const;
 
 const codexFeatureKeys = [

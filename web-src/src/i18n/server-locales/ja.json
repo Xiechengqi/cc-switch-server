@@ -406,7 +406,16 @@
       "sectionTitle": "リモート Share",
       "sharing": "共有中",
       "stop": "クリックして共有を停止",
-      "tokenLimit": "Token 上限"
+      "tokenLimit": "Token 上限",
+      "limitsTitle": "Share 全体の上限",
+      "limitsHint": "全ユーザーの合計に適用されます。Token は累計で数え、使い切ると Share 全体（オーナーを含む）が停止します。新しいユーザーはこの値を初期値として引き継ぎます。",
+      "limitInvalid": "1 以上の整数を入力してください。空欄で無制限です。",
+      "limitLegacyZero": "保存済みの値は 0 で、最初のリクエストで Share が停止します。変更しなければそのまま保存されます。1 以上の整数にするか、空欄で無制限にしてください。",
+      "tokenLimitHint": "Token 数を整数で入力します。",
+      "expiryCurrent": "現在のまま：{{date}}",
+      "expiryEnded": "{{date}} に期限切れ",
+      "expiryFromNow": "今から {{duration}}",
+      "expiryHint": "期間を選ぶと、保存した時点から有効期限を計算し直します。"
     },
     "sortUpdateFailed": "並び順の更新に失敗しました",
     "sortUpdated": "並び順を更新しました",
@@ -1106,15 +1115,16 @@
       "thirtyDays": "30日"
     },
     "freeAccess": {
-      "label": "公開無料アクセス",
+      "title": "アクセス方式",
       "private": "非公開",
       "public": "公開・無料",
-      "short": "Router にログイン済みのユーザーは無料で呼び出せます"
+      "short": "Router にログイン済みのユーザーは無料で呼び出せます",
+      "publicHint": "Router にサインインしたユーザーなら誰でも自分の Router API トークンで呼び出せます。匿名ではありません。",
+      "privateHint": "下に載っているユーザーだけが呼び出せます。"
     },
     "id": "ID",
     "lastUsedAt": "最終使用",
     "listCount": "{{count}} 件の share",
-    "manageInProviderHint": "共有設定を変更するには、バインド済み Provider の編集画面を開いてください。",
     "never": "未使用",
     "openShareSettings": "共有設定を開く",
     "ownerChange": {
@@ -1132,8 +1142,8 @@
       "success": "Share owner を {{email}} に変更しました",
       "title": "Owner メールを変更"
     },
-    "ownerEmail": "Owner Email",
-    "parallelLimit": "最大同時実行数",
+    "ownerEmail": "オーナーのメール",
+    "parallelLimit": "同時実行上限",
     "permanent": "無期限",
     "readOnlyOverviewHint": "これは読み取り専用の概要です。共有設定の変更はバインド済み Provider の編集画面で行ってください。",
     "remotePort": "リモートポート",
@@ -1287,7 +1297,7 @@
         "start": "証拠が揃っていれば保存時に変更先の単位が即時適用され、対象期間の消費と実行中の予約が引き継がれます。",
         "notReady": "Router v10、確定済み SQLite ストレージ、確認済み実行価格表が必要です。",
         "pending": "確定した使用量を同期中",
-        "unitUsdShort": "$",
+        "unitUsdShort": "US$",
         "limit": "米ドル換算の上限",
         "amountPlaceholder": "10.00",
         "amountError": {
@@ -1319,16 +1329,17 @@
           "pricing_unavailable": "この Share のモデルを含む確認済みの価格表がまだありません。",
           "storage_unavailable": "Server の計測ストレージが利用できません。",
           "router_upgrade_required": "米ドル上限を使うには Router と Server をアップグレードしてください。",
-          "blocked_needs_reconcile": "このユーザーの米ドル使用量を先に調整してください（使用量列の「今すぐ調整」）。",
+          "blocked_needs_reconcile": "このユーザーの米ドル利用量は先に調整が必要です（「使用量」列で調整してください）。",
           "invalid_policy": "この上限または期間は米ドル上限に使用できません。",
           "resource_upgrade_required": "Router と Server を更新し、リソース料金表を有効にしてください。",
           "history_incomplete": "履歴証拠が不足しているか、料金が確定していません。修復されるまで現在の単位が維持されます。",
           "history_preparing": "履歴証拠を準備しています。現在のポリシーは引き続き適用されます。",
           "conversion_upgrade_required": "即時の単位変更に対応する Router と Server に更新してください。",
-          "pending_evidence_missing": "実行中のリクエストには変更先の単位で信頼できる上限がありません。精算完了後に変更してください。"
+          "pending_evidence_missing": "実行中のリクエストには変更先の単位で信頼できる上限がありません。精算完了後に変更してください。",
+          "unknown": "このユーザーの米ドル利用状況は現在確認できません"
         },
         "rowReason": "{{email}}：{{reason}}",
-        "usageEditUnavailable": "米ドル上限のユーザーには消費トークンを設定できません。使用量列の「今すぐ調整」を使ってください。",
+        "usageEditUnavailable": "米ドル換算クォータのユーザーには消費 Token を設定できません。「使用量」列で調整してください。",
         "error": {
           "targetInvalid": "目標額は観測済み使用量を下回れず、サポート範囲内である必要があります。",
           "unavailable": "この Server では米ドル計測を利用できません。準備状況を確認して再試行してください。",
@@ -1366,20 +1377,76 @@
         "preparationProgress": "履歴を準備中 · {{count}} 件を確認済み",
         "evidence": "確認済み：{{tokens}} Token · {{requests}} 件 · 証拠不足の試行 {{missing}} 件",
         "pricingBasis": "リクエスト時の固定価格を優先し、復元分には料金表 {{revision}} を使用",
-        "originalPrices": "リクエスト時の固定価格"
+        "originalPrices": "リクエスト時の固定価格",
+        "saveFirst": "米ドル換算クォータは Share を保存してから使えます",
+        "equivalentAmount": "{{amount}} 相当"
       },
       "accountReset": {
         "label": "アカウントのリセット周期",
-        "ready": "アカウント周期は準備完了",
-        "unavailable": "アカウント周期を選択できません：{{reason}}",
         "pending": "アカウント周期・履歴の確認待ち",
         "noEnd": "次回リセットは未確認",
         "observed": "最終観測",
         "caveat": "公開告知の時刻は個別アカウントの実行時刻ではありません。証拠のない外部リセットの検出は保証できません。一時的な障害中は確認済みの周期を維持します。",
         "preview": "予想使用量（ゼロにはしません）。各ユーザーを確認し、もう一度適用してください：",
         "exceeded": "上限に到達または超過",
-        "saveFirst": "Share を保存してからアカウント周期を初期化してください。",
-        "notReady": "アカウント周期は未準備です。現在の周期を維持してください。"
+        "saveFirst": "アカウントリセット周期は Share を保存してから使えます",
+        "notReady": "アカウント周期は未準備です。現在の周期を維持してください。",
+        "status": {
+          "ready": "準備完了",
+          "initializing": "1 周期分の利用履歴を収集中",
+          "stale": "周期情報が古くなっています。新しい上流の観測を待っています",
+          "error": "同期に失敗しました",
+          "needsReconcile": "調整が必要です"
+        },
+        "reason": {
+          "historyIncomplete": "記録開始がこの周期の開始より後のため、次の完全な周期を待つ必要があります",
+          "cycleExpired": "前の周期は終了しましたが、新しい周期はまだ観測されていません",
+          "notReady": "アカウント周期の準備ができていません。現在の周期を維持してください",
+          "routerUpgradeRequired": "アカウントリセット周期を使うには Router のアップグレードが必要です",
+          "unsupported": "この Share のアカウントはアカウントリセット周期に対応していません",
+          "ledgerCapacityLimit": "クォータ台帳が上限に達したため、アカウント周期のユーザーは追加できません",
+          "ledgerUnavailable": "クォータ台帳が一時的に利用できません。しばらくしてから再試行してください",
+          "cycleConflict": "アカウント周期が変わりました。開き直してから保存してください",
+          "quotaExhausted": "この周期のクォータを使い切りました",
+          "unknown": "アカウント周期は利用できません",
+          "identityUnverified": "上流アカウントの本人確認ができません",
+          "quotaBoundaryUnavailable": "上流がクォータのリセット境界を提供していません",
+          "multipleQuotaScopes": "このアカウントには複数のクォータ範囲があり、周期を特定できません",
+          "nonRecurringPackage": "このアカウントのクォータは一回限りのパッケージで、周期的にリセットされません",
+          "profileUnsupported": "この Provider の種類はアカウント周期に対応していません",
+          "quotaProviderMissing": "クォータの取得元が見つかりません",
+          "quotaScopeUnproven": "クォータの範囲を確認できません"
+        },
+        "basis": {
+          "upstreamWindow": "上流のウィンドウ",
+          "derivedFromWindow": "上流のウィンドウから推定",
+          "knownNaturalBoundary": "既知の自然境界",
+          "publicAnnouncement": "公式告知",
+          "redeemConfirmation": "引き換え確認",
+          "unknown": "不明な根拠"
+        },
+        "bucket": {
+          "shared_weekly": "週次共有クォータ",
+          "generic": "アカウント周期",
+          "agentic_subscription_base": "サブスクリプション基本クォータ",
+          "included_plan_credits": "プラン付属クレジット",
+          "premium_monthly": "プレミアムクォータ（毎月）"
+        },
+        "details": "アカウント周期の詳細",
+        "basisLine": "根拠：{{basis}}",
+        "observedLine": "最終観測：{{time}}",
+        "code": "診断コード：{{code}}",
+        "retry": "再試行",
+        "loading": "状態を確認中",
+        "loadFailed": "状態を取得できませんでした",
+        "cycleRange": "{{start}} 〜 {{end}}",
+        "cycleEnded": "{{start}} 〜 {{end}}（終了）",
+        "cycleOpen": "{{start}} から、次回リセットは未確定",
+        "capacityWarning": "クォータ台帳が上限に近づいています（{{count}}/{{limit}}）。アカウント周期のユーザーは追加できません",
+        "rowReason": "{{email}}：{{reason}}",
+        "optionUnavailable": "{{label}}（{{reason}}）",
+        "optionNotReady": "準備中",
+        "optionSaveFirst": "Share の保存後に利用可能"
       },
       "remoteChanged": "Share 設定が別の場所で変更されました。再読み込みすると、編集中の Share の内容を破棄し、最新の設定を読み込みます。",
       "reloadShare": "Share を再読み込み",
@@ -1401,7 +1468,7 @@
       "invalidPolicy": "制限には正の整数を指定し、日時は有効な値にしてください。",
       "invalidUsage": "消費済み Token には 0 以上の整数を指定してください。",
       "newConsumedHint": "0 を入力できます。空欄のままなら手動基準を作成しません。",
-      "period": "Token 期間",
+      "period": "クォータ周期",
       "periodDay": "日次",
       "periodLifetime": "累計",
       "periodMonth": "暦月",
@@ -1413,7 +1480,25 @@
       "savedQuotaHint": "サーバー側の集計期間: {{start}} 〜 {{end}}、手動補正 {{offset}}。",
       "selectAll": "編集可能なユーザーをすべて選択",
       "selectUser": "{{email}} を選択",
-      "title": "許可ユーザーとクォータ"
+      "title": "許可ユーザーとクォータ",
+      "duration": {
+        "daysHours": "{{days}}日 {{hours}}時間",
+        "hoursMinutes": "{{hours}}時間 {{minutes}}分",
+        "minutes": "{{minutes}}分"
+      },
+      "tokenEcho": "≈ {{value}}",
+      "email": "メール",
+      "quota": "クォータ",
+      "used": "使用量（現在の周期）",
+      "actions": "操作",
+      "role": {
+        "owner": "オーナー",
+        "market": "マーケット席"
+      },
+      "privateHint": "ここに載っているユーザーだけが呼び出せ、各自のクォータ内で計算されます。",
+      "publicHint": "公開モードではこの一覧は個人の上限設定です。削除しても上限が外れるだけで、呼び出しは止まりません。",
+      "expiryHint": "空欄で無期限。ローカル時刻で入力します。",
+      "batchPeriodHint": "周期を変更するには「{{label}}」にチェックしてください。"
     },
     "validation": {
       "invalidEmail": "メールアドレスが無効です",
@@ -1453,6 +1538,13 @@
       "expiresAtAsc": "期限が近い順",
       "tokensUsedDesc": "使用トークン数が多い順",
       "nameAsc": "名前順"
+    },
+    "health": {
+      "unknown": "ヘルス不明",
+      "healthy": "正常",
+      "degraded": "低下",
+      "unhealthy": "異常",
+      "confirmationPending": "ヘルス確認中"
     }
   },
   "streamCheck": {

@@ -393,8 +393,8 @@
       "description": "描述",
       "enable": "分享",
       "enableShare": "启用远程分享",
-      "expiry": "有效期",
-      "parallelLimit": "并发限额",
+      "expiry": "到期时间",
+      "parallelLimit": "并发上限",
       "removeBindingError": "停止远程分享失败：{{error}}",
       "removeBindingSuccess": "已停止该应用的远程分享",
       "resume": "重新开启分享",
@@ -406,7 +406,16 @@
       "sectionTitle": "远程分享",
       "sharing": "分享中",
       "stop": "点击停止分享",
-      "tokenLimit": "Token 限额"
+      "tokenLimit": "Token 上限",
+      "limitsTitle": "Share 总上限",
+      "limitsHint": "所有用户合计生效。Token 按累计用量计算，用完后整个 Share（含所有者）暂停；新用户默认继承这里的值。",
+      "limitInvalid": "须为不小于 1 的整数；留空表示不限。",
+      "limitLegacyZero": "当前保存的值为 0，Share 会在第一次请求时停用。不改动可原样保存；建议改为不小于 1 的整数，或留空表示不限。",
+      "tokenLimitHint": "按整数 Token 填写。",
+      "expiryCurrent": "保持当前：{{date}}",
+      "expiryEnded": "已于 {{date}} 到期",
+      "expiryFromNow": "从现在起 {{duration}}",
+      "expiryHint": "选择时长会从保存时起重新计算到期时间。"
     },
     "sortUpdateFailed": "排序更新失败",
     "sortUpdated": "排序已更新",
@@ -1094,7 +1103,7 @@
     "error": {
       "title": "加载分享失败"
     },
-    "expiration": "到期",
+    "expiration": "到期时间",
     "expiresAt": "到期时间",
     "expiry": {
       "oneDay": "1 天",
@@ -1106,15 +1115,16 @@
       "thirtyDays": "30 天"
     },
     "freeAccess": {
-      "label": "公开免费使用",
+      "title": "访问方式",
       "private": "私有",
       "public": "公开免费",
-      "short": "任意已登录 Router 用户可免费调用"
+      "short": "任意已登录 Router 用户可免费调用",
+      "publicHint": "任意已登录 Router 用户都可用自己的 Router API Token 调用；不是匿名访问。",
+      "privateHint": "只有下方列出的用户可以调用。"
     },
     "id": "ID",
     "lastUsedAt": "最后使用",
     "listCount": "{{count}} 个 share",
-    "manageInProviderHint": "修改分享设置请打开绑定的 Provider 编辑页。",
     "never": "从未使用",
     "openShareSettings": "前往分享设置",
     "ownerChange": {
@@ -1132,8 +1142,8 @@
       "success": "Share owner 已换绑为 {{email}}",
       "title": "换绑 Owner 邮箱"
     },
-    "ownerEmail": "Owner Email",
-    "parallelLimit": "最大并发数",
+    "ownerEmail": "Owner 邮箱",
+    "parallelLimit": "并发上限",
     "permanent": "永久",
     "readOnlyOverviewHint": "此为只读总览。修改分享设置请前往绑定的 Provider 编辑页。",
     "remotePort": "远端端口",
@@ -1287,7 +1297,7 @@
         "start": "历史证据完整时，保存后立即按目标单位执行，并承接目标周期全部已用额度和在途用量；证据不足时保留原策略。",
         "notReady": "需要 Router v10、已切换的 SQLite 权威存储和已确认的执行价目。",
         "pending": "等待权威用量同步",
-        "unitUsdShort": "$",
+        "unitUsdShort": "US$",
         "limit": "美元等值额度",
         "amountPlaceholder": "10.00",
         "amountError": {
@@ -1319,16 +1329,17 @@
           "pricing_unavailable": "尚无已确认的价目覆盖该 Share 的模型。",
           "storage_unavailable": "Server 计量存储不可用。",
           "router_upgrade_required": "请升级 Router 和 Server 后再使用美元额度。",
-          "blocked_needs_reconcile": "该用户的美元用量需要先校准（在用量列中立即校准）。",
+          "blocked_needs_reconcile": "该用户的美元用量需要先校准（在“已用”列中立即校准）。",
           "invalid_policy": "该额度或周期不适用于美元额度。",
           "resource_upgrade_required": "请升级 Router、Server 并激活资源价目。",
           "history_incomplete": "历史请求证据缺失或尚未定价，补齐证据或价格前不能转换。",
           "history_preparing": "正在准备历史请求证据，当前策略继续生效。",
           "conversion_upgrade_required": "请升级 Router 和 Server，以支持立即切换额度单位。",
-          "pending_evidence_missing": "在途请求缺少目标单位的可信上界，请等待结算后再转换。"
+          "pending_evidence_missing": "在途请求缺少目标单位的可信上界，请等待结算后再转换。",
+          "unknown": "该用户的美元用量状态暂时无法确认"
         },
         "rowReason": "{{email}}：{{reason}}",
-        "usageEditUnavailable": "美元额度用户不能设置已消耗 Token，请在其用量列中立即校准。",
+        "usageEditUnavailable": "美元额度用户不能设置已消耗 Token，请在“已用”列中立即校准。",
         "error": {
           "targetInvalid": "目标金额不能低于已观测用量，且须在支持范围内。",
           "unavailable": "此 Server 的美元计量暂不可用，请检查就绪状态后重试。",
@@ -1366,20 +1377,76 @@
         "preparationProgress": "正在准备历史 · 已核对 {{count}} 条请求",
         "evidence": "已核对：{{tokens}} Token · {{requests}} 条请求 · {{missing}} 条待补证的尝试",
         "pricingBasis": "原请求冻结价优先，重建部分使用价目 {{revision}}",
-        "originalPrices": "原始冻结价格"
+        "originalPrices": "原始冻结价格",
+        "saveFirst": "保存 Share 后才能使用美元等值额度",
+        "equivalentAmount": "{{amount}} 等值"
       },
       "accountReset": {
         "label": "账号重置周期",
-        "ready": "账号周期已就绪",
-        "unavailable": "账号周期暂不可选：{{reason}}",
         "pending": "等待账号周期 / 完整历史",
         "noEnd": "下次重置待确认",
         "observed": "最后观测",
         "caveat": "公共公告按公告时间跟随，不代表逐账号执行；无证据的站外重置无法保证识别。暂时失败时沿用已确认周期。",
         "preview": "预计用量（不会清零）；核对各用户后再次应用：",
         "exceeded": "达到或超过限额",
-        "saveFirst": "请先保存 Share，再初始化账号周期。",
-        "notReady": "账号周期尚未就绪，请保留原周期。"
+        "saveFirst": "保存 Share 后才能使用账号重置周期",
+        "notReady": "账号周期尚未就绪，请保留原周期。",
+        "status": {
+          "ready": "已就绪",
+          "initializing": "正在积累完整周期的用量历史",
+          "stale": "周期信息已过期，等待新的上游观测",
+          "error": "同步失败",
+          "needsReconcile": "需要校准"
+        },
+        "reason": {
+          "historyIncomplete": "开始记录晚于本周期起点，需等到下一个完整周期",
+          "cycleExpired": "上一个周期已结束，尚未观测到新周期",
+          "notReady": "账号周期尚未就绪，请保留原周期",
+          "routerUpgradeRequired": "Router 版本过旧，升级后才能使用账号重置周期",
+          "unsupported": "此 Share 绑定的账号不支持账号重置周期",
+          "ledgerCapacityLimit": "额度账本已达容量上限，暂不能新增账号周期用户",
+          "ledgerUnavailable": "额度账本暂不可用，请稍后重试",
+          "cycleConflict": "账号周期已变化，请重新打开后再保存",
+          "quotaExhausted": "本周期额度已用尽",
+          "unknown": "账号周期暂不可用",
+          "identityUnverified": "无法确认上游账号身份",
+          "quotaBoundaryUnavailable": "上游未提供额度重置边界",
+          "multipleQuotaScopes": "该账号有多个额度范围，无法确定周期",
+          "nonRecurringPackage": "该账号额度是一次性套餐，不会周期重置",
+          "profileUnsupported": "该 Provider 类型不支持账号周期",
+          "quotaProviderMissing": "未找到额度来源",
+          "quotaScopeUnproven": "无法确认额度范围"
+        },
+        "basis": {
+          "upstreamWindow": "上游窗口",
+          "derivedFromWindow": "由上游窗口推算",
+          "knownNaturalBoundary": "已知自然边界",
+          "publicAnnouncement": "官方公告",
+          "redeemConfirmation": "兑换确认",
+          "unknown": "未知来源"
+        },
+        "bucket": {
+          "shared_weekly": "每周共享额度",
+          "generic": "账号周期",
+          "agentic_subscription_base": "订阅基础额度",
+          "included_plan_credits": "套餐内含额度",
+          "premium_monthly": "高级额度（每月）"
+        },
+        "details": "账号周期详情",
+        "basisLine": "周期依据：{{basis}}",
+        "observedLine": "最后观测：{{time}}",
+        "code": "诊断码：{{code}}",
+        "retry": "重试",
+        "loading": "正在读取状态",
+        "loadFailed": "状态读取失败",
+        "cycleRange": "{{start}} 至 {{end}}",
+        "cycleEnded": "{{start}} 至 {{end}}（已结束）",
+        "cycleOpen": "自 {{start}} 起，下次重置待确认",
+        "capacityWarning": "额度账本接近容量上限（{{count}}/{{limit}}），暂不能新增账号周期用户",
+        "rowReason": "{{email}}：{{reason}}",
+        "optionUnavailable": "{{label}}（{{reason}}）",
+        "optionNotReady": "未就绪",
+        "optionSaveFirst": "保存 Share 后可用"
       },
       "remoteChanged": "Share 配置已在其他位置修改。重新加载将丢弃当前 Share 草稿并使用最新配置。",
       "reloadShare": "重新加载 Share",
@@ -1401,7 +1468,7 @@
       "invalidPolicy": "限制必须为正整数，且时间必须有效。",
       "invalidUsage": "已消耗 Token 必须是大于等于 0 的整数。",
       "newConsumedHint": "可填写 0；留空表示不创建手工重基线。",
-      "period": "Token 周期",
+      "period": "额度周期",
       "periodDay": "每天",
       "periodLifetime": "累计",
       "periodMonth": "自然月",
@@ -1413,7 +1480,25 @@
       "savedQuotaHint": "服务端统计周期：{{start}} 至 {{end}}；手工修正 {{offset}}。",
       "selectAll": "选择全部可编辑用户",
       "selectUser": "选择 {{email}}",
-      "title": "授权用户与配额"
+      "title": "授权用户与配额",
+      "duration": {
+        "daysHours": "{{days}} 天 {{hours}} 小时",
+        "hoursMinutes": "{{hours}} 小时 {{minutes}} 分钟",
+        "minutes": "{{minutes}} 分钟"
+      },
+      "tokenEcho": "≈ {{value}}",
+      "email": "邮箱",
+      "quota": "额度",
+      "used": "已用（当前周期）",
+      "actions": "操作",
+      "role": {
+        "owner": "所有者",
+        "market": "市场席位"
+      },
+      "privateHint": "只有列表中的用户可以调用，每人按自己的额度计算。",
+      "publicHint": "公开模式下列表是个人限额覆盖；移除用户只取消其个人限额，不会阻止其调用。",
+      "expiryHint": "留空表示永久；按本地时间填写。",
+      "batchPeriodHint": "勾选“{{label}}”后才能修改周期。"
     },
     "validation": {
       "invalidEmail": "邮箱格式无效",
@@ -1453,6 +1538,13 @@
       "expiresAtAsc": "即将过期优先",
       "tokensUsedDesc": "Token 使用量从高到低",
       "nameAsc": "名称正序"
+    },
+    "health": {
+      "unknown": "健康状态未知",
+      "healthy": "健康",
+      "degraded": "性能下降",
+      "unhealthy": "不可用",
+      "confirmationPending": "健康状态待确认"
     }
   },
   "streamCheck": {
