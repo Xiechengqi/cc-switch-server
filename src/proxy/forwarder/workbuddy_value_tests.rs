@@ -417,33 +417,30 @@ fn workbuddy_value_retries_settle_free_attempt_and_never_replay_paid_output() {
 }
 
 #[test]
-fn workbuddy_value_missing_prices_opaque_models_and_media_never_generate() {
+fn workbuddy_value_owner_unpriced_models_generate_and_media_never_generates() {
     run_codebuddy_async_test(async {
         let route = ProxyRoute::CodexChatCompletions;
         let (state, provider, fixture, server, _) = workbuddy_value_setup(
             route,
-            vec![CodeBuddyGenerationReply::Value(
-                WorkBuddyValueReply::Success,
-            )],
+            vec![CodeBuddyGenerationReply::Value(WorkBuddyValueReply::Success); 3],
             "1000000",
         )
         .await;
-        for (model, reason) in [
-            ("hy3", "model_unpriced"),
-            ("auto", "model_unresolved"),
-            ("default-model", "model_unresolved"),
-        ] {
-            let error =
+        // Owner-managed grants meter unpriced and opaque models at an explicit
+        // $0 instead of refusing them; only Market scopes stay strict.
+        for model in ["hy3", "auto", "default-model"] {
+            let response =
                 workbuddy_value_request(state.clone(), provider.clone(), route, false, model)
                     .await
-                    .unwrap_err();
-            assert_eq!(error.error_code(), "price_unavailable");
-            assert!(error.message.contains(reason), "{}", error.message);
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+            collect(response).await;
         }
+        assert_eq!(fixture.count(&fixture.generation_requests), 3);
         let error=super::forward_for_test_surface(state.clone(),route,provider,None,codebuddy_headers("workbuddy-value-share","owner@example.com","media"),Bytes::from(json!({"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://invalid.example/image.png"}}]}]}).to_string())).await.unwrap_err();
         assert_eq!(error.error_code(), "cc_switch_invalid_request");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert_eq!(fixture.count(&fixture.generation_requests), 0);
+        assert_eq!(fixture.count(&fixture.generation_requests), 3);
         server.abort();
     });
 }
@@ -552,10 +549,11 @@ fn workbuddy_value_readiness_names_opaque_and_priced_fixed_models() {
     run_codebuddy_async_test(async {
         let (state, _, _, server, _) =
             workbuddy_value_setup(ProxyRoute::CodexChatCompletions, vec![], "1000000").await;
-        for (model, ready, reason) in [
-            ("auto", false, Some("model_unresolved")),
-            ("workbuddy/GLM-5.2", true, None),
-            ("hy3", false, Some("model_unpriced")),
+        // Owner-managed readiness only warns about models metered at $0.
+        for (model, reason) in [
+            ("auto", Some("model_unresolved")),
+            ("workbuddy/GLM-5.2", None),
+            ("hy3", Some("model_unpriced")),
         ] {
             let mut providers = state.providers_snapshot().await;
             providers.providers[0].provider.settings_config["modelMapping"] =
@@ -583,7 +581,8 @@ fn workbuddy_value_readiness_names_opaque_and_priced_fixed_models() {
                 .iter()
                 .find(|c| c["code"] == "model_price_coverage")
                 .unwrap();
-            assert_eq!(coverage["ready"], ready, "{model}");
+            assert_eq!(coverage["ready"], true, "{model}");
+            assert_eq!(coverage["state"] == "unpriced", reason.is_some(), "{model}");
             assert_eq!(coverage["app"], "codex");
             assert_eq!(coverage["profileId"], "codex.workbuddy_oauth");
             assert_eq!(coverage["driverId"], "special.workbuddy_oauth");
