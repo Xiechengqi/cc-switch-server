@@ -369,14 +369,6 @@ async fn value_quota_status_emits_unpriced_fields_only_to_a_negotiated_router() 
         .await
         .unwrap()
         .unwrap();
-    state
-        .mutate_shares_immediate(|store| {
-            store
-                .upsert(router_sync_share_input("unpriced-status-share", "provider"))
-                .unwrap();
-        })
-        .await
-        .unwrap();
     let config = state.config_snapshot().await;
     let scope = ledger::Scope {
         router_url: config.router_api_base().unwrap().into(),
@@ -405,15 +397,15 @@ async fn value_quota_status_emits_unpriced_fields_only_to_a_negotiated_router() 
             "valueQuota":{"limitUsdMicros":"1000000","tariffPolicyId":"api-equivalent-v1"}}}),
     )
     .unwrap();
+    // A brand-new Share takes a USD grant directly; an existing one would
+    // require a signed token-to-USD conversion.
     state
         .mutate_shares_immediate(|store| {
-            store
-                .shares
-                .iter_mut()
-                .find(|s| s.id == "unpriced-status-share")
-                .unwrap()
+            let mut input = router_sync_share_input("unpriced-status-share", "provider");
+            input
                 .user_grants
                 .insert("user@example.test".into(), grant.clone());
+            store.upsert(input).unwrap();
         })
         .await
         .unwrap();
