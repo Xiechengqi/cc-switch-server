@@ -330,7 +330,10 @@ export function ShareUserGrantsEditor({
   onChange,
 }: ShareUserGrantsEditorProps) {
   const { t, i18n } = useTranslation();
+  // Usage reads compact; a configured limit, a rebase target and the
+  // projection compared against a limit read exactly, as they are entered.
   const tokens = (value: number | null | undefined) => formatShareTokens(value, i18n.language);
+  const exactTokens = (value: number) => value.toLocaleString(i18n.language);
   const [accountPreview, setAccountPreview] = useState<AccountResetPreview>();
   const [previewIntent, setPreviewIntent] = useState("");
   const [previewBusy, setPreviewBusy] = useState(false);
@@ -1122,7 +1125,7 @@ export function ShareUserGrantsEditor({
                 </TableCell>
                 <TableCell className="px-3 py-2">{displayLimit(grant.policy.parallelLimit, unlimited)}</TableCell>
                 <TableCell className="px-3 py-2 align-top">
-                  {malformed ? "—" : <>{usdLimit ? t("share.userLimit.valueQuota.equivalentAmount", { amount: valueLimitLabel(usdLimit) }) : enforcedPolicy.tokenLimit == null ? unlimited : tokens(enforcedPolicy.tokenLimit)} · {periodLabels[enforcedPolicy.tokenPeriod]}</>}
+                  {malformed ? "—" : <>{usdLimit ? t("share.userLimit.valueQuota.equivalentAmount", { amount: valueLimitLabel(usdLimit) }) : enforcedPolicy.tokenLimit == null ? unlimited : exactTokens(enforcedPolicy.tokenLimit)} · {periodLabels[enforcedPolicy.tokenPeriod]}</>}
                   {scheduled ? <ShareValueScheduledLine limitMicros={scheduled.policy.valueQuota!.limitUsdMicros} effectiveFromMs={scheduled.effectiveFromMs} /> : null}
                 </TableCell>
                 <TableCell className="px-3 py-2 align-top">
@@ -1137,7 +1140,7 @@ export function ShareUserGrantsEditor({
                   {grant.usageRebase && !usdLimit && !malformed ? (
                     <div className="text-[11px] text-muted-foreground">
                       {t("share.userLimit.rebaseTarget", {
-                        value: tokens(grant.usageRebase.targetTokens),
+                        value: exactTokens(grant.usageRebase.targetTokens),
                       })}
                     </div>
                   ) : null}
@@ -1391,7 +1394,7 @@ export function ShareUserGrantsEditor({
           ) : null}
           {draft?.tokenPeriod === "accountReset" && previewIntent && accountPreview ? <div className="space-y-0.5 px-6 text-xs" role="status">
             <p>{t("share.userLimit.accountReset.preview")}</p>
-            {accountPreview.rows.map((row) => <p key={row.email} className="break-all">{row.email}: {row.currentTokens == null ? t("share.userLimit.accountReset.pending") : tokens(row.currentTokens)} → {row.expectedTokens == null ? t("share.userLimit.accountReset.notReady") : tokens(row.expectedTokens)}{row.wouldExceed ? <span className="text-destructive"> · {t("share.userLimit.accountReset.exceeded")}</span> : null}</p>)}
+            {accountPreview.rows.map((row) => <p key={row.email} className="break-all">{row.email}: {row.currentTokens == null ? t("share.userLimit.accountReset.pending") : exactTokens(row.currentTokens)} → {row.expectedTokens == null ? t("share.userLimit.accountReset.notReady") : exactTokens(row.expectedTokens)}{row.wouldExceed ? <span className="text-destructive"> · {t("share.userLimit.accountReset.exceeded")}</span> : null}</p>)}
           </div> : null}
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => setDraft(null)}>{t("common.cancel")}</Button>
@@ -1622,7 +1625,7 @@ export function ShareUserGrantsEditor({
           ) : null}
           {batchDraft && previewIntent && accountPreview ? <div className="space-y-0.5 px-6 text-xs" role="status">
             <p>{t("share.userLimit.accountReset.preview")}</p>
-            {accountPreview.rows.map((row) => <p key={row.email} className="break-all">{row.email}: {row.currentTokens == null ? t("share.userLimit.accountReset.pending") : tokens(row.currentTokens)} → {row.expectedTokens == null ? t("share.userLimit.accountReset.notReady") : tokens(row.expectedTokens)}{row.wouldExceed ? <span className="text-destructive"> · {t("share.userLimit.accountReset.exceeded")}</span> : null}</p>)}
+            {accountPreview.rows.map((row) => <p key={row.email} className="break-all">{row.email}: {row.currentTokens == null ? t("share.userLimit.accountReset.pending") : exactTokens(row.currentTokens)} → {row.expectedTokens == null ? t("share.userLimit.accountReset.notReady") : exactTokens(row.expectedTokens)}{row.wouldExceed ? <span className="text-destructive"> · {t("share.userLimit.accountReset.exceeded")}</span> : null}</p>)}
           </div> : null}
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => {
