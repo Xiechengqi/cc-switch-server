@@ -1981,7 +1981,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/save_provider_bundle_share",
-      "notes": "Atomically reconciles every enabled Provider Bundle Surface binding, canonical freeAccess, userGrants-derived ACL projection, limits, URL settings, and optional Server-owned userUsageEdits (consumed-token rebase) in one Share commit."
+      "notes": "Atomically reconciles every enabled Provider Bundle Surface binding, canonical freeAccess (omitted on update keeps the current access; a new Share defaults to private), userGrants-derived ACL projection, limits, URL settings, and optional Server-owned userUsageEdits (consumed-token rebase) in one Share commit."
     },
     {
       "name": "save_provider_share",
@@ -1989,7 +1989,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/save_provider_share",
-      "notes": "Atomically persists canonical freeAccess and userGrants-derived ShareTo configuration plus optional Server-owned userUsageEdits (target tokens and period anchor), while preserving Router Share Market-managed grants and keeping Share Owner derived from Client Owner."
+      "notes": "Atomically persists canonical freeAccess (omitted keeps the current access) and userGrants-derived ShareTo configuration plus optional Server-owned userUsageEdits (target tokens and period anchor), while preserving Router Share Market-managed grants and keeping Share Owner derived from Client Owner."
     },
     {
       "name": "set_auto_launch",

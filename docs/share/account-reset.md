@@ -32,7 +32,7 @@
 
 streamIncarnation 区分恢复后的同步流；cycleSequence/cycleId 标识新周期；cycleRevision 标识同周期修正；usageWatermark 标识使用修订。新观测仅更新 freshness，不修改管理员 configRevision。事件与指针、回执同属 ShareStore 持久化单元。旧事件不回退当前周期；跨过其他已确认边界的修正进入 needsReconcile；加载时验证事件引用、修正链、回执和公共游标。
 
-第一版不声明任何可离线无限外推的 recurring adapter。已知下一边界只推进一次，标 knownNaturalBoundary/stale，随后 end 为空；不会断网每周凭空重置或将自然月换算成三十天。
+第一版不声明任何可离线无限外推的 recurring adapter。已知下一边界只推进一次，标 knownNaturalBoundary/stale，随后 end 为空；无法推进的过期周期标 stale/`cycle_expired`（见“投影状态、可选周期与后台刷新”）；不会断网每周凭空重置或将自然月换算成三十天。
 
 精简账本保存不可变来源/开始毫秒、稳定 metering ID、累计 Token revisions 和持久化水位。详情与精简 revision 沿用同次 usage commit；准入前先 durable pending，崩溃遗留的不明使用不能等于零。按 source/epoch/bucket/share/user 建 scope 索引，SQL 另有来源/毫秒索引；当前查询仍遍历目标用户历史 records，尚非时间树 O(log n) 查询。没有新增 Token 预留系统，在途仍可能超额。
 
@@ -86,6 +86,28 @@ Router reader v2..v8，市场最低v5不变。Server普通未协商payload保持
 动态投影不纳入静态fingerprint/configRevision/generation。此版复用完整descriptor持久同步和ACK：Notify主动唤醒+30秒重放；不是独立dynamic envelope，也没有精确usageWatermark ACK。按stream→source/epoch→cycleSequence→cycleRevision/usageWatermark合并，合法校正可以下降，旧周期不靠max复活。新stream全量descriptor作为恢复握手，Share级retired stream落盘，删除/新增用户也不能复活旧流。
 
 历史新增nullable started_at_ms/source/epoch/bucket；旧秒级行unknown，不乘1000冒充精确。账号quota只用Server权威，不重复相加Router本地历史。
+
+### 投影状态、可选周期与后台刷新
+
+投影能力 `accountResetCapability` 按以下顺序取值（`ShareStore::project_account_reset`）：
+
+| 条件 | syncStatus | reason |
+| --- | --- | --- |
+| 当前周期终点已过（`endsAtMs <= now`）且尚未推进，历史不完整 | `stale` | `history_incomplete`（真正的阻断原因仍可见） |
+| 当前周期终点已过且尚未推进，历史完整 | `stale` | `cycle_expired` |
+| 历史不完整 | `initializing` | `history_incomplete` |
+| 历史完整，但观测早于周期开始、超过5分钟或终点未知 | `stale` | 空 |
+| 其余 | `ready` | 空 |
+
+过期周期只改变展示状态，不放宽执行：准入仍要求完整历史生成的 `usageQuota`，历史不完整时有限额度照旧返回503。
+
+预览接口 `preview_share_account_reset` 用同一口径（`preview_account_reset_status`）：周期终点已过时不是 `ready`，即使最后观测仍在5分钟内；状态为 `stale`，原因依次取容量限制 `QUOTA_LEDGER_CAPACITY_LIMIT`、历史不完整 `QUOTA_HISTORY_INCOMPLETE`、否则 `cycle_expired`。
+
+`supportedUserTokenPeriods` 在 Router 已协商 v8 时追加 `accountReset`，条件为任一：Share 已有启用中的 accountReset 用户（周期 stale 时仍可编辑这些用户，不被 Router 以周期不受支持拒绝）；或任一投影为 `ready`，或为历史完整的 `stale`（reason 为空）。`initializing` 与 `cycle_expired` 不新增该选项；新切换到 accountReset 的用户仍须通过 `validate_account_reset_configuration` 的来源、周期 CAS 与完整历史校验。
+
+“是否在用 accountReset”分两种口径：准入、校验、后台刷新和可选周期只看启用中的 grant（`Share::uses_account_reset`）；契约序列化看全部 grant（`Share::serializes_account_reset_period`），因为已撤销的 grant 仍按原周期上线，旧 Router 会拒绝，Server 因此仍以 `ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED` 提前失败。
+
+后台账号额度循环（最长60秒一轮）每轮刷新有启用中 accountReset 用户的 Share，并在到期时探测上游。其余已投影过周期的启用 Share 每10分钟做一次纯本地重投影：推进已知边界、标记过期周期，不发上游额度请求；随后由30秒定时同步带给 Router，空闲 Share 不再长期显示已过期的周期。
 
 Server invoke `preview_share_account_reset`、HTTP账号周期preview与控制 `/_ctl/preview_account_reset`、Router管理preview贯通。双端单用户/批量逐人预览、冻结cycle CAS、隐藏清理anchor、开放终点/时间依据/同步质量/容量告警、草稿与动态分离；市场合同只读。
 

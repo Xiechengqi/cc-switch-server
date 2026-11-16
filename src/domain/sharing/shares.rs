@@ -974,7 +974,68 @@ pub struct UpsertShareInput {
     pub user_grants: BTreeMap<String, ShareUserGrant>,
 }
 
+/// Execution, refresh and the Router's period offer follow active grants. The
+/// contract serializer follows every stored grant: a revoked grant still
+/// carries its policy period on the wire.
+impl Share {
+    /// An active grant meters against the upstream account cycle.
+    pub fn uses_account_reset(&self) -> bool {
+        self.user_grants.values().any(|grant| {
+            grant.active && grant.policy.token_period == ShareTokenPeriod::AccountReset
+        })
+    }
+
+    /// Some stored grant, active or revoked, serializes the account-reset period.
+    pub fn serializes_account_reset_period(&self) -> bool {
+        self.user_grants
+            .values()
+            .any(|grant| grant.policy.token_period == ShareTokenPeriod::AccountReset)
+    }
+
+    /// The Router may offer the account-reset period when an active grant
+    /// already uses it, so a stale cycle never locks those users out of
+    /// editing, or when the projected history is complete. A new account-reset
+    /// policy still has to pass `validate_account_reset_configuration`.
+    pub fn offers_account_reset_period(&self) -> bool {
+        self.uses_account_reset()
+            || self.user_grants.values().any(|grant| {
+                grant
+                    .account_reset_capability
+                    .as_ref()
+                    .is_some_and(|capability| {
+                        capability.sync_status == "ready"
+                            || (capability.sync_status == "stale" && capability.reason.is_none())
+                    })
+            })
+    }
+
+    /// The Share shows a projected account cycle that must not go stale unseen.
+    pub fn has_account_cycle_projection(&self) -> bool {
+        self.user_grants
+            .values()
+            .any(|grant| grant.account_quota_cycle.is_some())
+    }
+}
+
 impl ShareStore {
+    /// Shares the account-cycle loop refreshes, as `(referenced, projected)`.
+    /// Referenced Shares meter an active grant against the account cycle and
+    /// may probe upstream when due. Projected Shares only show a cycle; on the
+    /// slow sweep they are re-projected locally, which advances a known
+    /// boundary and marks an expired cycle without upstream quota requests.
+    pub fn account_cycle_refresh_targets(&self, sweep_due: bool) -> (Vec<String>, Vec<String>) {
+        let mut referenced = Vec::new();
+        let mut projected = Vec::new();
+        for share in self.shares.iter().filter(|share| share.enabled) {
+            if share.uses_account_reset() {
+                referenced.push(share.id.clone());
+            } else if sweep_due && share.has_account_cycle_projection() {
+                projected.push(share.id.clone());
+            }
+        }
+        (referenced, projected)
+    }
+
     pub fn validate_account_reset_configuration(
         &self,
         share_id: &str,
@@ -982,9 +1043,7 @@ impl ShareStore {
         expected: Option<&super::quota_cycle::AccountQuotaCycle>,
     ) -> Result<(), SharePatchError> {
         let share = self.get(share_id).ok_or(SharePatchError::NotFound)?;
-        if !share.user_grants.values().any(|grant| {
-            grant.active && grant.policy.token_period == ShareTokenPeriod::AccountReset
-        }) {
+        if !share.uses_account_reset() {
             return Ok(());
         }
         let source = self
@@ -1025,6 +1084,12 @@ impl ShareStore {
             .iter_mut()
             .find(|share| share.id == share_id)
             .ok_or(SharePatchError::NotFound)?;
+        // A cycle whose end has passed and was not advanced is no longer the
+        // account's current window, whatever its history says.
+        let expired = cycle
+            .as_ref()
+            .and_then(|cycle| cycle.ends_at_ms)
+            .is_some_and(|ends_at_ms| ends_at_ms <= now_ms);
         for grant in share.user_grants.values_mut() {
             grant.account_quota_cycle = cycle.clone();
             let ready = cycle
@@ -1045,7 +1110,9 @@ impl ShareStore {
             grant.account_reset_capability =
                 Some(super::quota_cycle_source::AccountResetCapability {
                     support: "supported".into(),
-                    sync_status: if !ready {
+                    sync_status: if expired {
+                        "stale"
+                    } else if !ready {
                         "initializing"
                     } else if stale {
                         "stale"
@@ -1053,10 +1120,15 @@ impl ShareStore {
                         "ready"
                     }
                     .into(),
-                    reason: if ready {
-                        None
-                    } else {
+                    // An expired cycle with incomplete history keeps naming
+                    // the history as the blocker; it, not the missing next
+                    // observation, is what refuses the quota.
+                    reason: if !ready {
                         Some("history_incomplete".into())
+                    } else if expired {
+                        Some("cycle_expired".into())
+                    } else {
+                        None
                     },
                     minimum_contract_version: 8,
                 });
@@ -6774,6 +6846,152 @@ mod tests {
             started_at_ms: started,
         });
         log
+    }
+
+    fn quota_share(store: &mut ShareStore) -> &mut Share {
+        store
+            .shares
+            .iter_mut()
+            .find(|share| share.id == "quota-share")
+            .unwrap()
+    }
+
+    fn set_account_reset_status(share: &mut Share, status: &str, reason: Option<&str>) {
+        for grant in share.user_grants.values_mut() {
+            if let Some(capability) = grant.account_reset_capability.as_mut() {
+                capability.sync_status = status.into();
+                capability.reason = reason.map(str::to_string);
+            }
+        }
+    }
+
+    #[test]
+    fn account_reset_expired_cycle_projects_stale_and_names_the_blocker() {
+        let (mut store, usage, source, _) = account_quota_fixture();
+        let capability = |store: &ShareStore| {
+            store.get("quota-share").unwrap().user_grants["a@example.com"]
+                .account_reset_capability
+                .clone()
+                .unwrap()
+        };
+        // The fixture's cycle ends at 10_000 and its history is complete.
+        store
+            .project_account_reset("quota-share", &source, &usage, 9_999)
+            .unwrap();
+        assert_eq!(capability(&store).sync_status, "ready");
+        store
+            .project_account_reset("quota-share", &source, &usage, 10_000)
+            .unwrap();
+        assert_eq!(capability(&store).sync_status, "stale");
+        assert_eq!(capability(&store).reason.as_deref(), Some("cycle_expired"));
+        assert!(
+            store.get("quota-share").unwrap().user_grants["a@example.com"]
+                .usage_quota
+                .is_some()
+        );
+
+        // History collected only after the cycle began.
+        let mut late = UsageStore::default();
+        late.quota_ledger.begin_collection(&source, 5_000);
+        store
+            .project_account_reset("quota-share", &source, &late, 9_000)
+            .unwrap();
+        assert_eq!(capability(&store).sync_status, "initializing");
+        assert_eq!(
+            capability(&store).reason.as_deref(),
+            Some("history_incomplete")
+        );
+        store
+            .project_account_reset("quota-share", &source, &late, 20_000)
+            .unwrap();
+        // Out of date, but the reason still names the history that blocks it.
+        assert_eq!(capability(&store).sync_status, "stale");
+        assert_eq!(
+            capability(&store).reason.as_deref(),
+            Some("history_incomplete")
+        );
+        // Admission still lacks a verified usage window.
+        assert!(
+            store.get("quota-share").unwrap().user_grants["a@example.com"]
+                .usage_quota
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn account_reset_period_offer_follows_active_use_or_complete_history() {
+        let (mut store, _, _, _) = account_quota_fixture();
+        let share = quota_share(&mut store);
+        assert!(share.offers_account_reset_period());
+        for grant in share.user_grants.values_mut() {
+            grant.policy.token_period = ShareTokenPeriod::Lifetime;
+        }
+        assert!(!share.uses_account_reset());
+        // Complete history offers the period to ordinary users.
+        assert!(share.offers_account_reset_period());
+        set_account_reset_status(share, "stale", None);
+        assert!(share.offers_account_reset_period());
+        set_account_reset_status(share, "stale", Some("cycle_expired"));
+        assert!(!share.offers_account_reset_period());
+        set_account_reset_status(share, "initializing", Some("history_incomplete"));
+        assert!(!share.offers_account_reset_period());
+
+        // An active account-reset user stays editable whatever the status.
+        share
+            .user_grants
+            .get_mut("a@example.com")
+            .unwrap()
+            .policy
+            .token_period = ShareTokenPeriod::AccountReset;
+        assert!(share.uses_account_reset());
+        assert!(share.offers_account_reset_period());
+
+        // A revoked one no longer counts, but still serializes the period.
+        share.user_grants.get_mut("a@example.com").unwrap().active = false;
+        assert!(!share.uses_account_reset());
+        assert!(!share.offers_account_reset_period());
+        assert!(share.serializes_account_reset_period());
+    }
+
+    #[test]
+    fn account_cycle_refresh_sweeps_idle_projections_only_when_due() {
+        let (mut store, _, _, _) = account_quota_fixture();
+        let quota = || vec!["quota-share".to_string()];
+        quota_share(&mut store).enabled = true;
+        assert_eq!(
+            store.account_cycle_refresh_targets(false),
+            (quota(), Vec::new())
+        );
+
+        for grant in quota_share(&mut store).user_grants.values_mut() {
+            grant.policy.token_period = ShareTokenPeriod::Lifetime;
+        }
+        assert_eq!(
+            store.account_cycle_refresh_targets(false),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(
+            store.account_cycle_refresh_targets(true),
+            (Vec::new(), quota())
+        );
+
+        // A revoked account-reset grant is an idle projection, not a reference.
+        let grant = quota_share(&mut store)
+            .user_grants
+            .get_mut("a@example.com")
+            .unwrap();
+        grant.policy.token_period = ShareTokenPeriod::AccountReset;
+        grant.active = false;
+        assert_eq!(
+            store.account_cycle_refresh_targets(true),
+            (Vec::new(), quota())
+        );
+
+        quota_share(&mut store).enabled = false;
+        assert_eq!(
+            store.account_cycle_refresh_targets(true),
+            (Vec::new(), Vec::new())
+        );
     }
 
     #[test]

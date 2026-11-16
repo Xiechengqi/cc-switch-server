@@ -15,6 +15,8 @@
 | `false`（默认） | 私有。只有 Owner、活动的人工 `role=shareto` grant，以及 Router Share Market 管理的有效 grant 可以调用。 |
 | `true` | 公开免费。任何持有效 Router 用户 API Token 的已登录用户都可以调用；匿名请求仍被拒绝。若调用者另有活动 grant，个人 Token、并发、周期和到期策略仍优先生效。 |
 
+保存命令 `save_provider_bundle_share` 与 `save_provider_share` 更新已有 Share 时，请求缺省 `freeAccess` 表示保持当前值，不会把公开 Share 静默改回私有；新建 Share 缺省为私有。
+
 `userGrants` 是授权用户、来源和个人配额的唯一真值。人工授权只通过“授权用户与配额 / 添加授权用户”维护；不存在独立的“授权邮箱”输入框。
 
 Router Share Market 创建的 `manager=routerShareMarket` grant 由 Router 独占管理。普通 Share 编辑只能原样保留这些 grant；前端只读，Server 和 Router 后端均拒绝 Owner 伪造、修改或删除。

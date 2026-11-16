@@ -1361,12 +1361,11 @@ pub fn descriptor_for_share_with_accounts_and_usage(
     let model_health =
         crate::domain::sharing::model_health::summary_for_share(share, providers, accounts, usage);
 
-    let uses_account_reset = share
-        .user_grants
-        .values()
-        .any(|grant| grant.policy.token_period == ShareTokenPeriod::AccountReset);
+    // Serialization, not execution: a revoked grant still carries its period,
+    // so it keeps the projection fields that go with it.
+    let serializes_account_reset = share.serializes_account_reset_period();
     let mut user_grants = share.user_grants.clone();
-    if !uses_account_reset {
+    if !serializes_account_reset {
         // v7 readers deny unknown nested fields. Do not leak new projections
         // into ordinary Shares, even after the Server started collecting them.
         for grant in user_grants.values_mut() {
@@ -1407,7 +1406,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
             .any(|g| g.value_metering.is_some() || g.policy.value_quota.is_some())
         {
             VALUE_QUOTA_CONTRACT_VERSION
-        } else if uses_account_reset {
+        } else if serializes_account_reset {
             ACCOUNT_RESET_CONTRACT_VERSION
         } else {
             SHARE_CONTRACT_VERSION

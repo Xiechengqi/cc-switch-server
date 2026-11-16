@@ -1229,7 +1229,8 @@ fn stage_provider_bundle_share(
     }
     let (token_limit, parallel_limit) = provider_bundle_share_limits(command)?;
     let expires_at = provider_bundle_share_expiration(&command.expires_at)?;
-    let free_access = command.free_access.unwrap_or(false);
+    // An omitted flag keeps the existing Share's access; a new Share is private.
+    let free_access = command.free_access;
     let subdomain =
         (!command.subdomain.trim().is_empty()).then(|| command.subdomain.trim().to_string());
     let description = command
@@ -1249,7 +1250,7 @@ fn stage_provider_bundle_share(
                 ShareSettingsPatch {
                     expected_account_cycle: command.expected_account_cycle.clone(),
                     description: Some(description),
-                    free_access: Some(free_access),
+                    free_access,
                     token_limit: Some(command.token_limit),
                     parallel_limit: Some(command.parallel_limit),
                     expires_at: Some(command.expires_at.clone()),
@@ -1314,7 +1315,7 @@ fn stage_provider_bundle_share(
                 token_limit,
                 parallel_limit,
                 expires_at: Some(expires_at),
-                free_access: Some(free_access),
+                free_access: Some(free_access.unwrap_or(false)),
                 allow_personal_credits: Some(command.allow_personal_credits),
                 auto_consume_banked_reset: Some(command.auto_consume_banked_reset),
                 banked_reset_expiry_lead_minutes: Some(command.banked_reset_expiry_lead_minutes),
@@ -1847,7 +1848,8 @@ pub(in crate::api) async fn web_save_provider_share(
     .ok_or_else(|| ApiError::bad_request("expectedConfigRevision is required"))?;
     let subdomain = web_arg_string_any(value, &["subdomain"])?;
     let description = web_optional_string_any(value, &["description"]);
-    let free_access = web_share_free_access(value)?.unwrap_or(false);
+    // An omitted flag keeps the current access rather than closing it.
+    let free_access = web_share_free_access(value)?;
     let user_grants =
         web_optional_deserialize::<BTreeMap<String, ShareUserGrant>>(value, "userGrants")?
             .unwrap_or_default();
@@ -1898,7 +1900,7 @@ pub(in crate::api) async fn web_save_provider_share(
             ShareSettingsPatch {
                 expected_account_cycle: expected_account_cycle.clone(),
                 description: Some(description),
-                free_access: Some(free_access),
+                free_access,
                 token_limit: Some(token_limit),
                 parallel_limit: Some(parallel_limit),
                 expires_at: Some(expires_at),

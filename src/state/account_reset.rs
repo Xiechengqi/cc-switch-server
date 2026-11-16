@@ -196,6 +196,50 @@ pub(super) fn apply_restore_quota_fence(
     Ok(true)
 }
 
+/// What the preview knows about the account cycle, reduced to the facts its
+/// status depends on.
+#[derive(Clone, Copy)]
+struct PreviewCycleFacts {
+    negotiated: bool,
+    has_source: bool,
+    has_cycle: bool,
+    capacity_limited: bool,
+    complete: bool,
+    expired: bool,
+    fresh: bool,
+}
+
+/// The preview's reason and status. It follows the Share projection: an
+/// expired cycle is `stale`, never `ready`; incomplete history stays the named
+/// blocker; `cycle_expired` names a complete cycle that has simply ended.
+fn preview_account_reset_status(facts: PreviewCycleFacts) -> (Option<&'static str>, &'static str) {
+    let reason = if !facts.negotiated {
+        Some("ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED")
+    } else if !facts.has_source {
+        Some("ACCOUNT_RESET_UNSUPPORTED")
+    } else if !facts.has_cycle {
+        Some("ACCOUNT_RESET_NOT_READY")
+    } else if facts.capacity_limited {
+        Some("QUOTA_LEDGER_CAPACITY_LIMIT")
+    } else if !facts.complete {
+        Some("QUOTA_HISTORY_INCOMPLETE")
+    } else if facts.expired {
+        Some("cycle_expired")
+    } else if !facts.fresh {
+        Some("ACCOUNT_RESET_NOT_READY")
+    } else {
+        None
+    };
+    let status = if reason.is_none() {
+        "ready"
+    } else if facts.expired || (facts.complete && !facts.fresh) {
+        "stale"
+    } else {
+        "initializing"
+    };
+    (reason, status)
+}
+
 impl ServerStateInner {
     pub(crate) async fn record_passive_quota_window(
         self: &Arc<Self>,
@@ -333,27 +377,27 @@ impl ServerStateInner {
             .into());
         }
         let complete = cycle.is_some_and(|cycle| usage.quota_ledger.complete_for(cycle));
-        let fresh = source.is_some_and(|source| {
-            now_ms_i64().saturating_sub(source.last_observed_at_ms) <= 300_000
-                && cycle.is_some_and(|cycle| {
-                    source.last_observed_at_ms >= cycle.starts_at_ms && cycle.ends_at_ms.is_some()
-                })
+        let now = now_ms_i64();
+        // Same rule as the Share projection: a cycle whose end has passed is
+        // not the current window, however recent the last observation.
+        let expired = cycle.is_some_and(|cycle| cycle.ends_at_ms.is_some_and(|end| end <= now));
+        let fresh = !expired
+            && source.is_some_and(|source| {
+                now.saturating_sub(source.last_observed_at_ms) <= 300_000
+                    && cycle.is_some_and(|cycle| {
+                        source.last_observed_at_ms >= cycle.starts_at_ms
+                            && cycle.ends_at_ms.is_some()
+                    })
+            });
+        let (reason, sync_status) = preview_account_reset_status(PreviewCycleFacts {
+            negotiated,
+            has_source: source.is_some(),
+            has_cycle: cycle.is_some(),
+            capacity_limited: usage.quota_ledger.capacity_limited(),
+            complete,
+            expired,
+            fresh,
         });
-        let reason = if !negotiated {
-            Some("ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED")
-        } else if source.is_none() {
-            Some("ACCOUNT_RESET_UNSUPPORTED")
-        } else if cycle.is_none() {
-            Some("ACCOUNT_RESET_NOT_READY")
-        } else if usage.quota_ledger.capacity_limited() {
-            Some("QUOTA_LEDGER_CAPACITY_LIMIT")
-        } else if !complete {
-            Some("QUOTA_HISTORY_INCOMPLETE")
-        } else if !fresh {
-            Some("ACCOUNT_RESET_NOT_READY")
-        } else {
-            None
-        };
         let capability = crate::domain::sharing::quota_cycle_source::AccountResetCapability {
             support: if source.is_some() {
                 "supported".into()
@@ -365,14 +409,7 @@ impl ServerStateInner {
                     .map(|capability| capability.support.clone())
                     .unwrap_or_else(|| "conditional".into())
             },
-            sync_status: if reason.is_none() {
-                "ready"
-            } else if complete && !fresh {
-                "stale"
-            } else {
-                "initializing"
-            }
-            .into(),
+            sync_status: sync_status.into(),
             reason: if source.is_none() && negotiated {
                 share
                     .user_grants
@@ -863,6 +900,61 @@ impl ServerStateInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_status_follows_the_projection_for_an_expired_cycle() {
+        let base = PreviewCycleFacts {
+            negotiated: true,
+            has_source: true,
+            has_cycle: true,
+            capacity_limited: false,
+            complete: true,
+            expired: false,
+            fresh: true,
+        };
+        assert_eq!(preview_account_reset_status(base), (None, "ready"));
+        // A recent observation does not make an ended cycle current.
+        assert_eq!(
+            preview_account_reset_status(PreviewCycleFacts {
+                expired: true,
+                fresh: false,
+                ..base
+            }),
+            (Some("cycle_expired"), "stale")
+        );
+        // Incomplete history stays the named blocker after the end.
+        assert_eq!(
+            preview_account_reset_status(PreviewCycleFacts {
+                expired: true,
+                fresh: false,
+                complete: false,
+                ..base
+            }),
+            (Some("QUOTA_HISTORY_INCOMPLETE"), "stale")
+        );
+        assert_eq!(
+            preview_account_reset_status(PreviewCycleFacts {
+                complete: false,
+                ..base
+            }),
+            (Some("QUOTA_HISTORY_INCOMPLETE"), "initializing")
+        );
+        assert_eq!(
+            preview_account_reset_status(PreviewCycleFacts {
+                fresh: false,
+                ..base
+            }),
+            (Some("ACCOUNT_RESET_NOT_READY"), "stale")
+        );
+        assert_eq!(
+            preview_account_reset_status(PreviewCycleFacts {
+                negotiated: false,
+                ..base
+            })
+            .0,
+            Some("ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED")
+        );
+    }
 
     struct TestDir(PathBuf);
     impl TestDir {

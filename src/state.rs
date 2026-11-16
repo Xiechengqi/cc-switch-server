@@ -1122,6 +1122,8 @@ pub struct ServerStateInner {
     router_request_log_sync_wakeup: Notify,
     router_share_sync_wakeup: Notify,
     router_provider_identity_sync_pending: std::sync::atomic::AtomicBool,
+    /// Next time the background loop re-projects idle Shares' account cycles.
+    account_cycle_projection_sweep_due_ms: std::sync::atomic::AtomicI64,
     periodic_backup_wakeup: Notify,
     setup_completion_notification_flight: AsyncMutex<()>,
     router_share_prune_retry_pending: std::sync::atomic::AtomicBool,
@@ -7502,6 +7504,7 @@ impl ServerStateInner {
             router_request_log_sync_wakeup: Notify::new(),
             router_share_sync_wakeup: Notify::new(),
             router_provider_identity_sync_pending: std::sync::atomic::AtomicBool::new(false),
+            account_cycle_projection_sweep_due_ms: std::sync::atomic::AtomicI64::new(0),
             periodic_backup_wakeup: Notify::new(),
             setup_completion_notification_flight: AsyncMutex::new(()),
             router_share_prune_retry_pending: std::sync::atomic::AtomicBool::new(false),
@@ -21976,13 +21979,10 @@ pub(crate) async fn authoritative_share_descriptor(
             .await;
         let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
         let account_reset_supported = state.router_supports_account_reset().await;
+        // A revoked grant still serializes its period, which a Router without
+        // the account-reset contract rejects; fail here with the clear code.
         anyhow::ensure!(
-            account_reset_supported
-                || !share
-                    .user_grants
-                    .values()
-                    .any(|grant| grant.policy.token_period
-                        == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset),
+            account_reset_supported || !share.serializes_account_reset_period(),
             "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED"
         );
         apply_account_reset_descriptor_projection(&mut descriptor, &share, account_reset_supported);
@@ -22054,12 +22054,7 @@ fn apply_account_reset_descriptor_projection(
     if !descriptor
         .supported_user_token_periods
         .contains(&ShareTokenPeriod::AccountReset)
-        && descriptor.user_grants.values().any(|grant| {
-            grant
-                .account_reset_capability
-                .as_ref()
-                .is_some_and(|capability| capability.sync_status == "ready")
-        })
+        && share.offers_account_reset_period()
     {
         descriptor
             .supported_user_token_periods

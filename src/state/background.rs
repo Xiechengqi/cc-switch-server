@@ -1,5 +1,4 @@
 use super::*;
-use crate::domain::sharing::router_contract::ShareTokenPeriod;
 
 pub fn spawn_periodic_backups(state: ServerState) {
     tokio::spawn(async move {
@@ -1053,8 +1052,12 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
             .filter(|share| {
                 shares.descriptor_projection_pending(share)
                     || share.router_last_sync_error.is_some()
-                    || share.user_grants.values().any(|grant| grant.policy.token_period == crate::domain::sharing::router_contract::ShareTokenPeriod::AccountReset)
-                    || (account_reset_supported && share.user_grants.values().any(|grant| grant.account_reset_capability.is_some()))
+                    || share.uses_account_reset()
+                    || (account_reset_supported
+                        && share
+                            .user_grants
+                            .values()
+                            .any(|grant| grant.account_reset_capability.is_some()))
             })
             .map(|share| share.id.clone())
             .collect::<Vec<_>>()
@@ -1293,13 +1296,9 @@ async fn next_account_quota_refresh_delay(state: &ServerState) -> Duration {
             .quota_cycle_sources
             .iter()
             .filter(|(id, _)| {
-                shares.get(id).is_some_and(|share| {
-                    share.enabled
-                        && share.user_grants.values().any(|grant| {
-                            grant.active
-                                && grant.policy.token_period == ShareTokenPeriod::AccountReset
-                        })
-                })
+                shares
+                    .get(id)
+                    .is_some_and(|share| share.enabled && share.uses_account_reset())
             })
             .filter_map(|(_, source)| shares.quota_cycle_ledger.source(source))
             .filter_map(|source| {
@@ -1380,26 +1379,39 @@ async fn refresh_due_account_quotas(state: &ServerState) {
     }
 }
 
+/// How often idle Shares that show a projected account cycle are re-projected.
+const PROJECTED_ACCOUNT_CYCLE_SWEEP_MS: i64 = 10 * 60 * 1_000;
+
 /// Only explicitly referenced sources are added to the normal scheduler. In
 /// particular, an inactive but pinned Codex account is not an account-pool
 /// candidate. Network work is outside state locks and uses the existing
 /// per-account / per-Coding-Plan singleflight and generation checks.
 async fn refresh_referenced_share_account_quotas(state: &ServerState) {
     use crate::domain::sharing::quota_cycle_source::resolve_share_source;
-    let ids: Vec<_> = state
+    use std::sync::atomic::Ordering;
+    let now = now_ms_i64();
+    let sweep_due = state
+        .account_cycle_projection_sweep_due_ms
+        .load(Ordering::Acquire)
+        <= now;
+    let (ids, projected) = state
         .shares
         .read()
         .await
-        .shares
-        .iter()
-        .filter(|share| {
-            share.enabled
-                && share.user_grants.values().any(|grant| {
-                    grant.active && grant.policy.token_period == ShareTokenPeriod::AccountReset
-                })
-        })
-        .map(|share| share.id.clone())
-        .collect();
+        .account_cycle_refresh_targets(sweep_due);
+    if sweep_due {
+        state
+            .account_cycle_projection_sweep_due_ms
+            .store(now + PROJECTED_ACCOUNT_CYCLE_SWEEP_MS, Ordering::Release);
+    }
+    for id in projected {
+        if state.is_shutting_down() {
+            return;
+        }
+        if let Err(error) = state.refresh_share_account_quota(&id).await {
+            tracing::warn!(%error, "idle account-cycle projection needs recovery");
+        }
+    }
     let mut visited = std::collections::BTreeSet::new();
     for id in ids {
         if state.is_shutting_down() {
