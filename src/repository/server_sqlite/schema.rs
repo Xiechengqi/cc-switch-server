@@ -95,7 +95,7 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
         hex::encode(Sha256::digest(include_bytes!("value_quota_schema.sql")))
     );
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    anyhow::ensure!((1..=6).contains(&version),
+    anyhow::ensure!((1..=7).contains(&version),
         "unsupported Server SQLite schema {version}; use a matching Server binary/backup (never downgrade)");
     let checksum: String = connection.query_row(
         "SELECT checksum FROM schema_migrations WHERE version=1",
@@ -258,6 +258,37 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
     anyhow::ensure!(
         checksum == conversion_checksum,
         "Server SQLite v6 migration checksum mismatch"
+    );
+    let unpriced_checksum = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(include_bytes!(
+            "value_quota_unpriced_schema.sql"
+        )))
+    );
+    if version < 7 {
+        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> anyhow::Result<()> {
+            connection.execute_batch(include_str!("value_quota_unpriced_schema.sql"))?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES(7,'value_quota_unpriced_zero',0,?1)",
+                [&unpriced_checksum],
+            )?;
+            connection.execute_batch("PRAGMA user_version=7; COMMIT;")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = connection.execute_batch("ROLLBACK;");
+        }
+        result.context("migrate Server SQLite to v7 unpriced value attempts")?;
+    }
+    let checksum: String = connection.query_row(
+        "SELECT checksum FROM schema_migrations WHERE version=7",
+        [],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        checksum == unpriced_checksum,
+        "Server SQLite v7 migration checksum mismatch"
     );
     Ok(())
 }

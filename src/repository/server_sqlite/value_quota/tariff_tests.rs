@@ -46,8 +46,18 @@ fn prepared_price_update() -> (Connection, Scope, Window, ValueQuota, String, St
 
 #[test]
 fn installed_model_price_becomes_usable_at_boundary_without_a_heartbeat() {
-    let (mut conn, scope, window, quota, old, new) = prepared_price_update();
+    let (mut conn, owner, window, quota, old, new) = prepared_price_update();
+    // Market contracts keep refusing an unpriced model before send.
+    let scope = Scope {
+        entitlement_id: Some("contract".into()),
+        ..owner.clone()
+    };
     let tx = conn.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO value_quota_coverage VALUES(?1,0)",
+        [scope.key().unwrap()],
+    )
+    .unwrap();
     assert_eq!(
         tariff::activate_due_in_tx(&tx, &scope, 99).unwrap(),
         Some(old.clone())
@@ -76,6 +86,27 @@ fn installed_model_price_becomes_usable_at_boundary_without_a_heartbeat() {
     let diagnostic = error.downcast_ref::<PriceRejection>().unwrap();
     assert_eq!(diagnostic.reason_code, "tariff_not_effective");
     assert_eq!(diagnostic.effective_from_ms, Some(100));
+    // An owner-managed grant is admitted as an explicit $0 with the reason.
+    admit_in_tx(
+        &tx,
+        &Admission {
+            scope: &owner,
+            request_id: "owner-early",
+            ..admission.clone()
+        },
+    )
+    .unwrap();
+    let row: (String, String, Option<String>) = tx
+        .query_row(
+            "SELECT usage_picos,pending_risk_picos,unpriced_reason FROM value_quota_attempts WHERE request_id='owner-early'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        ("0".into(), "0".into(), Some("tariff_not_effective".into()))
+    );
     assert_eq!(
         tariff::activate_due_in_tx(&tx, &scope, 100).unwrap(),
         Some(new.clone())
@@ -92,7 +123,7 @@ fn installed_model_price_becomes_usable_at_boundary_without_a_heartbeat() {
         tx.query_row("SELECT count(*) FROM value_quota_attempts", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     assert!(!tx
         .query_row(

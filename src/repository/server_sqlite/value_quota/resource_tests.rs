@@ -57,10 +57,41 @@ fn resource_admission<'a>(
         parallel_limit: 4,
     }
 }
+fn market_scope(scope: &Scope) -> Scope {
+    Scope {
+        entitlement_id: Some("contract".into()),
+        ..scope.clone()
+    }
+}
 #[test]
-fn resource_admission_refuses_missing_prices_and_v1_before_any_attempt() {
-    let (mut conn, scope, window, quota, revision) = resource_fixture();
+fn resource_admission_refuses_market_missing_prices_and_v1_before_any_attempt() {
+    let (mut conn, owner, window, quota, revision) = resource_fixture();
+    let scope = market_scope(&owner);
     let tx = conn.transaction().unwrap();
+    // Owner-managed: an unpriced resource is an explicit $0 attempt.
+    admit_in_tx(
+        &tx,
+        &resource_admission(
+            &owner,
+            &window,
+            &quota,
+            &revision,
+            "owner-bad",
+            ("tool.web_search", 1),
+            true,
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        tx.query_row(
+            "SELECT unpriced_reason FROM value_quota_attempts WHERE request_id='owner-bad'",
+            [],
+            |r| r.get::<_, Option<String>>(0)
+        )
+        .unwrap()
+        .as_deref(),
+        Some("resource_unpriced")
+    );
     let bad = resource_admission(
         &scope,
         &window,
@@ -93,9 +124,12 @@ fn resource_admission_refuses_missing_prices_and_v1_before_any_attempt() {
         .to_string()
         .contains("RESOURCE_POLICY_REQUIRED"));
     assert_eq!(
-        tx.query_row("SELECT count(*) FROM value_quota_attempts", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
+        tx.query_row(
+            "SELECT count(*) FROM value_quota_attempts WHERE request_id!='owner-bad'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         0
     );
 }
@@ -192,13 +226,19 @@ fn estimated_resources_keep_the_bound_until_trusted_evidence_arrives() {
     }
 }
 #[test]
-fn unexpected_unpriced_resources_retain_risk_and_fence_only_their_window() {
+fn unexpected_unpriced_market_resources_retain_risk_and_fence_only_their_window() {
     use crate::domain::usage::{
         store::{InferenceOperation, RequestKind},
         value_pricing::{ResourceUsage, RESOURCE_ESTIMATE_VERSION},
     };
-    let (mut conn, scope, window, quota, revision) = resource_fixture();
+    let (mut conn, owner, window, quota, revision) = resource_fixture();
+    let scope = market_scope(&owner);
     let tx = conn.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO value_quota_coverage(scope,collected_from_ms) VALUES(?1,0)",
+        [scope.key().unwrap()],
+    )
+    .unwrap();
     admit_in_tx(
         &tx,
         &resource_admission(
@@ -273,6 +313,52 @@ fn unexpected_unpriced_resources_retain_risk_and_fence_only_their_window() {
         ),
     )
     .unwrap();
+}
+#[test]
+fn unexpected_unpriced_owner_resources_charge_priced_dimensions_with_a_reason() {
+    use crate::domain::usage::{
+        store::{InferenceOperation, RequestKind},
+        value_pricing::{ResourceUsage, RESOURCE_ESTIMATE_VERSION},
+    };
+    let (mut conn, scope, window, quota, revision) = resource_fixture();
+    let tx = conn.transaction().unwrap();
+    admit_in_tx(
+        &tx,
+        &resource_admission(
+            &scope,
+            &window,
+            &quota,
+            &revision,
+            "owner-resource",
+            ("image.output", 1),
+            false,
+        ),
+    )
+    .unwrap();
+    let mut log = log_for(&scope, "owner-resource");
+    log.operation = InferenceOperation::ImageGeneration;
+    log.request_kind = RequestKind::Image;
+    log.attempt_count = 1;
+    log.image_count = Some(1);
+    log.value_resources = Some(ResourceUsage {
+        quantities: BTreeMap::from([("tool.web_search".into(), 1)]),
+        source: "upstream.protocol".into(),
+        estimated: false,
+        version: RESOURCE_ESTIMATE_VERSION.into(),
+    });
+    assert!(!settle_usage_log_isolated(&tx, &log).unwrap());
+    assert!(!window_blocked(&tx, &scope.key().unwrap(), &window.id).unwrap());
+    let row: (String, String, Option<String>) = tx
+        .query_row(
+            "SELECT usage_picos,metering_status,unpriced_reason FROM value_quota_attempts WHERE request_id='owner-resource'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    // The priced image is charged; the unpriced search counts as $0.
+    assert_eq!(row.0, "1000000000");
+    assert_ne!(row.1, "pending");
+    assert_eq!(row.2.as_deref(), Some("resource_unpriced"));
 }
 #[test]
 fn pending_log_does_not_disarm_body_terminal_settlement() {

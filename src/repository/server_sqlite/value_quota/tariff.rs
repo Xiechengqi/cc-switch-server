@@ -50,8 +50,20 @@ pub(super) fn activate_due_in_tx(
             &scope.installation_id,
             &pending.revision,
         )?;
+        let previous: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key=?1",
+                [active_key(scope)],
+                |r| r.get(0),
+            )
+            .optional()?;
         conn.execute("INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![active_key(scope), pending.revision])?;
         conn.execute("DELETE FROM meta WHERE key=?1", [pending_tariff_key(scope)])?;
+        // A newly active revision may cover $0 owner attempts. Re-pricing is
+        // a durable background job, never part of this (admission) transaction.
+        if previous.as_deref() != Some(pending.revision.as_str()) {
+            reprice::mark_due(conn, scope, &pending.revision)?;
+        }
     }
     Ok(conn
         .query_row(

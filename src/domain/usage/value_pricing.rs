@@ -478,6 +478,31 @@ pub struct ValueQuotaStatus {
     pub pending_risk_picos: String,
     pub metering_status: String,
     pub synced_at_ms: i64,
+    /// Attempts of this window metered at $0 for a price-type reason. Only
+    /// emitted to a Router that advertised `valueQuotaUnpricedV1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpriced_requests: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpriced_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpriced_models: Option<Vec<String>>,
+}
+
+/// Owner-managed USD metering records a missing price as an explicit $0
+/// attempt instead of refusing. `usage_unobserved` is the one reason that is
+/// not about price: the attempt has no usage evidence to price at all.
+pub const UNPRICED_REASONS: &[&str] = &[
+    "model_unpriced",
+    "model_unresolved",
+    "tier_unpriced",
+    "resource_unpriced",
+    "tariff_not_effective",
+    "usage_unobserved",
+];
+pub const USAGE_UNOBSERVED: &str = "usage_unobserved";
+/// Price-type reasons are re-priced when a covering tariff activates.
+pub fn price_type_unpriced_reason(reason: &str) -> bool {
+    reason != USAGE_UNOBSERVED && UNPRICED_REASONS.contains(&reason)
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -791,6 +816,29 @@ impl ExecutionModelPrice {
             .get(&key)
             .ok_or(ValueError::PriceUnavailable)?
             .price(tokens)
+    }
+    /// Tiers this model can price text at, in a fixed order.
+    pub fn supported_tiers(&self) -> impl Iterator<Item = &'static str> + '_ {
+        ["standard", "priority", "flex"]
+            .into_iter()
+            .filter(|tier| self.supports_tier(tier))
+    }
+    /// Owner-managed fallback for an unknown or unsupported execution tier:
+    /// the highest price over the tiers this model supports (conservative).
+    pub fn price_or_highest_tier(
+        &self,
+        tier: &str,
+        tokens: &ValueTokens,
+    ) -> Result<PricedValue, ValueError> {
+        if self.supports_tier(tier) {
+            return self.price(tier, tokens);
+        }
+        self.supported_tiers()
+            .map(|tier| self.price(tier, tokens))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max_by_key(|priced| priced.usage_picos)
+            .ok_or(ValueError::PriceUnavailable)
     }
     pub fn supports_tier(&self, tier: &str) -> bool {
         self.rates.contains_key(&format!("{tier}/base"))

@@ -1,5 +1,7 @@
-//! Unit-independent, body-free evidence. A missing price is a recorded gap,
-//! never a reason to reject a Token request or invent a zero dollar amount.
+//! Unit-independent, body-free evidence. A missing price never rejects a
+//! Token request. Owner-managed scopes record it as an explicit `$0` attempt
+//! with an `unpriced_reason` (re-priced while its window is open); Market
+//! entitlement scopes keep it a recorded gap.
 use super::*;
 use crate::domain::usage::store::{UsageLog, UsageRecordKind};
 use crate::domain::usage::value_pricing::{ResourcePlan, ResourceUsage};
@@ -11,13 +13,13 @@ pub(super) struct Fact {
     attribution: Option<crate::domain::usage::quota_ledger::QuotaAttribution>,
     model: String,
     tier: String,
-    estimate: Option<RiskEstimate>,
-    resource_plan: Option<ResourcePlan>,
-    tokens: Option<ValueTokens>,
-    resources: Option<ResourceUsage>,
-    reported_model: Option<String>,
-    observed_tier: Option<String>,
-    outcome: ObservedOutcome,
+    pub(super) estimate: Option<RiskEstimate>,
+    pub(super) resource_plan: Option<ResourcePlan>,
+    pub(super) tokens: Option<ValueTokens>,
+    pub(super) resources: Option<ResourceUsage>,
+    pub(super) reported_model: Option<String>,
+    pub(super) observed_tier: Option<String>,
+    pub(super) outcome: ObservedOutcome,
     priced_at_admission: bool,
     /// A historical price is frozen once, independently of later catalog edits.
     migration_revision: Option<String>,
@@ -223,9 +225,26 @@ pub(crate) fn capture_log(
     {
         return Ok(());
     }
+    // Post-cutoff logs without a fact were never admitted: a local rejection
+    // before admission (400/429 ...) still counts as a Share request in the
+    // Token proof (`share_user_quota_usage`). Recording it here as a free,
+    // zero-Token fact makes evidence and proof count the same requests for
+    // past and future rejections alike: every history preparation rescans the
+    // retained logs. Anything that may have executed (a success without
+    // usage, any Token, resource, image or video evidence) stays a hole.
+    let mut log_only_rejection = false;
     if existing.is_none() && !legacy_scope_matches(tx, &identity, log)? {
-        return Ok(());
+        log_only_rejection = identity.entitlement_id.is_none()
+            && log.record_kind == UsageRecordKind::UserInference
+            && local_rejection_without_usage(log)
+            && legacy_cutoff_passed(tx, log)?;
+        if !log_only_rejection {
+            return Ok(());
+        }
     }
+    let existing_free = existing
+        .as_ref()
+        .is_some_and(|f| f.outcome == ObservedOutcome::Free);
     let mut fact = existing.unwrap_or(Fact {
         attribution: log.quota_attribution.clone(),
         model: log
@@ -269,7 +288,19 @@ pub(crate) fn capture_log(
             .is_none_or(|a| fact.attribution.as_ref() == Some(a)),
         "QUOTA_CONVERSION_ATTRIBUTION_CONFLICT"
     );
-    fact.outcome = outcome;
+    // A request proven not sent (or rejected before admission) stays free:
+    // only complete usage evidence can replace that, never an unknown or
+    // interrupted classification of the same local failure.
+    let not_sent = (existing_free || log_only_rejection)
+        && !matches!(
+            outcome,
+            ObservedOutcome::Final | ObservedOutcome::FinalConservative
+        );
+    fact.outcome = if not_sent {
+        ObservedOutcome::Free
+    } else {
+        outcome
+    };
     fact.tokens = tokens;
     fact.observed_tier = tier.map(str::to_owned);
     fact.reported_model = log.reported_model.clone();
@@ -314,16 +345,20 @@ pub(super) fn materialize(
     if !fact.verified {
         return Ok(false);
     }
-    if matches!(
-        fact.outcome,
-        ObservedOutcome::Unknown | ObservedOutcome::InProgress
-    ) && fact
-        .estimate
-        .is_none_or(|e| e.input_tokens.saturating_add(e.output_tokens) == 0)
-        && !fact
-            .resource_plan
-            .as_ref()
-            .is_some_and(|p| p.quantities.values().any(|q| *q > 0))
+    // Zero-quantity dimensions executed nothing; they never need a rate. A
+    // historical text plan left empty by that is no plan (its v2 flag was
+    // synthesized from the log, not from the request body).
+    let resource_plan = strip_zero_resources(fact.resource_plan.clone())
+        .filter(|plan| !plan.quantities.is_empty() || !plan.text_tokens);
+    // A still-running request without a bound is not history yet. An
+    // outcome-unknown one is: priced from observed tokens when present,
+    // otherwise an explicit `usage_unobserved` $0 (local rejections,
+    // cancellations without usage).
+    if fact.outcome == ObservedOutcome::InProgress
+        && fact
+            .estimate
+            .is_none_or(|e| e.input_tokens.saturating_add(e.output_tokens) == 0)
+        && resource_plan.is_none()
     {
         return Ok(false);
     }
@@ -351,7 +386,7 @@ pub(super) fn materialize(
     };
     let quota = ValueQuota {
         limit_usd_micros: "1".into(),
-        tariff_policy_id: if fact.resource_plan.as_ref().is_some_and(|p| p.requires_v2) {
+        tariff_policy_id: if resource_plan.as_ref().is_some_and(|p| p.requires_v2) {
             crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
         } else {
             crate::domain::usage::value_pricing::TARIFF_POLICY
@@ -376,7 +411,7 @@ pub(super) fn materialize(
                 effective_tier: &fact.tier,
                 started_at_ms: started,
                 estimate: fact.estimate.unwrap_or_default(),
-                resource_plan: fact.resource_plan.clone(),
+                resource_plan: resource_plan.clone(),
                 parallel_limit: 4,
             },
             None,
@@ -400,8 +435,9 @@ pub(super) fn materialize(
         )?;
         Ok(())
     })();
-    if result.is_err() {
+    if let Err(error) = result {
         tx.execute_batch("ROLLBACK TO materialize_fact; RELEASE materialize_fact;")?;
+        tracing::debug!(%error, request_id = %request, "historical fact left unmaterialized");
         return Ok(false);
     }
     tx.execute_batch("RELEASE materialize_fact;")?;
@@ -875,6 +911,40 @@ pub(crate) fn pin_legacy_origin(
     };
     conn.execute("INSERT INTO meta(key,value) VALUES('quota_evidence_legacy_origin_v6',?1) ON CONFLICT(key) DO NOTHING",[serde_json::to_string(&origin)?])?;
     Ok(())
+}
+/// A 4xx (incl. 400/429/499) or not-sent failure carrying no evidence that
+/// anything executed: no Token count, resource quantity, image or video.
+fn local_rejection_without_usage(log: &UsageLog) -> bool {
+    let rejected = (400..500).contains(&log.status_code)
+        || log.failure_kind.as_deref() == Some("request_not_sent");
+    rejected
+        && log.quota_tokens() == 0
+        && log.processed_tokens() == 0
+        && log.raw_input_tokens.unwrap_or(0) == 0
+        && log.total_tokens.unwrap_or(0) == 0
+        && log.image_count.unwrap_or(0) == 0
+        && log.video_duration_seconds.unwrap_or(0) == 0
+        && log
+            .value_resources
+            .as_ref()
+            .is_none_or(|usage| usage.quantities.values().all(|quantity| *quantity == 0))
+}
+/// True only after a pinned legacy origin: such a log was written under
+/// per-attempt evidence, so a missing fact means it was never admitted.
+/// Without a pinned origin nothing can be proven and the log stays a hole.
+fn legacy_cutoff_passed(conn: &Connection, log: &UsageLog) -> anyhow::Result<bool> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='quota_evidence_legacy_origin_v6'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(false);
+    };
+    let origin: LegacyOrigin = serde_json::from_str(&raw)?;
+    Ok(i64::try_from(log.created_at_ms).is_ok_and(|at| at > origin.through_ms))
 }
 fn legacy_scope_matches(
     conn: &Connection,

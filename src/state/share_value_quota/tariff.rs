@@ -2,6 +2,20 @@
 use super::*;
 use crate::domain::providers::runtime::RuntimeModelPolicy;
 
+/// Owner-managed grants meter a missing price as an explicit $0, so the
+/// check does not block: `ready:true, state:"unpriced"` keeps the reason for
+/// a warning. Market seats treat `state:"unpriced"` as not ready
+/// (`market_price_ready`). A missing tariff is never downgraded here.
+fn owner_unpriced(check: &mut Value) {
+    if check["ready"] != true {
+        check["ready"] = true.into();
+        check["state"] = "unpriced".into();
+    }
+}
+pub(super) fn market_price_ready(check: &Value) -> bool {
+    check["ready"] == true && check["state"] != "unpriced"
+}
+
 impl ServerStateInner {
     pub(super) fn value_model_coverage(
         &self,
@@ -37,10 +51,12 @@ impl ServerStateInner {
                             upstream_model,
                         )
                     else {
-                        checks.push(serde_json::json!({"code":"model_price_coverage","ready":false,
+                        let mut check = serde_json::json!({"code":"model_price_coverage","ready":false,
                             "app":binding.app,"providerId":binding.provider_id,"profileId":plan.profile_id.as_str(),
                             "driverId":plan.driver_id.as_str(),"model":upstream_model,
-                            "scope":"configured_model","reasonCode":"model_unresolved"}));
+                            "scope":"configured_model","reasonCode":"model_unresolved"});
+                        owner_unpriced(&mut check);
+                        checks.push(check);
                         continue;
                     };
                     let coverage = ledger::model_coverage(
@@ -59,6 +75,8 @@ impl ServerStateInner {
                     check["scope"] = "configured_model".into();
                     if check["activePricingRevision"].is_null() {
                         check["blockedBy"] = "acknowledged_tariff".into();
+                    } else {
+                        owner_unpriced(&mut check);
                     }
                     checks.push(check);
                 }
@@ -88,18 +106,61 @@ impl ServerStateInner {
                     continue;
                 };
                 let dir = state.config_dir.clone();
+                let activation = identity.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     if !server_sqlite::is_committed(&dir)? {
-                        return Ok(());
+                        return Ok(false);
                     }
-                    ledger::activate_due_tariff(&dir, &identity, now_ms_i64()).map(|_| ())
+                    ledger::activate_due_tariff(&dir, &activation, now_ms_i64())?;
+                    ledger::reprice_due(&dir, &activation)
                 })
                 .await;
-                if let Ok(Err(error)) = result {
-                    tracing::debug!(%error,"local value tariff activation pending");
+                match result {
+                    Ok(Ok(true)) => state.reprice_unpriced_value_usage(&config, identity).await,
+                    Ok(Err(error)) => {
+                        tracing::debug!(%error,"local value tariff activation pending")
+                    }
+                    _ => {}
                 }
             }
         });
+    }
+
+    /// Owner-managed `$0` attempts inside the open window of each grant are
+    /// re-priced after a covering tariff activates. Bounded per tick; the
+    /// durable cursor resumes the job on the next tick or after a restart.
+    async fn reprice_unpriced_value_usage(&self, config: &ServerConfig, identity: ledger::Scope) {
+        let now = now_ms_i64();
+        let windows = {
+            let shares = self.shares.read().await;
+            reprice_windows(&shares, config, now)
+        };
+        let dir = self.config_dir.clone();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let mut repriced = 0;
+            for _ in 0..10 {
+                let page = ledger::reprice_page(&dir, &identity, &windows, now_ms_i64())?;
+                repriced += page.repriced;
+                if page.done {
+                    break;
+                }
+            }
+            Ok(repriced)
+        })
+        .await;
+        match result {
+            Ok(Ok(0)) => {}
+            Ok(Ok(repriced)) => {
+                tracing::info!(
+                    repriced,
+                    "unpriced USD-equivalent usage re-priced after a tariff activation"
+                )
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "unpriced USD-equivalent re-pricing will resume on the next tick")
+            }
+            Err(error) => tracing::warn!(%error, "unpriced USD-equivalent re-pricing task failed"),
+        }
     }
 
     pub(crate) async fn report_active_value_tariff(

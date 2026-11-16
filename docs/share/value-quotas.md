@@ -1,6 +1,6 @@
 # Share Token／USD 等值双口径额度
 
-> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-11-11。当前全供应商与资源扩展见 [统一计量规范](universal-value-metering.md)，单位即时切换以 [转换规范](quota-unit-conversions.md) 为准；本轮只做编译、类型和静态检查，产品测试由 CI 执行。
+> 状态：权威实现文档；本地／夹具验证，不是生产验收证明。真实 Provider/App 转发面保持 `live_pending`。最后核对：2026-11-16。当前全供应商与资源扩展见 [统一计量规范](universal-value-metering.md)，单位即时切换以 [转换规范](quota-unit-conversions.md) 为准；本轮只做编译、类型和静态检查，产品测试由 CI 执行。
 
 ## 1. 含义与启用条件
 
@@ -12,7 +12,7 @@
 2. 本地 SQLite authority 已经 `committed`；shadow 安装只能沿用 Token。
 3. Router 从模型价格（LiteLLM 派生价 + 模型价格表中的管理员定价）自动派生并发布执行价目；Server 通过签名请求取得、校验、持久化，并收到匹配 ACK 后激活。
 4. Share 已启用绑定须是 Registry 支持转发且具有统一计量生命周期策略的 Profile/Driver；凭据类别和 Coding Plan 不构成美元额度白名单。当前 Registry 为 39 families、91 Profiles、28 Drivers，Custom HTTP 展开 99 对。文本使用 v10/v1；已有媒体、音频内容及内置付费工具使用显式选择的 v11/v2 资源策略，按具体操作检查价格。重试的每次新生成独立准入，未知执行不能视为免费。
-5. 已启用且通过上述能力检查的 Single 绑定，其实际 upstream model 必须在当前 active 快照中具备 standard tier 价格。预览输出 `model_price_coverage`（模型／App／修订／排期时间），主动保存 USD 策略再次检查；只在排期快照有价时提示等待生效。Passthrough 输出 `scope=request_time`，不承诺所有调用方模型均有价，每次准入仍核实实际模型和 tier。后台保存已有授权不因该覆盖检查中断，也不清空历史。
+5. 已启用且通过上述能力检查的 Single 绑定，其实际 upstream model 应在当前 active 快照中具备 standard tier 价格。预览输出 `model_price_coverage`（模型／App／修订／排期时间）。普通授权缺价不阻断：该检查为 `ready:true, state:"unpriced"` 并保留 `reasonCode`，用量按 §3.1 记 $0；Share Market 席位仍为 `ready:false`，保存时再次检查；只在排期快照有价时提示等待生效（`tariff_not_effective`）。没有已确认价目仍阻断。Passthrough 输出 `scope=request_time`，不承诺所有调用方模型均有价，每次准入仍核实实际模型和 tier。后台保存已有授权不因该覆盖检查中断，也不清空历史。
 
 灰度部署还必须独立核对每个启用转发面 7 个自然日、至少 100 条真实完成文本请求。缺样本的面维持 Token；本地单测通过不等于 `live_verified`。
 
@@ -20,7 +20,7 @@
 
 wire：`policy.valueQuota={limitUsdMicros:"10000000",tariffPolicyId:"api-equivalent-v1"}` 表示 $10，和 `tokenLimit` 互斥，周期与 anchor 沿用 `tokenPeriod`。额度为正整数 micro-USD 字符串，最高 $1,000,000,000；不是 JS 浮点金额。
 
-Server-owned `valueMetering` 保存 `quotaPolicyEpoch/valueMeteredFromMs/effectiveFromMs/pricingRevision`。生效 / 排期 USD 和已完成 v12 单位转换的 Token 授权保留 binding。所有生成保存独立于单位的事实；Token 模式可选冻结金额，缺价仍可调用，不把缺历史当零。
+Server-owned `valueMetering` 保存 `quotaPolicyEpoch/valueMeteredFromMs/effectiveFromMs/pricingRevision`。生效 / 排期 USD 和已完成 v12 单位转换的 Token 授权保留 binding。所有生成保存独立于单位的事实；普通授权缺价按带原因的显式 $0 记账（§3.1），缺证据的历史仍不当零。
 
 普通授权单位或 USD 周期 / anchor 改动，经 v12 签名预览后保存立即生效，并承接目标当前窗口真实消费。只改 USD 额度沿用原计量起点。历史不完整、来源无法证明或在途无上界时拒绝保存，保留原策略。人工调整通过目标已用与原因建立跨单位审计映射，往返不重获额度；详细例子及协议见 [转换规范](quota-unit-conversions.md)。
 
@@ -54,7 +54,9 @@ Server-owned `valueMetering` 保存 `quotaPolicyEpoch/valueMeteredFromMs/effecti
 | 完整、单 attempt、模型与 tier 证据一致 | 精确价 | observed（缓存 TTL 合并量为 conservative） |
 | 多 attempt 但有最终用量；观测 tier 与准入不同 | 精确价（tier 取较高价） | conservative |
 | 流中断（客户端取消、上游断开、停机）或截断 | 已观测部分用量，输出 = max(上报输出, ceil(已流出文本 UTF-8 字节/3))，以 outputCeiling 封顶；未观测输入用 inputEstimate | conservative |
-| 结果未知（非流式发网后客户端断开、首字节超时、读体错误、模型／tier 证据不符、结算时缺价） | max(已观测用量的价格, 该 attempt 预占) | conservative |
+| 结果未知（非流式发网后客户端断开、首字节超时、读体错误、模型／tier 证据不符；Market 席位结算时缺价） | max(已观测用量的价格, 该 attempt 预占) | conservative |
+| 普通授权缺价（模型／tier／资源未定价、价目尚未生效） | $0，`unpricedReason` 记原因 | 完整精确证据 observed，其余 conservative |
+| 结果未知且无任何用量证据与预估（本地 429/400 拒绝、无用量取消） | $0，`unpricedReason=usage_unobserved` | conservative |
 
 已流出文本字节由流用量累加器统计（Anthropic text/thinking/partial_json、OpenAI content/reasoning/tool 参数、Responses `*.delta`、Gemini parts text），作为可选日志字段 `valueStreamedTextBytes` 保存（旧日志兼容，不导出给 Router）。
 
@@ -68,6 +70,14 @@ Server-owned `valueMetering` 保存 `quotaPolicyEpoch/valueMeteredFromMs/effecti
 清扫器（`state/background.rs`）每 5 分钟运行，启动时立即运行：对开始时间早于 max(进程启动时刻, now − (最长 Provider 请求超时 + 5 分钟)) 仍为 pending（含旧 `unavailable`）的 attempt，若有持久化用量日志则按上表分类（未结束的流视为中断），否则按“结果未知”收取预占，并以 info 记录数量。候选在**只读事务**中选出（WAL 读者不阻塞写；状态扫描无索引，schema 冻结不加索引），先 `pending` 后旧 `unavailable`，每次最多 400 条；随后以每批 25 条的短 IMMEDIATE 写事务结算。每条 attempt 在自己的 savepoint 中结算，失败（如检查点损坏）只回滚该条并阻断该 (scope, window)，其余照常提交。准入并发只统计**本 scope 当前窗口**的 `pending` 行；旧 Token shadow 遗留的 `unavailable` 行不计入并发、无预占，不会阻挡任何用户。
 
 原生 Gemini 的模型在 URL 中：额度与日志使用该真实路径模型。Gemini 金额模式仅允许 `generateContent`／`streamGenerateContent`。
+
+### 3.1 未定价用量（普通授权 $0）
+
+普通授权（Owner 与被授权用户，scope 无 `entitlementId`）的模型、tier 或资源没有价格时不再拒绝：请求照常转发，attempt 以 `usage_picos=0` 写入并在 `unpriced_reason` 记录 `model_unpriced`、`model_unresolved`、`tier_unpriced`、`resource_unpriced` 或 `tariff_not_effective`（仅待生效修订有价）。冻结价目是 `{"unpricedReason":…}` 标记，不是零单价模型。发送后才出现的未定价资源只把该维度记 $0，已定价维度照常计费。数量为 0 的资源维度既不定价也不阻断。结果未知且无任何用量证据或预估的 attempt 记 `usage_unobserved`；有观测 Token 的未知结果按这些 Token 保守计价。Share Market 席位与市场试用保持原严格行为。
+
+新修订激活时记录持久任务 `value_reprice_due`，后台每秒按页（游标持久、可重入、事务内无网络）用事实中的 Token／资源重算仍处于**未结束窗口**的价格类原因行，更新金额、`pricing_revision`、冻结价目并推进水位；已结束窗口与 `usage_unobserved` 保持 $0。schema 7 为 `value_quota_attempts` 增加可空 `unpriced_reason` 与部分索引。
+
+Router 声明 `valueQuotaUnpricedV1` 后，`ValueQuotaStatus` 才附带 `unpricedRequests`、`unpricedTokens`、`unpricedModels`（≤20，排序，不含 `usage_unobserved`）；转换预览 `coverage` 始终附带 `unpricedFacts`、`unpricedTokens`、`unpricedModels`，未定价行不阻断转换。
 
 ## 4. 价目和双端协议
 
@@ -108,7 +118,7 @@ Server Web 管理 invoke：`preview_share_value_quota`、`get_share_value_quota_
 | 已结算用量达到额度 | 403 | `value_quota_exhausted`，消息含 `resets at <RFC3339>`（lifetime 无重置），错误 details 带 `resetsAt` | 否 |
 | 并发上限或在途预占占满 | 429 | `value_quota_busy`，`Retry-After: 2` | 是 |
 | 私有 Share 授权已撤销 | 403 | `cc_switch_forbidden` | 否 |
-| 无已确认价目 | 503 | `price_unavailable` | 否 |
+| 无已确认价目；Share Market 席位模型／tier／资源缺价 | 503 | `price_unavailable` | 否 |
 | SQLite busy／locked | 503 | `quota_unavailable`，`Retry-After: 5` | 是 |
 | 其他（窗口待对账、未就绪等） | 503 | `quota_unavailable` | 否 |
 
@@ -145,7 +155,7 @@ schema v3 表结构不变（大规模 ledger 简化／schema v4 延后）。每�
 
 预览返回 `capabilityReady` 与 `checks[]`，独立报告 `router_protocol`、`sqlite_authority`（committed／prepared／shadow_verified／unavailable）、`metering_storage`、`acknowledged_tariff` 和每个**已启用 app** 绑定的 `text_surface`（app／profileId／driverId）；Provider Bundle 中已绑定但未启用的 app（常见于该 app 没有凭据）不承载请求，不参与就绪和保存校验，转发时每个请求仍单独校验运行面。任一基础条件失败均返回全部诊断及空 rows，不继续查询用户窗口；config revision 不匹配仍返回冲突。基础能力与用户 coverage 分开，不能因一个用户历史不完整禁用全体用户的单位选择。Server Web 和 Router 都可重新检查，后台检查不覆盖显式策略确认预览。
 
-执行价目不再单独编辑：Router 在启动和每次改价后，把「设置 → 模型价格」（LiteLLM 派生价 + 管理员为未定价模型填的价）冻结成快照并自动发布，替换已有价目时 60 秒后生效。快照按价格显示的回退链物化各 tier／上下文行，长上下文按含缓存的输入判定，缺 1h 写价按 5m 计；美元额度扣的就是用户看到的价格。Server `PricingSnapshot::model` 与显示使用同一模型身份剥离（厂商前缀、路径、`-thinking`／`[1m]`／`-v1:0`、日期戳等），共用 `tests/fixtures/share-value-model-identity-v1.json`。未定价模型美元额度用户无法调用，需在模型价格表定价。最新发布与当前 active 快照分开，等待未来发布不使旧快照失效。
+执行价目不再单独编辑：Router 在启动和每次改价后，把「设置 → 模型价格」（LiteLLM 派生价 + 管理员为未定价模型填的价）冻结成快照并自动发布，替换已有价目时 60 秒后生效。快照按价格显示的回退链物化各 tier／上下文行，长上下文按含缓存的输入判定，缺 1h 写价按 5m 计；美元额度扣的就是用户看到的价格。Server `PricingSnapshot::model` 与显示使用同一模型身份剥离（厂商前缀、路径、`-thinking`／`[1m]`／`-v1:0`、日期戳等），共用 `tests/fixtures/share-value-model-identity-v1.json`。普通授权调用未定价模型照常转发并按 $0 计量（§3.1），定价生效后自动重算未结束窗口；Market 席位仍需先定价。最新发布与当前 active 快照分开，等待未来发布不使旧快照失效。
 
 现有 `shadow_verified` 不代表完成 SQLite 权威迁移。空数据目录首次启动直接提交；已有数据的 Server 由管理员在「设置 → 通用 → 数据存储」点「迁移并重启」（一次性请求，下次启动在目录锁内执行，`prepared` 前失败则保留 legacy 并显示原因），或按 [官方 Server SQLite Authority 迁移](../guide/data-migration.md#server-sqlite-authority) 停服运行 `config migrate-server-store --apply`。禁止在线强改 marker。迁移后重启并验证旧授权、Provider 和用量。
 
@@ -224,7 +234,7 @@ Router 用户编辑弹窗和 Server 原生 Bundle 用户编辑器在 USD 模式�
 
 - 自定义 HTTP：Claude／Gemini 各四种、Codex 三种现有上游 driver，共 11 对 profile／driver；Codex 的 Responses／Chat 两个入口分别验证，合计 14 个自定义下游入口组合。只复用现有转换，不宣称支持 Registry 尚未实现的 Codex→Gemini。
 - WorkBuddy：精确允许三 App 的 `*.workbuddy_oauth + special.workbuddy_oauth`，覆盖 Messages、Responses、Chat、Gemini 四个文本入口及流式／非流式。CodeBuddy 即使共用转发实现仍不因此获得金额能力。
-- 固定 WorkBuddy 模型按真实 resolver 的规范化标识验价；`auto` 若能在准备阶段解析到具体模型，按该模型准入。最终仍为 `auto/default/default-model` 时，在生成前返回 `price_unavailable`／`model_unresolved`，不能猜测执行模型或把积分当美元。Passthrough 的价格覆盖仅承诺逐请求检查。
+- 固定 WorkBuddy 模型按真实 resolver 的规范化标识验价；`auto` 若能在准备阶段解析到具体模型，按该模型准入。最终仍为 `auto/default/default-model` 时，Market 席位在生成前返回 `price_unavailable`／`model_unresolved`；普通授权按 $0 计量并记原因。两者都不猜测执行模型，也不把积分当美元。Passthrough 的价格覆盖仅承诺逐请求检查。
 - 原始请求和转换后最终 payload 都必须是可计量文本；媒体、服务端付费工具、其他 OAuth、Web Session、Coding Plan 继续拒绝。普通客户端 function tool 和缓存文本沿用原有语义。
 
 ### 14.2 准入与结算边界

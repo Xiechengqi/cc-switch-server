@@ -29,6 +29,11 @@ pub(crate) struct Preview {
     pub pending_tokens: u64,
     pub pending_complete: bool,
     pub token_history_complete: bool,
+    /// Evidence metered at $0 for a missing price. It never blocks a
+    /// conversion; the Router shows a non-blocking note.
+    pub unpriced_facts: u64,
+    pub unpriced_tokens: u64,
+    pub unpriced_models: Vec<String>,
 }
 
 pub(crate) fn proof_start(dir: &Path, scope: &Scope, w: &Window) -> anyhow::Result<i64> {
@@ -94,6 +99,10 @@ pub(super) fn preview_in_tx(
     let (pending_tokens, pending_token_complete) = evidence::pending_tokens_in(tx, scope, w, None)?;
     status.pending_risk_picos = pending.to_string();
     let non_token_basis = evidence::non_token_basis(tx, scope, w)?;
+    let unpriced = unpriced_summary_in(tx, scope, w)?;
+    // Unpriced and `usage_unobserved` attempts are resolved $0 evidence, so
+    // they are neither missing nor unresolved. Gaps, Token totals that do
+    // not match the proof and blocked windows still block.
     let complete = missing == 0
         && holes == 0
         && pending_value_complete
@@ -123,6 +132,9 @@ pub(super) fn preview_in_tx(
             && requests <= proof.requests,
         processed: preparation.map_or(0, |p| p.2.max(0) as u64),
         source_adjustment,
+        unpriced_facts: unpriced.requests,
+        unpriced_tokens: unpriced.tokens,
+        unpriced_models: unpriced.models,
     })
 }
 

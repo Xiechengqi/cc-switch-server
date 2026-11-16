@@ -219,6 +219,10 @@ impl ResourceUsageObserver {
         }
     }
     fn counter(&mut self, key: &str, count: u64) {
+        // A reported zero is no resource; an absent key keeps evidence lean.
+        if count == 0 && !self.quantities.contains_key(key) {
+            return;
+        }
         let old = self.quantities.entry(key.into()).or_default();
         *old = (*old).max(count);
     }

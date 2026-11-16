@@ -1,5 +1,5 @@
 #[tokio::test]
-async fn fixed_execution_model_coverage_gates_usd_edits_but_not_ordinary_background_saves() {
+async fn fixed_execution_model_coverage_warns_owner_usd_edits_without_blocking_them() {
     use crate::domain::usage::value_pricing::PricingSnapshot;
     use crate::repository::server_sqlite::{self, value_quota as ledger};
     let state = test_state();
@@ -92,8 +92,12 @@ async fn fixed_execution_model_coverage_gates_usd_edits_but_not_ordinary_backgro
         .preview_share_value_quota("coverage-share", revision, BTreeMap::new())
         .await
         .unwrap();
+    // Owner-managed grants meter an unpriced model at an explicit $0: the
+    // check stays a warning (`state: unpriced`) and never blocks readiness.
     assert_eq!(coverage(&preview)["reasonCode"], "model_unpriced");
-    assert_eq!(preview["capabilityReady"], false);
+    assert_eq!(coverage(&preview)["ready"], true);
+    assert_eq!(coverage(&preview)["state"], "unpriced");
+    assert_eq!(preview["capabilityReady"], true, "{preview}");
     snapshot.models.insert(
         "qiniu/conatus-free".into(),
         snapshot.models.values().next().unwrap().clone(),
@@ -115,40 +119,33 @@ async fn fixed_execution_model_coverage_gates_usd_edits_but_not_ordinary_backgro
         .await
         .unwrap();
     assert_eq!(coverage(&pending)["reasonCode"], "tariff_not_effective");
+    assert_eq!(coverage(&pending)["state"], "unpriced");
     let grant:crate::domain::sharing::router_contract::ShareUserGrant=serde_json::from_value(json!({"email":"user@example.test","active":true,"policy":{"tokenPeriod":"lifetime","valueQuota":{"limitUsdMicros":"1000000","tariffPolicyId":"api-equivalent-v1"}}})).unwrap();
-    let insert_grant = |store: &mut ShareStore| {
+    // An owner-managed USD edit is never refused for price coverage alone.
+    let other = |store: &mut ShareStore| {
+        let mut grant = grant.clone();
+        grant.email = "other@example.test".into();
         store
             .shares
             .iter_mut()
             .find(|s| s.id == "coverage-share")
             .unwrap()
             .user_grants
-            .insert("user@example.test".into(), grant.clone());
+            .insert("other@example.test".into(), grant);
     };
-    let previous_grants = state
+    if let Err(error) = state.mutate_shares_immediate(other).await {
+        assert!(
+            !error.to_string().starts_with("VALUE_QUOTA_PRICE_COVERAGE:"),
+            "{error}"
+        );
+    }
+    let revision = state
         .shares
         .read()
         .await
         .get("coverage-share")
         .unwrap()
-        .user_grants
-        .clone();
-    assert!(state
-        .mutate_shares_immediate(insert_grant)
-        .await
-        .unwrap_err()
-        .to_string()
-        .starts_with("VALUE_QUOTA_PRICE_COVERAGE:"));
-    assert_eq!(
-        state
-            .shares
-            .read()
-            .await
-            .get("coverage-share")
-            .unwrap()
-            .user_grants,
-        previous_grants
-    );
+        .config_revision;
     // Activation is local, with no Router call or heartbeat.
     ledger::schedule_tariff(
         &state.config_dir,
@@ -349,4 +346,102 @@ async fn restored_router_ack_and_withdrawn_pending_tariff_converge_without_rewri
         "delivery never creates a grant or changes a policy"
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn value_quota_status_emits_unpriced_fields_only_to_a_negotiated_router() {
+    use crate::domain::usage::value_pricing::PricingSnapshot;
+    use crate::repository::server_sqlite::{self, value_quota as ledger};
+    let state = test_state();
+    state
+        .configure_value_quota_router_for_test("unpriced-status-install")
+        .await;
+    server_sqlite::activate_authority(&state.config_dir).unwrap();
+    state
+        .upsert_provider_command(
+            AppKind::Codex,
+            test_provider("provider", "Provider"),
+            Some(ProfileId::parse("codex.openai_api_key").unwrap()),
+            None,
+            None,
+            test_api_key_credential(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .mutate_shares_immediate(|store| {
+            store
+                .upsert(router_sync_share_input("unpriced-status-share", "provider"))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    let config = state.config_snapshot().await;
+    let scope = ledger::Scope {
+        router_url: config.router_api_base().unwrap().into(),
+        installation_id: "unpriced-status-install".into(),
+        share_id: "unpriced-status-share".into(),
+        email: "user@example.test".into(),
+        entitlement_id: None,
+    };
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/share-value-pricing-v1.json"
+    ))
+    .unwrap();
+    let snapshot: PricingSnapshot = serde_json::from_value(fixture["snapshot"].clone()).unwrap();
+    let revision = snapshot.revision().unwrap();
+    ledger::install_snapshot(
+        &state.config_dir,
+        &scope,
+        &revision,
+        &snapshot,
+        now_ms_i64(),
+    )
+    .unwrap();
+    ledger::activate_snapshot(&state.config_dir, &scope, &revision).unwrap();
+    let grant: crate::domain::sharing::router_contract::ShareUserGrant = serde_json::from_value(
+        json!({"email":"user@example.test","active":true,"policy":{"tokenPeriod":"lifetime",
+            "valueQuota":{"limitUsdMicros":"1000000","tariffPolicyId":"api-equivalent-v1"}}}),
+    )
+    .unwrap();
+    state
+        .mutate_shares_immediate(|store| {
+            store
+                .shares
+                .iter_mut()
+                .find(|s| s.id == "unpriced-status-share")
+                .unwrap()
+                .user_grants
+                .insert("user@example.test".into(), grant.clone());
+        })
+        .await
+        .unwrap();
+    let row = || async {
+        state
+            .value_quota_statuses("unpriced-status-share")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row["email"] == "user@example.test")
+            .unwrap()
+    };
+    // A Router without the capability has a strict reader: no new fields.
+    let legacy = row().await;
+    assert!(legacy.get("usageWatermark").is_some(), "{legacy}");
+    assert!(legacy.get("unpricedRequests").is_none(), "{legacy}");
+    assert!(legacy.get("unpricedModels").is_none(), "{legacy}");
+    state
+        .record_router_quota_capability(
+            &config,
+            client::RouterShareCapabilities {
+                share_contract_version: 10,
+                capabilities: vec!["usdEquivalentQuotaV1".into(), "valueQuotaUnpricedV1".into()],
+            },
+        )
+        .await;
+    let negotiated = row().await;
+    assert_eq!(negotiated["unpricedRequests"], 0, "{negotiated}");
+    assert_eq!(negotiated["unpricedTokens"], 0, "{negotiated}");
+    assert_eq!(negotiated["unpricedModels"], json!([]), "{negotiated}");
 }

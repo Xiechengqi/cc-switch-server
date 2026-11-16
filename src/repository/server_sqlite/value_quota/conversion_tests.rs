@@ -335,7 +335,7 @@ fn token_conversion_rechecks_calibration_evidence_in_the_commit_transaction() {
     );
 }
 #[test]
-fn conversion_missing_prices_gaps_and_lost_rollups_cannot_become_zero() {
+fn conversion_unverified_gaps_and_lost_rollups_cannot_become_zero() {
     let (mut conn, scope, w, quota, revision) = conversion_fixture();
     let tx = conn.transaction().unwrap();
     let a = conversion_admission(&scope, &w, &quota, &revision, "unpriced");

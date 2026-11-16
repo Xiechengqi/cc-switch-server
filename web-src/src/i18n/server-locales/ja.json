@@ -1267,7 +1267,7 @@
           "openStorage": "ストレージ設定を開く",
           "opensNewTab": "（新しいタブで開きます）",
           "resource_metering": "プロトコル v11 と有効なリソース料金表が必要です。Router と Server を更新し、料金表の配信を確認してください。",
-          "resource_unpriced": "実行モデルが使う各リソースに価格を設定してください。未設定の価格は無料になりません。"
+          "resource_unpriced": "実行モデルが使う各リソースに価格を設定してください。設定までは通常の許可ユーザーで $0 として計量され、Share Market の席では拒否されます。"
         },
         "remaining": "残りの換算使用量：{{amount}}",
         "exhausted": "上限に達しました",
@@ -1332,7 +1332,7 @@
           "blocked_needs_reconcile": "このユーザーの米ドル利用量は先に調整が必要です（「使用量」列で調整してください）。",
           "invalid_policy": "この上限または期間は米ドル上限に使用できません。",
           "resource_upgrade_required": "Router と Server を更新し、リソース料金表を有効にしてください。",
-          "history_incomplete": "履歴証拠が不足しているか、料金が確定していません。修復されるまで現在の単位が維持されます。",
+          "history_incomplete": "履歴証拠が不足しています。修復されるまで現在の単位が維持されます。未設定価格の利用は $0 として扱われ、切り替えを妨げません。",
           "history_preparing": "履歴証拠を準備しています。現在のポリシーは引き続き適用されます。",
           "conversion_upgrade_required": "即時の単位変更に対応する Router と Server に更新してください。",
           "pending_evidence_missing": "実行中のリクエストには変更先の単位で信頼できる上限がありません。精算完了後に変更してください。",

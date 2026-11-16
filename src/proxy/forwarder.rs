@@ -20410,12 +20410,20 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
         };
         let model_id = prepared.model_id.clone();
 
+        // Owner-managed USD grants meter an unresolved model as an explicit
+        // $0 attempt; only a Market seat refuses before send.
         if value_metering
             && crate::domain::usage::value_pricing::value_execution_model_hint(
                 execution.plan.profile_id.as_str(),
                 &model_id,
             )
             .is_none()
+            && state
+                .share_value_quota_requires_price(
+                    request_context.share_id.as_deref(),
+                    request_context.user_email.as_deref(),
+                )
+                .await
         {
             return Err(value_quota_proxy_error(
                 crate::domain::usage::value_pricing::PriceRejection {

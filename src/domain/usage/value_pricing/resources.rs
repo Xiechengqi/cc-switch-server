@@ -62,8 +62,12 @@ pub fn price_resources(
         if !valid_resource_key(key) {
             return Err(ValueError::UsageUnavailable);
         }
+        // A zero quantity executed nothing: it is neither priced nor a reason
+        // to refuse. A positive quantity still requires an explicit price.
+        if *count == 0 {
+            return Ok(total);
+        }
         let base = key.split('/').next().ok_or(ValueError::UsageUnavailable)?;
-        // Even zero requires an explicit price: unpriced is not a zero rate.
         let rate = rates
             .get(key)
             .or_else(|| rates.get(base))
@@ -174,7 +178,11 @@ mod tests {
             ("video.output_millisecond/720p".into(), 1250),
         ]);
         assert_eq!(price_resources(&rates, &quantities).unwrap(), 8_750_000_000);
-        assert!(price_resources(&rates, &BTreeMap::from([("tool.web_search".into(), 0)])).is_err());
+        assert_eq!(
+            price_resources(&rates, &BTreeMap::from([("tool.web_search".into(), 0)])).unwrap(),
+            0
+        );
+        assert!(price_resources(&rates, &BTreeMap::from([("tool.web_search".into(), 1)])).is_err());
         assert_eq!(
             price_resources(
                 &BTreeMap::from([("image.output".into(), "0".into())]),

@@ -248,6 +248,7 @@ fn value_status(
     email: &str,
     grant: &ShareUserGrant,
     now: i64,
+    unpriced_fields: bool,
 ) -> anyhow::Result<ValueQuotaStatus> {
     let binding = grant
         .value_metering
@@ -258,7 +259,15 @@ fn value_status(
     let revision =
         ledger::active_revision(dir, &identity)?.context("VALUE_QUOTA_SNAPSHOT_UNAVAILABLE")?;
     let status = ledger::status(dir, &identity, &w)?;
+    // Only a Router that advertised `valueQuotaUnpricedV1` accepts these
+    // fields; its older strict reader rejects unknown ones.
+    let unpriced = unpriced_fields
+        .then(|| ledger::unpriced_summary(dir, &identity, &w))
+        .transpose()?;
     Ok(ValueQuotaStatus {
+        unpriced_requests: unpriced.as_ref().map(|u| u.requests),
+        unpriced_tokens: unpriced.as_ref().map(|u| u.tokens),
+        unpriced_models: unpriced.map(|u| u.models),
         email: email.into(),
         policy_epoch: binding.quota_policy_epoch.clone(),
         window_id: w.id,
@@ -300,6 +309,42 @@ fn metering_status_for(
         return "scheduled".into();
     }
     window_status
+}
+/// Scope key -> currently open window of every active owner-managed grant
+/// (Token grants included: their facts become USD evidence on conversion).
+/// Market seats are absent, so their attempts are never re-priced.
+fn reprice_windows(
+    shares: &ShareStore,
+    config: &ServerConfig,
+    now: i64,
+) -> BTreeMap<String, ledger::Window> {
+    let mut windows = BTreeMap::new();
+    for share in &shares.shares {
+        for (email, grant) in &share.user_grants {
+            if !grant.active || grant.manager == ShareGrantManager::RouterShareMarket {
+                continue;
+            }
+            let mut bound = grant.clone();
+            if bound.value_metering.is_none() {
+                bound.value_metering = Some(ValueMeteringBinding {
+                    quota_policy_epoch: "evidence".into(),
+                    value_metered_from_ms: 0,
+                    effective_from_ms: 0,
+                    pricing_revision: String::new(),
+                });
+            }
+            let (Ok(identity), Ok(w)) = (
+                grant_scope(config, &share.id, email, grant),
+                window(&bound, now),
+            ) else {
+                continue;
+            };
+            if let Ok(key) = identity.key() {
+                windows.insert(key, w);
+            }
+        }
+    }
+    windows
 }
 fn metered_grant(grant: &ShareUserGrant) -> bool {
     grant.active
@@ -1116,6 +1161,22 @@ impl ServerStateInner {
                         .is_some_and(|identity| identity.installation_id == *id)
             })
     }
+    /// The Router's strict `ValueQuotaStatus` reader accepts unpriced fields.
+    pub(crate) async fn value_quota_unpriced_router_negotiated(&self) -> bool {
+        let config = self.config_snapshot().await;
+        self.router_quota_capability
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(base, id, at, supported)| {
+                supported.9
+                    && at.elapsed() < Duration::from_secs(300)
+                    && config.router_api_base() == Some(base.as_str())
+                    && config
+                        .registered_router_identity()
+                        .is_some_and(|identity| identity.installation_id == *id)
+            })
+    }
     pub(crate) async fn resource_value_router_negotiated(&self) -> bool {
         let config = self.config_snapshot().await;
         self.router_quota_capability
@@ -1138,6 +1199,23 @@ impl ServerStateInner {
             .get(share_id)
             .and_then(|s| email.and_then(|e| s.user_grants.get(&e.to_ascii_lowercase())))
             .is_some_and(|g| g.active && g.policy.value_quota.is_some())
+    }
+    /// Market seats bind money to the price: an unpriced model is refused
+    /// before send. Owner-managed grants meter it as an explicit $0 attempt.
+    pub(crate) async fn share_value_quota_requires_price(
+        &self,
+        share_id: Option<&str>,
+        email: Option<&str>,
+    ) -> bool {
+        let (Some(share_id), Some(email)) = (share_id, email) else {
+            return false;
+        };
+        self.shares
+            .read()
+            .await
+            .get(share_id)
+            .and_then(|s| s.user_grants.get(&email.to_ascii_lowercase()))
+            .is_some_and(|g| g.active && g.manager == ShareGrantManager::RouterShareMarket)
     }
     /// Called before persisting a candidate. Browser-supplied bindings are
     /// discarded by ShareStore; policy changes cannot reset collection.
@@ -1202,8 +1280,17 @@ impl ServerStateInner {
             } else {
                 Vec::new()
             };
-            let require_prices = || -> anyhow::Result<()> {
-                if let Some(check) = price_checks.iter().find(|check| check["ready"] != true) {
+            // Market seats require every configured model to be priced. For
+            // owner-managed grants an unpriced model is `ready` (metered at an
+            // explicit $0); only a missing acknowledged tariff still blocks.
+            let require_prices = |market: bool| -> anyhow::Result<()> {
+                if let Some(check) = price_checks.iter().find(|check| {
+                    if market {
+                        !tariff::market_price_ready(check)
+                    } else {
+                        check["ready"] != true
+                    }
+                }) {
                     anyhow::bail!(
                         "VALUE_QUOTA_PRICE_COVERAGE: {}",
                         serde_json::to_string(check)?
@@ -1232,7 +1319,7 @@ impl ServerStateInner {
                                 || g.entitlement_id != grant.entitlement_id
                         });
                     if managed_edit {
-                        require_prices()?;
+                        require_prices(true)?;
                     }
                     match self.prepare_managed_value_grant(
                         &share.id,
@@ -1271,7 +1358,7 @@ impl ServerStateInner {
                 let user_edit = converted.contains(&(share.id.clone(), email.clone()))
                     || old.is_none_or(|g| !g.active || g.policy != requested);
                 if user_edit && grant.policy.value_quota.is_some() {
-                    require_prices()?;
+                    require_prices(false)?;
                 }
                 match self.prepare_value_grant(
                     &share.id,
@@ -2174,8 +2261,13 @@ impl ServerStateInner {
                 !enforce || verified_surface,
                 "VALUE_QUOTA_UNVERIFIED_SURFACE"
             );
+            // An owner-managed grant meters an unknown tier as `tier_unpriced`
+            // ($0, re-priced later); a Market seat still refuses before send.
             let tier = effective_tier
-                .or_else(|| (!enforce).then_some("unknown"))
+                .or_else(|| {
+                    (!enforce || grant.manager != ShareGrantManager::RouterShareMarket)
+                        .then_some("unknown")
+                })
                 .ok_or_else(|| crate::domain::usage::value_pricing::PriceRejection {
                     reason_code: "tier_unknown",
                     model: crate::domain::usage::value_pricing::diagnostic_identity(
@@ -2316,9 +2408,18 @@ impl ServerStateInner {
             .get(share_id)
             .cloned()
             .context("Share not found")?;
+        let unpriced_fields = self.value_quota_unpriced_router_negotiated().await;
         let mut result = Vec::new();
         for (email, grant) in share.user_grants.iter().filter(|(_, g)| metered_grant(g)) {
-            let row = match value_status(&self.config_dir, &config, share_id, email, grant, now) {
+            let row = match value_status(
+                &self.config_dir,
+                &config,
+                share_id,
+                email,
+                grant,
+                now,
+                unpriced_fields,
+            ) {
                 Ok(status) => {
                     let code = match status.metering_status.as_str() {
                         "blocked" => "blocked_needs_reconcile",
@@ -2388,6 +2489,7 @@ impl ServerStateInner {
         {
             grants.rotate_left(position);
         }
+        let unpriced_fields = self.value_quota_unpriced_router_negotiated().await;
         let mut sent = 0;
         for ((id, email), grant) in grants {
             if sent >= 16 || sync_started.elapsed() >= Duration::from_secs(5) {
@@ -2405,6 +2507,7 @@ impl ServerStateInner {
                 &email,
                 &grant,
                 now_ms_i64(),
+                unpriced_fields,
             ) {
                 Ok(status) => status,
                 Err(error) => {

@@ -323,30 +323,6 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                             assert_eq!(status.observed_picos, "0", "{action}");
                         }
                     }
-                    {
-                        let mut unpriced = request.clone();
-                        if app != AppKind::Gemini {
-                            unpriced["model"] = json!("unpriced-model");
-                        }
-                        let unpriced_path = gemini_path
-                            .as_ref()
-                            .map(|path| path.replace("text-model", "unpriced-model"));
-                        let error = forward(
-                            state.clone(),
-                            route,
-                            unpriced_path,
-                            headers.clone(),
-                            Bytes::from(serde_json::to_vec(&unpriced).unwrap()),
-                        )
-                        .await
-                        .unwrap_err();
-                        assert_eq!(
-                            error.error_code(),
-                            "price_unavailable",
-                            "{profile} {route:?} streaming={streaming}"
-                        );
-                        assert_eq!(calls.load(Ordering::SeqCst), 0);
-                    }
                     let response = forward(
                     state.clone(),
                     route,
@@ -396,6 +372,33 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                     assert_eq!(error.status, StatusCode::FORBIDDEN, "{label}");
                     assert!(!error.retryable());
                     assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    {
+                        // An owner-managed grant no longer refuses an unpriced
+                        // model before send (it is metered at an explicit $0);
+                        // the exhausted window still refuses it pre-send.
+                        let mut unpriced = request.clone();
+                        if app != AppKind::Gemini {
+                            unpriced["model"] = json!("unpriced-model");
+                        }
+                        let unpriced_path = gemini_path
+                            .as_ref()
+                            .map(|path| path.replace("text-model", "unpriced-model"));
+                        let error = forward(
+                            state.clone(),
+                            route,
+                            unpriced_path,
+                            headers.clone(),
+                            Bytes::from(serde_json::to_vec(&unpriced).unwrap()),
+                        )
+                        .await
+                        .unwrap_err();
+                        assert_eq!(
+                            error.error_code(),
+                            "value_quota_exhausted",
+                            "{profile} {route:?} streaming={streaming}"
+                        );
+                        assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    }
 
                     if app == AppKind::Codex && protocol.is_none() {
                         let web = install_web_session_forwarder_test_provider(
@@ -427,12 +430,10 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                         )
                         .await
                         .unwrap_err();
-                        assert_eq!(
-                            error.error_code(),
-                            "price_unavailable",
-                            "the Web Session execution model needs its own explicit price"
-                        );
-                        assert!(error.message.contains("model_unpriced"), "{error:?}");
+                        // The Web Session execution model has no explicit price;
+                        // an owner grant would meter it at $0, but the exhausted
+                        // window still refuses before any upstream I/O.
+                        assert_eq!(error.error_code(), "value_quota_exhausted");
                         assert_eq!(calls.load(Ordering::SeqCst), 1);
                     }
                     server.abort();

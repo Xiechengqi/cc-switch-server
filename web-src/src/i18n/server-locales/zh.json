@@ -1267,7 +1267,7 @@
           "openStorage": "前往存储设置",
           "opensNewTab": "（在新标签页打开）",
           "resource_metering": "资源计量正在等待协议 v11 和已激活的资源价目。请升级 Router、Server 并检查价目下发状态。",
-          "resource_unpriced": "请为实际执行模型使用的每项资源配置明确价格，缺价不会按免费处理。"
+          "resource_unpriced": "请为实际执行模型使用的每项资源配置明确价格；定价前普通授权按 $0 计量，Share Market 席位拒绝。"
         },
         "remaining": "剩余等值额度：{{amount}}",
         "exhausted": "已耗尽",
@@ -1332,7 +1332,7 @@
           "blocked_needs_reconcile": "该用户的美元用量需要先校准（在“已用”列中立即校准）。",
           "invalid_policy": "该额度或周期不适用于美元额度。",
           "resource_upgrade_required": "请升级 Router、Server 并激活资源价目。",
-          "history_incomplete": "历史请求证据缺失或尚未定价，补齐证据或价格前不能转换。",
+          "history_incomplete": "历史请求证据缺失，补齐证据前不能转换；未定价用量按 $0 计，不阻断转换。",
           "history_preparing": "正在准备历史请求证据，当前策略继续生效。",
           "conversion_upgrade_required": "请升级 Router 和 Server，以支持立即切换额度单位。",
           "pending_evidence_missing": "在途请求缺少目标单位的可信上界，请等待结算后再转换。",

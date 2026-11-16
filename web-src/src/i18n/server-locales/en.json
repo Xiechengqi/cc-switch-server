@@ -1267,7 +1267,7 @@
           "openStorage": "Open storage settings",
           "opensNewTab": "(opens in a new tab)",
           "resource_metering": "Resource metering is waiting for protocol v11 and an active resource tariff. Upgrade Router and Server, then check price delivery.",
-          "resource_unpriced": "Configure an explicit price for every resource the execution model uses. A missing price is never treated as free."
+          "resource_unpriced": "Configure an explicit price for every resource the execution model uses. Until then it counts as $0 for owner-managed users; Share Market seats refuse it."
         },
         "remaining": "Remaining equivalent quota: {{amount}}",
         "exhausted": "Limit reached",
@@ -1332,7 +1332,7 @@
           "blocked_needs_reconcile": "This user's USD usage needs reconciling first (reconcile it in the Used column).",
           "invalid_policy": "This limit or period isn't valid for a USD quota.",
           "resource_upgrade_required": "Upgrade Router and Server and activate the resource tariff.",
-          "history_incomplete": "Historical request evidence is incomplete or unpriced. Repair evidence or prices before converting.",
+          "history_incomplete": "Historical request evidence is incomplete. Repair the evidence before converting; unpriced usage counts as $0 and does not block.",
           "history_preparing": "Preparing request history. The current policy remains active.",
           "conversion_upgrade_required": "Upgrade Router and Server for immediate quota unit conversion.",
           "pending_evidence_missing": "An in-flight request has no trustworthy bound in the target unit. Wait for settlement before converting.",

@@ -1267,7 +1267,7 @@
           "openStorage": "前往儲存設定",
           "opensNewTab": "（在新分頁開啟）",
           "resource_metering": "資源計量正在等待協定 v11 與已啟用的資源價目。請升級 Router、Server 並檢查價目傳送狀態。",
-          "resource_unpriced": "請為實際執行模型使用的每項資源設定明確價格，缺價不會視為免費。"
+          "resource_unpriced": "請為實際執行模型使用的每項資源設定明確價格；定價前一般授權按 $0 計量，Share Market 席位拒絕。"
         },
         "remaining": "剩餘等值額度：{{amount}}",
         "exhausted": "已用盡",
@@ -1332,7 +1332,7 @@
           "blocked_needs_reconcile": "該使用者的美元用量需要先校準（在「已用」欄中立即校準）。",
           "invalid_policy": "此額度或週期不適用於美元額度。",
           "resource_upgrade_required": "請升級 Router、Server 並啟用資源價目。",
-          "history_incomplete": "歷史請求證據缺失或尚未定價，補齊前保留目前的額度單位。",
+          "history_incomplete": "歷史請求證據缺失，補齊前保留目前的額度單位；未定價用量按 $0 計，不阻擋轉換。",
           "history_preparing": "正在準備歷史請求證據，目前策略繼續生效。",
           "conversion_upgrade_required": "請升級 Router 和 Server，以支援立即切換額度單位。",
           "pending_evidence_missing": "執行中的請求缺少目標單位的可信上限，請等待結算後再轉換。",

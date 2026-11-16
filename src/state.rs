@@ -992,7 +992,7 @@ type CachedRouterShareCapabilities = (
     String,
     String,
     std::time::Instant,
-    (bool, bool, bool, bool, bool, bool, bool, bool, bool),
+    (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool),
 );
 
 #[derive(Clone, Copy)]
@@ -19686,6 +19686,7 @@ impl ServerStateInner {
                         capability.buddy_quota_presentation(),
                         capability.resource_value_quotas(),
                         capability.quota_unit_conversion(),
+                        capability.value_quota_unpriced(),
                     ),
                 )
             });
@@ -19693,10 +19694,10 @@ impl ServerStateInner {
             let mut previous = self.router_quota_capability.write().await;
             let changed = previous
                 .as_ref()
-                .map(|(base, id, _, c)| (base, id, c.5, c.6, c.7, c.8))
+                .map(|(base, id, _, c)| (base, id, c.5, c.6, c.7, c.8, c.9))
                 != value
                     .as_ref()
-                    .map(|(base, id, _, c)| (base, id, c.5, c.6, c.7, c.8))
+                    .map(|(base, id, _, c)| (base, id, c.5, c.6, c.7, c.8, c.9))
                 || previous
                     .as_ref()
                     .is_some_and(|(_, _, at, c)| c.6 && at.elapsed() >= Duration::from_secs(300));

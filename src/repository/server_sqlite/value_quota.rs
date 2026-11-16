@@ -15,8 +15,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) mod conversion;
 pub(crate) mod evidence;
+mod reprice;
 mod resource_tasks;
 mod tariff;
+pub(crate) use reprice::{reprice_due, reprice_page};
 pub(crate) use resource_tasks::attach_task;
 pub(crate) use tariff::{activate_due_tariff, model_coverage, schedule_tariff};
 
@@ -332,11 +334,78 @@ struct AttemptMeta {
     exact_aliases: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resource_plan: Option<crate::domain::usage::value_pricing::ResourcePlan>,
+    /// Revision the attempt was admitted with, kept when re-pricing moves
+    /// `pricing_revision` so an admission replay stays idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission_revision: Option<String>,
 }
 impl AttemptMeta {
     fn reserved(&self) -> i128 {
         unsigned_decimal(&self.reserved_picos).unwrap_or(0)
     }
+}
+/// Drops zero-quantity dimensions; the plan itself (and its v2 requirement,
+/// which may come from a non-text body) is kept.
+fn strip_zero_resources(
+    plan: Option<crate::domain::usage::value_pricing::ResourcePlan>,
+) -> Option<crate::domain::usage::value_pricing::ResourcePlan> {
+    plan.map(|mut plan| {
+        plan.quantities.retain(|_, quantity| *quantity > 0);
+        plan
+    })
+}
+/// Frozen tariff of an attempt admitted without a price. It is never a
+/// zero-rate model: settlement recognises it and records an explicit `$0`
+/// with its reason; re-pricing replaces it with the covering model price.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UnpricedTariff {
+    unpriced_reason: String,
+}
+fn unpriced_marker(frozen: &str) -> Option<String> {
+    serde_json::from_str::<UnpricedTariff>(frozen)
+        .ok()
+        .map(|marker| marker.unpriced_reason)
+}
+/// Unclamped price of the admission bound (input estimate + output ceiling
+/// and planned resources): the outcome-unknown charge of a shadow attempt.
+fn estimate_picos(
+    model: &ExecutionModelPrice,
+    tier: &str,
+    estimate: &RiskEstimate,
+    plan: Option<&crate::domain::usage::value_pricing::ResourcePlan>,
+) -> anyhow::Result<i128> {
+    let text = if plan.is_none_or(|p| p.text_tokens) {
+        model
+            .price_or_highest_tier(tier, &estimate.tokens())?
+            .usage_picos
+    } else {
+        0
+    };
+    let resources = plan
+        .map(|p| {
+            crate::domain::usage::value_pricing::price_resources(&model.resources, &p.quantities)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    text.checked_add(resources)
+        .context("value quota arithmetic overflow")
+}
+/// An admission bound exists: an outcome-unknown attempt has something to
+/// charge once it is priced. Without one, zero usage is `usage_unobserved`.
+fn has_estimate(meta: Option<&AttemptMeta>) -> bool {
+    meta.is_some_and(|m| {
+        m.input_tokens.saturating_add(m.output_tokens) > 0
+            || m.resource_plan
+                .as_ref()
+                .is_some_and(|p| p.quantities.values().any(|n| *n > 0))
+    })
+}
+fn observed_usage(o: &Observation<'_>) -> bool {
+    o.tokens.is_some_and(|t| t != ValueTokens::default())
+        || o.resources
+            .as_ref()
+            .is_some_and(|r| r.quantities.values().any(|n| *n > 0))
 }
 fn read_attempt_meta(
     conn: &Connection,
@@ -582,6 +651,8 @@ impl Checkpoint {
         self.watermark = self.watermark.max(other.watermark);
         Ok(())
     }
+    /// Unpriced and `usage_unobserved` attempts are ordinary observed /
+    /// conservative rows (resolved $0 evidence), never a gap or pending.
     /// Window status is observed, conservative or pending. Legacy
     /// `unavailable` attempts and coverage gaps are reported as conservative:
     /// they never lock a window, an owner reconcile resolves them.
@@ -1143,6 +1214,51 @@ fn status_with_coverage_in(
         )?),
     })
 }
+/// Attempts of one window metered at $0 for a price-type reason
+/// (`usage_unobserved` is empty, not unpriced). Models: distinct, sorted, <=20.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UnpricedSummary {
+    pub requests: u64,
+    pub tokens: u64,
+    pub models: Vec<String>,
+}
+pub(super) fn unpriced_summary_in(
+    conn: &Connection,
+    scope: &Scope,
+    w: &Window,
+) -> anyhow::Result<UnpricedSummary> {
+    let (key, from, account) = (scope.key()?, w.metered_start_ms(), w.account_key()?);
+    let args = params![key, from, w.ends_at_ms, account];
+    let filter = "FROM value_quota_attempts a LEFT JOIN quota_metering_facts f USING(request_id,attempt_id)
+        WHERE a.scope=?1 AND a.unpriced_reason IS NOT NULL AND a.unpriced_reason!='usage_unobserved'
+        AND a.started_at_ms>=?2 AND (?3 IS NULL OR a.started_at_ms<?3) AND (?4 IS NULL OR f.account_key=?4)";
+    let (requests, tokens): (i64, i64) = conn.query_row(
+        &format!("SELECT count(*),COALESCE(sum(f.quota_tokens),0) {filter}"),
+        args,
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut query = conn.prepare(&format!(
+        "SELECT DISTINCT a.effective_model {filter} ORDER BY 1 LIMIT 20"
+    ))?;
+    let models = query
+        .query_map(args, |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(UnpricedSummary {
+        requests: u64::try_from(requests)?,
+        tokens: u64::try_from(tokens)?,
+        models,
+    })
+}
+pub(crate) fn unpriced_summary(
+    config_dir: &Path,
+    scope: &Scope,
+    window: &Window,
+) -> anyhow::Result<UnpricedSummary> {
+    assert_committed(config_dir)?;
+    let conn = open_database(&database_path(config_dir), true)?;
+    unpriced_summary_in(&conn, scope, window)
+}
 /// Read-only status. A restore fence or a scoped block reports `blocked`
 /// instead of failing, so one user's recovery state never hides others.
 pub(crate) fn status(
@@ -1201,6 +1317,19 @@ fn admit_with_trial_in_tx(
     a: &Admission<'_>,
     trial: Option<&MarketTrialBudget>,
 ) -> anyhow::Result<Admitted> {
+    // Zero-quantity dimensions executed nothing: they never reach pricing,
+    // the v2 policy check or the stored plan (live, shadow and history alike).
+    let stripped;
+    let a = match a.resource_plan.as_ref() {
+        Some(plan) if plan.quantities.values().any(|quantity| *quantity == 0) => {
+            stripped = Admission {
+                resource_plan: strip_zero_resources(a.resource_plan.clone()),
+                ..a.clone()
+            };
+            &stripped
+        }
+        _ => a,
+    };
     a.window.validate()?;
     ensure!(
         !a.policy_epoch.is_empty() && !a.request_id.is_empty() && !a.attempt_id.is_empty(),
@@ -1226,54 +1355,77 @@ fn admit_with_trial_in_tx(
         &a.scope.installation_id,
         a.pricing_revision,
     )?;
-    let model = snapshot.model(a.effective_model).map_err(|_| {
-        tariff::price_rejection(
+    // Owner-managed scopes meter a missing price as an explicit $0 attempt
+    // carrying its reason; a later covering tariff re-prices it while its
+    // window is open. Market contracts (entitlement scopes) bind money and
+    // keep refusing before any upstream I/O.
+    let unpriced = |reason: &'static str| -> anyhow::Result<&'static str> {
+        let rejection = tariff::price_rejection(
             tx,
             a.scope,
             a.pricing_revision,
             a.effective_model,
             a.effective_tier,
-            if a.effective_model.is_empty() {
+            reason,
+        );
+        if a.scope.entitlement_id.is_none() {
+            Ok(rejection.reason_code)
+        } else {
+            Err(rejection.into())
+        }
+    };
+    let mut unpriced_reason: Option<&'static str> = None;
+    let model = match snapshot.model(a.effective_model) {
+        Ok(model) => Some(model),
+        Err(_) => {
+            unpriced_reason = Some(unpriced(if a.effective_model.is_empty() {
                 "model_unresolved"
             } else {
                 "model_unpriced"
-            },
-        )
-    })?;
-    if let Some(plan) = &a.resource_plan {
-        if plan.requires_v2 {
-            ensure!(
-                a.quota.tariff_policy_id
-                    == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
-                    && snapshot.schema_version == 2,
-                "VALUE_QUOTA_RESOURCE_POLICY_REQUIRED"
-            );
+            })?);
+            None
         }
-        crate::domain::usage::value_pricing::price_resources(&model.resources, &plan.quantities)
-            .map_err(|_| {
-                tariff::price_rejection(
-                    tx,
-                    a.scope,
-                    a.pricing_revision,
-                    a.effective_model,
-                    a.effective_tier,
-                    "resource_unpriced",
+    };
+    if let Some(model) = model {
+        if let Some(plan) = &a.resource_plan {
+            if plan.requires_v2 {
+                ensure!(
+                    a.quota.tariff_policy_id
+                        == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY,
+                    "VALUE_QUOTA_RESOURCE_POLICY_REQUIRED"
+                );
+                if snapshot.schema_version != 2 {
+                    // A v1 tariff cannot price a positive resource at all.
+                    ensure!(
+                        a.scope.entitlement_id.is_none()
+                            && plan.quantities.values().any(|quantity| *quantity > 0),
+                        "VALUE_QUOTA_RESOURCE_POLICY_REQUIRED"
+                    );
+                    unpriced_reason = Some(unpriced("resource_unpriced")?);
+                }
+            }
+            if unpriced_reason.is_none()
+                && crate::domain::usage::value_pricing::price_resources(
+                    &model.resources,
+                    &plan.quantities,
                 )
-            })?;
+                .is_err()
+            {
+                unpriced_reason = Some(unpriced("resource_unpriced")?);
+            }
+        }
+        // An unknown or unsupported tier of an owner-managed grant is priced
+        // conservatively at the model's highest tier; only a model without
+        // any text tier is `tier_unpriced`. Market contracts still refuse.
+        if unpriced_reason.is_none()
+            && a.resource_plan.as_ref().is_none_or(|plan| plan.text_tokens)
+            && !model.supports_tier(a.effective_tier)
+            && (a.scope.entitlement_id.is_some() || model.supported_tiers().next().is_none())
+        {
+            unpriced_reason = Some(unpriced("tier_unpriced")?);
+        }
     }
-    if a.resource_plan.as_ref().is_none_or(|plan| plan.text_tokens)
-        && !model.supports_tier(a.effective_tier)
-    {
-        return Err(tariff::price_rejection(
-            tx,
-            a.scope,
-            a.pricing_revision,
-            a.effective_model,
-            a.effective_tier,
-            "tier_unpriced",
-        )
-        .into());
-    }
+    let model = model.filter(|_| unpriced_reason.is_none());
     // policy_epoch is deliberately not part of the identity: a retry after a
     // policy edit is the same request in the same real window.
     let existing: Option<(String, String, String, String, String, i64)> = tx
@@ -1294,15 +1446,23 @@ fn admit_with_trial_in_tx(
         )
         .optional()?;
     if let Some(old) = existing {
+        // Re-pricing replaces the stored revision but records the one the
+        // attempt was admitted with; a replay of that admission is the same
+        // request, not a conflict.
+        let admitted_revision = old.1 == a.pricing_revision
+            || read_attempt_meta(tx, a.request_id, a.attempt_id)?
+                .and_then(|meta| meta.admission_revision)
+                .is_some_and(|revision| revision == a.pricing_revision);
         ensure!(
-            old == (
-                key,
-                a.pricing_revision.into(),
-                a.effective_model.into(),
-                a.effective_tier.into(),
-                a.window.id.clone(),
-                a.started_at_ms
-            ),
+            admitted_revision
+                && (old.0, old.2, old.3, old.4, old.5)
+                    == (
+                        key,
+                        a.effective_model.into(),
+                        a.effective_tier.into(),
+                        a.window.id.clone(),
+                        a.started_at_ms
+                    ),
             "VALUE_QUOTA_REQUEST_IDENTITY_CONFLICT"
         );
         if let Some(trial) = trial {
@@ -1362,40 +1522,51 @@ fn admit_with_trial_in_tx(
             return Err(ValueQuotaRejection::new(ValueQuotaRejectionKind::Busy).into());
         }
         // Bounded reservation: price(input estimate + output ceiling) at the
-        // context tier implied by the estimate, never more than remains.
-        let text = if a.resource_plan.as_ref().is_none_or(|plan| plan.text_tokens) {
-            model
-                .price(a.effective_tier, &a.estimate.tokens())
-                .map(|price| price.usage_picos)
-                .unwrap_or(available)
-        } else {
-            0
-        };
-        let resources = a
-            .resource_plan
-            .as_ref()
-            .map(|plan| {
-                crate::domain::usage::value_pricing::price_resources(
-                    &model.resources,
-                    &plan.quantities,
-                )
-            })
-            .transpose()?
-            .unwrap_or(0);
-        text.checked_add(resources)
-            .context("value quota arithmetic overflow")?
-            .clamp(0, available)
+        // context tier implied by the estimate, never more than remains. An
+        // unpriced attempt reserves nothing: it settles at $0.
+        match model {
+            Some(model) => {
+                let text = if a.resource_plan.as_ref().is_none_or(|plan| plan.text_tokens) {
+                    model
+                        .price_or_highest_tier(a.effective_tier, &a.estimate.tokens())
+                        .map(|price| price.usage_picos)
+                        .unwrap_or(available)
+                } else {
+                    0
+                };
+                let resources = a
+                    .resource_plan
+                    .as_ref()
+                    .map(|plan| {
+                        crate::domain::usage::value_pricing::price_resources(
+                            &model.resources,
+                            &plan.quantities,
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                text.checked_add(resources)
+                    .context("value quota arithmetic overflow")?
+                    .clamp(0, available)
+            }
+            None => 0,
+        }
     } else {
         0
     };
     let watermark = next_watermark(tx)?;
-    let frozen = serde_json::to_string(model)?;
+    let frozen = match (model, unpriced_reason) {
+        (Some(model), _) => serde_json::to_string(model)?,
+        (None, reason) => serde_json::to_string(&UnpricedTariff {
+            unpriced_reason: reason.context("value quota tariff missing")?.into(),
+        })?,
+    };
     tx.execute(
         "INSERT INTO value_quota_attempts(request_id,attempt_id,scope,policy_epoch,window_id,started_at_ms,
          pricing_revision,effective_model,effective_tier,frozen_tariff_json,usage_revision,usage_picos,
-         pending_risk_picos,metering_status,watermark) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,'0',?11,'pending',?12)",
+         pending_risk_picos,metering_status,watermark,unpriced_reason) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,'0',?11,'pending',?12,?13)",
         params![a.request_id,a.attempt_id,key,a.policy_epoch,a.window.id,a.started_at_ms,a.pricing_revision,
-            a.effective_model,a.effective_tier,frozen,reserved.to_string(),watermark])?;
+            a.effective_model,a.effective_tier,frozen,reserved.to_string(),watermark,unpriced_reason])?;
     tx.execute(
         "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![
@@ -1403,18 +1574,20 @@ fn admit_with_trial_in_tx(
             serde_json::to_string(&AttemptMeta {
                 input_tokens: a.estimate.input_tokens,
                 output_tokens: a.estimate.output_tokens,
-                reserved_picos: if a.enforce { reserved } else {
-                    let text = if a.resource_plan.as_ref().is_none_or(|p| p.text_tokens) {
-                        model.price(a.effective_tier, &a.estimate.tokens())?.usage_picos
-                    } else { 0 };
-                    let resources = a.resource_plan.as_ref().map(|p|
-                        crate::domain::usage::value_pricing::price_resources(&model.resources, &p.quantities)
-                    ).transpose()?.unwrap_or(0);
-                    text.checked_add(resources).context("value quota arithmetic overflow")?
+                reserved_picos: match model {
+                    _ if a.enforce => reserved,
+                    Some(model) => estimate_picos(
+                        model,
+                        a.effective_tier,
+                        &a.estimate,
+                        a.resource_plan.as_ref(),
+                    )?,
+                    None => 0,
                 }.to_string(),
                 frozen_tariff_sha256: Some(sha256_hex(frozen.as_bytes())),
                 exact_aliases: snapshot.exact_aliases.clone(),
                 resource_plan: a.resource_plan.clone(),
+                admission_revision: None,
             })?
         ],
     )?;
@@ -2198,6 +2371,7 @@ fn write_settlement(
     amount: i128,
     state: &str,
     risk: i128,
+    unpriced: Option<&str>,
 ) -> anyhow::Result<()> {
     // Persist the trial high-water in this same transaction, before a crash
     // can separate ledger settlement from the entitlement mirror. A later
@@ -2227,9 +2401,9 @@ fn write_settlement(
         params![request_id,attempt_id,revision,digest,amount,state,watermark,observation_json])?;
     tx.execute(
         "UPDATE value_quota_attempts SET usage_revision=?3,usage_picos=?4,metering_status=?5,watermark=?6,
-         observation_sha256=?7,pending_risk_picos=?8
+         observation_sha256=?7,pending_risk_picos=?8,unpriced_reason=?9
          WHERE request_id=?1 AND attempt_id=?2",
-        params![request_id, attempt_id, revision, amount, state, watermark, digest, risk],
+        params![request_id, attempt_id, revision, amount, state, watermark, digest, risk, unpriced],
     )?;
     update_checkpoint(
         tx,
@@ -2296,6 +2470,46 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
     // New attempts retain the minimal tariff and aliases independently of the
     // catalog/report retention. Old compacted rows still need their snapshot.
     let meta = read_attempt_meta(tx, o.request_id, o.attempt_id)?;
+    if let Some(reason) = unpriced_marker(&old.3) {
+        if let Some(hash) = meta.as_ref().and_then(|m| m.frozen_tariff_sha256.as_ref()) {
+            ensure!(
+                *hash == sha256_hex(old.3.as_bytes()),
+                "VALUE_QUOTA_FROZEN_TARIFF_CORRUPT"
+            );
+        }
+        // Admitted without a price: every outcome is an explicit $0. A free
+        // outcome owes nothing whatever the price; an attempt without any
+        // usage evidence or admission bound has nothing to re-price later.
+        // `$0` is the exact owner rule, not an estimate that may overstate
+        // usage, so complete exact evidence stays `observed`; weaker
+        // evidence keeps the same `conservative` state a priced row gets.
+        let (state, unpriced) = match o.outcome {
+            ObservedOutcome::InProgress => ("pending", Some(reason.as_str())),
+            ObservedOutcome::Free => ("observed", None),
+            _ if !observed_usage(o) && !has_estimate(meta.as_ref()) => (
+                "conservative",
+                Some(crate::domain::usage::value_pricing::USAGE_UNOBSERVED),
+            ),
+            ObservedOutcome::Final if o.observed_tier.is_none() => {
+                ("observed", Some(reason.as_str()))
+            }
+            _ => ("conservative", Some(reason.as_str())),
+        };
+        write_settlement(
+            tx,
+            o.request_id,
+            o.attempt_id,
+            &old,
+            revision,
+            &digest,
+            &observation_json,
+            0,
+            state,
+            0,
+            unpriced,
+        )?;
+        return Ok(true);
+    }
     let (tariff, aliases) =
         if let Some(hash) = meta.as_ref().and_then(|m| m.frozen_tariff_sha256.as_ref()) {
             ensure!(
@@ -2334,15 +2548,51 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
     let old_amount = unsigned_decimal(&old.5)?;
     let meta = read_attempt_meta(tx, o.request_id, o.attempt_id)?;
     let plan = meta.as_ref().and_then(|meta| meta.resource_plan.as_ref());
-    if let Some(usage) = &o.resources {
-        // A positive dimension discovered after send must not disappear into
-        // the text reservation when its price is missing. The isolated
-        // settlement caller retains the risk/evidence and fences this window
-        // for reconciliation; other scopes remain available.
-        usage.validate()?;
-        crate::domain::usage::value_pricing::price_resources(&tariff.resources, &usage.quantities)?;
-    }
-    let price = |tier: &str| {
+    let original = o;
+    let priced_only;
+    let mut resource_unpriced = false;
+    let o = match &o.resources {
+        Some(usage) => {
+            usage.validate()?;
+            match crate::domain::usage::value_pricing::price_resources(
+                &tariff.resources,
+                &usage.quantities,
+            ) {
+                Ok(_) => o,
+                // A positive Market dimension discovered after send must not
+                // disappear into the text reservation when its price is
+                // missing. The isolated settlement caller retains the
+                // risk/evidence and fences this window for reconciliation.
+                Err(error)
+                    if scope.entitlement_id.is_some()
+                        || error != crate::domain::usage::value_pricing::ValueError::PriceUnavailable =>
+                {
+                    return Err(error.into())
+                }
+                // Owner-managed: the priced dimensions are still charged; the
+                // unpriced ones count as $0 under an explicit reason until a
+                // covering tariff re-prices the attempt.
+                Err(_) => {
+                    resource_unpriced = true;
+                    let mut usage = usage.clone();
+                    usage.quantities.retain(|key, _| {
+                        tariff.resources.contains_key(key)
+                            || key
+                                .split('/')
+                                .next()
+                                .is_some_and(|base| tariff.resources.contains_key(base))
+                    });
+                    priced_only = Observation {
+                        resources: Some(usage),
+                        ..o.clone()
+                    };
+                    &priced_only
+                }
+            }
+        }
+        None => o,
+    };
+    let price_at = |tier: &str| {
         let text = if plan.is_some_and(|plan| !plan.text_tokens) {
             Some(crate::domain::usage::value_pricing::PricedValue {
                 usage_picos: 0,
@@ -2372,6 +2622,24 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
             conservative_cache_ttl: text.conservative_cache_ttl
                 || o.resources.as_ref().is_some_and(|usage| usage.estimated),
         })
+    };
+    // Owner-managed: an unknown or unsupported tier is charged at the
+    // model's highest tier and can never be `observed`.
+    let text_tier = plan.is_none_or(|plan| plan.text_tokens);
+    let tier_fallback =
+        |tier: &str| text_tier && scope.entitlement_id.is_none() && !tariff.supports_tier(tier);
+    let price = |tier: &str| {
+        if !tier_fallback(tier) {
+            return price_at(tier);
+        }
+        tariff
+            .supported_tiers()
+            .filter_map(&price_at)
+            .max_by_key(|priced| priced.usage_picos)
+            .map(|priced| crate::domain::usage::value_pricing::PricedValue {
+                conservative_cache_ttl: true,
+                ..priced
+            })
     };
     let unknown = || {
         let priced = price(o.effective_tier)
@@ -2425,6 +2693,17 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
     } else {
         0
     };
+    // An outcome-unknown attempt with neither usage nor an admission bound is
+    // an explicit $0 (`usage_unobserved`), not a missing price or a gap.
+    let unpriced = if o.outcome == ObservedOutcome::Free {
+        None
+    } else if resource_unpriced {
+        Some("resource_unpriced")
+    } else if state == "conservative" && amount == 0 && reserved == 0 && !observed_usage(original) {
+        Some(crate::domain::usage::value_pricing::USAGE_UNOBSERVED)
+    } else {
+        None
+    };
     write_settlement(
         tx,
         o.request_id,
@@ -2436,6 +2715,7 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
         amount,
         state,
         risk,
+        unpriced,
     )?;
     Ok(true)
 }
@@ -2484,6 +2764,16 @@ fn settle_outcome_in_tx(
         AttemptOutcome::NotSent | AttemptOutcome::UpstreamError => (0, "observed"),
         AttemptOutcome::Unknown => (reserved.max(unsigned_decimal(&old.5)?), "conservative"),
     };
+    let meta = read_attempt_meta(tx, request_id, attempt_id)?;
+    let observed = old.4 != 0 || has_estimate(meta.as_ref());
+    let unpriced = match (outcome, unpriced_marker(&old.3)) {
+        (AttemptOutcome::NotSent | AttemptOutcome::UpstreamError, _) => None,
+        (AttemptOutcome::Unknown, Some(reason)) if observed => Some(reason),
+        (AttemptOutcome::Unknown, _) if amount == 0 && !observed => {
+            Some(crate::domain::usage::value_pricing::USAGE_UNOBSERVED.to_owned())
+        }
+        (AttemptOutcome::Unknown, _) => None,
+    };
     let observation_json = serde_json::json!({"requestId":request_id,"attemptId":attempt_id,
         "usageRevision":old.4,"outcome":outcome,"amountPicos":amount.to_string()})
     .to_string();
@@ -2499,6 +2789,7 @@ fn settle_outcome_in_tx(
         amount,
         state,
         0,
+        unpriced.as_deref(),
     )?;
     Ok(true)
 }
@@ -3087,6 +3378,7 @@ mod tests {
         }
     }
     include!("value_quota/conversion_tests.rs");
+    include!("value_quota/unpriced_tests.rs");
     use crate::domain::usage::value_pricing::*;
     #[test]
     fn value_quota_durable_admission_is_atomic_across_connections_and_survives_reopen() {
@@ -3424,6 +3716,9 @@ mod tests {
             pending_risk_picos: "0".into(),
             metering_status: "observed".into(),
             synced_at_ms: 1,
+            unpriced_requests: None,
+            unpriced_tokens: None,
+            unpriced_models: None,
         };
         let tx = conn.transaction().unwrap();
         assert!(!ack_in_tx(&tx, &scope, &status, 0, 10).unwrap());
@@ -3912,7 +4207,10 @@ mod tests {
         // result, but the durable trial floor must survive even if its Share
         // mirror had not been written when the process crashed.
         let old = read_attempt_row(&tx, "one", "1").unwrap().unwrap();
-        write_settlement(&tx, "one", "1", &old, 1, "lower", "{}", 0, "observed", 0).unwrap();
+        write_settlement(
+            &tx, "one", "1", &old, 1, "lower", "{}", 0, "observed", 0, None,
+        )
+        .unwrap();
         assert_eq!(
             status_in_tx(&tx, &scope, &window).unwrap().used_picos,
             "2000000"
@@ -4444,6 +4742,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             reserved_picos: "1".into(),
+            admission_revision: None,
         };
         let mut error = log_for(&scope, "e");
         error.status_code = 529;

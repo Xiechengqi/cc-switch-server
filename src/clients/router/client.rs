@@ -1013,6 +1013,13 @@ impl RouterShareCapabilities {
                 .iter()
                 .any(|c| c == "quotaUnitConversionV1")
     }
+    /// Router accepts the optional `unpricedRequests/Tokens/Models` fields of
+    /// a strict `ValueQuotaStatus` (owner-managed $0 unpriced usage).
+    pub fn value_quota_unpriced(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == "valueQuotaUnpricedV1")
+    }
     pub fn resource_value_quotas(&self) -> bool {
         self.share_contract_version >= 11
             && self

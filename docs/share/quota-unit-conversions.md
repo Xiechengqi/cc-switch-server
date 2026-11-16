@@ -8,11 +8,11 @@
 
 ## 事实与历史准备
 
-SQLite schema 6 的 `quota_metering_facts` 独立于报表保留期，按 request / attempt 保存不含正文的模型、tier、Token 分类、资源量、估算上界、结果、修订与账号归属。Token 请求先提交事实；有价时冻结可选金额，缺价不阻断 Token 请求。USD 准入仍须有价并保留风险。
+SQLite schema 6 的 `quota_metering_facts` 独立于报表保留期，按 request / attempt 保存不含正文的模型、tier、Token 分类、资源量、估算上界、结果、修订与账号归属。Token 请求先提交事实；有价时冻结可选金额，缺价不阻断 Token 请求。普通授权的 USD 准入缺价时转发并记带 `unpriced_reason` 的 $0（见 [双口径额度 §3.1](value-quotas.md#31-未定价用量普通授权-0)）；Market 席位仍须有价并保留风险。
 
 历史准备是显式写接口，预览本身只读。每次最多 500 条日志或事实，持久保存游标、阶段与迁移价目修订，超时或重启可继续。已经入账的请求不重价；首次补价的事实冻结本轮迁移价目。完成后可重新准备，补获迟到日志或新事实。索引限定 Share、规范化 email、request 游标；账号金额按 source / epoch / bucket 及周期边界隔离。
 
-历史完整性同时核对独立 Token 汇总、水位、请求数、每个重试 attempt、未定价事实与金额缺口。只剩汇总但缺模型 / Token 分类 / 资源等证据时拒绝切 USD，不能将缺失历史当成 0。升级时固定旧日志的 Router / installation 身份，排除市场身份，禁止后续配置切换把旧消费重标到另一主体。账号缺归属同样阻断。
+历史完整性同时核对独立 Token 汇总、水位、请求数、每个重试 attempt 与金额缺口。普通授权的未定价事实物化为带原因的 $0 行，不再阻断，预览 `coverage` 报告 `unpricedFacts／unpricedTokens／unpricedModels`；无用量证据的未知结果物化为 `usage_unobserved`。截止点后仅有日志、零用量的本地拒绝在历史准备时补记为 free 事实，使证据请求数与 Token 证明一致；带用量却无事实的日志仍是缺口。只剩汇总但缺模型 / Token 分类 / 资源等证据时拒绝切 USD，不能将缺失历史当成 0。升级时固定旧日志的 Router / installation 身份，排除市场身份，禁止后续配置切换把旧消费重标到另一主体。账号缺归属同样阻断。
 
 冻结 tariff、alias、estimate、资源计划与 hash 随 attempt 保留；压缩目录或日志不会影响迟到修订结算。异步 task 允许绑定未定价 Token fact，轮询验证 task、父 request、Share 与用户，终态事实独立于可选金额结算保存；完成后的迟到失败不能清除消费。
 
