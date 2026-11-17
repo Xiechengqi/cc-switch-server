@@ -3458,7 +3458,7 @@ pub(in crate::api) async fn fetch_provider_models_inner(
         let client = state.http_client().await;
         let ids = crate::proxy::opencode_zen::refresh_catalog(&client)
             .await
-            .map_err(|message| ApiError::bad_gateway(message))?;
+            .map_err(ApiError::bad_gateway)?;
         return Ok(ProviderModelsFetchResult {
             url: format!(
                 "{}{}",

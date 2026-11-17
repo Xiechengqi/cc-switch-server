@@ -20169,11 +20169,11 @@ async fn forward_opencode_zen(options: OpencodeZenForwardOptions) -> Result<Resp
             .body(Body::from(encoded))
             .map_err(|error| ProxyError::bad_gateway(error.to_string()));
     }
-    Ok(Response::builder()
+    Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, content_type)
         .body(Body::from(bytes))
-        .map_err(|error| ProxyError::bad_gateway(error.to_string()))?)
+        .map_err(|error| ProxyError::bad_gateway(error.to_string()))
 }
 
 async fn opencode_zen_post(
