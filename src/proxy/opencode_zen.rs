@@ -2041,8 +2041,8 @@ mod catalog_lifecycle_tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        let client = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(proxy).unwrap())
+        let client = crate::infra::http::test_outbound_client_builder_with_proxy(&proxy)
+            .unwrap()
             .build()
             .unwrap();
         let directory =
