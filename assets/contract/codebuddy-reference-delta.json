@@ -2134,7 +2134,7 @@
           {
             "path": "src/proxy/codebuddy_runtime.rs",
             "anchors": [
-              "codebuddy_r4_prompt_identity_and_tool_result_text_remain_opaque"
+              "codebuddy_r4_fingerprint_rewrite_is_scoped_to_system_and_assistant_only"
             ]
           },
           {
