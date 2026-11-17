@@ -58,6 +58,7 @@
 | [deepseek-web.md](provider/deepseek-web.md) | 权威 | DeepSeek Web bearer、session/PoW、严格终态与单账号恢复边界 |
 | [api-key-coding-plans.md](provider/api-key-coding-plans.md) | 权威 | 20 个 region × Surface typed API Key Plan、外部证据漂移门禁与 Ollama Cloud |
 | [web-session.md](provider/web-session.md) | 权威 | Grok/Perplexity Web Session 隐藏 typed Provider、独立 Cookie rail、严格终态、作用域隔离与 live-pending 门禁 |
+| [opencode-zen.md](provider/opencode-zen.md) | 权威 | OpenCode Zen 免 Key 免费车道：固定 Bearer public、铸造 session、三条推理路径与 live-pending 门禁 |
 | [cursor.md](provider/cursor.md) | 权威 | Cursor AgentService 验收 |
 | [code-plan-delta-2026-08-23.md](provider/code-plan-delta-2026-08-23.md) | 权威 | 2026-08-23 Code Plan 协议增量、证据边界与 live 缺口 |
 | [code-plan-enhancement-2026-08-24.md](provider/code-plan-enhancement-2026-08-24.md) | 权威 | 七类低于 9 分 Code Plan 的参考、实施、拒绝项、不变量证明与 live gates |
