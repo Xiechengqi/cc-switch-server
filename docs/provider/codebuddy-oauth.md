@@ -871,7 +871,7 @@ CodeBuddy 流式清洗保留非空 `delta.refusal`；非流聚合现将多段拒
 
 目录使用128项B-tree，8分钟fresh、24小时最大stale与原身份键不变，访问/发布时惰性清理。缓存snapshot共享不可变payload及一份父预算owner，最后引用释放才退账；替换准入失败移除旧目录，当前新结果正常返回且不缓存，不能复活旧模型授权。single-flight最多128个注册，等待者/guard共享owner；新注册预算或数量不足时，在目录fetch前返回`503 / cc_switch_request_memory_exhausted`，不刷新、不重放、不罚账号。进程默认只观测，硬上限需按部署测量启用。逻辑稀疏索引估算不是RSS，控制面fetch/parse/不缓存结果scratch未声称全部归属。
 
-R4-CB-01比较完整客户端tuple后继续使用本仓受审2.142.0及原目录身份。参考新CLI/IDE/Product/Session组合与Global desktop目录UA没有本仓Intl/CN两站真实回执，不能只换版本或把目录模型当成生成接受性。个人CLI的private-data=false保持，企业不扩张；WAF对system/developer/assistant及user/tool/reasoning字串的重写均不采纳。两个站点与CB-N4继续live_pending；现有响应头超时、非认证refresh分类、11148历史修复、唯一DONE+EOF和取消usage保留。没有新增统一milestone或socket-write计量，验证范围见计划§20.8。
+R4-CB-01比较完整客户端tuple后继续使用本仓受审2.142.0及原目录身份。参考新CLI/IDE/Product/Session组合与Global desktop目录UA没有本仓Intl/CN两站真实回执，不能只换版本或把目录模型当成生成接受性。个人CLI的private-data=false保持，企业不扩张；WAF对system/developer/assistant及user/tool/reasoning字串的重写原不采纳。**2026-11-17 在明确授权下仅为已核对的 DeepSeek Harness 自述指纹新增窄范围例外**，见文末同日章节；R4 当时的“均不采纳”结论在该日期之前仍然成立。两个站点与CB-N4继续live_pending；现有响应头超时、非认证refresh分类、11148历史修复、唯一DONE+EOF和取消usage保留。没有新增统一milestone或socket-write计量，验证范围见计划§20.8。
 
 
 CORE-03统一观察见增强计划§20.10.7：两站独立send/headers/read和原同账号恢复分attempt记录；sanitize后的文本、推理及实际工具字段才算首内容，空字段/role/usage/finish-only排除。原DONE+EOF、错误锁存、license/limit与恢复合同保持，HTTP仅body handoff，取消和真实末owner释放独立。计时不改变提示词、客户端身份、目录、usage或健康；两站真实验收继续live_pending。
@@ -986,3 +986,20 @@ CodeBuddy / WorkBuddy 不再执行本地固定 16 个图片块上限。普通消
 保留单图 20 MiB、内联图片合计 32 MiB 的解码字节校验、URL/MIME/签名校验，以及原有请求体、生命周期内存预算和超时。HTTPS 图片不由此校验器下载，内联合计预算不代表远程图片大小已验证。上游实际图片数量和上下文限制仍由固定绑定的上游返回；取消本地数量检查不等于所有模型已验证支持任意数量。其他 Provider 的数量策略不变。
 
 本地回环覆盖双产品、双站、四请求入口及流式/非流式 17 图保真；生产 17 图上游能力仍待部署后单独验收。
+
+### DeepSeek Harness 自述指纹的窄范围兼容（2026-11-17）
+
+deepseek harness 经 WorkBuddy OAuth Provider 的 OpenAI Chat 接口调用时，上游返回 `11128 / Illegal API invocation from an unapproved channel`。出站头与探针完全一致（共用 `buddy_wire::generation_headers`），因此不是身份头错配；探针只发送 ping/最小 system，不含第三方自述文本，所以连接测试通过但不能暴露该失败。失败来自 harness 写在 system / developer / assistant 中的客户端自述指纹。
+
+参考 `workbuddy2api-hub/wb_proxy.py`（只读证据，CN 号池 A/B）记录的同族已确认指纹：`You are … (powered by | built on | built by | created by | developed by | made by | trained by) …`、`You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.`、`Tokens prefixed with @ are paths the user explicitly referenced.`，以及与 GUI 描述同段出现的 `DeepSeek Harness` 品牌；`developer` 角色原样发送也会被上游以 11128 拒绝。
+
+**明确授权的产品决策变更**：R4-CB-01「WAF 字串重写均不采纳」在此仅为上述**已核对指纹**开一个窄例外，不是转为通用 WAF 改写：
+
+- 清洗集中在 canonical Chat 边界 `src/proxy/codebuddy_runtime/prompt_compat.rs`，使纯 OpenAI Chat 请求也经过同一路径，消除 `(AppKind::Codex, OpenAiChat)` 带 `messages` 时 `Ok(input)` 的旁路。
+- 只改 system / developer / assistant 的 content；`user`、`tool`、`function`、reasoning、`tool_calls.arguments` 保持逐字节不改。只做精确/近精确、锚定、有界的整句替换，幂等；不做品牌泛替换、关键词正则或任意正文改写。
+- 仍不因 11128 刷新、重试、换模型、换账号或切站点；400 / 非重试分类和按绑定产品的错误标注不变。
+- `developer` → `system` 是上游角色枚举兼容（协议规范化），不改动正文。
+- 诊断仅 opt-in（`CODEBUDDY_PROMPT_COMPAT_DIAGNOSTIC=1`）输出类别标签，不记正文、凭据或完整头。
+- 账号 `extraHeaders` 对 Buddy 增加专用身份头阻断，防止覆盖渠道判定头。
+
+探针 body **不改**：把指纹串写进 Router 消费的探针 wire 会把字串固化进合同，并使清洗回归变成集群健康全红；改由本地 fixture 覆盖。参考证据与本地 fixture 都不等于双产品双站真实接受性，CN / Intl × CodeBuddy / WorkBuddy 仍各自 `live_pending`。

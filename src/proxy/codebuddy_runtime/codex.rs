@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::domain::codebuddy::BUDDY_CODEX_CLI_PREAMBLE;
 
@@ -10,16 +10,26 @@ const BUDDY_CODEX_PREAMBLE: &str =
 /// Run on Responses instructions before role conversion: input system/developer
 /// items, custom instructions, history and tools must never be scanned. This is
 /// separate from protocol normalization and does not change outbound identity.
-pub(crate) fn normalize_buddy_codex_instructions(input: &mut Value) {
+pub(crate) fn normalize_buddy_codex_instructions(input: &mut Value) -> bool {
+    let Some(map) = input.as_object_mut() else {
+        return false;
+    };
+    normalize_buddy_codex_instructions_map(map)
+}
+
+pub(super) fn normalize_buddy_codex_instructions_map(input: &mut Map<String, Value>) -> bool {
     let Some(Value::String(text)) = input.get_mut("instructions") else {
-        return;
+        return false;
     };
     let Some(suffix) = text.strip_prefix(BUDDY_CODEX_CLI_PREAMBLE) else {
-        return;
+        return false;
     };
     if suffix.is_empty() || suffix.starts_with("\n\n") || suffix.starts_with("\r\n\r\n") {
         // Retain the behavioral expectation and every byte after this paragraph.
         text.replace_range(..BUDDY_CODEX_CLI_PREAMBLE.len(), BUDDY_CODEX_PREAMBLE);
+        true
+    } else {
+        false
     }
 }
 

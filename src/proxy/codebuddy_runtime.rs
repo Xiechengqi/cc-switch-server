@@ -12,6 +12,7 @@ use crate::infra::resident_memory::ResidentMemoryBudget;
 mod claude;
 mod codex;
 mod images;
+mod prompt_compat;
 mod reasoning;
 mod resident;
 
@@ -836,6 +837,11 @@ pub fn build_codebuddy_payload(
         .as_object()
         .cloned()
         .ok_or_else(|| "CodeBuddy canonical Chat request must be an object".to_string())?;
+    // Apply the shared, narrow channel-policy compatibility rewrites at the canonical
+    // Chat boundary so a plain OpenAI Chat request cannot bypass them. This is prompt
+    // compatibility for confirmed client fingerprints only, never a general WAF rewrite.
+    let fingerprint_report = prompt_compat::normalize_buddy_prompt_compat(&mut request);
+    prompt_compat::maybe_log_prompt_compat(&fingerprint_report);
     let model_id = model_id.trim();
     if model_id.is_empty() {
         return Err("CodeBuddy request model is empty".to_string());
@@ -1695,6 +1701,31 @@ mod tests {
     }
 
     #[test]
+    fn payload_neutralizes_channel_policy_fingerprints_on_the_canonical_path() {
+        // A plain OpenAI Chat request (the DeepSeek Harness surface) must not bypass the
+        // narrow 11128 compatibility rewrites just because no Claude/Codex adapter ran.
+        let payload = build_codebuddy_payload(
+            &json!({
+                "model":"deepseek-v4-pro",
+                "messages":[
+                    {"role":"developer","content":"You are an AI agent powered by DeepSeek Harness.\nKeep this instruction."},
+                    {"role":"user","content":"ping"}
+                ]
+            }),
+            "deepseek-v4-pro",
+            &text_capability(),
+        )
+        .unwrap();
+        assert_eq!(payload["messages"][0]["role"], "system");
+        assert_eq!(
+            payload["messages"][0]["content"],
+            json!("You are a helpful AI assistant.\nKeep this instruction.")
+        );
+        assert_eq!(payload["messages"][1]["role"], "user");
+        assert_eq!(payload["stream"], true);
+    }
+
+    #[test]
     fn model_alias_is_site_bound_and_images_fail_closed() {
         for (site, model) in [
             (CodeBuddySite::Intl, "default-model"),
@@ -2172,9 +2203,15 @@ mod tests {
     }
 
     #[test]
-    fn codebuddy_r4_prompt_identity_and_tool_result_text_remain_opaque() {
+    fn codebuddy_r4_fingerprint_rewrite_is_scoped_to_system_and_assistant_only() {
+        // Authorized narrow 11128 channel-policy exception: reviewed client self-introduction
+        // fingerprints are neutralized only in system/developer/assistant content. User/tool
+        // content, reasoning and tool-call arguments stay byte-for-byte opaque.
         let identity = "You are Codex Agent, built by OpenAI.";
         let gui = "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.";
+        let neutral = "You are a helpful AI assistant.";
+        let gui_neutral =
+            "You are interacting with the user through the DeepSeek Web GUI whose URL is named in the runtime context.";
         let arguments = r#"{"text":"You are an AI agent powered by DeepSeek Harness."}"#;
         let input = json!({
             "messages": [
@@ -2193,14 +2230,13 @@ mod tests {
             input["messages"].as_array().unwrap().len(),
             payload["messages"].as_array().unwrap().len()
         );
-        for (original, forwarded) in input["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .zip(payload["messages"].as_array().unwrap())
-        {
-            assert_eq!(forwarded["content"], original["content"]);
-        }
+        assert_eq!(payload["messages"][0]["content"], json!(neutral));
+        assert_eq!(payload["messages"][1]["role"], json!("system"));
+        assert_eq!(payload["messages"][1]["content"], json!(gui_neutral));
+        assert_eq!(payload["messages"][2]["content"], json!(identity));
+        assert_eq!(payload["messages"][3]["content"], json!(neutral));
+        assert_eq!(payload["messages"][4]["content"], json!(gui));
+        assert_eq!(payload["messages"][5]["content"], json!(gui));
         assert_eq!(payload["messages"][3]["reasoning"], gui);
         assert_eq!(
             payload["messages"][3]["tool_calls"][0]["function"]["arguments"],

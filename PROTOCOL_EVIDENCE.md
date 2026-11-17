@@ -3240,3 +3240,35 @@ Thread 只持久化协议 betas、政策摘要和工具别名，不保存 token�
 交付前补充 review 修正了 TOS fence 错用刷新前账号租约快照的边界：先检查持久化服务阻断，再允许主动 token 刷新/项目发现；实际发送的 TOS fence 与构造出站认证的刷新后账号快照一致。双 rail、双 App 的回环覆盖刷新后 TOS 持久化；既有 TOS 矩阵也核对 token 过期后仍在刷新前拒绝。旧 Gemini 合成夹具迁至 Agy 后按既有 Antigravity 合同移除客户端 safety 覆盖，原生截断错误保留 terminal candidate 与 finishReason 的明确说明；没有放宽成功、终态或无重放断言。
 
 上述新增回环初次执行进一步暴露了租约前凭据有效性校验早于刷新机会的问题：已过期但具有 refresh token 的双 rail 账号也会先被本地拒绝。现将精确服务检查前移至该凭据准入之前，只有未阻断账号才允许固定身份的受控刷新，然后再走原租约验证及最终认证；不以忽略过期时间、绕过认证或弱化回归断言处理。
+
+## 2026-11-17 WorkBuddy 11128 与 DeepSeek Harness 自述指纹
+
+故障：deepseek harness 调 WorkBuddy OAuth Provider 的 OpenAI Chat 接口，上游 400 /
+`11128 / Illegal API invocation from an unapproved channel`，Server 按绑定产品包装为
+`cc_switch_invalid_request`，非重试。
+
+已核对事实与来源置信度：
+- 出站头不是根因：`src/proxy/forwarder.rs` 的连接测试与真实 chat 都调用
+  `src/proxy/buddy_wire.rs::generation_headers`，同一套头族，仅 request_id / token 不同。
+  这是本地源码事实，置信度高。
+- 探针 body 为 ping + 1-token，Codex 探针只注入已知 Codex CLI preamble 且会被清洗；
+  不含任意第三方 system 文本。因此探针通过不覆盖真实提示词，置信度高。
+- 参考 `workbuddy2api-hub/wb_proxy.py`（本地快照，只读）在 14002-14078 记录 DeepSeek
+  Harness 身份句、GUI 描述段、`@` 文件引用段、`DeepSeek Harness` 品牌组合触发同一 11128，
+  并用 `normalize_roles()` 处理 `developer` 角色。该证据为参考项目 CN 号池 A/B，
+  不是本仓双产品双站回执，置信度中。
+
+产品决策变更：经明确授权，R4-CB-01 的「WAF 字串重写均不采纳」仅为上述已核对指纹开窄例外。
+实现 `src/proxy/codebuddy_runtime/prompt_compat.rs`，在 canonical Chat 边界统一生效，
+覆盖纯 OpenAI Chat 的 `Ok(input)` 旁路；仅 system / developer / assistant 的 content，
+user / tool / reasoning / 工具参数逐字节不动，替换锚定、有界、幂等，不做关键词或品牌泛改写。
+11128 的 400 / 非重试 / 不 refresh / 不 fallback 合同保持。`developer → system` 属角色枚举兼容。
+诊断 opt-in 且只输出类别标签，不记正文或凭据。账号 `extraHeaders` 的 Buddy 身份头阻断防御性加固。
+
+验证：本仓本地 fixture（双产品、OpenAI Chat 与各 Surface、流/非流、指纹族、幂等、
+user/tool/reasoning 不改写、工具调用保真）通过。`cargo check`、`cargo test --lib`
+的 Buddy 相关子集与 rustfmt 通过；全量 `cargo test --lib` 的 4 项失败位于本轮开始前即存在的
+OpenCode Zen 注册/USD 计价/share tariff 工作树改动，与本变更无关。
+
+参考证据与本地 fixture 都不等于真实接受性。CN / Intl × CodeBuddy / WorkBuddy 的
+DeepSeek Harness 完整会话仍为 `live_pending`，未部署、未发起真实推理调用。

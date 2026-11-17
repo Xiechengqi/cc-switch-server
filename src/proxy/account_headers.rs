@@ -87,6 +87,37 @@ pub(super) fn account_header_override_blocked(name: &str, provider_type: Provide
     {
         return true;
     }
+    if provider_type.is_buddy_oauth()
+        && matches!(
+            normalized.as_str(),
+            "x-user-id"
+                | "x-domain"
+                | "x-product"
+                | "x-requested-with"
+                | "x-request-id"
+                | "x-conversation-id"
+                | "x-conversation-request-id"
+                | "x-conversation-message-id"
+                | "x-root-request-id"
+                | "x-agent-intent"
+                | "x-agent-purpose"
+                | "x-agent-type"
+                | "x-private-data"
+                | "x-codebuddy-request"
+                | "x-enterprise-id"
+                | "x-no-enterprise-id"
+                | "x-ide-type"
+                | "x-ide-name"
+                | "x-ide-version"
+                | "x-product-version"
+                | "x-env-id"
+                | "x-model-id"
+                | "origin"
+                | "referer"
+        )
+    {
+        return true;
+    }
     if provider_type == ProviderType::GitHubCopilot
         && matches!(
             normalized.as_str(),
@@ -184,6 +215,40 @@ mod tests {
                 ProviderType::KimiCode
             ));
         }
+    }
+
+    #[test]
+    fn buddy_account_headers_cannot_override_channel_identity() {
+        for name in [
+            "x-user-id",
+            "x-domain",
+            "x-product",
+            "X-Conversation-ID",
+            "x-root-request-id",
+            "x-agent-intent",
+            "x-private-data",
+            "x-codebuddy-request",
+            "x-enterprise-id",
+            "x-no-enterprise-id",
+            "x-ide-type",
+            "x-ide-version",
+            "origin",
+            "referer",
+            "user-agent",
+        ] {
+            assert!(
+                account_header_override_blocked(name, ProviderType::CodeBuddyOAuth),
+                "{name} must be blocked for CodeBuddy"
+            );
+            assert!(
+                account_header_override_blocked(name, ProviderType::WorkBuddyOAuth),
+                "{name} must be blocked for WorkBuddy"
+            );
+        }
+        assert!(!account_header_override_blocked(
+            "x-team-feature",
+            ProviderType::WorkBuddyOAuth
+        ));
     }
 
     #[test]

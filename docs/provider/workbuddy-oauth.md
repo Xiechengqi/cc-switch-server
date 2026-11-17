@@ -92,6 +92,14 @@ Claude Code 身份句。CN 同账号对照证实保留该 billing 元数据仍�
 完整合同见 [CodeBuddy §5.6](codebuddy-oauth.md)，
 目录/最小对照证据见 `PROTOCOL_EVIDENCE.md`。
 
+2026-11-17 新增 DeepSeek Harness 自述指纹的窄范围兼容：经 WorkBuddy OAuth 的 OpenAI
+Chat 请求若携带 `powered by / built on …`、`DeepSeek Harness Web GUI` 描述、`@` 文件引用
+等已核对指纹，会在 canonical Chat 边界被中性化；`developer` 角色映射为 `system`。
+仅作用于 system / developer / assistant，user / tool / reasoning / 工具参数保持原样；
+不因 11128 刷新或重试。这是对 R4「WAF 字串重写均不采纳」的**明确授权窄例外**，
+不是通用改写；出站头和探针不变，双站真实验收仍 `live_pending`。
+详见 [CodeBuddy 文末同日章节](codebuddy-oauth.md)。
+
 ## 2026-11-04 国际站目录与套餐兼容
 
 实时目录中 `onlyReasoning=true` 优先于同时出现的 `reasoning.canDisableThinking=true`：

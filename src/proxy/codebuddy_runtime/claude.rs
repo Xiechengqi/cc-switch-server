@@ -8,27 +8,30 @@ const CLAUDE_BILLING_HEADER: &str = "x-anthropic-billing-header:";
 
 pub(crate) fn transform_buddy_claude_request(input: &Value) -> Result<Value, TransformError> {
     let mut chat = transforms::anthropic_to_openai_chat(input)?;
-    normalize_claude_cli_preamble(&mut chat);
+    let _ = normalize_claude_cli_preamble_report(&mut chat);
     Ok(chat)
 }
 
 /// Only the leading CLI billing metadata and fixed identity are transport data.
 /// User messages, tool output, assistant history and subsequent system text
 /// remain caller data. No regex, brand-wide replacement or recursive scan.
-fn normalize_claude_cli_preamble(chat: &mut Value) {
+/// Returns `(billing_metadata_removed, identity_replaced)` for the narrow diagnostic.
+pub(super) fn normalize_claude_cli_preamble_report(chat: &mut Value) -> (bool, bool) {
     let Some(system) = chat.pointer_mut("/messages/0") else {
-        return;
+        return (false, false);
     };
     if system.get("role").and_then(Value::as_str) != Some("system") {
-        return;
+        return (false, false);
     }
     match system.get_mut("content") {
-        Some(Value::String(text)) => {
-            strip_leading_billing_metadata(text);
-            replace_identity_prefix(text);
-        }
+        Some(Value::String(text)) => (
+            strip_leading_billing_metadata(text),
+            replace_identity_prefix(text),
+        ),
         Some(Value::Array(blocks)) => {
             let mut metadata_blocks = 0;
+            let mut billing = false;
+            let mut identity = false;
             for block in blocks.iter_mut() {
                 if block.get("type").and_then(Value::as_str) != Some("text") {
                     break;
@@ -36,16 +39,20 @@ fn normalize_claude_cli_preamble(chat: &mut Value) {
                 let Some(Value::String(text)) = block.get_mut("text") else {
                     break;
                 };
-                if strip_leading_billing_metadata(text) && text.is_empty() {
-                    metadata_blocks += 1;
-                    continue;
+                if strip_leading_billing_metadata(text) {
+                    billing = true;
+                    if text.is_empty() {
+                        metadata_blocks += 1;
+                        continue;
+                    }
                 }
-                replace_identity_prefix(text);
+                identity = replace_identity_prefix(text);
                 break;
             }
             blocks.drain(..metadata_blocks);
+            (billing, identity)
         }
-        _ => {}
+        _ => (false, false),
     }
 }
 
@@ -99,12 +106,15 @@ fn strip_leading_billing_metadata(text: &mut String) -> bool {
     true
 }
 
-fn replace_identity_prefix(text: &mut String) {
+fn replace_identity_prefix(text: &mut String) -> bool {
     let Some(suffix) = text.strip_prefix(CLAUDE_CODE_IDENTITY) else {
-        return;
+        return false;
     };
     if suffix.is_empty() || suffix.starts_with('\n') || suffix.starts_with("\r\n") {
         text.replace_range(..CLAUDE_CODE_IDENTITY.len(), BUDDY_CODING_IDENTITY);
+        true
+    } else {
+        false
     }
 }
 
