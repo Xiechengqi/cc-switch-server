@@ -1262,7 +1262,9 @@
     "claude.xiaomi_mimo_token_plan",
     "codex.xiaomi_mimo_token_plan",
     "claude.xiaomi_mimo_token_plan_sgp",
-    "codex.xiaomi_mimo_token_plan_sgp"
+    "codex.xiaomi_mimo_token_plan_sgp",
+    "claude.opencode_zen",
+    "codex.opencode_zen"
   ],
   "customRecipeAdditions": [
     "claude.anthropic_bearer_relay"

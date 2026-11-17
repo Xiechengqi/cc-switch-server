@@ -50,7 +50,10 @@ const requiredReachablePaths = Object.freeze([
 
 const forbiddenSourcePatterns = Object.freeze([
   ["Tauri runtime", /@tauri-apps\b|\b(?:isTauri|invokeTauri|TauriEvent)\b/i],
-  ["desktop-only Provider surface", /\b(?:OpenCode|OpenClaw|Hermes|ClaudeDesktop)\b|claude-desktop/i],
+  [
+    "desktop-only Provider surface",
+    /\b(?:OpenClaw|Hermes|ClaudeDesktop)\b|claude-desktop|\bOpen Code\b/i,
+  ],
   ["MCP surface", /\bMcp[A-Z][A-Za-z]*\b|\bmcp_servers\b/],
   ["cloud config transfer", /\bWebDav[A-Za-z]*\b|\bwebdav_sync\b|\bs3_sync\b/i],
   ["affiliate or campaign URL", /[?&](?:utm_[a-z_]+|aff(?:iliate)?(?:_?id)?|partner_?id)=/i],
