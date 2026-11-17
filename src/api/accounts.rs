@@ -5,6 +5,27 @@ use std::path::PathBuf;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(in crate::api) struct ResetAntigravityServiceRequest {
+    auth_identity_generation: u64,
+    service: crate::domain::accounts::antigravity_access::AntigravityService,
+}
+
+pub(in crate::api) async fn reset_antigravity_service(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ResetAntigravityServiceRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_web_admin_session(&state, &headers).await?;
+    let changed = state
+        .reset_antigravity_service(&id, input.auth_identity_generation, input.service)
+        .await
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({"ok": true, "changed": changed})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(in crate::api) struct CheckinAccountRequest {
     pub auth_identity_generation: u64,
 }
@@ -4251,6 +4272,80 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn antigravity_service_reset_requires_admin_and_current_identity() {
+        use crate::domain::accounts::antigravity_access::{
+            service_blocked, AntigravityService as Service,
+        };
+        let state = account_api_test_state("antigravity-service-reset");
+        let account = state.mutate_accounts_immediate(|accounts| accounts.upsert(
+            serde_json::from_value(json!({"id":"reset-agy","providerType":"agy_oauth","accessToken":"private-bearer"})).unwrap()
+        )).await.unwrap();
+        let incarnation = state
+            .accounts_snapshot()
+            .await
+            .account_incarnation(&account.id)
+            .unwrap();
+        let fence = crate::state::AntigravityServiceFence::capture(
+            &account,
+            incarnation,
+            crate::domain::antigravity_identity::antigravity_client_identity_for(
+                account.provider_type,
+            ),
+        )
+        .unwrap();
+        state
+            .block_antigravity_service(&fence, Service::Inference)
+            .await
+            .unwrap();
+        let input = |generation| {
+            Json(ResetAntigravityServiceRequest {
+                auth_identity_generation: generation,
+                service: Service::Inference,
+            })
+        };
+        let error = reset_antigravity_service(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(account.id.clone()),
+            input(account.auth_identity_generation),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert!(service_blocked(
+            &state.find_account_by_id(&account.id).await.unwrap(),
+            Service::Inference
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cc-switch-web-user-email",
+            HeaderValue::from_static("owner@example.com"),
+        );
+        assert!(reset_antigravity_service(
+            State(state.clone()),
+            headers.clone(),
+            Path(account.id.clone()),
+            input(account.auth_identity_generation + 1)
+        )
+        .await
+        .is_err());
+        let Json(response) = reset_antigravity_service(
+            State(state.clone()),
+            headers,
+            Path(account.id.clone()),
+            input(account.auth_identity_generation),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, json!({"ok":true,"changed":true}));
+        assert!(!service_blocked(
+            &state.find_account_by_id(&account.id).await.unwrap(),
+            Service::Inference
+        ));
+        assert!(!response.to_string().contains("private-bearer"));
+    }
+
     #[test]
     fn account_refresh_api_error_does_not_expose_upstream_message() {
         let error = account_refresh_api_error(AccountRefreshFailure {
@@ -5277,7 +5372,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_quota_401_refreshes_the_same_account_and_replays_once() {
+    async fn antigravity_quota_401_refreshes_the_same_account_and_replays_once() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let token_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5379,7 +5474,7 @@ mod tests {
                 accounts.upsert(
                     serde_json::from_value(json!({
                         "id": account_id,
-                        "providerType": "gemini_cli",
+                        "providerType": "antigravity_oauth",
                         "accessToken": "gemini-old-access",
                         "refreshToken": "gemini-old-refresh",
                         "tokenType": "Bearer",
@@ -5429,7 +5524,7 @@ mod tests {
         let persisted =
             crate::domain::accounts::store::AccountStore::load_or_default(&config_dir).unwrap();
         let persisted = persisted
-            .find_for_provider(ProviderType::GeminiCli, Some(account_id))
+            .find_for_provider(ProviderType::AntigravityOAuth, Some(account_id))
             .unwrap();
         assert_eq!(persisted.access_token.as_deref(), Some("gemini-new-access"));
         assert_eq!(

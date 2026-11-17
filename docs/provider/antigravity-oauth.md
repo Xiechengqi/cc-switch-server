@@ -2,6 +2,24 @@
 
 状态：权威。两条 rail 分别使用 `antigravity_oauth` / `special.antigravity` 和 `agy_oauth` / `special.agy`，每个 Provider 固定绑定一个 Account；账号、凭据和目录缓存互不借用。Claude 与 Gemini 为已登记入口，真实接受性继续按各 rail 的私有回执独立验收。
 
+## 当前增强合同（2026-11-16）
+
+优先保证 Gemini 格式 API 的生成、流、模型目录和独立 `countTokens`；已有 Claude 兼容保留，本轮不新增 OpenAI API Surface。Gemini 格式也能承载上游目录授权的 Claude 模型，但不代表 Agy CLI 客户端菜单允许选择它；模型权限仍以精确绑定账号的目录为准。
+
+Agy 使用独立的 `CC_SWITCH_SERVER_AGY_CLIENT_ID` / `CC_SWITCH_SERVER_AGY_CLIENT_SECRET` 或显式导入的账号 OAuth client，不借 Hub 或已退役 Gemini CLI 的 client。授权使用 PKCE，scope 为 openid、cloud-platform、userinfo.email、userinfo.profile、cclog、experimentsandconfigs、aicode；刷新不追加 Hub scope。Server 不探测本机 CLI。`CC_SWITCH_AGY_CLIENT_VERSION` 默认 `1.4.6`，User-Agent 为 `cc-switch-server/<server-version> (antigravity/cli/<cli-version>)`；metadata 为 `{"ideType":"ANTIGRAVITY"}`。Hub 保持原身份与独立版本更新机制。
+
+Agy 的项目和额度控制面使用 `daily-cloudcode-pa.googleapis.com`：先只读 `loadCodeAssist` 取得已有项目/资格，再读取 `retrieveUserQuotaSummary.groups[].buckets[]`。按 bucketId 保留独立额度窗口、剩余比例和重置时间；未知或坏窗口不猜成模型权限，冲突重复窗口或超过 256 个 bucket 失败关闭。Summary 不替代 `fetchAvailableModels` 模型目录。结构化不合资格直接失败，不因 paidTier、allowedTiers 或文本提示自动开通、切站或接受条款。Hub 仍读取原 `retrieveUserQuota`；两者不混用响应形状。
+
+对象 `anyOf` / `oneOf` 投影保留字段并集和 required 交集，父层约束保留，嵌套对象递归合并，冲突字段不采用第一个分支。该投影是上游 Schema 子集的有界放宽，不宣称完整等价于 JSON Schema；未知类型组合的厂商接受性仍须真实验证。
+
+生成流在真实文本、思考、工具、媒体、grounding 或明确安全拒绝出现前不提交下游成功；usage、role-only、空文本和孤立签名不算生成。首语义阶段受绝对 deadline、1 MiB 原始字节上限和现有请求内存预算约束。流/非流共用终态校验：空 STOP、缺终态以及 `MALFORMED_FUNCTION_CALL`、`UNEXPECTED_TOOL_CALL`、`MALFORMED_RESPONSE` 失败；已经输出后也只报告错误，不重放、续写或拼接。
+
+TOS 仅识别完整的 Google RPC 结构：code=403、status=PERMISSION_DENIED、ErrorInfo reason=TOS_VIOLATION。按精确账号身份和服务（`inference` / `count_tokens`）持久化阻断，不删除 token、不标成 OAuth 失效、不扩散到另一条 rail。普通 token/额度刷新、版本更新或重启不解除。错误不返回上游 appeal URL 等 metadata。
+
+管理员解决资格问题后，可用当前管理员会话调用 `POST /api/accounts/:id/antigravity/access/reset`，正文 `{"authIdentityGeneration":<当前代次>,"service":"inference"}`（或 `count_tokens`），显式允许再次尝试。恢复不等于上游已解封；旧在途请求不能覆盖恢复动作。没有 UI 自动重试或换号行为。
+
+本轮参考 cc-switch `4f92be18`、CLIProxyAPI `14144df5`、Manager `9b82fb7e`，只借协议行为、独立实现；不改变下方 R4/R5 冻结来源与回执。离线测试不代表真实 OAuth、模型或套餐接受性，两 rail 仍为 `live_pending`。
+
 ## 目录与客户端版本
 
 `fetchAvailableModels` 在请求开始时捕获客户端版本、完整 User-Agent 和不透明 generation。缓存键和实际 HTTP 头使用这一份快照，并保留账号 incarnation、auth/token generation、Bearer 指纹、project 和 endpoint 隔离。运行时版本更新失败保持原快照；有效版本发生变化时更换 generation，A→B→A 也不复活 A 的旧观察。`CC_SWITCH_ANTIGRAVITY_CLIENT_VERSION` 仍可固定有效客户端版本。

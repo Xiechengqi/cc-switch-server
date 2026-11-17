@@ -1320,7 +1320,7 @@ async fn next_account_quota_refresh_delay(state: &ServerState) -> Duration {
 }
 
 pub(super) fn account_quota_refresh_candidate(accounts: &AccountStore, account: &Account) -> bool {
-    if account.needs_relogin {
+    if account.provider_type.is_retired() || account.needs_relogin {
         return false;
     }
     if account.provider_type == ProviderType::CodexOAuth

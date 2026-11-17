@@ -163,7 +163,8 @@ pub fn subscription_expiry_capability(provider_type: ProviderType) -> Subscripti
         | ProviderType::CursorApiKey
         | ProviderType::AwsBedrock
         | ProviderType::Nvidia
-        | ProviderType::DeepSeekApi => SubscriptionExpiryCapability::NotApplicable,
+        | ProviderType::DeepSeekApi
+        | ProviderType::OpenCodeZen => SubscriptionExpiryCapability::NotApplicable,
     }
 }
 

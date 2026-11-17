@@ -923,6 +923,17 @@ fn clean_antigravity_schema_node(value: &mut Value, mode: AntigravitySchemaMode)
     };
     normalize_antigravity_type_array(object);
     merge_antigravity_all_of(object);
+    // Normalize branch-local refs/allOf/nested unions before combining them.
+    for key in ["anyOf", "oneOf"] {
+        if let Some(branches) = object.get_mut(key).and_then(Value::as_array_mut) {
+            for branch in branches {
+                // Do not invent a required placeholder in an empty branch:
+                // the final tool schema gets that compatibility repair only
+                // after the union has been projected.
+                clean_antigravity_schema_node(branch, AntigravitySchemaMode::Response);
+            }
+        }
+    }
     project_antigravity_union(object, "anyOf");
     project_antigravity_union(object, "oneOf");
     promote_boolean_required_properties(object);
@@ -1083,6 +1094,37 @@ fn project_antigravity_union(object: &mut Map<String, Value>, key: &str) {
     if branches.is_empty() {
         return;
     }
+    if branches.len() >= 2 && branches.iter().all(antigravity_is_object_schema) {
+        if let Some(merged) = merge_antigravity_object_union(&branches).as_object() {
+            for (field, value) in merged {
+                if field == "properties" {
+                    let target = object.entry(field.clone()).or_insert_with(|| json!({}));
+                    if let (Some(target), Some(incoming)) =
+                        (target.as_object_mut(), value.as_object())
+                    {
+                        for (name, schema) in incoming {
+                            target.entry(name.clone()).or_insert_with(|| schema.clone());
+                        }
+                    }
+                } else if field == "required" {
+                    let target = object.entry(field.clone()).or_insert_with(|| json!([]));
+                    if let (Some(target), Some(incoming)) =
+                        (target.as_array_mut(), value.as_array())
+                    {
+                        for name in incoming {
+                            if !target.contains(name) {
+                                target.push(name.clone());
+                            }
+                        }
+                        target.sort_by_key(Value::to_string);
+                    }
+                } else {
+                    object.entry(field.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+        return;
+    }
     let nullable = branches
         .iter()
         .any(|branch| branch.get("type").and_then(Value::as_str) == Some("null"));
@@ -1109,6 +1151,106 @@ fn project_antigravity_union(object: &mut Map<String, Value>, key: &str) {
     if nullable {
         object.insert("nullable".to_string(), Value::Bool(true));
     }
+}
+
+fn antigravity_is_object_schema(schema: &Value) -> bool {
+    schema
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("object"))
+        || (schema.get("type").is_none() && schema.get("properties").is_some_and(Value::is_object))
+}
+
+// A bounded, order-independent widening into the upstream Schema subset, not
+// an assertion that anyOf/oneOf can be represented exactly without unions.
+fn merge_antigravity_object_union(branches: &[Value]) -> Value {
+    let mut definitions: std::collections::BTreeMap<&str, Vec<Value>> =
+        std::collections::BTreeMap::new();
+    let mut required: Option<std::collections::BTreeSet<String>> = None;
+    for branch in branches {
+        for (name, schema) in branch
+            .get("properties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            definitions.entry(name).or_default().push(schema.clone());
+        }
+        let names = branch
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>();
+        required = Some(required.map_or(names.clone(), |current| {
+            current.intersection(&names).cloned().collect()
+        }));
+    }
+    let properties = definitions
+        .into_iter()
+        .map(|(name, schemas)| (name.to_string(), widen_antigravity_property(&schemas)))
+        .collect::<Map<_, _>>();
+    let mut result = json!({"type":"object", "properties":properties});
+    let required = required.unwrap_or_default().into_iter().collect::<Vec<_>>();
+    if !required.is_empty() {
+        result["required"] = json!(required);
+    }
+    if branches
+        .iter()
+        .any(|branch| branch.get("nullable") == Some(&Value::Bool(true)))
+    {
+        result["nullable"] = json!(true);
+    }
+    result
+}
+
+fn widen_antigravity_property(schemas: &[Value]) -> Value {
+    if schemas.windows(2).all(|pair| pair[0] == pair[1]) {
+        return schemas[0].clone();
+    }
+    if schemas.iter().all(antigravity_is_object_schema) {
+        return merge_antigravity_object_union(schemas);
+    }
+    let mut result = Map::new();
+    // Different types (or a free branch) must not silently select the first.
+    for key in ["type", "description"] {
+        if let Some(value) = schemas[0].get(key) {
+            if schemas.iter().all(|schema| schema.get(key) == Some(value)) {
+                result.insert(key.into(), value.clone());
+            }
+        }
+    }
+    if schemas
+        .iter()
+        .all(|schema| schema.get("enum").is_some_and(Value::is_array))
+    {
+        let values = schemas
+            .iter()
+            .flat_map(|schema| schema["enum"].as_array().unwrap().iter())
+            .map(|value| (value.to_string(), value.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        result.insert("enum".into(), Value::Array(values.into_values().collect()));
+    }
+    if schemas
+        .iter()
+        .any(|schema| schema.get("nullable") == Some(&Value::Bool(true)))
+    {
+        result.insert("nullable".into(), json!(true));
+    }
+    if result
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("array"))
+    {
+        let items = schemas
+            .iter()
+            .map(|schema| schema.get("items").cloned().unwrap_or_else(|| json!({})))
+            .collect::<Vec<_>>();
+        result.insert("items".into(), widen_antigravity_property(&items));
+    }
+    Value::Object(result)
 }
 
 fn normalize_gemini_schema_node(value: &mut Value) {
@@ -1495,6 +1637,77 @@ mod tests {
             Some(&json!(["0.5", "1"]))
         );
         assert!(schema.pointer("/properties/enabled/enum").is_none());
+    }
+
+    #[test]
+    fn antigravity_object_union_preserves_fields_parent_constraints_and_order() {
+        let branches = vec![
+            json!({"allOf":[{"type":"object","properties":{"shared":{"type":"string"},"a":{"type":"integer"}},"required":["shared","a"]}]}),
+            json!({"type":"object","properties":{"shared":{"type":"string"},"b":{"type":"boolean"}},"required":["shared","b"]}),
+        ];
+        for key in ["anyOf", "oneOf"] {
+            let normalize = |branches: Vec<Value>| {
+                let mut schema = json!({"type":"object","properties":{"parent":{"type":"string"}},"required":["parent"]});
+                schema[key] = json!(branches);
+                clean_antigravity_schema(&mut schema, AntigravitySchemaMode::Tool);
+                schema
+            };
+            let result = normalize(branches.clone());
+            let reverse = normalize(branches.iter().cloned().rev().collect());
+            assert_eq!(result, reverse);
+            assert_eq!(result["required"], json!(["parent", "shared"]));
+            for name in ["parent", "shared", "a", "b"] {
+                assert!(result["properties"].get(name).is_some());
+            }
+            let mut twice = result.clone();
+            clean_antigravity_schema(&mut twice, AntigravitySchemaMode::Tool);
+            assert_eq!(result, twice);
+        }
+    }
+
+    #[test]
+    fn antigravity_object_union_widens_conflicts_nested_objects_arrays_and_enums() {
+        let schemas = vec![
+            json!({"type":"object","properties":{
+                "conflict":{"type":"string"},"open":{},
+                "nested":{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]},
+                "array":{"type":"array","items":{"type":"string","enum":["a"]}},
+                "enum":{"type":"string","enum":["a"],"description":"same"}}}),
+            json!({"type":"object","properties":{
+                "conflict":{"type":"integer"},"open":{"type":"string"},
+                "nested":{"type":"object","properties":{"b":{"type":"number"}},"required":["b"]},
+                "array":{"type":"array","items":{"type":"number"}},
+                "enum":{"type":"string","enum":["b"],"description":"same"}}}),
+        ];
+        let result = merge_antigravity_object_union(&schemas);
+        assert_eq!(
+            result,
+            merge_antigravity_object_union(&schemas.into_iter().rev().collect::<Vec<_>>())
+        );
+        assert!(result.pointer("/properties/conflict/type").is_none());
+        assert!(result.pointer("/properties/open/type").is_none());
+        assert!(result.pointer("/properties/nested/properties/a").is_some());
+        assert!(result.pointer("/properties/nested/properties/b").is_some());
+        assert!(result.pointer("/properties/nested/required").is_none());
+        assert_eq!(result.pointer("/properties/array/items"), Some(&json!({})));
+        assert_eq!(
+            result.pointer("/properties/enum/enum"),
+            Some(&json!(["a", "b"]))
+        );
+        assert_eq!(
+            result.pointer("/properties/enum/description"),
+            Some(&json!("same"))
+        );
+    }
+
+    #[test]
+    fn antigravity_object_union_empty_branch_does_not_invent_required_reason() {
+        let mut schema = json!({"anyOf":[{"type":"object","properties":{}},
+            {"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}]});
+        clean_antigravity_schema(&mut schema, AntigravitySchemaMode::Tool);
+        assert!(schema.get("required").is_none());
+        assert!(schema.pointer("/properties/reason").is_none());
+        assert_eq!(schema.pointer("/properties/a/type"), Some(&json!("string")));
     }
 
     #[test]

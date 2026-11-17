@@ -151,7 +151,6 @@ const evidence = {
     claude: redactEmail(env("CLAUDE_OAUTH_TEST_ACCOUNT")),
     claudeMax5x: redactEmail(env("CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT")),
     claudeMax20x: redactEmail(env("CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT")),
-    gemini: redactEmail(env("GEMINI_OAUTH_TEST_ACCOUNT")),
     grok: redactEmail(env("GROK_OAUTH_TEST_ACCOUNT")),
     cursor: redactEmail(env("CURSOR_OAUTH_TEST_ACCOUNT")),
     antigravity: redactEmail(env("ANTIGRAVITY_OAUTH_TEST_ACCOUNT")),
@@ -177,11 +176,6 @@ const evidence = {
       env("CLAUDE_OAUTH_REFRESH_TOKEN_FIXTURE") ||
       env("CLAUDE_OAUTH_REFRESH_TOKEN"),
     ),
-    gemini: Boolean(
-      env("GEMINI_OAUTH_REFRESH_TOKEN_FIXTURE") ||
-      env("GEMINI_OAUTH_REFRESH_TOKEN") ||
-      env("GEMINI_CLI_CREDENTIALS_FIXTURE"),
-    ),
     grok: Boolean(
       env("GROK_OAUTH_REFRESH_TOKEN_FIXTURE") ||
       env("GROK_OAUTH_AUTH_JSON_FIXTURE"),
@@ -191,6 +185,7 @@ const evidence = {
       env("CURSOR_API_KEY_FIXTURE"),
     ),
     antigravity: Boolean(env("ANTIGRAVITY_OAUTH_REFRESH_TOKEN_FIXTURE")),
+    agy: Boolean(env("AGY_OAUTH_REFRESH_TOKEN_FIXTURE")),
     githubCopilot: Boolean(env("GITHUB_COPILOT_TOKEN_FIXTURE")),
     kiro: Boolean(env("KIRO_REFRESH_TOKEN_FIXTURE")),
     amazonQ: Boolean(env("AMAZON_Q_REFRESH_TOKEN_FIXTURE")),

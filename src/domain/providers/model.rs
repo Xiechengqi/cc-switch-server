@@ -55,6 +55,8 @@ pub enum ProviderType {
     CodeBuddyOAuth,
     #[serde(rename = "workbuddy_oauth")]
     WorkBuddyOAuth,
+    #[serde(rename = "opencode_zen")]
+    OpenCodeZen,
     #[serde(rename = "trae_solo")]
     TraeSolo,
     #[serde(rename = "trae_raw_chat")]
@@ -82,6 +84,20 @@ pub enum ProviderType {
 }
 
 impl ProviderType {
+    /// Kept in serialized data only. Never reinterpret these credentials as Agy.
+    pub const fn is_retired(self) -> bool {
+        matches!(self, Self::GeminiCli)
+    }
+
+    pub fn ensure_active(self) -> anyhow::Result<()> {
+        if self.is_retired() {
+            anyhow::bail!(
+                "gemini_cli is retired; create an agy_oauth account and bind it explicitly"
+            );
+        }
+        Ok(())
+    }
+
     pub const fn is_trae(self) -> bool {
         matches!(self, Self::TraeSolo | Self::TraeRaw | Self::TraeIntl)
     }
@@ -102,6 +118,7 @@ impl ProviderType {
         match self {
             Self::CodeBuddyOAuth => Some("special.codebuddy_oauth"),
             Self::WorkBuddyOAuth => Some("special.workbuddy_oauth"),
+            Self::OpenCodeZen => Some("special.opencode_zen"),
             _ => None,
         }
     }
@@ -124,6 +141,7 @@ impl ProviderType {
             Self::QoderCosy => "qoder_cosy",
             Self::CodeBuddyOAuth => "codebuddy_oauth",
             Self::WorkBuddyOAuth => "workbuddy_oauth",
+            Self::OpenCodeZen => "opencode_zen",
             Self::TraeSolo => "trae_solo",
             Self::TraeRaw => "trae_raw_chat",
             Self::TraeIntl => "trae_raw_chat_intl",
@@ -313,6 +331,7 @@ fn classify_claude_provider(provider: &Provider) -> ProviderType {
         Some("qoder_cosy") => return ProviderType::QoderCosy,
         Some("codebuddy_oauth") => return ProviderType::CodeBuddyOAuth,
         Some("workbuddy_oauth") => return ProviderType::WorkBuddyOAuth,
+        Some("opencode_zen") => return ProviderType::OpenCodeZen,
         Some("trae_solo") => return ProviderType::TraeSolo,
         Some("trae_raw_chat") => return ProviderType::TraeRaw,
         Some("trae_raw_chat_intl") => return ProviderType::TraeIntl,
@@ -366,6 +385,7 @@ fn classify_codex_provider(provider: &Provider) -> ProviderType {
         Some("qoder_cosy") => ProviderType::QoderCosy,
         Some("codebuddy_oauth") => ProviderType::CodeBuddyOAuth,
         Some("workbuddy_oauth") => ProviderType::WorkBuddyOAuth,
+        Some("opencode_zen") => ProviderType::OpenCodeZen,
         Some("trae_solo") => ProviderType::TraeSolo,
         Some("trae_raw_chat") => ProviderType::TraeRaw,
         Some("trae_raw_chat_intl") => ProviderType::TraeIntl,
@@ -411,6 +431,7 @@ fn classify_gemini_provider(provider: &Provider) -> ProviderType {
         Some("qoder_cosy") => return ProviderType::QoderCosy,
         Some("codebuddy_oauth") => return ProviderType::CodeBuddyOAuth,
         Some("workbuddy_oauth") => return ProviderType::WorkBuddyOAuth,
+        Some("opencode_zen") => return ProviderType::OpenCodeZen,
         Some("trae_solo") => return ProviderType::TraeSolo,
         Some("trae_raw_chat") => return ProviderType::TraeRaw,
         Some("trae_raw_chat_intl") => return ProviderType::TraeIntl,

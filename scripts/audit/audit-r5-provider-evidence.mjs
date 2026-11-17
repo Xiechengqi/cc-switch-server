@@ -85,7 +85,8 @@ export function auditSharedCoreProjection(document, input = {}) {
     "special.grok_web_session": "grok_web_session",
     "special.perplexity_web_session": "perplexity_web_session",
   })[driver] ?? kind;
-  const profiles = registry.profiles.filter((profile) => profile.compatibilityProviderType).map((profile) => ({
+  const reviewedProfiles = new Set(document.scope.registry.profiles.map((profile) => profile.profileId));
+  const profiles = registry.profiles.filter((profile) => reviewedProfiles.has(profile.profileId)).map((profile) => ({
     profileId: profile.profileId, app: profile.app,
     providerType: profile.compatibilityProviderType, driverBinding: profile.driverBinding,
     timingLabel: label(profile.compatibilityProviderType, profile.driverBinding.driverId),
@@ -116,7 +117,11 @@ export function auditSharedCoreProjection(document, input = {}) {
     trae: constants("trae", "src/proxy/trae_runtime.rs", ["MAX_RUNTIME_ENTRIES","MAX_ACTIVE_CATALOG_FLIGHTS","MAX_RUNTIME_BYTES","TRAE_MODEL_CATALOG_TTL_MS","MAX_STALE_CATALOG_AGE_MS"]),
     web: constants("web", "src/proxy/web_session_runtime.rs", ["MAX_WEB_SCOPES","MAX_SESSION_ID_BYTES"]),
   }, "R5 resource bounds changed; review ownership and evidence");
-  return { profiles: profiles.length, providerTypes: 28, timingLabels: 30 };
+  return {
+    profiles: profiles.length,
+    providerTypes: new Set(all.map((item) => item.providerType)).size,
+    timingLabels: new Set(all.map((item) => item.timingLabel)).size,
+  };
 }
 export function auditR5Evidence(document) {
   assert.equal(document.schemaVersion, 1);

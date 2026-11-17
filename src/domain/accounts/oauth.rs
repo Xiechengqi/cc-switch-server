@@ -285,13 +285,13 @@ static CLAUDE_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 pub const CLAUDE_WEB_PASTE_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 pub const CLAUDE_API_TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 pub const CLAUDE_PLATFORM_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-static GEMINI_TOKEN_URLS: &[&str] = &["https://oauth2.googleapis.com/token"];
 static GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 static CURSOR_TOKEN_URLS: &[&str] = &["https://api2.cursor.sh/auth/exchange_user_api_key"];
 static CURSOR_AUTHORIZE_URL: &str = "https://cursor.com/loginDeepControl";
 static CURSOR_POLL_URL: &str = "https://api2.cursor.sh/auth/poll";
 static ANTIGRAVITY_TOKEN_URLS: &[&str] = &["https://oauth2.googleapis.com/token"];
 static ANTIGRAVITY_AUTHORIZE_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
+static AGY_AUTHORIZE_SCOPE: &str = "openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs https://www.googleapis.com/auth/aicode";
 static XAI_TOKEN_URLS: &[&str] = &["https://auth.x.ai/oauth2/token"];
 static XAI_AUTHORIZE_URL: &str = "https://auth.x.ai/oauth2/authorize";
 static XAI_AUTHORIZE_SCOPE: &str =
@@ -618,27 +618,23 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
         }),
         ProviderType::GeminiCli => Some(OAuthProviderSpec {
             provider_type,
-            stage: OAuthSupportStage::NativeRefreshProfile,
-            authorize_url: Some(GOOGLE_AUTHORIZE_URL),
-            authorize_flow: OAuthAuthorizeFlow::AuthorizationCode,
-            authorize_scope: Some(
-                "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
-            ),
-            token_urls: GEMINI_TOKEN_URLS,
+            stage: OAuthSupportStage::ManualImportOnly,
+            authorize_url: None,
+            authorize_flow: OAuthAuthorizeFlow::Unsupported,
+            authorize_scope: None,
+            token_urls: &[],
             token_body_format: OAuthRequestBodyFormat::Form,
             client_id: None,
-            client_id_env: Some("CC_SWITCH_SERVER_GEMINI_CLIENT_ID"),
+            client_id_env: None,
             client_secret: None,
-            client_secret_env: Some("CC_SWITCH_SERVER_GEMINI_CLIENT_SECRET"),
-            refresh_scope: Some(
-                "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
-            ),
-            user_agent: Some("cc-switch-server-gemini-oauth"),
-            profile_url: Some("https://www.googleapis.com/oauth2/v2/userinfo"),
-            profile_strategy: OAuthProfileStrategy::UserInfoEndpoint,
-            quota_strategy: OAuthQuotaStrategy::ProviderSnapshot,
-            refresh_capability: OAuthRefreshCapability::OAuthRequest,
-            quota_capability: OAuthQuotaCapability::LiveRefresh,
+            client_secret_env: None,
+            refresh_scope: None,
+            user_agent: None,
+            profile_url: None,
+            profile_strategy: OAuthProfileStrategy::None,
+            quota_strategy: OAuthQuotaStrategy::NotAvailable,
+            refresh_capability: OAuthRefreshCapability::Unavailable,
+            quota_capability: OAuthQuotaCapability::CachedOnly,
         }),
         ProviderType::CursorOAuth => Some(OAuthProviderSpec {
             provider_type,
@@ -664,18 +660,16 @@ pub fn oauth_provider_spec(provider_type: ProviderType) -> Option<OAuthProviderS
             provider_type,
             stage: OAuthSupportStage::NativeRefreshProfile,
             authorize_url: Some(GOOGLE_AUTHORIZE_URL),
-            authorize_flow: OAuthAuthorizeFlow::AuthorizationCode,
-            authorize_scope: Some(ANTIGRAVITY_AUTHORIZE_SCOPE),
+            authorize_flow: if provider_type == ProviderType::AgyOAuth { OAuthAuthorizeFlow::AuthorizationCodePkce } else { OAuthAuthorizeFlow::AuthorizationCode },
+            authorize_scope: Some(if provider_type == ProviderType::AgyOAuth { AGY_AUTHORIZE_SCOPE } else { ANTIGRAVITY_AUTHORIZE_SCOPE }),
             token_urls: ANTIGRAVITY_TOKEN_URLS,
             token_body_format: OAuthRequestBodyFormat::Form,
             client_id: None,
-            client_id_env: Some("CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_ID"),
+            client_id_env: Some(if provider_type == ProviderType::AgyOAuth { "CC_SWITCH_SERVER_AGY_CLIENT_ID" } else { "CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_ID" }),
             client_secret: None,
-            client_secret_env: Some("CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_SECRET"),
-            refresh_scope: Some(
-                "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
-            ),
-            user_agent: Some("cc-switch-server-antigravity-oauth"),
+            client_secret_env: Some(if provider_type == ProviderType::AgyOAuth { "CC_SWITCH_SERVER_AGY_CLIENT_SECRET" } else { "CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_SECRET" }),
+            refresh_scope: if provider_type == ProviderType::AgyOAuth { None } else { Some("https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile") },
+            user_agent: Some(if provider_type == ProviderType::AgyOAuth { "cc-switch-server-agy-oauth" } else { "cc-switch-server-antigravity-oauth" }),
             profile_url: Some("https://www.googleapis.com/oauth2/v1/userinfo"),
             profile_strategy: OAuthProfileStrategy::UserInfoEndpoint,
             quota_strategy: OAuthQuotaStrategy::ProviderSpecific,
@@ -930,7 +924,6 @@ pub fn provider_token_exchange_available(provider_type: ProviderType) -> bool {
         provider_type,
         ProviderType::CodexOAuth
             | ProviderType::ClaudeOAuth
-            | ProviderType::GeminiCli
             | ProviderType::CursorOAuth
             | ProviderType::AntigravityOAuth
             | ProviderType::AgyOAuth
@@ -992,6 +985,10 @@ pub fn build_authorize_url(
                     params.push(("referrer", "cc-switch-server".to_string()));
                     params.push(("nonce", state.to_string()));
                 }
+                ProviderType::AgyOAuth => {
+                    params.push(("access_type", "offline".to_string()));
+                    params.push(("prompt", "consent".to_string()));
+                }
                 _ => {}
             }
             Ok(format!("{authorize_url}?{}", query_string(&params)))
@@ -1044,6 +1041,11 @@ pub fn build_authorization_code_request(
         OAuthAuthorizeFlow::AuthorizationCode | OAuthAuthorizeFlow::AuthorizationCodePkce
     ) {
         return Err(unsupported_login(provider_type));
+    }
+    if spec.authorize_flow == OAuthAuthorizeFlow::AuthorizationCodePkce
+        && code_verifier.is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(missing_credential("code_verifier is required for PKCE"));
     }
     let token_url_owned;
     let token_url = if provider_type == ProviderType::ClaudeOAuth {
@@ -1159,6 +1161,11 @@ pub fn build_refresh_request_for_token_url(
     account: &Account,
     token_url: &str,
 ) -> Result<OAuthHttpRequest, OAuthErrorClassification> {
+    if provider_type.is_retired() {
+        return Err(missing_credential(
+            "gemini_cli is retired; sign in to agy_oauth explicitly",
+        ));
+    }
     let spec = oauth_provider_spec(provider_type).ok_or_else(|| unsupported(provider_type))?;
     validate_oauth_endpoint_url(provider_type, token_url)?;
     let refresh_token = account
@@ -1633,6 +1640,11 @@ fn upsert_input_from_login_response_inner(
     quota_refresh_interval_ms: i64,
     verified_identity: Option<&OAuthIdentity>,
 ) -> Result<UpsertAccountInput, OAuthErrorClassification> {
+    if provider_type.is_retired() {
+        return Err(missing_credential(
+            "gemini_cli is retired; sign in to agy_oauth explicitly",
+        ));
+    }
     if provider_type == ProviderType::ClaudeOAuth
         && claude_scope_is_inference_only(response.scope.as_deref())
         && response
@@ -3004,16 +3016,13 @@ mod tests {
 
     #[test]
     fn google_style_provider_specs_require_external_client_credentials() {
-        let gemini = oauth_provider_spec(ProviderType::GeminiCli).unwrap();
+        let gemini = oauth_provider_spec(ProviderType::AgyOAuth).unwrap();
         assert_eq!(gemini.client_id, None);
-        assert_eq!(
-            gemini.client_id_env,
-            Some("CC_SWITCH_SERVER_GEMINI_CLIENT_ID")
-        );
+        assert_eq!(gemini.client_id_env, Some("CC_SWITCH_SERVER_AGY_CLIENT_ID"));
         assert_eq!(gemini.client_secret, None);
         assert_eq!(
             gemini.client_secret_env,
-            Some("CC_SWITCH_SERVER_GEMINI_CLIENT_SECRET")
+            Some("CC_SWITCH_SERVER_AGY_CLIENT_SECRET")
         );
 
         let antigravity = oauth_provider_spec(ProviderType::AntigravityOAuth).unwrap();
@@ -3027,6 +3036,62 @@ mod tests {
             antigravity.client_secret_env,
             Some("CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_SECRET")
         );
+    }
+
+    #[test]
+    fn retired_gemini_cli_has_no_login_import_refresh_or_profile_requests() {
+        let legacy = account(ProviderType::GeminiCli);
+        assert!(build_refresh_request(ProviderType::GeminiCli, &legacy).is_err());
+        assert!(build_refresh_request_for_token_url(
+            ProviderType::GeminiCli,
+            &legacy,
+            "https://oauth2.googleapis.com/token"
+        )
+        .is_err());
+        assert!(build_profile_request(ProviderType::GeminiCli, "token").is_none());
+        let raw = json!({"access_token":"token", "refresh_token":"refresh"});
+        let response = serde_json::from_value(raw.clone()).unwrap();
+        assert!(upsert_input_from_login_response(
+            ProviderType::GeminiCli,
+            &response,
+            raw,
+            None,
+            1,
+            1000
+        )
+        .is_err());
+        let spec = oauth_provider_spec(ProviderType::GeminiCli).unwrap();
+        assert_eq!(spec.stage, OAuthSupportStage::ManualImportOnly);
+        assert!(spec.authorize_url.is_none());
+        assert!(!provider_token_exchange_available(ProviderType::GeminiCli));
+    }
+
+    #[test]
+    fn agy_pkce_scopes_and_credentials_are_independent_from_hub() {
+        let cli = oauth_provider_spec(ProviderType::AgyOAuth).unwrap();
+        let hub = oauth_provider_spec(ProviderType::AntigravityOAuth).unwrap();
+        assert_eq!(
+            cli.authorize_flow,
+            OAuthAuthorizeFlow::AuthorizationCodePkce
+        );
+        assert_eq!(hub.authorize_flow, OAuthAuthorizeFlow::AuthorizationCode);
+        assert_eq!(cli.authorize_scope.unwrap().split_whitespace().count(), 7);
+        assert!(cli
+            .authorize_scope
+            .unwrap()
+            .split_whitespace()
+            .any(|scope| scope == "openid"));
+        assert_ne!(cli.client_id_env, hub.client_id_env);
+        assert_ne!(cli.client_secret_env, hub.client_secret_env);
+        assert!(cli.refresh_scope.is_none());
+        assert!(build_authorization_code_request(
+            ProviderType::AgyOAuth,
+            "code",
+            "http://localhost/callback",
+            None,
+            "state"
+        )
+        .is_err());
     }
 
     #[test]
@@ -3547,7 +3612,7 @@ mod tests {
     }
 
     #[test]
-    fn gemini_login_import_uses_userinfo_email() {
+    fn agy_login_import_uses_userinfo_email() {
         let raw = json!({
             "access_token": "access-new",
             "refresh_token": "refresh-new",
@@ -3560,7 +3625,7 @@ mod tests {
         });
         let response: OAuthTokenResponse = serde_json::from_value(raw.clone()).unwrap();
         let input = upsert_input_from_login_response(
-            ProviderType::GeminiCli,
+            ProviderType::AgyOAuth,
             &response,
             raw,
             Some(profile.clone()),
@@ -3847,9 +3912,9 @@ mod tests {
     #[test]
     fn ac6_ac7_refresh_requests_are_server_native_refresh_ready() {
         let gemini = build_refresh_request(
-            ProviderType::GeminiCli,
+            ProviderType::AgyOAuth,
             &account_with_raw(
-                ProviderType::GeminiCli,
+                ProviderType::AgyOAuth,
                 json!({"clientId":"gemini-client-fixture","clientSecret":"gemini-secret-fixture"}),
             ),
         )
@@ -3905,7 +3970,6 @@ mod tests {
 
         for provider_type in [
             ProviderType::ClaudeOAuth,
-            ProviderType::GeminiCli,
             ProviderType::CursorOAuth,
             ProviderType::AntigravityOAuth,
             ProviderType::AgyOAuth,
@@ -3916,6 +3980,7 @@ mod tests {
         }
 
         for provider_type in [
+            ProviderType::GeminiCli,
             ProviderType::DeepSeekAccount,
             ProviderType::CursorApiKey,
             ProviderType::OllamaCloud,
@@ -3957,8 +4022,8 @@ mod tests {
             ),
             (
                 ProviderType::GeminiCli,
-                OAuthRefreshCapability::OAuthRequest,
-                OAuthQuotaCapability::LiveRefresh,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::CachedOnly,
             ),
             (
                 ProviderType::GitHubCopilot,

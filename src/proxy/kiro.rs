@@ -4176,6 +4176,7 @@ mod tests {
             needs_relogin: false,
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
+            antigravity_access_generations: Default::default(),
             quota_window_observations: Default::default(),
             codex_passive_quota: None,
         }

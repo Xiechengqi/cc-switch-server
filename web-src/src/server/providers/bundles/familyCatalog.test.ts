@@ -101,6 +101,8 @@ describe("familyCatalog", () => {
     expect(familyAuthKind(familyById("family.openrouter")!)).toBe("api_key");
     expect(familyAuthKind(familyById("family.aws_bedrock_aksk")!)).toBe("aws");
     expect(familyAuthKind(familyById("family.custom_http")!)).toBe("custom");
+    expect(familyAuthKind(familyById("family.opencode_zen")!)).toBe("public");
+    expect(familyCategoryId("family.opencode_zen")).toBe("subscription");
     expect(familyCategoryId("family.cursor_api_key")).toBe("subscription");
     expect(familyCategoryId("family.ollama_cloud")).toBe("subscription");
     expect(familyCategoryId("family.kimi_coding_api_key")).toBe("subscription");

@@ -81,6 +81,10 @@ impl ProviderExecution {
         store: &ProviderStore,
         stored: StoredProvider,
     ) -> Result<Self, ProxyError> {
+        stored
+            .provider_type
+            .ensure_active()
+            .map_err(|error| ProxyError::bad_request(error.to_string()))?;
         let plan = store
             .runtime_plan(stored.app, &stored.provider.id)
             .ok_or_else(|| ProxyError {
@@ -116,7 +120,11 @@ impl ProviderExecution {
                 stored.provider_type,
                 ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
             )
-            .then(crate::domain::antigravity_identity::antigravity_client_identity),
+            .then(|| {
+                crate::domain::antigravity_identity::antigravity_client_identity_for(
+                    stored.provider_type,
+                )
+            }),
             stored,
             plan,
             quota_source_fence: None,
@@ -261,6 +269,7 @@ impl ProviderExecution {
                 | "special.qoder_cosy"
                 | "special.codebuddy_oauth"
                 | "special.workbuddy_oauth"
+                | "special.opencode_zen"
                 | "special.trae_solo"
                 | "special.trae_raw_chat"
                 | "special.trae_raw_chat_intl" => Some("openai_chat"),

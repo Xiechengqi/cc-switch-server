@@ -60,6 +60,8 @@ function authKindLabel(
       return t("providerBundle.authKindCustom", {
         defaultValue: "Custom",
       });
+    case "public":
+      return t("providerBundle.authKindPublic", { defaultValue: "No API key" });
     default:
       return t("providerBundle.authKindApiKey", { defaultValue: "API Key" });
   }
@@ -283,10 +285,14 @@ export function FamilyPicker({
                       defaultValue:
                         "Each enabled App needs its own URL and credential.",
                     })
-                  : t("providerBundle.familyNeedsSecret", {
-                      defaultValue:
-                        "Enter the shared credential before saving.",
-                    }),
+                  : familyAuthKind(selectedFamily) === "public"
+                    ? t("providerBundle.familyNeedsNoSecret", {
+                        defaultValue: "No API key. The free lane uses Bearer public.",
+                      })
+                    : t("providerBundle.familyNeedsSecret", {
+                        defaultValue:
+                          "Enter the shared credential before saving.",
+                      }),
           })}
         </p>
       ) : null}

@@ -1,5 +1,6 @@
 use std::sync::{Mutex, OnceLock};
 
+use crate::domain::providers::model::ProviderType;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,9 @@ pub struct AntigravityClientIdentity {
     pub version: String,
     pub user_agent: String,
     pub generation: String,
+    /// Absent on legacy Hub observations. CLI evidence is never interchangeable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
 }
 
 impl AntigravityClientIdentity {
@@ -25,11 +29,23 @@ impl AntigravityClientIdentity {
             version: version.to_string(),
             user_agent: format!("antigravity/hub/{version} {HUB_PLATFORM}"),
             generation: hex::encode(generation),
+            product: None,
         }
     }
 
     pub fn is_current(&self) -> bool {
-        self == &antigravity_client_identity()
+        self == &antigravity_client_identity_for(if self.product.as_deref() == Some("agy_cli") {
+            ProviderType::AgyOAuth
+        } else {
+            ProviderType::AntigravityOAuth
+        })
+    }
+
+    pub fn is_current_for(&self, provider_type: ProviderType) -> bool {
+        matches!(
+            provider_type,
+            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+        ) && self == &antigravity_client_identity_for(provider_type)
     }
 }
 
@@ -101,6 +117,34 @@ pub fn antigravity_client_identity() -> AntigravityClientIdentity {
         .capture(configured.as_deref())
 }
 
+/// A server-owned CLI identity: no desktop binary probing and no Hub updater.
+pub fn antigravity_client_identity_for(provider_type: ProviderType) -> AntigravityClientIdentity {
+    if provider_type != ProviderType::AgyOAuth {
+        return antigravity_client_identity();
+    }
+    static AGY_STATE: OnceLock<Mutex<IdentityState>> = OnceLock::new();
+    let configured = std::env::var("CC_SWITCH_AGY_CLIENT_VERSION")
+        .ok()
+        .map(|version| version.trim().to_string())
+        .filter(|version| valid_antigravity_version(version));
+    let mut identity = AGY_STATE
+        .get_or_init(|| Mutex::new(IdentityState::new("1.4.6")))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .capture(configured.as_deref());
+    #[cfg(test)]
+    if let Ok(snapshot) = TEST_IDENTITY.try_with(|state| state.lock().unwrap().capture(None)) {
+        identity = snapshot;
+    }
+    identity.product = Some("agy_cli".to_string());
+    identity.user_agent = format!(
+        "cc-switch-server/{} (antigravity/cli/{})",
+        env!("CARGO_PKG_VERSION"),
+        identity.version
+    );
+    identity
+}
+
 pub(crate) fn update_cached_antigravity_version(version: &str) -> bool {
     let configured = configured_antigravity_version();
     state()
@@ -161,6 +205,26 @@ mod tests {
                 assert_eq!(first.user_agent, antigravity_client_identity().user_agent);
             })
             .await;
+    }
+
+    #[test]
+    fn agy_and_hub_identity_states_are_independent_and_product_scoped() {
+        let hub = antigravity_client_identity_for(ProviderType::AntigravityOAuth);
+        let agy = antigravity_client_identity_for(ProviderType::AgyOAuth);
+        assert_eq!(hub.product, None);
+        assert_eq!(agy.product.as_deref(), Some("agy_cli"));
+        assert_ne!(hub.generation, agy.generation);
+        assert!(hub.user_agent.starts_with("antigravity/hub/"));
+        assert!(agy.user_agent.starts_with(concat!(
+            "cc-switch-server/",
+            env!("CARGO_PKG_VERSION"),
+            " (antigravity/cli/"
+        )));
+        assert_eq!(agy, antigravity_client_identity_for(ProviderType::AgyOAuth));
+        assert!(hub.is_current());
+        assert!(agy.is_current());
+        assert!(!hub.is_current_for(ProviderType::AgyOAuth));
+        assert!(!agy.is_current_for(ProviderType::AntigravityOAuth));
     }
 
     #[test]

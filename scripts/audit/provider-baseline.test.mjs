@@ -88,7 +88,7 @@ test("first-class Server Profiles are committed additions, not candidates", () =
   const unmappedFirstClassProfiles = registry.profiles
     .filter(
       (profile) =>
-        profile.visibility === "visible" &&
+        (profile.visibility === "visible" || profile.compatibilityProviderType === "gemini_cli") &&
         profile.formComposition !== "custom" &&
         profile.formComposition !== "legacy" &&
         !mappedProfileIds.has(profile.profileId),
@@ -103,16 +103,16 @@ test("first-class Server Profiles are committed additions, not candidates", () =
 
 test("every required Provider type/app pair has a creatable Profile or recipe", () => {
   const registry = contract("provider-registry.json");
-  assert.equal(requiredProviderProfilePairs().length, 61);
+  assert.equal(requiredProviderProfilePairs().length, 59);
   assert.doesNotThrow(() => assertRequiredProviderCoverage(registry));
 
   const missing = structuredClone(registry);
   missing.profiles = missing.profiles.filter(
-    (profile) => profile.profileId !== "claude.google_oauth",
+    (profile) => profile.profileId !== "gemini.antigravity_cli",
   );
   assert.throws(
     () => assertRequiredProviderCoverage(missing),
-    /Missing visible create_allowed Provider Profile or Custom HTTP recipe for claude:gemini_cli/,
+    /Missing visible create_allowed Provider Profile or Custom HTTP recipe for gemini:agy_oauth/,
   );
 
   const missingRecipe = structuredClone(registry);

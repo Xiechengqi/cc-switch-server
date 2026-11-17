@@ -18,7 +18,7 @@
             "displayName": "Claude OAuth",
             "icon": "claude",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -45,7 +45,7 @@
             "displayName": "Anthropic API Key",
             "icon": "claude",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -73,7 +73,7 @@
             "displayName": "OpenAI OAuth",
             "icon": "openai",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -91,7 +91,7 @@
             "displayName": "OpenAI OAuth",
             "icon": "openai",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -119,7 +119,7 @@
             "displayName": "Google OAuth",
             "icon": "gemini",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -137,7 +137,7 @@
             "displayName": "Google OAuth",
             "icon": "gemini",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -166,7 +166,7 @@
             "displayName": "Grok OAuth",
             "icon": "grok",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -184,7 +184,7 @@
             "displayName": "Grok OAuth",
             "icon": "grok",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -202,7 +202,7 @@
             "displayName": "Grok OAuth",
             "icon": "grok",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -231,7 +231,7 @@
             "displayName": "Kimi OAuth",
             "icon": "kimi",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -249,7 +249,7 @@
             "displayName": "Kimi OAuth",
             "icon": "kimi",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -267,7 +267,7 @@
             "displayName": "Kimi OAuth",
             "icon": "kimi",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -296,7 +296,7 @@
             "displayName": "Qoder OAuth",
             "icon": "qoder",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -314,7 +314,7 @@
             "displayName": "Qoder OAuth",
             "icon": "qoder",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -332,7 +332,7 @@
             "displayName": "Qoder OAuth",
             "icon": "qoder",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -361,7 +361,7 @@
             "displayName": "CodeBuddy",
             "icon": "codebuddy",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -379,7 +379,7 @@
             "displayName": "CodeBuddy",
             "icon": "codebuddy",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -397,7 +397,7 @@
             "displayName": "CodeBuddy",
             "icon": "codebuddy",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -426,7 +426,7 @@
             "displayName": "WorkBuddy",
             "icon": "workbuddy",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -444,7 +444,7 @@
             "displayName": "WorkBuddy",
             "icon": "workbuddy",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -462,13 +462,59 @@
             "displayName": "WorkBuddy",
             "icon": "workbuddy",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
       ]
     },
     "expectedCategory": "workbuddy"
+  },
+  {
+    "name": "family.opencode_zen",
+    "bindings": {
+      "claude": "fixture-provider",
+      "codex": "fixture-provider"
+    },
+    "appProviders": {
+      "claude": [
+        {
+          "id": "fixture-provider",
+          "name": "OpenCode Zen",
+          "app": "claude",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.opencode_zen",
+            "category": "opencode_zen",
+            "displayName": "OpenCode Zen",
+            "icon": "custom",
+            "iconColor": "#00A67E",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
+            "revision": 7
+          }
+        }
+      ],
+      "codex": [
+        {
+          "id": "fixture-provider",
+          "name": "OpenCode Zen",
+          "app": "codex",
+          "bundleId": "fixture-private-bundle",
+          "providerIdentity": {
+            "schemaVersion": 1,
+            "familyId": "family.opencode_zen",
+            "category": "opencode_zen",
+            "displayName": "OpenCode Zen",
+            "icon": "custom",
+            "iconColor": "#00A67E",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
+            "revision": 7
+          }
+        }
+      ]
+    },
+    "expectedCategory": "opencode_zen"
   },
   {
     "name": "family.trae_solo",
@@ -491,7 +537,7 @@
             "displayName": "Trae CN Solo",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -509,7 +555,7 @@
             "displayName": "Trae CN Solo",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -527,7 +573,7 @@
             "displayName": "Trae CN Solo",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -556,7 +602,7 @@
             "displayName": "Trae CN raw_chat",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -574,7 +620,7 @@
             "displayName": "Trae CN raw_chat",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -592,7 +638,7 @@
             "displayName": "Trae CN raw_chat",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -621,7 +667,7 @@
             "displayName": "Trae Intl raw_chat",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -639,7 +685,7 @@
             "displayName": "Trae Intl raw_chat",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -657,7 +703,7 @@
             "displayName": "Trae Intl raw_chat",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -685,7 +731,7 @@
             "displayName": "Kiro OAuth",
             "icon": "kiro",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -703,7 +749,7 @@
             "displayName": "Kiro OAuth",
             "icon": "kiro",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -731,7 +777,7 @@
             "displayName": "Amazon Q Developer",
             "icon": "aws",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -749,7 +795,7 @@
             "displayName": "Amazon Q Developer",
             "icon": "aws",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -777,7 +823,7 @@
             "displayName": "Ollama API Key",
             "icon": "ollama",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -795,7 +841,7 @@
             "displayName": "Ollama API Key",
             "icon": "ollama",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -824,7 +870,7 @@
             "displayName": "Cursor OAuth",
             "icon": "cursor",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -842,7 +888,7 @@
             "displayName": "Cursor OAuth",
             "icon": "cursor",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -860,7 +906,7 @@
             "displayName": "Cursor OAuth",
             "icon": "cursor",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -889,7 +935,7 @@
             "displayName": "Cursor API Key",
             "icon": "cursor",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -907,7 +953,7 @@
             "displayName": "Cursor API Key",
             "icon": "cursor",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -925,7 +971,7 @@
             "displayName": "Cursor API Key",
             "icon": "cursor",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -953,7 +999,7 @@
             "displayName": "Antigravity OAuth",
             "icon": "gemini",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -971,7 +1017,7 @@
             "displayName": "Antigravity OAuth",
             "icon": "gemini",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -999,7 +1045,7 @@
             "displayName": "Antigravity CLI (agy)",
             "icon": "gemini",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1017,7 +1063,7 @@
             "displayName": "Antigravity CLI (agy)",
             "icon": "gemini",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1046,7 +1092,7 @@
             "displayName": "GitHub Copilot",
             "icon": "githubcopilot",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1064,7 +1110,7 @@
             "displayName": "GitHub Copilot",
             "icon": "githubcopilot",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1082,7 +1128,7 @@
             "displayName": "GitHub Copilot",
             "icon": "githubcopilot",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1109,7 +1155,7 @@
             "displayName": "DeepSeek Official",
             "icon": "deepseek",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1136,7 +1182,7 @@
             "displayName": "AWS Bedrock AK/SK",
             "icon": "aws",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1163,7 +1209,7 @@
             "displayName": "AWS Bedrock API Key",
             "icon": "aws",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1192,7 +1238,7 @@
             "displayName": "OpenRouter",
             "icon": "openrouter",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1210,7 +1256,7 @@
             "displayName": "OpenRouter",
             "icon": "openrouter",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1228,7 +1274,7 @@
             "displayName": "OpenRouter",
             "icon": "openrouter",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1256,7 +1302,7 @@
             "displayName": "NVIDIA",
             "icon": "nvidia",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1274,7 +1320,7 @@
             "displayName": "NVIDIA",
             "icon": "nvidia",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1302,7 +1348,7 @@
             "displayName": "DeepSeek API",
             "icon": "deepseek",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1320,7 +1366,7 @@
             "displayName": "DeepSeek API",
             "icon": "deepseek",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1347,7 +1393,7 @@
             "displayName": "OpenAI API Key",
             "icon": "openai",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1374,7 +1420,7 @@
             "displayName": "Google Gemini API Key",
             "icon": "gemini",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1402,7 +1448,7 @@
             "displayName": "Kimi API Key",
             "icon": "kimi",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1420,7 +1466,7 @@
             "displayName": "Kimi API Key",
             "icon": "kimi",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1448,7 +1494,7 @@
             "displayName": "Zhipu (China)",
             "icon": "zhipu",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1466,7 +1512,7 @@
             "displayName": "Zhipu (China)",
             "icon": "zhipu",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1494,7 +1540,7 @@
             "displayName": "Zhipu (Global)",
             "icon": "zhipu",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1512,7 +1558,7 @@
             "displayName": "Zhipu (Global)",
             "icon": "zhipu",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1540,7 +1586,7 @@
             "displayName": "Bailian",
             "icon": "bailian",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1558,7 +1604,7 @@
             "displayName": "Bailian",
             "icon": "bailian",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1586,7 +1632,7 @@
             "displayName": "Bailian",
             "icon": "bailian",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1604,7 +1650,7 @@
             "displayName": "Bailian",
             "icon": "bailian",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1632,7 +1678,7 @@
             "displayName": "MiniMax (China)",
             "icon": "minimax",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1650,7 +1696,7 @@
             "displayName": "MiniMax (China)",
             "icon": "minimax",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1678,7 +1724,7 @@
             "displayName": "MiniMax (Global)",
             "icon": "minimax",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1696,7 +1742,7 @@
             "displayName": "MiniMax (Global)",
             "icon": "minimax",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1724,7 +1770,7 @@
             "displayName": "Volcengine",
             "icon": "bytedance",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1742,7 +1788,7 @@
             "displayName": "Volcengine",
             "icon": "bytedance",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1770,7 +1816,7 @@
             "displayName": "Xiaomi MiMo (China)",
             "icon": "xiaomimimo",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1788,7 +1834,7 @@
             "displayName": "Xiaomi MiMo (China)",
             "icon": "xiaomimimo",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1816,7 +1862,7 @@
             "displayName": "Xiaomi MiMo (Singapore)",
             "icon": "xiaomimimo",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1834,7 +1880,7 @@
             "displayName": "Xiaomi MiMo (Singapore)",
             "icon": "xiaomimimo",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1863,7 +1909,7 @@
             "displayName": "Custom",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1881,7 +1927,7 @@
             "displayName": "Custom",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }
@@ -1899,7 +1945,7 @@
             "displayName": "Custom",
             "icon": "custom",
             "iconColor": "#00A67E",
-            "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95",
+            "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e",
             "revision": 7
           }
         }

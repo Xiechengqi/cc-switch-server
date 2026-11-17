@@ -160,6 +160,16 @@ export const serverProviderPresets: Readonly<
     },
     "category": "official"
   },
+  "claude.opencode_zen": {
+    "icon": "custom",
+    "name": "OpenCode Zen",
+    "websiteUrl": "https://opencode.ai",
+    "notes": "Free lane. No API key.",
+    "settingsConfig": {
+      "env": {}
+    },
+    "category": "official"
+  },
   "claude.workbuddy_oauth": {
     "icon": "workbuddy",
     "name": "WorkBuddy OAuth",
@@ -689,6 +699,16 @@ export const serverProviderPresets: Readonly<
       "env": {
         "OPENAI_MODEL": "auto"
       }
+    },
+    "category": "official"
+  },
+  "codex.opencode_zen": {
+    "icon": "custom",
+    "name": "OpenCode Zen",
+    "websiteUrl": "https://opencode.ai",
+    "notes": "Free lane. No API key.",
+    "settingsConfig": {
+      "env": {}
     },
     "category": "official"
   },

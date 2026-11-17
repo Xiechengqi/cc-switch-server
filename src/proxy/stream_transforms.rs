@@ -36,9 +36,13 @@ pub(super) struct StreamEventTransformer {
     ollama_terminal: Option<super::ollama::ChatStreamTerminal>,
     unwrap_v1internal: bool,
     gemini_terminal: Option<GeminiStreamTerminalState>,
+    tos_violation: bool,
 }
 
 impl StreamEventTransformer {
+    pub(super) fn tos_violation(&self) -> bool {
+        self.tos_violation
+    }
     pub(super) fn retained_bytes(&self) -> usize {
         let bridge = self
             .bridge
@@ -48,11 +52,10 @@ impl StreamEventTransformer {
             0,
             super::openai_chat_compat::OpenAiChatStreamCanonicalizer::retained_bytes,
         );
-        let gemini_terminal = self.gemini_terminal.as_ref().map_or(0, |terminal| {
-            terminal.candidates.len().saturating_mul(
-                std::mem::size_of::<(i64, bool)>().saturating_add(std::mem::size_of::<usize>() * 3),
-            )
-        });
+        let gemini_terminal = self
+            .gemini_terminal
+            .as_ref()
+            .map_or(0, GeminiStreamTerminalState::retained_bytes);
         self.buffer
             .capacity()
             .saturating_add(self.responses_tool_context.retained_bytes())
@@ -193,6 +196,7 @@ impl StreamEventTransformer {
             ollama_terminal,
             unwrap_v1internal,
             gemini_terminal,
+            tos_violation: false,
         }
     }
 
@@ -328,6 +332,8 @@ impl StreamEventTransformer {
             terminal.observe(&value)?;
         }
         if self.unwrap_v1internal {
+            self.tos_violation |=
+                crate::domain::accounts::antigravity_access::is_tos_violation(&value);
             if let Some(error) = super::adapters::google_embedded_error(&value) {
                 crate::metrics::record_stream_transform_protocol_error("embedded_google_error");
                 return Err(error);
@@ -351,71 +357,7 @@ impl StreamEventTransformer {
     }
 }
 
-#[derive(Debug, Default)]
-struct GeminiStreamTerminalState {
-    candidates: BTreeMap<i64, bool>,
-    blocked_prompt: bool,
-}
-
-impl GeminiStreamTerminalState {
-    fn observe(&mut self, response: &Value) -> Result<(), ProxyError> {
-        let response = response.as_object().ok_or_else(|| {
-            ProxyError::bad_gateway("Gemini v1internal response must be a JSON object")
-        })?;
-        if response
-            .get("candidates")
-            .is_some_and(|value| !value.is_array())
-        {
-            return Err(ProxyError::bad_gateway(
-                "Gemini v1internal candidates must be an array",
-            ));
-        }
-        if let Some(candidates) = response.get("candidates").and_then(Value::as_array) {
-            for (position, candidate) in candidates.iter().enumerate() {
-                let candidate = candidate.as_object().ok_or_else(|| {
-                    ProxyError::bad_gateway("Gemini v1internal candidate must be a JSON object")
-                })?;
-                let index = candidate
-                    .get("index")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(position as i64);
-                let finished = candidate
-                    .get("finishReason")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .is_some_and(|reason| !reason.is_empty());
-                self.candidates
-                    .entry(index)
-                    .and_modify(|terminal| *terminal |= finished)
-                    .or_insert(finished);
-            }
-        }
-        self.blocked_prompt |= response
-            .get("promptFeedback")
-            .and_then(|feedback| feedback.get("blockReason"))
-            .or_else(|| {
-                response
-                    .get("prompt_feedback")
-                    .and_then(|feedback| feedback.get("block_reason"))
-            })
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(|reason| !reason.is_empty());
-        Ok(())
-    }
-
-    fn validate(&self) -> Result<(), ProxyError> {
-        if !self.candidates.is_empty() && self.candidates.values().all(|finished| *finished) {
-            return Ok(());
-        }
-        if self.candidates.is_empty() && self.blocked_prompt {
-            return Ok(());
-        }
-        Err(ProxyError::bad_gateway(
-            "Gemini v1internal stream ended before a terminal candidate or blocked prompt feedback",
-        ))
-    }
-}
+type GeminiStreamTerminalState = super::gemini_semantics::GeminiTerminal;
 
 fn stream_transform_sse_event_too_large() -> ProxyError {
     crate::metrics::record_stream_transform_protocol_error("event_too_large");
@@ -6479,6 +6421,7 @@ mod tests {
             ollama_terminal: None,
             unwrap_v1internal: false,
             gemini_terminal: None,
+            tos_violation: false,
         }
     }
 
@@ -8659,6 +8602,7 @@ mod tests {
             ollama_terminal: None,
             unwrap_v1internal: false,
             gemini_terminal: None,
+            tos_violation: false,
         };
         let output = transformer
             .push(Bytes::from_static(

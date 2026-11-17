@@ -38,7 +38,7 @@ async fn gemini_r5_missing_project_never_onboards_polls_refreshes_or_generates_o
             let stored = &mut providers.providers[0];
             stored.app = AppKind::Claude;
             stored.resource.profile_id = Some(
-                crate::domain::providers::registry::ProfileId::parse("claude.google_oauth")
+                crate::domain::providers::registry::ProfileId::parse("claude.antigravity_cli")
                     .unwrap(),
             );
             let accounts = state.accounts_snapshot().await;

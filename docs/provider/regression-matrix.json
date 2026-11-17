@@ -173,26 +173,14 @@
     "realAccountAcceptance": "live_pending"
   },
   "geminiCodeAssistImplementation": {
-    "scope": "one explicitly bound gemini_cli account per Provider; no account pool, static catalog merge, or cross-Provider fallback",
-    "contractState": "fixture_verified_live_pending",
-    "surfaces": ["claude_messages", "gemini_generate_content"],
-    "modelDiscovery": {
-      "source": "authenticated_retrieve_user_quota_model_buckets",
-      "sameAccount401Replay": 1,
-      "sameGenerationTransientStaleAllowed": true,
-      "authenticationOrGenerationFailure": "fail_closed",
-      "staticOrCrossAccountMerge": false
-    },
+    "scope": "Retired gemini_cli records are readable and deletable; no execution or automatic migration to Agy",
+    "contractState": "retired_reader_only",
+    "surfaces": [],
     "implementedContracts": [
-      "project_and_tier_bootstrap",
-      "generation_scoped_quota_refresh",
-      "quota_backed_entitlement_catalog",
-      "gemini_only_model_filter",
-      "authoritative_successful_empty_catalog",
-      "transient_only_same_generation_stale_catalog",
-      "schema_thought_signature_and_terminal_bridges"
+      "legacy_store_deserialization",
+      "explicit_retirement_errors_before_outbound_requests"
     ],
-    "realAccountAcceptance": "live_pending"
+    "realAccountAcceptance": "retired"
   },
   "antigravityCodePlanImplementation": {
     "scope": "one explicitly bound antigravity_oauth or agy_oauth account per Provider; the two rails never share catalog cache or credentials",
@@ -221,6 +209,10 @@
       "explicit_all_model_zero_quota_only",
       "structured_retry_after_and_model_scoped_cooldown",
       "antigravity_specific_schema_projection",
+      "agy_independent_pkce_scopes_client_identity_and_daily_quota_summary",
+      "object_union_field_union_and_required_intersection",
+      "semantic_prelude_and_abnormal_generation_finish_validation",
+      "service_scoped_structured_tos_block_and_explicit_epoch_fenced_reset",
       "http11_short_connection_default_and_credential_scoped_opt_in_pool"
     ],
     "reasoningReplay": {
@@ -369,7 +361,6 @@
         "codex",
         "codex_oauth",
         "gemini",
-        "gemini_cli",
         "kimi_code",
         "qoder_cosy",
         "openrouter",
@@ -396,7 +387,6 @@
           "codex",
           "codex_oauth",
           "gemini",
-          "gemini_cli",
           "kimi_code",
           "qoder_cosy",
           "openrouter",
@@ -436,7 +426,6 @@
         "claude_auth",
         "claude_oauth",
         "gemini",
-        "gemini_cli",
         "kimi_code",
         "qoder_cosy",
         "antigravity_oauth",
@@ -460,7 +449,6 @@
           "claude_auth",
           "claude_oauth",
           "gemini",
-          "gemini_cli",
           "kimi_code",
           "qoder_cosy",
           "antigravity_oauth",
@@ -497,7 +485,6 @@
         "claude_auth",
         "claude_oauth",
         "gemini",
-        "gemini_cli",
         "kimi_code",
         "qoder_cosy",
         "antigravity_oauth",
@@ -521,7 +508,6 @@
           "claude_auth",
           "claude_oauth",
           "gemini",
-          "gemini_cli",
           "kimi_code",
           "qoder_cosy",
           "antigravity_oauth",
@@ -549,7 +535,6 @@
       "source": "router_share",
       "providerFamilies": [
         "gemini",
-        "gemini_cli",
         "kimi_code",
         "qoder_cosy",
         "antigravity_oauth",
@@ -573,7 +558,6 @@
       "staticCoverage": {
         "nativeFamilies": [
           "gemini",
-          "gemini_cli",
           "kimi_code",
           "qoder_cosy",
           "antigravity_oauth",

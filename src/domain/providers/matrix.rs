@@ -122,6 +122,7 @@ pub fn all_provider_types() -> &'static [ProviderType] {
         ProviderType::QoderCosy,
         ProviderType::CodeBuddyOAuth,
         ProviderType::WorkBuddyOAuth,
+        ProviderType::OpenCodeZen,
         ProviderType::TraeSolo,
         ProviderType::TraeRaw,
         ProviderType::TraeIntl,
@@ -144,7 +145,6 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::ClaudeAuth,
             ProviderType::ClaudeOAuth,
             ProviderType::CodexOAuth,
-            ProviderType::GeminiCli,
             ProviderType::OpenRouter,
             ProviderType::GitHubCopilot,
             ProviderType::DeepSeekAccount,
@@ -154,6 +154,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::QoderCosy,
             ProviderType::CodeBuddyOAuth,
             ProviderType::WorkBuddyOAuth,
+            ProviderType::OpenCodeZen,
             ProviderType::TraeSolo,
             ProviderType::TraeRaw,
             ProviderType::TraeIntl,
@@ -182,6 +183,7 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::QoderCosy,
             ProviderType::CodeBuddyOAuth,
             ProviderType::WorkBuddyOAuth,
+            ProviderType::OpenCodeZen,
             ProviderType::TraeSolo,
             ProviderType::TraeRaw,
             ProviderType::TraeIntl,
@@ -191,11 +193,9 @@ pub fn ui_provider_types(app: AppKind) -> &'static [ProviderType] {
             ProviderType::ClaudeAuth,
             ProviderType::ClaudeOAuth,
             ProviderType::Gemini,
-            ProviderType::GeminiCli,
         ],
         AppKind::Gemini => &[
             ProviderType::Gemini,
-            ProviderType::GeminiCli,
             ProviderType::OpenRouter,
             ProviderType::GitHubCopilot,
             ProviderType::CursorOAuth,
@@ -293,7 +293,8 @@ fn provider_api_key_url(provider_type: ProviderType) -> Option<&'static str> {
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth
-        | ProviderType::GrokOAuth => None,
+        | ProviderType::GrokOAuth
+        | ProviderType::OpenCodeZen => None,
     }
 }
 
@@ -315,6 +316,7 @@ fn provider_website_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::QoderCosy => Some("https://qoder.com"),
         ProviderType::CodeBuddyOAuth => Some("https://www.codebuddy.ai"),
         ProviderType::WorkBuddyOAuth => Some("https://www.workbuddy.ai"),
+        ProviderType::OpenCodeZen => Some("https://opencode.ai"),
         ProviderType::TraeSolo | ProviderType::TraeRaw => Some("https://www.trae.cn"),
         ProviderType::TraeIntl => Some("https://www.trae.ai"),
         ProviderType::CursorOAuth | ProviderType::CursorApiKey => Some("https://cursor.com"),
@@ -346,6 +348,7 @@ fn provider_label(provider_type: ProviderType) -> &'static str {
         ProviderType::QoderCosy => "Qoder OAuth",
         ProviderType::CodeBuddyOAuth => "CodeBuddy",
         ProviderType::WorkBuddyOAuth => "WorkBuddy",
+        ProviderType::OpenCodeZen => "OpenCode Zen",
         ProviderType::TraeSolo => "Trae CN Solo",
         ProviderType::TraeRaw => "Trae CN raw_chat",
         ProviderType::TraeIntl => "Trae Intl raw_chat",
@@ -475,6 +478,13 @@ fn provider_defaults(provider_type: ProviderType) -> ProviderDefaults {
             key: "ANTHROPIC_AUTH_TOKEN",
             aws_region: None,
         },
+        ProviderType::OpenCodeZen => ProviderDefaults {
+            base_url: "https://opencode.ai",
+            api_format: "openai_chat",
+            model: "deepseek-v4-flash-free",
+            key: "",
+            aws_region: None,
+        },
         ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl => {
             ProviderDefaults {
                 base_url: "https://trae-api-cn.mchost.guru",
@@ -574,6 +584,7 @@ fn provider_template_env(provider_type: ProviderType) -> &'static [&'static str]
         ProviderType::QoderCosy
         | ProviderType::CodeBuddyOAuth
         | ProviderType::WorkBuddyOAuth
+        | ProviderType::OpenCodeZen
         | ProviderType::TraeSolo
         | ProviderType::TraeRaw
         | ProviderType::TraeIntl => &[],
@@ -606,6 +617,7 @@ fn credential_mode(provider_type: ProviderType) -> &'static str {
         | ProviderType::OllamaCloud
         | ProviderType::Nvidia
         | ProviderType::DeepSeekApi => "api_key",
+        ProviderType::OpenCodeZen => "none",
         ProviderType::ClaudeAuth => "bearer_token",
         ProviderType::AwsBedrock => "aws_credentials",
         ProviderType::ClaudeOAuth
@@ -711,6 +723,9 @@ fn provider_note(app: AppKind, provider_type: ProviderType, ui_visible: bool) ->
         }
         (_, ProviderType::QoderCosy) => {
             "Qoder COSY uses one explicitly bound managed account and a site-frozen signed driver; real-account acceptance remains external"
+        }
+        (_, ProviderType::OpenCodeZen) => {
+            "OpenCode Zen free lane uses Bearer public and one minted session; no API key and no account pool"
         }
         (_, ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth) => {
             "CodeBuddy uses one explicitly bound managed account and immutable Intl/CN site identity; real-account acceptance remains external"

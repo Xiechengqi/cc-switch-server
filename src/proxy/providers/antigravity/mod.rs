@@ -27,6 +27,70 @@ use super::super::{bounded_upstream_rate_limit_until, ProxyError};
 
 mod wire;
 
+#[derive(Clone)]
+pub(crate) struct ServiceAccessContext {
+    fence: crate::state::AntigravityServiceFence,
+    service: crate::domain::accounts::antigravity_access::AntigravityService,
+}
+
+impl ServiceAccessContext {
+    pub(crate) async fn record_tos(&self, state: &ServerState) {
+        if let Err(error) = state
+            .block_antigravity_service(&self.fence, self.service)
+            .await
+        {
+            tracing::warn!(error = %error, "could not persist Antigravity service access restriction");
+        }
+    }
+
+    pub(crate) async fn observe_http(&self, state: &ServerState, status: StatusCode, body: &[u8]) {
+        if (status == StatusCode::FORBIDDEN || status.is_success())
+            && serde_json::from_slice::<Value>(body).is_ok_and(|value| {
+                crate::domain::accounts::antigravity_access::is_tos_violation(&value)
+            })
+        {
+            self.record_tos(state).await;
+        }
+    }
+}
+
+pub(crate) fn service_access(
+    execution: &ProviderExecution,
+    accounts: &AccountStore,
+    count_tokens: bool,
+) -> Result<Option<ServiceAccessContext>, ProxyError> {
+    if !is_provider(execution.stored.provider_type) {
+        return Ok(None);
+    }
+    let Some((provider_type, id, generation)) = execution.managed_account_identity_target() else {
+        return Ok(None);
+    };
+    let account = accounts
+        .find_for_provider(provider_type, Some(id))
+        .filter(|account| account.auth_identity_generation == generation)
+        .ok_or_else(|| ProxyError::conflict("Antigravity account identity binding changed"))?;
+    let service = if count_tokens {
+        crate::domain::accounts::antigravity_access::AntigravityService::CountTokens
+    } else {
+        crate::domain::accounts::antigravity_access::AntigravityService::Inference
+    };
+    if crate::domain::accounts::antigravity_access::service_blocked(account, service) {
+        return Err(ProxyError { status: StatusCode::FORBIDDEN, message: "Antigravity service access blocked by TOS_VIOLATION; resolve eligibility and explicitly reset this service before retrying".into() });
+    }
+    let client = execution
+        .antigravity_client_identity
+        .clone()
+        .unwrap_or_else(|| {
+            crate::domain::antigravity_identity::antigravity_client_identity_for(provider_type)
+        });
+    Ok(accounts
+        .account_incarnation(id)
+        .and_then(|incarnation| {
+            crate::state::AntigravityServiceFence::capture(account, incarnation, client)
+        })
+        .map(|fence| ServiceAccessContext { fence, service }))
+}
+
 pub(crate) use wire::{
     apply_responses_reasoning_summary, drop_final_gemini_thought_tail, normalize_wire_request,
     validate_source_tool_choice,
@@ -116,7 +180,11 @@ pub(crate) async fn record_limit_evidence(
     let client_identity = execution
         .antigravity_client_identity
         .clone()
-        .unwrap_or_else(crate::domain::antigravity_identity::antigravity_client_identity);
+        .unwrap_or_else(|| {
+            crate::domain::antigravity_identity::antigravity_client_identity_for(
+                execution.stored.provider_type,
+            )
+        });
     if let Err(error) = state
         .record_antigravity_capability_observation_for_client_if_current(
             snapshot,

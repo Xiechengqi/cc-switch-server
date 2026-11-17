@@ -85,7 +85,6 @@ mod tests {
         "codex",
         "codex_oauth",
         "gemini",
-        "gemini_cli",
         "openrouter",
         "github_copilot",
         "deepseek_account",
@@ -125,6 +124,18 @@ mod tests {
                 "missing server compatibility provider type: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn retired_gemini_cli_is_a_reader_not_required_execution_coverage() {
+        let coverage = ProviderCoverage::load_embedded().unwrap();
+        let legacy = coverage
+            .provider_types
+            .iter()
+            .find(|item| item.id == "gemini_cli")
+            .unwrap();
+        assert!(legacy.present_in_source);
+        assert!(!legacy.required);
     }
 
     #[test]

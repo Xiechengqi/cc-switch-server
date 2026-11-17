@@ -1,5 +1,9 @@
 # Protocol evidence policy
 
+## OpenCode Zen free lane
+
+只读对照 `/data/projects/proxy/OpenCode/zen-gate/internal/lane/upstream.go` 的单账号免费车道：`Bearer public`、可解码 session 前缀、`/inference/v1` 三条路径、官方 `read`/`shell` 工具原文、无 HTML 转义的 CLI 字段顺序。不引用 OpenCode Go API Key，不引用 9router / OmniRoute 的旧 `/zen/v1` 指纹。zen-gate 不是构建、测试或运行时输入。实现与 fixture 见 `src/proxy/opencode_zen.rs` 与 `docs/provider/opencode-zen.md`。真实目录拉取和真实推理保持 `live_pending`。
+
 R5 CORE-01 / CORE-02 / EVID-01（当前工作树）：本仓 Registry 与实际 forwarding/owner 审查补齐统一计时标签、特殊 Trae/DeepSeek/网页路径、DeepSeek session/Trae catalog/Web scope 的父预算和最后引用。新增 `assets/contract/r5-shared-core.json`；此次不采纳新的厂商wire，不把外仓作为测试/构建/运行依赖。`implementationCommit=null`，本地循环回归不证明真实厂商接受性；HTTP handoff不是socket写出，容量不是账号失效，所有真实rail/operation继续live_pending。
 
 ## 2026-11-10 R5 隐藏 Web Session 复核（WS-01）
@@ -3223,3 +3227,16 @@ Thread 只持久化协议 betas、政策摘要和工具别名，不保存 token�
 `cargo check`、严格 all-targets Clippy（warnings denied）、build、cargo fmt 及全部独立 Rust 文件 rustfmt、原脚本本地启动 HTTP smoke 通过。本轮完整 static-checks 通过（含 Web typecheck / 396 项测试）；最后 Rust 收尾后另行复核上述编译/格式门禁，完整 Node 审计再次 2205 passed、smoke 脚本测试 13 passed。wire-profile、reference-delta（含 committed external object/tree/SHA 验证）、Provider coverage/UI matrix、Phase 0 合同及文档索引通过。离线 readiness 使用 RUN_TESTS=0 / RUN_REAL=0 / RUN_DEPLOYMENT_TESTS=0，实际为 failures=0、blocked_inputs；缺真实输入、内部 local-contracts-unverified 与 deployment-not-tested 保留，不能等同发布通过。
 
 本轮离线实现与整体 review 完成；全部真实 operation 仍为 live_pending。旧 5.1 receipt、合成样例和 loopback 不能证明真实 Anthropic 接受性，尚不能承诺生产断网/compact 后的实际 CLI 续接成功。未提交、推送、部署、调用生产推理或修改参考仓库。
+## 2026-11-16 Agy native-first 与旧 Gemini CLI 退役
+
+本轮只读核对 cc-switch `4f92be183104696c1a68a30ed649fe0c4a83b3bb` 的 `services/agy_account/{oauth,quota}.rs`、`agy_config.rs` 和 `commands/model_fetch.rs`，CLIProxyAPI `14144df573c77e8e0e1eeaa450d3e63a068372df` 的 Antigravity executor / zero-output / TOS 分类，以及 Antigravity-Manager `9b82fb7ef51c42e9d1662a14bd5b718da0525cd8` 的 JSON Schema 投影。外仓只作协议证据，不复制实现或引入运行/测试依赖；既有 R5 冻结记录保持原样。
+
+产品选择：`gemini_cli` 只保留旧数据 reader，不再创建、登录、刷新或推理，不自动转换为 Agy 凭据；普通 Gemini API-key 不受影响。Agy 与 Hub 保持独立 OAuth client、身份、账号和能力证据；Agy 控制面使用独立 PKCE/scopes、daily 站点和 `retrieveUserQuotaSummary`，额度 bucket 不充当模型目录。Gemini native 为增强主线，Claude 已有兼容保持，不增加 OpenAI Surface。Schema object union、原生流首帧/异常终态和精确 TOS 分类均以本仓合成回归验收，不迁入换号、prompt 文本清洗、输出后重放或自动 onboarding。
+
+`docs/provider/coverage.md` 已核对为生成件，退役支持面由 requirements/registry 源修改后重新生成。真实 OAuth、项目、额度、模型与推理接受性仍为 `live_pending`；本地验证结果在本轮完成后记录，不提前宣称通过。
+
+整体 review 已修正通用能力查询误用 Hub 身份检查 Agy 证据、旧 Gemini CLI 有效 token / 已有 project 的提前成功分支，以及 HTTP 200 内嵌 TOS 沿用成功状态记账的问题。TOS 恢复使用持久化的逐服务 generation，恢复前的在途错误不得重新封禁；正常 token 刷新、客户端版本变化和重启不解除已有阻断。首语义阶段保留原始字节的内存所有权直到 pending chunk 接管；错误前后均不追加重放。Schema 合并保持顺序无关和父层约束，不把 quota bucket 推为模型权限。源码、支持面和 Web 构建同步退役入口，旧 Account / Provider / Share 数据保留，无自动凭据迁移。
+
+交付前补充 review 修正了 TOS fence 错用刷新前账号租约快照的边界：先检查持久化服务阻断，再允许主动 token 刷新/项目发现；实际发送的 TOS fence 与构造出站认证的刷新后账号快照一致。双 rail、双 App 的回环覆盖刷新后 TOS 持久化；既有 TOS 矩阵也核对 token 过期后仍在刷新前拒绝。旧 Gemini 合成夹具迁至 Agy 后按既有 Antigravity 合同移除客户端 safety 覆盖，原生截断错误保留 terminal candidate 与 finishReason 的明确说明；没有放宽成功、终态或无重放断言。
+
+上述新增回环初次执行进一步暴露了租约前凭据有效性校验早于刷新机会的问题：已过期但具有 refresh token 的双 rail 账号也会先被本地拒绝。现将精确服务检查前移至该凭据准入之前，只有未阻断账号才允许固定身份的受控刷新，然后再走原租约验证及最终认证；不以忽略过期时间、绕过认证或弱化回归断言处理。

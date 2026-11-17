@@ -2592,7 +2592,21 @@ async fn forward_with_attempt_inner(
                 attempt_context.timing.track_unbudgeted_owners();
             }
         }
-        if execution.driver_is("oauth.claude_messages") {
+        if antigravity::is_provider(execution.stored.provider_type) {
+            // Service restrictions precede credential-validity admission, so
+            // an expired token cannot hide the block or trigger a refresh.
+            let count_tokens = route == ProxyRoute::Gemini
+                && gemini_path
+                    .as_deref()
+                    .is_some_and(|path| path.rsplit(':').next() == Some("countTokens"));
+            antigravity::service_access(&execution, &accounts_for_selection, count_tokens)?;
+        }
+        if execution.driver_is("oauth.claude_messages")
+            || antigravity::is_provider(execution.stored.provider_type)
+        {
+            // Refresh the fixed account before the lease's auth validation;
+            // otherwise an already-expired Agy/Hub token is rejected before
+            // the later preparation refresh can run.
             refresh_execution_managed_account_if_needed(&state, &execution).await?;
         }
         let accounts_for_lease = revalidate_execution_before_account_lease(
@@ -2704,6 +2718,21 @@ async fn forward_with_attempt_inner(
                 state,
                 execution,
                 stored,
+                body,
+                request_context,
+                account_in_flight_guard,
+                share_invocation_guard,
+                started,
+                timing: attempt_context.timing.clone(),
+            })
+            .await;
+        }
+        if execution.driver_is("special.opencode_zen") {
+            return forward_opencode_zen(OpencodeZenForwardOptions {
+                state,
+                execution,
+                stored,
+                route,
                 body,
                 request_context,
                 account_in_flight_guard,
@@ -3082,6 +3111,7 @@ async fn forward_with_attempt_inner(
         let mut claude_thread_mode = None;
         let mut claude_thread_declared_betas = Vec::new();
         let explicit_claude_session_id = request_context.session_id.clone();
+        let mut antigravity_service_access = None;
         let (mut adapter_request, url, mut target_headers) = if execution
             .driver_is("oauth.claude_messages")
         {
@@ -3209,6 +3239,13 @@ async fn forward_with_attempt_inner(
                 &mut adapter_request,
                 &mut url,
                 &mut target_headers,
+            )?;
+            // Bind later TOS evidence to the same post-refresh account
+            // snapshot used to materialize the actual outbound credentials.
+            antigravity_service_access = antigravity::service_access(
+                &execution,
+                &accounts,
+                adapter_request.is_gemini_count_tokens(),
             )?;
             if execution.driver_is("oauth.openai_codex") {
                 if let Some(scope) = codex_metadata_scope(&execution, &accounts) {
@@ -3518,6 +3555,11 @@ async fn forward_with_attempt_inner(
             .upstream_stream_requested
             .then(|| execution.stream_first_byte_timeout())
             .flatten()
+            .or_else(|| {
+                (adapter_request.upstream_stream_requested
+                    && antigravity::is_provider(stored.provider_type))
+                .then_some(Duration::from_secs(120))
+            })
             .map(|timeout| tokio::time::Instant::now() + timeout);
 
         let send_timing = attempt_context.timing.get();
@@ -4403,6 +4445,9 @@ async fn forward_with_attempt_inner(
                 &mut upstream,
                 execution.request_timeout(),
                 attempt_context.timing.get(),
+                antigravity_service_access
+                    .as_ref()
+                    .map(|context| (&state, context)),
             )
             .await
             {
@@ -4543,7 +4588,96 @@ async fn forward_with_attempt_inner(
             } else {
                 inner.map_err(StreamReadError::Upstream).boxed()
             };
-            let mut pending_chunk = None;
+            let antigravity_prelude_memory = if antigravity::is_provider(stored.provider_type) {
+                attempt_context
+                    .request_memory()
+                    .map(|budget| {
+                        budget
+                            .reserve(RequestMemoryComponent::SemanticPrelude, 0)
+                            .map_err(|error| error.into_proxy_error())
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            let mut pending_chunk = if antigravity::is_provider(stored.provider_type) {
+                let mut inspector = super::streaming::GeminiPreludeInspector::new();
+                let mut prelude = Vec::new();
+                let deadline = stream_first_event_deadline.unwrap_or_else(|| {
+                    tokio::time::Instant::now()
+                        + timeouts.first_byte.unwrap_or(Duration::from_secs(120))
+                });
+                let result =
+                    async {
+                        while !inspector.ready() {
+                            let wait = attempt_context
+                                .timing
+                                .get()
+                                .map(|timing| timing.wait(WaitKind::UpstreamRead));
+                            let next = tokio::time::timeout_at(deadline, inner.try_next()).await;
+                            drop(wait);
+                            let chunk =
+                                match next {
+                                    Ok(Ok(Some(chunk))) => chunk,
+                                    Ok(Ok(None)) => {
+                                        inspector.finish()?;
+                                        break;
+                                    }
+                                    Ok(Err(_)) => return Err(ProxyError::bad_gateway(
+                                        "Antigravity stream interrupted before generated output",
+                                    )),
+                                    Err(_) => return Err(ProxyError {
+                                        status: StatusCode::GATEWAY_TIMEOUT,
+                                        message:
+                                            "Antigravity stream timed out before generated output"
+                                                .to_string(),
+                                    }),
+                                };
+                            if prelude.len().saturating_add(chunk.len()) > 1024 * 1024 {
+                                return Err(ProxyError::bad_gateway(
+                                    "Antigravity semantic prelude exceeds 1 MiB",
+                                ));
+                            }
+                            if let Some(reservation) = &antigravity_prelude_memory {
+                                reservation
+                                    .resize(
+                                        prelude
+                                            .len()
+                                            .saturating_add(chunk.len())
+                                            .saturating_mul(256)
+                                            .saturating_add(64 * 1024)
+                                            .saturating_add(inspector.retained_bytes()),
+                                    )
+                                    .map_err(|error| error.into_proxy_error())?;
+                            }
+                            inspector.push(&chunk)?;
+                            prelude.extend_from_slice(&chunk);
+                        }
+                        Ok::<_, ProxyError>(Bytes::from(prelude))
+                    }
+                    .await;
+                match result {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) => {
+                        if inspector.tos_violation() {
+                            if let Some(context) = &antigravity_service_access {
+                                context.record_tos(&state).await;
+                            }
+                        }
+                        record_provider_outcome(
+                            &state,
+                            &stored,
+                            ProviderOutcome::Failure {
+                                status_code: error.status.as_u16(),
+                            },
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
             let mut sse_error_detector = claude_sse_error_detector_for(&stored, route);
             let mut sse_error_outcome_recorded = false;
             let upstream_format =
@@ -4671,7 +4805,8 @@ async fn forward_with_attempt_inner(
             let mut pending_chunk_already_inspected = false;
             let mut pending_chunk_saw_business_output = false;
             let mut pending_chunk_committed_output = false;
-            if !responses_image_transport
+            if pending_chunk.is_none()
+                && !responses_image_transport
                 && (sse_error_detector.is_some()
                     || inspect_responses_semantics
                     || inspect_anthropic_semantics)
@@ -5346,6 +5481,9 @@ async fn forward_with_attempt_inner(
                         .map_err(|error| error.into_proxy_error())
                 })
                 .transpose()?;
+            // The raw prelude remains owned until its pending-chunk owner is
+            // admitted. Never leave retained bytes unaccounted between stages.
+            drop(antigravity_prelude_memory);
             let stream_transform =
                 super::stream_transforms::StreamEventTransformer::new_with_downstream_usage(
                     &stored,
@@ -5449,6 +5587,7 @@ async fn forward_with_attempt_inner(
                         antigravity::ReplayStreamWrite::new(context, adapter_request.body.clone())
                     })
                     .transpose()?,
+                antigravity_service_access: antigravity_service_access.clone(),
                 kimi_thinking_replay: kimi_thinking_replay.clone().map(|context| {
                     KimiThinkingReplayStreamWrite {
                         context,
@@ -5757,6 +5896,10 @@ async fn forward_with_attempt_inner(
                             if let Err(error) =
                                 stream_state.inspect_antigravity_reasoning_replay_chunk(&chunk)
                             {
+                                // Replay validation precedes transformation. Preserve
+                                // structured service restrictions before discarding
+                                // the raw event on this failure path.
+                                let _ = stream_state.transform_stream_chunk(chunk.clone());
                                 return stream_state.terminate_transform_error(error).await;
                             }
                             stream_state.inspect_grok_reasoning_replay_chunk(&chunk);
@@ -6526,6 +6669,22 @@ async fn forward_with_attempt_inner(
         };
         let mut preserve_content_encoding = decoded.preserve_content_encoding;
         let mut bytes = decoded.body;
+        if let Some(context) = &antigravity_service_access {
+            context.observe_http(&state, status, &bytes).await;
+            if (status == StatusCode::FORBIDDEN || status.is_success())
+                && serde_json::from_slice::<Value>(&bytes).is_ok_and(|value| {
+                    crate::domain::accounts::antigravity_access::is_tos_violation(&value)
+                })
+            {
+                status = StatusCode::FORBIDDEN;
+                status_code = status.as_u16();
+                bytes = Bytes::from_static(br#"{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Antigravity service restricted: TOS_VIOLATION","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION"}]}}"#);
+                content_type = Some("application/json".to_string());
+                preserve_content_encoding = false;
+                response_headers.remove(CONTENT_ENCODING);
+                response_headers.remove(CONTENT_LENGTH);
+            }
+        }
         if let Some(limit) = antigravity::limit_info(&execution, status, &bytes) {
             antigravity::install_retry_after(&mut response_headers, &limit);
             antigravity::record_limit_evidence(&state, &execution, &accounts_for_lease, &limit)
@@ -19872,6 +20031,202 @@ async fn maybe_update_grok_entitlement(
         .await;
 }
 
+struct OpencodeZenForwardOptions {
+    state: ServerState,
+    execution: ProviderExecution,
+    stored: StoredProvider,
+    route: ProxyRoute,
+    body: Bytes,
+    request_context: UsageLogContext,
+    account_in_flight_guard: Option<AccountInFlightGuard>,
+    share_invocation_guard: Option<ShareInFlightGuard>,
+    started: Instant,
+    timing: TimingSlot,
+}
+
+async fn forward_opencode_zen(options: OpencodeZenForwardOptions) -> Result<Response, ProxyError> {
+    let OpencodeZenForwardOptions {
+        state,
+        execution: _execution,
+        stored,
+        route,
+        body,
+        request_context,
+        account_in_flight_guard: _account_in_flight_guard,
+        share_invocation_guard: _share_invocation_guard,
+        started: _started,
+        timing: _timing,
+    } = options;
+    if !matches!(
+        route,
+        ProxyRoute::ClaudeMessages | ProxyRoute::CodexChatCompletions | ProxyRoute::CodexResponses
+    ) {
+        return Err(ProxyError::bad_request(
+            "OpenCode Zen supports Claude Messages, Chat Completions, and Responses only",
+        ));
+    }
+    let mut requested: Value = serde_json::from_slice(&body)
+        .map_err(|_| ProxyError::bad_request("OpenCode Zen request body must be a JSON object"))?;
+    if requested.get("stream").is_none() {
+        if let Some(map) = requested.as_object_mut() {
+            map.insert(
+                "stream".to_string(),
+                Value::Bool(request_context.is_streaming),
+            );
+        }
+    }
+    if requested.get("model").and_then(Value::as_str).is_none() {
+        if let Some(map) = requested.as_object_mut() {
+            map.insert(
+                "model".to_string(),
+                Value::String(crate::proxy::opencode_zen::DEFAULT_MODEL.to_string()),
+            );
+        }
+    }
+    let model = requested
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(crate::proxy::opencode_zen::DEFAULT_MODEL)
+        .to_string();
+    if crate::proxy::opencode_zen::current_catalog().is_none() {
+        let client = state.http_client().await;
+        crate::proxy::opencode_zen::refresh_catalog(&client)
+            .await
+            .map_err(ProxyError::bad_gateway)?;
+    }
+    if let Err(message) = crate::proxy::opencode_zen::generation_allowed(&model) {
+        return Err(ProxyError::bad_request(message));
+    }
+    let prepared =
+        crate::proxy::opencode_zen::prepare_upstream(&requested).map_err(|error| match error {
+            crate::proxy::opencode_zen::PrepareError::ToolChoiceNone => ProxyError {
+                status: StatusCode::FORBIDDEN,
+                message: error.to_string(),
+            },
+            _ => ProxyError::bad_request(error.to_string()),
+        })?;
+    let seed = request_context
+        .session_id
+        .clone()
+        .unwrap_or_else(|| stored.provider.id.clone());
+    let session = crate::proxy::opencode_zen::session_for_conversation(&seed);
+    let url = format!("{}{}", crate::proxy::opencode_zen::ORIGIN, prepared.path);
+    let response = opencode_zen_post(
+        &state,
+        &url,
+        &session,
+        prepared.stream,
+        prepared.body.clone(),
+    )
+    .await?;
+    let status = response.status();
+    if status.as_u16() == 429 || status.as_u16() == 403 {
+        let kind = crate::proxy::opencode_zen::classify_upstream_status(status.as_u16());
+        let text = response.text().await.unwrap_or_default();
+        return Err(ProxyError::bad_gateway(format!(
+            "OpenCode Zen upstream {kind}: {text}"
+        )));
+    }
+    let content_type = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(if prepared.stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        })
+        .to_string();
+    // Buffer before restoring tool names. An SSE frame can split across chunks,
+    // and a half frame is not valid JSON. Truncation continuation stays on the
+    // non-stream path, where the whole turn is one JSON object.
+    let bytes = response.bytes().await.map_err(|error| {
+        ProxyError::bad_gateway(format!("OpenCode Zen upstream body failed: {error}"))
+    })?;
+    if prepared.stream {
+        let text = String::from_utf8_lossy(&bytes);
+        let restored = crate::proxy::opencode_zen::restore_sse(&text, &prepared.rename);
+        return Response::builder()
+            .status(status)
+            .header(http::header::CONTENT_TYPE, content_type)
+            .body(Body::from(restored))
+            .map_err(|error| ProxyError::bad_gateway(error.to_string()));
+    }
+    let mut payload: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if payload.is_object() {
+        if let Some(kind) = crate::proxy::opencode_zen::continuation_kind(&payload) {
+            if let Some(continued) =
+                opencode_zen_continue(&state, &requested, &session, kind, &payload).await
+            {
+                payload = continued;
+            }
+        }
+        crate::proxy::opencode_zen::restore_tool_names(&mut payload, &prepared.rename);
+        let encoded = serde_json::to_vec(&payload).unwrap_or_else(|_| bytes.to_vec());
+        return Response::builder()
+            .status(status)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(encoded))
+            .map_err(|error| ProxyError::bad_gateway(error.to_string()));
+    }
+    Ok(Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, content_type)
+        .body(Body::from(bytes))
+        .map_err(|error| ProxyError::bad_gateway(error.to_string()))?)
+}
+
+async fn opencode_zen_post(
+    state: &ServerState,
+    url: &str,
+    session: &str,
+    stream: bool,
+    payload: Vec<u8>,
+) -> Result<reqwest::Response, ProxyError> {
+    let client = state.http_client().await;
+    let mut request = client.post(url).body(payload);
+    for (name, value) in crate::proxy::opencode_zen::gateway_headers(session, stream) {
+        request = request.header(name, value);
+    }
+    request.send().await.map_err(|error| {
+        ProxyError::bad_gateway(format!("OpenCode Zen upstream request failed: {error}"))
+    })
+}
+
+/// One continuation, only for a chat-shaped body that ended in reasoning or
+/// at the output ceiling. A second cut is returned as-is.
+async fn opencode_zen_continue(
+    state: &ServerState,
+    requested: &Value,
+    session: &str,
+    kind: crate::proxy::opencode_zen::ContinuationKind,
+    payload: &Value,
+) -> Option<Value> {
+    if crate::proxy::opencode_zen::wire_for(
+        requested.get("model").and_then(Value::as_str).unwrap_or(""),
+    ) != crate::proxy::opencode_zen::ZenWire::Chat
+    {
+        return None;
+    }
+    let mut next = requested.clone();
+    let messages = crate::proxy::opencode_zen::continuation_messages(&next, kind, payload)?;
+    next.as_object_mut()?
+        .insert("messages".to_string(), messages);
+    next.as_object_mut()?
+        .insert("stream".to_string(), Value::Bool(false));
+    let prepared = crate::proxy::opencode_zen::prepare_upstream(&next).ok()?;
+    let url = format!("{}{}", crate::proxy::opencode_zen::ORIGIN, prepared.path);
+    let response = opencode_zen_post(state, &url, session, false, prepared.body)
+        .await
+        .ok()?;
+    let status = response.status().as_u16();
+    if status == 429 || status == 403 || !response.status().is_success() {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 struct WebSessionForwardOptions {
     state: ServerState,
     execution: ProviderExecution,
@@ -28149,6 +28504,7 @@ fn auth_header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
                 app
             }
         }
+        ProviderType::OpenCodeZen => app,
     }
 }
 
@@ -29124,6 +29480,7 @@ async fn aggregate_gemini_v1internal_upstream(
     response: &mut reqwest::Response,
     timeout: Duration,
     timing: Option<ForwardTiming>,
+    access: Option<(&ServerState, &antigravity::ServiceAccessContext)>,
 ) -> Result<Value, ProxyError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut aggregator = GeminiV1InternalSseAggregator::new();
@@ -29151,9 +29508,22 @@ async fn aggregate_gemini_v1internal_upstream(
             let Some(chunk) = chunk else {
                 break;
             };
-            aggregator.push(&chunk)?;
+            if let Err(error) = aggregator.push(&chunk) {
+                if aggregator.tos_violation() {
+                    if let Some((state, context)) = access {
+                        context.record_tos(state).await;
+                    }
+                }
+                return Err(error);
+            }
         }
-        aggregator.finish()
+        let result = aggregator.finish();
+        if aggregator.tos_violation() {
+            if let Some((state, context)) = access {
+                context.record_tos(state).await;
+            }
+        }
+        result
     }
     .await;
     if let Some(timing) = timing {
@@ -30345,6 +30715,7 @@ struct StreamForwardState {
     grok_search_evidence_recorded: bool,
     grok_reasoning_replay: Option<grok_provider::ReplayStreamWrite>,
     antigravity_reasoning_replay: Option<antigravity::ReplayStreamWrite>,
+    antigravity_service_access: Option<antigravity::ServiceAccessContext>,
     kimi_thinking_replay: Option<KimiThinkingReplayStreamWrite>,
     stream_transform: super::stream_transforms::StreamEventTransformer,
     terminal_detector: UpstreamTerminalDetector,
@@ -31322,6 +31693,11 @@ impl StreamForwardState {
         mut self: Box<Self>,
         error: ProxyError,
     ) -> Result<Option<(Bytes, Box<Self>)>, std::io::Error> {
+        if self.stream_transform.tos_violation() {
+            if let Some(context) = self.antigravity_service_access.take() {
+                context.record_tos(&self.state).await;
+            }
+        }
         if let Some(timing) = self.terminal_detector.timing() {
             timing.observe_terminal(TimingResult::Failed);
         }
@@ -32846,6 +33222,7 @@ mod tests {
     include!("forwarder/claude_r5_tests.rs");
     include!("forwarder/antigravity_timing_tests.rs");
     include!("forwarder/antigravity_r5_tests.rs");
+    include!("forwarder/antigravity_native_tests.rs");
     include!("forwarder/grok_r4_tests.rs");
     include!("forwarder/grok_r5_tests.rs");
     include!("forwarder/grok_timing_tests.rs");
@@ -39999,7 +40376,11 @@ mod tests {
             async move {
                 requests.fetch_add(1, Ordering::SeqCst);
                 let chunks = (0..128).map(|index| {
-                    let text = format!("{index:03}-{}", "x".repeat(256));
+                    let text = if index == 0 {
+                        "hello".to_string()
+                    } else {
+                        format!("{index:03}-{}", "x".repeat(4096))
+                    };
                     Ok::<_, std::convert::Infallible>(Bytes::from(format!(
                         "data: {}\n\n",
                         json!({
@@ -40018,7 +40399,12 @@ mod tests {
                 Response::builder()
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from_stream(stream::iter(chunks)))
+                    .body(Body::from_stream(stream::iter(chunks).then(
+                        |chunk| async move {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            chunk
+                        },
+                    )))
                     .unwrap()
             }
         }));
@@ -40516,7 +40902,7 @@ mod tests {
                 accounts.upsert(
                     serde_json::from_value(json!({
                         "id": account_id_for_state,
-                        "providerType": "gemini_cli",
+                        "providerType": "agy_oauth",
                         "authIdentityGeneration": 1,
                         "accessToken": "gemini-initial-access",
                         "refreshToken": refresh_token,
@@ -40540,13 +40926,13 @@ mod tests {
         let provider_id = format!("gemini-v1internal-{fixture}-provider");
         let mut stored = stored_provider(
             AppKind::Gemini,
-            ProviderType::GeminiCli,
-            json!({}),
+            ProviderType::AgyOAuth,
+            json!({"modelMapping":{"mode":"passthrough"}}),
             Some(&account_id),
         );
         stored.provider.id = provider_id.clone();
         stored.resource.profile_id = Some(
-            crate::domain::providers::registry::ProfileId::parse("gemini.google_oauth").unwrap(),
+            crate::domain::providers::registry::ProfileId::parse("gemini.antigravity_cli").unwrap(),
         );
         stored.resource.profile_schema_revision = Some(1);
         let accounts = state.accounts_snapshot().await;
@@ -41274,13 +41660,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn antigravity_grounding_state_exhaustion_terminates_stream_without_retry() {
+    async fn antigravity_semantic_prelude_memory_exhaustion_rejects_before_commit_without_retry() {
         let (address, requests, server) = spawn_antigravity_memory_stream_upstream().await;
         let mut state = forwarder_test_state("antigravity-grounding-request-memory");
         Arc::get_mut(&mut state)
             .expect("test state must still be uniquely owned")
             .request_body_limits
             .memory_budget_bytes = 16 * 1024;
+        let provider_id = install_antigravity_claude_test_provider(
+            &state,
+            "grounding-request-memory",
+            format!("http://{address}"),
+        )
+        .await;
+        let share_id = "antigravity-grounding-request-memory-share";
+        install_antigravity_test_share(
+            &state,
+            share_id,
+            AppKind::Claude,
+            ProviderType::AntigravityOAuth,
+            &provider_id,
+        )
+        .await;
+        let error = forward(
+            state,
+            ProxyRoute::ClaudeMessages,
+            None,
+            antigravity_share_headers(share_id),
+            Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-6","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"search with bounded memory"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}"#,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("CC_REQUEST_MEMORY_EXHAUSTED"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_grounding_state_exhaustion_terminates_stream_without_retry() {
+        let (address, requests, server) = spawn_antigravity_memory_stream_upstream().await;
+        let mut state = forwarder_test_state("antigravity-grounding-request-memory");
+        Arc::get_mut(&mut state)
+            .expect("test state must still be uniquely owned")
+            .request_body_limits
+            .memory_budget_bytes = 256 * 1024;
         let provider_id = install_antigravity_claude_test_provider(
             &state,
             "grounding-request-memory",
@@ -41308,13 +41734,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-
-        let downstream = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
+        let downstream = collect_response_body(response).await;
         let downstream = String::from_utf8_lossy(&downstream);
-        assert!(downstream.contains("cc_switch_request_memory_exhausted"));
+        assert!(
+            downstream.contains("cc_switch_request_memory_exhausted"),
+            "{downstream}"
+        );
         assert!(downstream.contains("\"status\":503"));
+        assert!(!downstream.contains("event: message_stop"));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
@@ -41516,15 +41943,19 @@ mod tests {
         assert_eq!(observation.uri, "/v1internal:streamGenerateContent?alt=sse");
         assert_eq!(observation.body["project"], "gemini-v1internal-project");
         assert_eq!(observation.body["model"], "gemini-2.5-pro");
-        assert_eq!(observation.body.as_object().unwrap().len(), 3);
-        assert!(observation.body.get("requestId").is_none());
-        assert!(observation.body.get("userAgent").is_none());
-        assert!(observation.body.get("requestType").is_none());
+        assert_eq!(observation.body.as_object().unwrap().len(), 6);
+        assert!(observation.body.get("requestId").is_some());
+        assert_eq!(observation.body["userAgent"], "antigravity");
+        assert_eq!(observation.body["requestType"], "agent");
+        // Agy uses the existing Antigravity request contract, not the retired
+        // Gemini CLI passthrough contract: client safety overrides are removed.
+        assert!(observation
+            .body
+            .pointer("/request/safetySettings")
+            .is_none());
         assert_eq!(
-            observation
-                .body
-                .pointer("/request/safetySettings/0/threshold"),
-            Some(&json!("BLOCK_NONE"))
+            observation.body.pointer("/request/contents/0/parts/0/text"),
+            Some(&json!("ping"))
         );
         upstream_server.abort();
     }
@@ -41552,7 +41983,7 @@ mod tests {
                         "id": share_id_for_state,
                         "app": "gemini",
                         "providerId": provider_id_for_share,
-                        "providerType": "gemini_cli",
+                        "providerType": "agy_oauth",
                         "ownerEmail": "owner@example.com",
                         "enabled": true,
                         "status": "active",
@@ -41560,7 +41991,7 @@ mod tests {
                         "bindings": [{
                             "app": "gemini",
                             "providerId": provider_id_for_share,
-                            "providerType": "gemini_cli"
+                            "providerType": "agy_oauth"
                         }],
                         "userGrants": {
                             "owner@example.com": {
@@ -41673,7 +42104,7 @@ mod tests {
             .find(|line| {
                 line.starts_with("cc_switch_provider_outcome_total")
                     && line.contains("app=\"gemini\"")
-                    && line.contains("provider_type=\"gemini_cli\"")
+                    && line.contains("provider_type=\"agy_oauth\"")
                     && line.contains("outcome=\"failure\"")
             })
             .unwrap_or_default();
@@ -42205,7 +42636,7 @@ mod tests {
         .await;
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = forward_for_test_surface(
+        let error = forward_for_test_surface(
             state,
             ProxyRoute::ClaudeMessages,
             provider_id.clone(),
@@ -42216,23 +42647,9 @@ mod tests {
             ),
         )
         .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("event: error"), "{body}");
-        assert!(!body.contains("event: message_stop"), "{body}");
-        let mut inspector = AnthropicSseInspector::default();
-        inspector.push(body.as_bytes()).unwrap();
-        assert!(matches!(
-            inspector.terminal(),
-            Some(AnthropicTerminal::Error(_))
-        ));
-        assert!(body.contains("embedded stream failure"), "{body}");
-        assert!(!body.contains("event: message_start"), "{body}");
-        assert!(!body.contains("event: message_delta"), "{body}");
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("embedded stream failure"));
         let metrics = crate::metrics::render();
         let outcome = metrics
             .lines()
@@ -42296,7 +42713,7 @@ mod tests {
             crate::domain::accounts::store::AccountStore::load_or_default(&state.config_dir)
                 .unwrap();
         let persisted = persisted
-            .find_for_provider(ProviderType::GeminiCli, Some(&account_id))
+            .find_for_provider(ProviderType::AgyOAuth, Some(&account_id))
             .unwrap();
         assert_eq!(
             crate::domain::accounts::store::gemini_v1internal_project_id(persisted).as_deref(),
@@ -42320,8 +42737,8 @@ mod tests {
         .await;
         state.inject_gemini_project_commit_failures(1);
 
-        let first = state.ensure_gemini_v1internal_project(ProviderType::GeminiCli, &account_id);
-        let second = state.ensure_gemini_v1internal_project(ProviderType::GeminiCli, &account_id);
+        let first = state.ensure_gemini_v1internal_project(ProviderType::AgyOAuth, &account_id);
+        let second = state.ensure_gemini_v1internal_project(ProviderType::AgyOAuth, &account_id);
         let (first, second) = tokio::join!(first, second);
         for result in [first, second] {
             assert!(matches!(
@@ -42336,7 +42753,7 @@ mod tests {
         assert_eq!(load_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let cooled_down = state
-            .ensure_gemini_v1internal_project(ProviderType::GeminiCli, &account_id)
+            .ensure_gemini_v1internal_project(ProviderType::AgyOAuth, &account_id)
             .await;
         assert!(matches!(
             cooled_down,
@@ -42366,8 +42783,8 @@ mod tests {
         .await;
         state.inject_account_refresh_persist_failures(1);
 
-        let first = state.ensure_gemini_v1internal_project(ProviderType::GeminiCli, &account_id);
-        let second = state.ensure_gemini_v1internal_project(ProviderType::GeminiCli, &account_id);
+        let first = state.ensure_gemini_v1internal_project(ProviderType::AgyOAuth, &account_id);
+        let second = state.ensure_gemini_v1internal_project(ProviderType::AgyOAuth, &account_id);
         let (first, second) = tokio::join!(first, second);
         for result in [first, second] {
             assert!(matches!(

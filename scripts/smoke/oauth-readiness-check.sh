@@ -201,10 +201,10 @@ check_required_vars "AB6 Claude OAuth" CLAUDE_OAUTH_TEST_ACCOUNT CLAUDE_OAUTH_CA
 check_any_var "AB6 Claude refresh/import fixture" CLAUDE_OAUTH_REFRESH_TOKEN_FIXTURE CLAUDE_OAUTH_REFRESH_TOKEN
 check_claude_max_external_gate "AB6 Claude Max 5x plan resolution" CLAUDE_OAUTH_MAX_5X_TEST_ACCOUNT CLAUDE_MAX_5X_GATE_STATUS
 check_claude_max_external_gate "AB6 Claude Max 20x plan resolution" CLAUDE_OAUTH_MAX_20X_TEST_ACCOUNT CLAUDE_MAX_20X_GATE_STATUS
-check_required_vars "AB6 Gemini OAuth" GEMINI_OAUTH_TEST_ACCOUNT GEMINI_OAUTH_CALLBACK_URL
-check_any_var "AB6 Gemini refresh/import fixture" GEMINI_OAUTH_REFRESH_TOKEN_FIXTURE GEMINI_OAUTH_REFRESH_TOKEN GEMINI_CLI_CREDENTIALS_FIXTURE
-check_required_vars "AB6 Antigravity/Agy OAuth" ANTIGRAVITY_OAUTH_TEST_ACCOUNT ANTIGRAVITY_OAUTH_CALLBACK_URL
-check_any_var "AB6 Antigravity/Agy refresh/import fixture" ANTIGRAVITY_OAUTH_REFRESH_TOKEN_FIXTURE
+check_required_vars "AB6 Antigravity Hub OAuth" ANTIGRAVITY_OAUTH_TEST_ACCOUNT ANTIGRAVITY_OAUTH_CALLBACK_URL
+check_any_var "AB6 Antigravity Hub refresh/import fixture" ANTIGRAVITY_OAUTH_REFRESH_TOKEN_FIXTURE
+check_required_vars "AB6 Agy CLI OAuth" AGY_OAUTH_TEST_ACCOUNT AGY_OAUTH_CALLBACK_URL
+check_any_var "AB6 Agy CLI refresh/import fixture" AGY_OAUTH_REFRESH_TOKEN_FIXTURE
 check_grok_external_gate
 check_required_vars "AB7 Cursor OAuth" CURSOR_OAUTH_TEST_ACCOUNT CURSOR_OAUTH_CALLBACK_URL
 check_any_var "AB7 Cursor credential fixture" CURSOR_OAUTH_REFRESH_TOKEN_FIXTURE CURSOR_API_KEY_FIXTURE

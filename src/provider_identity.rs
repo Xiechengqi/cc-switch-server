@@ -19,7 +19,6 @@ pub const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.54.0";
 pub const COPILOT_EDITOR_VERSION: &str = "vscode/1.126.0";
 pub const COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.54.0";
 pub const COPILOT_API_VERSION: &str = "2026-06-01";
-pub const GEMINI_CLI_X_GOOG_API_CLIENT: &str = "google-genai-sdk/1.41.0 gl-node/v22.19.0";
 
 static ANTIGRAVITY_UPDATER_STARTED: OnceLock<()> = OnceLock::new();
 
@@ -48,24 +47,14 @@ pub fn antigravity_client_metadata() -> Value {
     })
 }
 
-pub fn gemini_cli_user_agent() -> String {
-    let platform = match std::env::consts::OS {
-        "windows" => "win32",
-        other => other,
-    };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x64",
-        "x86" => "x86",
-        other => other,
-    };
-    format!("GeminiCLI/0.31.0/unknown ({platform}; {arch})")
-}
-
-pub fn gemini_cli_code_assist_metadata() -> Value {
-    json!({
-        "ideType": "GEMINI_CLI",
-        "pluginType": "GEMINI",
-    })
+pub fn antigravity_client_metadata_for(
+    provider_type: crate::domain::providers::model::ProviderType,
+) -> Value {
+    if provider_type == crate::domain::providers::model::ProviderType::AgyOAuth {
+        json!({"ideType": "ANTIGRAVITY"})
+    } else {
+        antigravity_client_metadata()
+    }
 }
 
 pub fn spawn_antigravity_version_updater() {
@@ -150,21 +139,6 @@ mod tests {
         assert_eq!(metadata["ideType"], 9);
         assert_eq!(metadata["pluginType"], 2);
         assert_eq!(metadata["platform"], ANTIGRAVITY_CLIENT_METADATA_PLATFORM);
-    }
-
-    #[test]
-    fn gemini_cli_identity_is_centralized_with_code_assist_metadata() {
-        let user_agent = gemini_cli_user_agent();
-        assert!(user_agent.starts_with("GeminiCLI/0.31.0/unknown ("));
-        assert!(user_agent.ends_with(')'));
-        assert_eq!(
-            GEMINI_CLI_X_GOOG_API_CLIENT,
-            "google-genai-sdk/1.41.0 gl-node/v22.19.0"
-        );
-        assert_eq!(
-            gemini_cli_code_assist_metadata(),
-            json!({"ideType": "GEMINI_CLI", "pluginType": "GEMINI"})
-        );
     }
 
     #[test]

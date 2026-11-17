@@ -10,7 +10,6 @@ pub mod copilot_device;
 pub mod copilot_models;
 pub mod cursor;
 pub mod cursor_dashboard;
-pub mod gemini_models;
 pub mod grok_device;
 pub mod grok_jwks;
 pub mod grok_models;

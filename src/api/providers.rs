@@ -3448,6 +3448,46 @@ pub(in crate::api) async fn fetch_provider_models_inner(
             crate::clients::oauth::claude_models::static_claude_model_catalog(),
         ));
     }
+    if execution.driver_is("special.opencode_zen") {
+        if stored.provider_type != ProviderType::OpenCodeZen {
+            return Err(ApiError::conflict(
+                "OpenCode Zen model discovery ProviderType and Driver do not match",
+            ));
+        }
+        ensure_provider_outbound_allowed(state, execution).await?;
+        let client = state.http_client().await;
+        let ids = crate::proxy::opencode_zen::refresh_catalog(&client)
+            .await
+            .map_err(|message| ApiError::bad_gateway(message))?;
+        return Ok(ProviderModelsFetchResult {
+            url: format!(
+                "{}{}",
+                crate::proxy::opencode_zen::ORIGIN,
+                crate::proxy::opencode_zen::CATALOG_PATH
+            ),
+            models: ids
+                .into_iter()
+                .map(|id| FetchedProviderModel {
+                    upstream_model: id.clone(),
+                    display_name: Some(id.clone()),
+                    raw: serde_json::json!({
+                        "id": id,
+                        "source": "opencode_zen_live_model_catalog",
+                        "capabilities": {
+                            "stream": true,
+                            "tools": true,
+                            "images": false,
+                            "inputModalities": ["text"]
+                        }
+                    }),
+                    id,
+                })
+                .collect(),
+            source: Some("opencode_zen_live_model_catalog".to_string()),
+            stale: Some(false),
+            fetched_at_ms: crate::proxy::opencode_zen::catalog_fetched_at_ms(),
+        });
+    }
     if crate::proxy::web_session::is_web_session_driver(execution.plan.driver_id.as_str()) {
         let models = crate::proxy::web_session::reviewed_models_for_driver(
             execution.plan.driver_id.as_str(),
@@ -3581,77 +3621,6 @@ pub(in crate::api) async fn fetch_provider_models_inner(
             .await
             .map_err(copilot_model_catalog_error_to_api_error)?;
         return Ok(copilot_provider_models_fetch_result(catalog));
-    }
-    if stored.provider_type == ProviderType::GeminiCli {
-        let (account_id, expected_generation) = match &execution.plan.auth_ref {
-            crate::domain::providers::runtime::RuntimeAuthRef::ManagedAccount {
-                account_id,
-                expected_provider_type: ProviderType::GeminiCli,
-                auth_identity_generation,
-            } if execution.driver_is("oauth.gemini_code_assist")
-                && !account_id.trim().is_empty() =>
-            {
-                (account_id.as_str(), *auth_identity_generation)
-            }
-            _ => {
-                return Err(ApiError::bad_request(
-                    "gemini_cli model discovery requires one explicit managed account binding",
-                ));
-            }
-        };
-        let refresh = state
-            .refresh_bound_account_quota_for_generation(
-                ProviderType::GeminiCli,
-                account_id,
-                expected_generation,
-                true,
-            )
-            .await;
-        let (account, force_stale) = match refresh {
-            Ok(account) => (account, false),
-            Err(error) => {
-                tracing::warn!(
-                    account_id,
-                    error = %error,
-                    "Gemini Code Assist model discovery quota refresh failed"
-                );
-                if !error
-                    .downcast_ref::<crate::state::BoundAccountQuotaRefreshFailure>()
-                    .is_some_and(|failure| failure.allows_same_generation_stale_catalog())
-                {
-                    return Err(ApiError::bad_gateway(
-                        "Gemini Code Assist model discovery failed for the bound account",
-                    ));
-                }
-                let account = state
-                    .find_account_for_provider(ProviderType::GeminiCli, account_id)
-                    .await
-                    .filter(|account| account.auth_identity_generation == expected_generation)
-                    .ok_or_else(|| {
-                        ApiError::bad_gateway(
-                            "Gemini Code Assist model discovery failed for the bound account",
-                        )
-                    })?;
-                (account, true)
-            }
-        };
-        let max_age_ms = state
-            .oauth_quota_refresh_interval_ms()
-            .await
-            .saturating_mul(2)
-            .max(60_000);
-        let catalog = crate::clients::oauth::gemini_models::model_catalog_from_account(
-            &account,
-            crate::infra::time::now_ms() as i64,
-            max_age_ms,
-            force_stale,
-        );
-        if catalog.descriptors.is_empty() && catalog.stale {
-            return Err(ApiError::bad_gateway(
-                "Gemini Code Assist model discovery has no current bound-account catalog",
-            ));
-        }
-        return Ok(gemini_provider_models_fetch_result(catalog));
     }
     if matches!(
         stored.provider_type,
@@ -4807,34 +4776,6 @@ fn copilot_provider_models_fetch_result(
             .unwrap_or_else(|| "unavailable://github-copilot/models".to_string()),
         models,
         source: Some(catalog.source.to_string()),
-        stale: Some(catalog.stale),
-        fetched_at_ms: catalog.fetched_at_ms,
-    }
-}
-
-fn gemini_provider_models_fetch_result(
-    catalog: crate::clients::oauth::gemini_models::GeminiCodeAssistModelCatalog,
-) -> ProviderModelsFetchResult {
-    let models = catalog
-        .descriptors
-        .iter()
-        .map(|descriptor| FetchedProviderModel {
-            id: descriptor.model_id.clone(),
-            upstream_model: descriptor.model_id.clone(),
-            display_name: descriptor.display_name.clone(),
-            raw: serde_json::json!({
-                "id": descriptor.model_id,
-                "object": "model",
-                "entitlementSource": "retrieveUserQuota",
-                "remainingFraction": descriptor.remaining_fraction,
-                "resetTime": descriptor.reset_time,
-            }),
-        })
-        .collect();
-    ProviderModelsFetchResult {
-        url: crate::clients::oauth::gemini_models::GEMINI_CODE_ASSIST_MODELS_SOURCE_URL.to_string(),
-        models,
-        source: Some(catalog.source),
         stale: Some(catalog.stale),
         fetched_at_ms: catalog.fetched_at_ms,
     }
@@ -9198,183 +9139,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_code_assist_discovery_refreshes_only_the_bound_account_and_keeps_stale_cache() {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
-        let failure_status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
-        let observed_authorizations =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let failure_status_for_route = std::sync::Arc::clone(&failure_status);
-        let authorizations_for_route = std::sync::Arc::clone(&observed_authorizations);
-        let app = axum::Router::new().fallback(axum::routing::post(
-            move |uri: axum::http::Uri, headers: HeaderMap| {
-                let failure_status = std::sync::Arc::clone(&failure_status_for_route);
-                let observed = std::sync::Arc::clone(&authorizations_for_route);
-                async move {
-                    observed.lock().unwrap().push(
-                        headers
-                            .get(axum::http::header::AUTHORIZATION)
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string(),
-                    );
-                    let failure_status =
-                        failure_status.load(std::sync::atomic::Ordering::SeqCst);
-                    if failure_status != 0 {
-                        return (
-                            StatusCode::from_u16(failure_status).unwrap(),
-                            axum::Json(json!({"error": {"message": "temporary failure"}})),
-                        );
-                    }
-                    match uri.path() {
-                        "/v1internal:loadCodeAssist" => (
-                            StatusCode::OK,
-                            axum::Json(json!({
-                                "cloudaicompanionProject": "bound-project",
-                                "paidTier": {"id": "standard-tier", "name": "Gemini Code Assist"}
-                            })),
-                        ),
-                        "/v1internal:retrieveUserQuota" => (
-                            StatusCode::OK,
-                            axum::Json(json!({
-                                "buckets": [
-                                    {"modelId": "gemini-3.1-pro", "remainingFraction": 0.75},
-                                    {"modelId": "models/gemini-3.1-flash", "remainingFraction": 0.0},
-                                    {"modelId": "claude-sonnet-4-6", "remainingFraction": 1.0}
-                                ]
-                            })),
-                        ),
-                        path => panic!("unexpected Gemini model discovery request: {path}"),
-                    }
-                }
-            },
-        ));
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let state = provider_api_test_state("gemini-code-assist-model-catalog");
-        let test_base_url = format!("http://{address}");
-        state
-            .mutate_accounts_immediate(move |accounts| {
-                accounts.upsert(
-                    serde_json::from_value(json!({
-                        "id": "gemini-bound-model-account",
-                        "providerType": "gemini_cli",
-                        "accessToken": "gemini-bound-access",
-                        "expiresAt": i64::MAX / 2,
-                        "raw": {"testGeminiCodeAssistBaseUrl": test_base_url}
-                    }))
-                    .unwrap(),
-                );
-                accounts.upsert(
-                    serde_json::from_value(json!({
-                        "id": "gemini-unbound-model-account",
-                        "providerType": "gemini_cli",
-                        "accessToken": "gemini-unbound-must-not-be-used",
-                        "expiresAt": i64::MAX / 2
-                    }))
-                    .unwrap(),
-                );
-            })
-            .await
-            .unwrap();
-        state
-            .mutate_providers_immediate(|providers| {
-                providers.upsert(
-                    AppKind::Gemini,
-                    Provider {
-                        id: "gemini-bound-model-provider".to_string(),
-                        name: "Gemini bound model provider".to_string(),
-                        settings_config: json!({}),
-                        category: None,
-                        meta: Some(ProviderMeta {
-                            provider_type: Some("gemini_cli".to_string()),
-                            auth_binding: Some(AuthBinding {
-                                source: Some("account_store".to_string()),
-                                auth_provider: Some("gemini_cli".to_string()),
-                                account_id: Some("gemini-bound-model-account".to_string()),
-                                auth_identity_generation: Some(1),
-                            }),
-                            ..Default::default()
-                        }),
-                        extra: Default::default(),
-                    },
-                );
-            })
-            .await
-            .unwrap();
-        let execution = resolve_provider_execution_by_key(
-            &state,
+    async fn retired_gemini_discovery_fails_before_network_and_preserves_legacy_reader() {
+        let state = provider_api_test_state("retired-gemini-discovery");
+        state.mutate_accounts_immediate(|accounts| {
+            accounts.upsert(serde_json::from_value(json!({"id":"legacy-gemini-account","providerType":"gemini_cli","accessToken":"must-not-send"})).unwrap());
+        }).await.unwrap();
+        let mut providers = ProviderStore::default();
+        providers.upsert(
             AppKind::Gemini,
-            "gemini-bound-model-provider",
-        )
-        .await
-        .unwrap();
-        assert!(execution.driver_is("oauth.gemini_code_assist"));
-
-        let fresh = fetch_provider_models_inner(&state, &execution, Some(2_000))
-            .await
-            .unwrap();
-        assert_eq!(
-            fresh.source.as_deref(),
-            Some("authenticated_retrieve_user_quota")
+            Provider {
+                id: "legacy-gemini-provider".into(),
+                name: "Legacy Gemini".into(),
+                settings_config: json!({}),
+                category: None,
+                meta: Some(ProviderMeta {
+                    provider_type: Some("gemini_cli".into()),
+                    auth_binding: Some(AuthBinding {
+                        source: Some("account_store".into()),
+                        auth_provider: Some("gemini_cli".into()),
+                        account_id: Some("legacy-gemini-account".into()),
+                        auth_identity_generation: Some(1),
+                    }),
+                    ..Default::default()
+                }),
+                extra: Default::default(),
+            },
         );
-        assert_eq!(fresh.stale, Some(false));
-        assert_eq!(
-            fresh
-                .models
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            ["gemini-3.1-flash", "gemini-3.1-pro"]
-        );
-        assert!(observed_authorizations
-            .lock()
-            .unwrap()
+        let stored = providers
+            .providers
             .iter()
-            .all(|value| value == "Bearer gemini-bound-access"));
-
-        failure_status.store(
-            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-            std::sync::atomic::Ordering::SeqCst,
+            .find(|item| item.provider.id == "legacy-gemini-provider")
+            .unwrap();
+        assert_eq!(stored.provider_type, ProviderType::GeminiCli);
+        let result = crate::proxy::provider_ops::ProviderExecution::from_store_for_operation(
+            &providers,
+            stored.clone(),
         );
-        let stale = fetch_provider_models_inner(&state, &execution, Some(2_000))
+        let error = result.unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("retired"));
+        assert!(state
+            .find_account_by_id("legacy-gemini-account")
             .await
-            .unwrap();
-        assert_eq!(
-            stale.source.as_deref(),
-            Some("same_account_cached_retrieve_user_quota")
-        );
-        assert_eq!(stale.stale, Some(true));
-        assert_eq!(stale.models.len(), 2);
-
-        failure_status.store(
-            StatusCode::UNAUTHORIZED.as_u16(),
-            std::sync::atomic::Ordering::SeqCst,
-        );
-        let auth_error = match fetch_provider_models_inner(&state, &execution, Some(2_000)).await {
-            Ok(_) => panic!("authentication failure must not use a stale model catalog"),
-            Err(error) => error,
-        };
-        assert_eq!(auth_error.status, StatusCode::BAD_GATEWAY);
-        assert_eq!(
-            auth_error.message,
-            "Gemini Code Assist model discovery failed for the bound account"
-        );
-
-        let conformance = crate::domain::providers::registry::provider_registry()
-            .conformance
-            .iter()
-            .find(|item| item.driver_id.as_str() == "oauth.gemini_code_assist")
-            .unwrap();
-        assert_eq!(
-            conformance.discovery,
-            crate::domain::providers::registry::ConformanceState::FixtureVerified
-        );
-        server.abort();
+            .is_some());
     }
 
     #[tokio::test]
@@ -9385,7 +9192,7 @@ mod tests {
             MODEL_CATALOG_DIMENSION,
         };
         use crate::domain::antigravity_identity::{
-            antigravity_client_identity, TestAntigravityIdentity,
+            antigravity_client_identity_for, TestAntigravityIdentity,
         };
         for rail in [ProviderType::AntigravityOAuth, ProviderType::AgyOAuth] {
             let versions = TestAntigravityIdentity::new("2.2.1");
@@ -9397,7 +9204,7 @@ mod tests {
                 let (_,incarnation) = state.find_antigravity_account_with_incarnation(rail,&snapshot.id).await.unwrap();
                 let old = crate::clients::oauth::antigravity_models::AntigravityModelCatalog {
                     descriptors:Vec::new(),source:"authenticated_fetch_available_models",source_url:"https://example.test/models".to_string(),
-                    stale:false,fetched_at_ms:chrono::Utc::now().timestamp_millis(),request_revision:1,client_identity:antigravity_client_identity()
+                    stale:false,fetched_at_ms:chrono::Utc::now().timestamp_millis(),request_revision:1,client_identity:antigravity_client_identity_for(rail)
                 };
                 assert!(state.record_antigravity_model_catalog_observations_for_generation(&snapshot,incarnation,&old).await.unwrap());
                 let current = state.find_account_for_provider(rail,&snapshot.id).await.unwrap();
@@ -9413,7 +9220,7 @@ mod tests {
                 let old_stale = crate::clients::oauth::antigravity_models::AntigravityModelCatalog {stale:true,..old.clone()};
                 assert!(!state.record_antigravity_model_catalog_observations_for_generation(&snapshot,incarnation,&old_stale).await.unwrap());
                 let new = crate::clients::oauth::antigravity_models::AntigravityModelCatalog {
-                    request_revision:2,client_identity:antigravity_client_identity(),..old.clone()
+                    request_revision:2,client_identity:antigravity_client_identity_for(rail),..old.clone()
                 };
                 assert!(state.record_antigravity_model_catalog_observations_for_generation(&snapshot,incarnation,&new).await.unwrap());
                 let late = crate::clients::oauth::antigravity_models::AntigravityModelCatalog {request_revision:u64::MAX,..old.clone()};
@@ -10082,79 +9889,6 @@ mod tests {
             );
         }
         server.abort();
-    }
-
-    #[tokio::test]
-    async fn gemini_code_assist_discovery_rejects_binding_generation_drift_before_network() {
-        let state = provider_api_test_state("gemini-code-assist-model-generation");
-        state
-            .mutate_accounts_immediate(|accounts| {
-                accounts.upsert(
-                    serde_json::from_value(json!({
-                        "id": "gemini-generation-account",
-                        "providerType": "gemini_cli",
-                        "authIdentityGeneration": 1,
-                        "accessToken": "gemini-generation-access",
-                        "expiresAt": i64::MAX / 2
-                    }))
-                    .unwrap(),
-                );
-            })
-            .await
-            .unwrap();
-        state
-            .mutate_providers_immediate(|providers| {
-                providers.upsert(
-                    AppKind::Gemini,
-                    Provider {
-                        id: "gemini-generation-provider".to_string(),
-                        name: "Gemini generation provider".to_string(),
-                        settings_config: json!({}),
-                        category: None,
-                        meta: Some(ProviderMeta {
-                            provider_type: Some("gemini_cli".to_string()),
-                            auth_binding: Some(AuthBinding {
-                                source: Some("account_store".to_string()),
-                                auth_provider: Some("gemini_cli".to_string()),
-                                account_id: Some("gemini-generation-account".to_string()),
-                                auth_identity_generation: Some(1),
-                            }),
-                            ..Default::default()
-                        }),
-                        extra: Default::default(),
-                    },
-                );
-            })
-            .await
-            .unwrap();
-        let execution = resolve_provider_execution_by_key(
-            &state,
-            AppKind::Gemini,
-            "gemini-generation-provider",
-        )
-        .await
-        .unwrap();
-        state
-            .mutate_accounts_immediate(|accounts| {
-                accounts
-                    .accounts
-                    .iter_mut()
-                    .find(|account| account.id == "gemini-generation-account")
-                    .unwrap()
-                    .auth_identity_generation = 2;
-            })
-            .await
-            .unwrap();
-
-        let error = match fetch_provider_models_inner(&state, &execution, Some(100)).await {
-            Ok(_) => panic!("generation drift must fail model discovery"),
-            Err(error) => error,
-        };
-        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
-        assert_eq!(
-            error.message,
-            "Gemini Code Assist model discovery failed for the bound account"
-        );
     }
 
     #[tokio::test]

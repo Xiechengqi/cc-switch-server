@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::domain::accounts::store::Account;
-use crate::domain::antigravity_identity::{antigravity_client_identity, AntigravityClientIdentity};
+use crate::domain::antigravity_identity::{
+    antigravity_client_identity_for, AntigravityClientIdentity,
+};
 use crate::domain::providers::model::ProviderType;
 
 pub const GEMINI_CODE_PLAN_CAPABILITY: &str = "gemini_code_plan";
@@ -445,7 +447,8 @@ fn antigravity_capability_projection(
     now_ms: i64,
     rail: &str,
 ) -> AccountCapabilityProjection {
-    let client_identity = antigravity_client_identity();
+    let client_identity =
+        crate::domain::antigravity_identity::antigravity_client_identity_for(account.provider_type);
     let mut dimensions = BTreeMap::new();
     dimensions.insert(
         CREDENTIAL_FLOW_DIMENSION.to_string(),
@@ -471,6 +474,23 @@ fn antigravity_capability_projection(
                 Some(&client_identity),
             ),
         );
+    }
+    for service in [
+        crate::domain::accounts::antigravity_access::AntigravityService::Inference,
+        crate::domain::accounts::antigravity_access::AntigravityService::CountTokens,
+    ] {
+        if crate::domain::accounts::antigravity_access::service_blocked(account, service) {
+            let mut evidence = observation_projection(
+                account,
+                ANTIGRAVITY_CODE_PLAN_CAPABILITY,
+                service.dimension(),
+                now_ms,
+            );
+            // An updater/version refresh is not proof that a TOS restriction ended.
+            evidence.state = AccountCapabilityState::Unsupported;
+            evidence.freshness = AccountCapabilityFreshness::Fresh;
+            dimensions.insert(service.dimension().to_string(), evidence);
+        }
     }
     let state = aggregate_state(dimensions.values().map(|evidence| evidence.state));
     AccountCapabilityProjection {
@@ -665,8 +685,8 @@ fn observation_projection(
     dimension: &str,
     now_ms: i64,
 ) -> AccountCapabilityEvidenceProjection {
-    let identity =
-        (capability == ANTIGRAVITY_CODE_PLAN_CAPABILITY).then(antigravity_client_identity);
+    let identity = (capability == ANTIGRAVITY_CODE_PLAN_CAPABILITY)
+        .then(|| antigravity_client_identity_for(account.provider_type));
     observation_projection_for_client(account, capability, dimension, now_ms, identity.as_ref())
 }
 
@@ -785,8 +805,8 @@ pub fn fresh_observation_state(
     dimension: &str,
     now_ms: i64,
 ) -> Option<AccountCapabilityObservationState> {
-    let identity =
-        (capability == ANTIGRAVITY_CODE_PLAN_CAPABILITY).then(antigravity_client_identity);
+    let identity = (capability == ANTIGRAVITY_CODE_PLAN_CAPABILITY)
+        .then(|| antigravity_client_identity_for(account.provider_type));
     fresh_observation_state_for_client(account, capability, dimension, now_ms, identity.as_ref())
 }
 
@@ -899,7 +919,7 @@ mod tests {
         versions
             .scope(async {
                 let mut account = account(ProviderType::AgyOAuth);
-                let first = antigravity_client_identity();
+                let first = antigravity_client_identity_for(account.provider_type);
                 let draft = |identity: &AntigravityClientIdentity, observed_at| {
                     AccountCapabilityObservationDraft::antigravity_feature(
                         MODEL_CATALOG_DIMENSION,
@@ -943,7 +963,7 @@ mod tests {
                         .as_deref(),
                     Some("antigravity_client_identity_superseded")
                 );
-                let second = antigravity_client_identity();
+                let second = antigravity_client_identity_for(account.provider_type);
                 assert_eq!(
                     record_observation_drafts(&mut restored, [draft(&second, 1_000)]),
                     1
@@ -1272,7 +1292,8 @@ mod tests {
                 .values_mut()
                 .filter(|observation| observation.source == "fetch_available_models")
             {
-                observation.antigravity_client_identity = Some(antigravity_client_identity());
+                observation.antigravity_client_identity =
+                    Some(antigravity_client_identity_for(provider_type));
             }
             let projections = account_capability_projections(&account, 2_000);
             assert_eq!(projections.len(), 2);

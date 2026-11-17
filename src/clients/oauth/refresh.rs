@@ -244,6 +244,10 @@ pub async fn execute_native_account_refresh_with_receipt_hook<F>(
 where
     F: FnMut(&AccountRefreshUpdate) -> Result<(), AccountRefreshFailure>,
 {
+    account
+        .provider_type
+        .ensure_active()
+        .map_err(|error| AccountRefreshFailure::bad_request(error.to_string()))?;
     if let Some(failure) = refresh_guard.coalesced_native_failure_for(account) {
         return Err(AccountRefreshFailure {
             status_code: failure.status_code,
@@ -1373,6 +1377,7 @@ mod tests {
             needs_relogin: false,
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
+            antigravity_access_generations: Default::default(),
             quota_window_observations: Default::default(),
             codex_passive_quota: None,
         }
@@ -1884,7 +1889,7 @@ mod tests {
         });
         let token_url = format!("http://{address}/token");
 
-        for (index, provider_type) in [ProviderType::GeminiCli, ProviderType::AntigravityOAuth]
+        for (index, provider_type) in [ProviderType::AgyOAuth, ProviderType::AntigravityOAuth]
             .into_iter()
             .enumerate()
         {

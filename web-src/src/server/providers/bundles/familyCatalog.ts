@@ -14,7 +14,7 @@ export type FamilyCategoryId = "custom" | "subscription" | "api_key";
 // to change just because the picker gained product-facing categories.
 export type FamilyGroupId = FamilyCategoryId;
 
-export type FamilyAuthKind = "oauth" | "api_key" | "aws" | "custom";
+export type FamilyAuthKind = "oauth" | "api_key" | "aws" | "custom" | "public";
 
 export const FAMILY_GROUP_ORDER: FamilyCategoryId[] = [
   "custom",
@@ -54,6 +54,7 @@ export const SUBSCRIPTION_FAMILY_IDS = [
   "family.qoder_cosy",
   "family.codebuddy_oauth",
   "family.workbuddy_oauth",
+  "family.opencode_zen",
   "family.trae_solo",
   "family.trae_raw_chat",
   "family.trae_raw_chat_intl",
@@ -134,6 +135,7 @@ const FAMILY_SEARCH_ALIASES: Record<string, string[]> = {
   "family.qoder_cosy": ["qoder cosy"],
   "family.codebuddy_oauth": ["codebuddy"],
   "family.workbuddy_oauth": ["workbuddy", "办公"],
+  "family.opencode_zen": ["opencode", "zen", "free"],
   "family.trae_solo": ["trae", "trae cn solo"],
   "family.trae_raw_chat": ["trae", "trae cn raw"],
   "family.trae_raw_chat_intl": ["trae", "trae intl raw"],
@@ -150,6 +152,14 @@ export function familyAuthKind(family: ProviderFamilySpec): FamilyAuthKind {
   if (profile?.formComposition === "custom") return "custom";
   if (profile?.formComposition === "aws") return "aws";
   if (profile?.credentialPolicy.mode === "managed_account") return "oauth";
+  // A static secret with no slots and auth scheme none has nothing to type.
+  if (
+    profile?.credentialPolicy.mode === "static_secret" &&
+    profile.credentialPolicy.slots.length === 0 &&
+    profile.credentialPolicy.authScheme === "none"
+  ) {
+    return "public";
+  }
   return "api_key";
 }
 
@@ -194,6 +204,11 @@ export function filterFamilies(
 ): ProviderFamilySpec[] {
   const normalizedQuery = query.trim().toLowerCase();
   return families.filter((family) => {
+    // Reader-only families still resolve existing bundles but cannot be picked.
+    if (!family.surfaces.every((surface) => {
+      const profile = profileById(surface.profileId);
+      return profile?.visibility === "visible" && profile.creationPolicy === "create_allowed";
+    })) return false;
     if (app && app !== "all" && !familySupportedApps(family).includes(app)) {
       return false;
     }

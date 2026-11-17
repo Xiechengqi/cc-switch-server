@@ -491,6 +491,10 @@ impl AccountManager for AccountProviderDriver {
         mut input: UpsertAccountInput,
     ) -> Result<Account, AccountManagerError> {
         self.ensure_provider_type(input.provider_type)?;
+        input
+            .provider_type
+            .ensure_active()
+            .map_err(|error| AccountManagerError::CredentialUnavailable(error.to_string()))?;
         validate_required_account_credential(&input)?;
         if let Some(account_id) = input.id.as_deref() {
             if let Some(existing) = store
@@ -575,6 +579,9 @@ impl AccountManager for AccountProviderDriver {
         now_ms: i64,
     ) -> Result<AccountCredential, AccountManagerError> {
         self.ensure_provider_type(provider_type)?;
+        provider_type
+            .ensure_active()
+            .map_err(|error| AccountManagerError::CredentialUnavailable(error.to_string()))?;
         let account = store
             .find_for_provider(provider_type, account_id)
             .ok_or_else(|| {
@@ -638,6 +645,9 @@ impl AccountManager for AccountProviderDriver {
         account_id: &str,
         now_ms: i64,
     ) -> Result<Account, AccountManagerError> {
+        self.provider_type
+            .ensure_active()
+            .map_err(|error| AccountManagerError::CredentialUnavailable(error.to_string()))?;
         let account = store
             .accounts
             .iter()
@@ -704,7 +714,6 @@ fn account_manager_kind_for(provider_type: ProviderType) -> AccountManagerKind {
         ProviderType::ClaudeOAuth
         | ProviderType::CodexOAuth
         | ProviderType::GrokOAuth
-        | ProviderType::GeminiCli
         | ProviderType::GitHubCopilot
         | ProviderType::KiroOAuth
         | ProviderType::AmazonQOAuth
@@ -718,7 +727,7 @@ fn account_manager_kind_for(provider_type: ProviderType) -> AccountManagerKind {
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth => AccountManagerKind::NativeOAuth,
-        ProviderType::DeepSeekAccount => AccountManagerKind::ImportOnly,
+        ProviderType::GeminiCli | ProviderType::DeepSeekAccount => AccountManagerKind::ImportOnly,
         ProviderType::Claude
         | ProviderType::ClaudeAuth
         | ProviderType::Codex
@@ -728,7 +737,8 @@ fn account_manager_kind_for(provider_type: ProviderType) -> AccountManagerKind {
         | ProviderType::OllamaCloud
         | ProviderType::AwsBedrock
         | ProviderType::Nvidia
-        | ProviderType::DeepSeekApi => AccountManagerKind::StaticCredential,
+        | ProviderType::DeepSeekApi
+        | ProviderType::OpenCodeZen => AccountManagerKind::StaticCredential,
     }
 }
 
@@ -1019,6 +1029,7 @@ pub fn all_capabilities() -> Vec<AccountManagerCapability> {
 pub fn account_import_templates() -> Vec<AccountImportTemplate> {
     account_provider_types()
         .into_iter()
+        .filter(|provider_type| !provider_type.is_retired())
         .map(account_import_template_for)
         .collect()
 }
@@ -1068,15 +1079,17 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
     let supports_cached_quota = !matches!(quota_capability, OAuthQuotaCapability::Unavailable);
     let supports_live_quota_refresh = matches!(quota_capability, OAuthQuotaCapability::LiveRefresh);
     let credential_ownership = account_credential_ownership(provider_type);
-    let inference_binding_supported = matches!(
-        credential_ownership,
-        AccountCredentialOwnership::ManagedAccount
-    );
+    let inference_binding_supported = !provider_type.is_retired()
+        && matches!(
+            credential_ownership,
+            AccountCredentialOwnership::ManagedAccount
+        );
     let manager_kind = account_manager_kind_for(provider_type);
-    let deprecated_for_inference = matches!(
-        credential_ownership,
-        AccountCredentialOwnership::MetadataOnly
-    );
+    let deprecated_for_inference = provider_type.is_retired()
+        || matches!(
+            credential_ownership,
+            AccountCredentialOwnership::MetadataOnly
+        );
     let native_oauth_planned = matches!(
         provider_type,
         ProviderType::ClaudeOAuth
@@ -1106,7 +1119,9 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
         },
         manager_kind,
         support: AccountManagerSupport::ManualTokenStore,
-        status: if deprecated_for_inference {
+        status: if provider_type.is_retired() {
+            "retired"
+        } else if deprecated_for_inference {
             "metadata_only"
         } else if supports_start_login && supports_native_refresh {
             "native_login_refresh"
@@ -1119,7 +1134,9 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
         } else {
             "manual_api_key_available"
         },
-        blocking_reason: if deprecated_for_inference {
+        blocking_reason: if provider_type.is_retired() {
+            Some("gemini_cli is retired; login to agy_oauth and bind a new Provider explicitly")
+        } else if deprecated_for_inference {
             Some(
                 "static credentials are Provider-owned; this Account record is metadata/quota compatibility only",
             )
@@ -1146,8 +1163,12 @@ fn manual_capability(provider_type: ProviderType) -> AccountManagerCapability {
         inference_binding_supported,
         credential_ownership,
         deprecated_for_inference,
-        migration_target: deprecated_for_inference.then_some("provider"),
-        supports_import: true,
+        migration_target: if provider_type.is_retired() {
+            Some("agy_oauth")
+        } else {
+            deprecated_for_inference.then_some("provider")
+        },
+        supports_import: !provider_type.is_retired(),
         supports_delete: true,
         server_native_stage: oauth_spec.map(|spec| spec.stage),
         profile_strategy: oauth_spec.map(|spec| spec.profile_strategy),
@@ -1163,7 +1184,6 @@ pub(crate) fn account_credential_ownership(
         ProviderType::ClaudeOAuth
         | ProviderType::CodexOAuth
         | ProviderType::GrokOAuth
-        | ProviderType::GeminiCli
         | ProviderType::GitHubCopilot
         | ProviderType::DeepSeekAccount
         | ProviderType::KiroOAuth
@@ -1178,11 +1198,13 @@ pub(crate) fn account_credential_ownership(
         | ProviderType::CursorOAuth
         | ProviderType::AntigravityOAuth
         | ProviderType::AgyOAuth => AccountCredentialOwnership::ManagedAccount,
-        ProviderType::CursorApiKey
+        ProviderType::GeminiCli
+        | ProviderType::CursorApiKey
         | ProviderType::OllamaCloud
         | ProviderType::AwsBedrock
         | ProviderType::Nvidia
-        | ProviderType::DeepSeekApi => AccountCredentialOwnership::MetadataOnly,
+        | ProviderType::DeepSeekApi
+        | ProviderType::OpenCodeZen => AccountCredentialOwnership::MetadataOnly,
         ProviderType::Claude
         | ProviderType::ClaudeAuth
         | ProviderType::Codex
@@ -1791,9 +1813,9 @@ mod tests {
             ),
             (
                 ProviderType::GeminiCli,
-                OAuthRefreshCapability::OAuthRequest,
-                OAuthQuotaCapability::LiveRefresh,
-                true,
+                OAuthRefreshCapability::Unavailable,
+                OAuthQuotaCapability::CachedOnly,
+                false,
             ),
             (
                 ProviderType::GitHubCopilot,
@@ -1948,7 +1970,11 @@ mod tests {
             assert_eq!(capability.deprecated_for_inference, !binding_supported);
             assert_eq!(
                 capability.migration_target,
-                (!binding_supported).then_some("provider")
+                if provider_type.is_retired() {
+                    Some("agy_oauth")
+                } else {
+                    (!binding_supported).then_some("provider")
+                }
             );
         }
 
@@ -1981,14 +2007,14 @@ mod tests {
                 .iter()
                 .filter(|item| item.kind == AccountManagerKind::NativeOAuth)
                 .count(),
-            17
+            16
         );
         assert_eq!(
             registrations
                 .iter()
                 .filter(|item| item.kind == AccountManagerKind::ImportOnly)
                 .count(),
-            1
+            2
         );
         assert_eq!(
             registrations
@@ -2006,7 +2032,16 @@ mod tests {
     #[test]
     fn account_import_templates_cover_all_manual_account_types() {
         let templates = account_import_templates();
-        assert_eq!(templates.len(), all_capabilities().len());
+        assert_eq!(
+            templates.len(),
+            all_capabilities()
+                .iter()
+                .filter(|item| item.supports_import)
+                .count()
+        );
+        assert!(!templates
+            .iter()
+            .any(|item| item.provider_type == ProviderType::GeminiCli));
 
         let codex = templates
             .iter()

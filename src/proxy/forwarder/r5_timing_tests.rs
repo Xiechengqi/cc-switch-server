@@ -287,10 +287,10 @@ async fn r5_timing_static_provider_types_observe_all_four_protocols_in_real_forw
 }
 
 #[tokio::test]
-async fn r5_timing_kimi_and_gemini_cli_cover_all_declared_app_surfaces() {
+async fn r5_timing_kimi_and_agy_cover_all_declared_app_surfaces() {
     let (endpoint, calls, server) = r5_timing_protocol_fixture().await;
     let mut expected = 0;
-    for kind in [ProviderType::KimiCode, ProviderType::GeminiCli] {
+    for kind in [ProviderType::KimiCode, ProviderType::AgyOAuth] {
         let state = forwarder_test_state(&format!("r5-timing-{}", kind.as_str()));
         let id = if kind == ProviderType::KimiCode {
             install_kimi_replay_test_provider(&state, "r5-timing-kimi", endpoint.clone())
@@ -325,7 +325,7 @@ async fn r5_timing_kimi_and_gemini_cli_cover_all_declared_app_surfaces() {
                         if kind == ProviderType::KimiCode {
                             "kimi_code"
                         } else {
-                            "google_oauth"
+                            "antigravity_cli"
                         }
                     ))
                     .unwrap(),
@@ -633,7 +633,7 @@ fn r5_resource_runtime_capacity_is_503_and_never_authentication_recovery() {
 }
 
 #[tokio::test]
-async fn r5_timing_gemini_cli_native_count_tokens_is_semantic_without_discovery() {
+async fn r5_timing_agy_native_count_tokens_is_semantic_without_discovery() {
     let (address, _, loads, server) = spawn_gemini_count_tokens_upstream(0, false).await;
     let state = forwarder_test_state("r5-timing-gemini-cli-count");
     let (id, _) = install_gemini_v1internal_test_provider(
@@ -655,7 +655,7 @@ async fn r5_timing_gemini_cli_native_count_tokens_is_semantic_without_discovery(
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     drop(collect_response_body(response).await);
-    r5_timing_assert_delivery(&timing, "gemini_cli", "complete").await;
+    r5_timing_assert_delivery(&timing, "agy_oauth", "complete").await;
     assert_eq!(loads.load(Ordering::SeqCst), 0);
     server.abort();
 }

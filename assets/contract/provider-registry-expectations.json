@@ -2,14 +2,14 @@
   "format": "cc-switch-provider-registry-expectations",
   "schemaVersion": 1,
   "counts": {
-    "families": 39,
-    "profiles": 91,
+    "families": 40,
+    "profiles": 93,
     "legacyPresetMappings": 31,
-    "drivers": 28
+    "drivers": 29
   },
   "firstClassProfiles": {
-    "claude": 38,
-    "codex": 31,
+    "claude": 39,
+    "codex": 32,
     "gemini": 16
   },
   "requiredProfileIds": [
@@ -33,7 +33,9 @@
     "gemini.trae_raw_chat",
     "claude.trae_raw_chat_intl",
     "codex.trae_raw_chat_intl",
-    "gemini.trae_raw_chat_intl"
+    "gemini.trae_raw_chat_intl",
+    "claude.opencode_zen",
+    "codex.opencode_zen"
   ],
   "requiredDriverIds": [
     "special.amazon_q",
@@ -43,7 +45,8 @@
     "special.workbuddy_oauth",
     "special.trae_solo",
     "special.trae_raw_chat",
-    "special.trae_raw_chat_intl"
+    "special.trae_raw_chat_intl",
+    "special.opencode_zen"
   ],
   "requiredFamilyIds": [
     "family.amazon_q_oauth",
@@ -51,6 +54,7 @@
     "family.workbuddy_oauth",
     "family.trae_solo",
     "family.trae_raw_chat",
-    "family.trae_raw_chat_intl"
+    "family.trae_raw_chat_intl",
+    "family.opencode_zen"
   ]
 }

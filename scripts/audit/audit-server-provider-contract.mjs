@@ -189,6 +189,12 @@ export function validateServerProviderContracts(
   assertUnique(providerTypes, "variant", "Server Provider requirements");
   assertUnique(providerTypes, "id", "Server Provider requirements");
   for (const entry of providerTypes) {
+    if (entry.coverageClass === "legacy_reader") {
+      if (entry.id !== "gemini_cli" || !Array.isArray(entry.apps) || entry.apps.length !== 0) {
+        throw new Error(`invalid retired Provider reader: ${entry.id}`);
+      }
+      continue;
+    }
     if (
       !["core", "server_extension"].includes(entry.coverageClass) ||
       !Array.isArray(entry.apps) ||

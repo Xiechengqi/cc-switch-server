@@ -1013,7 +1013,18 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
         .collect::<BTreeSet<_>>();
     let mut family_ids = BTreeSet::new();
     let mut family_profile_ids = BTreeSet::new();
+    let mut all_family_profile_ids = BTreeSet::new();
     for family in &registry.families {
+        let reader_only = family.surfaces.iter().all(|surface| {
+            registry.profiles.iter().any(|profile| {
+                profile.profile_id == surface.profile_id
+                    && profile.visibility == ProfileVisibility::Hidden
+                    && profile.creation_policy == CreationPolicy::ExistingOnly
+                    && profile
+                        .compatibility_provider_type
+                        .is_some_and(ProviderType::is_retired)
+            })
+        });
         validate_registry_id(&family.family_id, "family")?;
         if !family_ids.insert(family.family_id.as_str()) {
             bail!("duplicate Provider family id {}", family.family_id);
@@ -1075,8 +1086,9 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
                     surface.app.as_str()
                 );
             }
-            if profile.visibility != ProfileVisibility::Visible
-                || profile.creation_policy != CreationPolicy::CreateAllowed
+            if !reader_only
+                && (profile.visibility != ProfileVisibility::Visible
+                    || profile.creation_policy != CreationPolicy::CreateAllowed)
             {
                 bail!(
                     "Provider family {} references non-creatable profile {}",
@@ -1093,11 +1105,14 @@ pub fn validate_registry(registry: &ProviderRegistry) -> anyhow::Result<()> {
                     family.family_id
                 );
             }
-            if !family_profile_ids.insert(surface.profile_id.as_str()) {
+            if !all_family_profile_ids.insert(surface.profile_id.as_str()) {
                 bail!(
                     "Provider profile {} belongs to more than one family",
                     surface.profile_id
                 );
+            }
+            if !reader_only {
+                family_profile_ids.insert(surface.profile_id.as_str());
             }
         }
     }
@@ -1408,7 +1423,10 @@ fn validate_profile_contract(
                     );
                 }
                 CredentialPolicy::StaticSecret { slots, auth_scheme } => {
-                    if slots.is_empty() {
+                    // A keyless lane is an explicit contract: auth scheme none
+                    // and an empty slot list. Any other empty list is a missing
+                    // secret, which the form would then fail to collect.
+                    if slots.is_empty() && *auth_scheme != AuthScheme::None {
                         bail!(
                             "static profile {} declares no secret slots",
                             profile.profile_id
@@ -1569,7 +1587,7 @@ fn validate_operation_contract(driver: &DriverSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
-const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 54] = [
+const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 56] = [
     "claude.anthropic_api_key",
     "claude.google_oauth",
     "claude.kimi_code",
@@ -1624,6 +1642,8 @@ const REVIEWED_FIRST_CLASS_PROFILE_ADDITIONS: [&str; 54] = [
     "codex.grok_web_session",
     "claude.perplexity_web_session",
     "codex.perplexity_web_session",
+    "claude.opencode_zen",
+    "codex.opencode_zen",
 ];
 
 #[cfg(test)]
@@ -1660,8 +1680,8 @@ mod tests {
         let registry = provider_registry();
         validate_registry(registry).unwrap();
 
-        assert_eq!(registry.families.len(), 39);
-        assert_eq!(registry.profiles.len(), 91);
+        assert_eq!(registry.families.len(), 40);
+        assert_eq!(registry.profiles.len(), 93);
         assert_eq!(registry.legacy_preset_mappings.len(), 31);
         assert_eq!(registry.custom_recipes.len(), 1);
         assert_eq!(
@@ -1811,8 +1831,6 @@ mod tests {
             (ProviderType::CodexOAuth, AppKind::Claude),
             (ProviderType::CodexOAuth, AppKind::Codex),
             (ProviderType::Gemini, AppKind::Gemini),
-            (ProviderType::GeminiCli, AppKind::Claude),
-            (ProviderType::GeminiCli, AppKind::Gemini),
             (ProviderType::OpenRouter, AppKind::Claude),
             (ProviderType::OpenRouter, AppKind::Codex),
             (ProviderType::OpenRouter, AppKind::Gemini),
@@ -1854,6 +1872,8 @@ mod tests {
             (ProviderType::WorkBuddyOAuth, AppKind::Claude),
             (ProviderType::WorkBuddyOAuth, AppKind::Codex),
             (ProviderType::WorkBuddyOAuth, AppKind::Gemini),
+            (ProviderType::OpenCodeZen, AppKind::Claude),
+            (ProviderType::OpenCodeZen, AppKind::Codex),
             (ProviderType::TraeSolo, AppKind::Claude),
             (ProviderType::TraeSolo, AppKind::Codex),
             (ProviderType::TraeSolo, AppKind::Gemini),
@@ -1937,6 +1957,14 @@ mod tests {
             if profile.form_composition == FormComposition::Legacy {
                 assert!(profile.allowed_model_policies.is_empty());
                 assert!(profile.default_upstream_model.is_none());
+                continue;
+            }
+            if profile
+                .compatibility_provider_type
+                .is_some_and(ProviderType::is_retired)
+            {
+                assert_eq!(profile.visibility, ProfileVisibility::Hidden);
+                assert_eq!(profile.creation_policy, CreationPolicy::ExistingOnly);
                 continue;
             }
             match profile.model_policy {

@@ -85,6 +85,8 @@ pub struct GeminiV1InternalSseAggregator {
     candidates: BTreeMap<i64, GeminiV1InternalCandidate>,
     retained_bytes: usize,
     timing: Option<super::request_timing::ForwardTiming>,
+    terminal: super::gemini_semantics::GeminiTerminal,
+    tos_violation: bool,
 }
 
 #[derive(Debug)]
@@ -172,6 +174,69 @@ struct JsonStreamEventDecoder {
     event_data: Vec<u8>,
     json_data: Vec<u8>,
     max_event_bytes: usize,
+}
+
+/// Admission-only decoder. The original bytes are replayed once to the normal
+/// usage/transform path after real output (or an explicit refusal) is observed.
+pub(super) struct GeminiPreludeInspector {
+    decoder: JsonStreamEventDecoder,
+    terminal: super::gemini_semantics::GeminiTerminal,
+    tos_violation: bool,
+}
+
+impl GeminiPreludeInspector {
+    pub(super) fn new() -> Self {
+        Self {
+            decoder: JsonStreamEventDecoder::new(1024 * 1024),
+            terminal: Default::default(),
+            tos_violation: false,
+        }
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.decoder
+            .retained_bytes()
+            .saturating_add(self.terminal.retained_bytes())
+    }
+
+    pub(super) fn ready(&self) -> bool {
+        self.terminal.ready()
+    }
+    pub(super) fn tos_violation(&self) -> bool {
+        self.tos_violation
+    }
+
+    fn observe(&mut self, events: Vec<JsonStreamEvent>) -> Result<(), ProxyError> {
+        for event in events {
+            self.tos_violation |=
+                crate::domain::accounts::antigravity_access::is_tos_violation(&event.value);
+            if let Some(error) = super::adapters::google_embedded_error(&event.value) {
+                return Err(error);
+            }
+            self.terminal
+                .observe(&super::adapters::unwrap_gemini_v1internal_value(
+                    event.value,
+                ))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn push(&mut self, chunk: &[u8]) -> Result<(), ProxyError> {
+        let events = self
+            .decoder
+            .push(chunk)
+            .map_err(|_| ProxyError::bad_gateway("invalid Gemini semantic prelude"))?;
+        self.observe(events)
+    }
+
+    pub(super) fn finish(&mut self) -> Result<(), ProxyError> {
+        let events = self
+            .decoder
+            .finish()
+            .map_err(|_| ProxyError::bad_gateway("invalid Gemini semantic prelude"))?;
+        self.observe(events)?;
+        self.terminal.validate()
+    }
 }
 
 impl JsonStreamEventDecoder {
@@ -837,6 +902,9 @@ impl ResponsesSseAggregator {
 }
 
 impl GeminiV1InternalSseAggregator {
+    pub(super) fn tos_violation(&self) -> bool {
+        self.tos_violation
+    }
     pub fn new() -> Self {
         Self {
             decoder: JsonStreamEventDecoder::new(DEFAULT_MAX_STREAM_EVENT_BYTES),
@@ -844,6 +912,8 @@ impl GeminiV1InternalSseAggregator {
             candidates: BTreeMap::new(),
             retained_bytes: 0,
             timing: None,
+            terminal: Default::default(),
+            tos_violation: false,
         }
     }
 
@@ -858,12 +928,13 @@ impl GeminiV1InternalSseAggregator {
         self.merge_events(events)
     }
 
-    pub fn finish(mut self) -> Result<Value, ProxyError> {
+    pub fn finish(&mut self) -> Result<Value, ProxyError> {
         let events = self.decoder.finish().map_err(|error| {
             ProxyError::bad_gateway(format!("Gemini v1internal stream decode failed: {error}"))
         })?;
         self.merge_events(events)?;
-        let mut response = self.last_response.ok_or_else(|| {
+        self.terminal.validate()?;
+        let mut response = self.last_response.take().ok_or_else(|| {
             ProxyError::bad_gateway("Gemini v1internal stream contained no JSON response")
         })?;
         if self.candidates.is_empty() {
@@ -885,8 +956,7 @@ impl GeminiV1InternalSseAggregator {
                 "Gemini v1internal response must be a JSON object",
             ));
         };
-        let candidates = self
-            .candidates
+        let candidates = std::mem::take(&mut self.candidates)
             .into_values()
             .map(|mut candidate| {
                 let candidate_object = candidate.latest.as_object_mut().ok_or_else(|| {
@@ -925,10 +995,13 @@ impl GeminiV1InternalSseAggregator {
 
     fn merge_events(&mut self, events: Vec<JsonStreamEvent>) -> Result<(), ProxyError> {
         for event in events {
+            self.tos_violation |=
+                crate::domain::accounts::antigravity_access::is_tos_violation(&event.value);
             if let Some(error) = super::adapters::google_embedded_error(&event.value) {
                 return Err(error);
             }
             let response = super::adapters::unwrap_gemini_v1internal_value(event.value);
+            self.terminal.observe(&response)?;
             let response_object = response.as_object().ok_or_else(|| {
                 ProxyError::bad_gateway("Gemini v1internal response must be a JSON object")
             })?;

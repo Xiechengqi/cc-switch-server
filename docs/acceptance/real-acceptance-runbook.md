@@ -305,13 +305,13 @@ CC_SWITCH_CODEX_REAL_OPERATION=ws_prewarm node scripts/smoke/codex-real-receipt.
 23. 对同一账号建立两个 Share 和两个模型。普通 model-capacity/未知 Codex 429 只让当前 `(Share,runtime,model)` 冷却五分钟，另一个 Share/模型仍可用；`usage_limit_reached` 或明确耗尽 window 只冷却固定账号，不切换账号、Provider 或模型。随后开启 previous-response cache：HTTP JSON 聚合、任意 chunk 切分 SSE、text/binary WS 和 WS→HTTP fallback 的 completed 均可续接 function/custom/shell/MCP call/output；message、reasoning/encrypted content、image/web-search 不得进入缓存，server item id 必须删除，重复 `(type,call_id)` 不注入。更换 Share、签名用户、runtime、workspace、账号代际或 response id 均 miss；缺 principal、TTL 到期、failed/incomplete/error、超 8 MiB、超 200 items 均不写入。普通 continuation miss 保持既有上游清洗行为；只有 `previous_response_id` 加当前未配对 tool output 的必需上下文 miss 返回精确 409，body 必须含 `type=invalid_request_error`、`code=response_context_unavailable`、`param=previous_response_id`，当前已有完整 call/output pairing 时不得误报。
 24. 上述 Share 策略保存、Bundle Share 保存和 Router descriptor 同步均检查 camelCase/snake_case 兼容、默认值、10..10080 reset lead 校验、revision/fingerprint 变化和重启持久化。账号中心 active account 改变不得影响 Referral 的 Provider 身份或任一 Share 的 credits/reset/cooldown/cache namespace。
 
-Gemini Code Assist 单账号专项补充：
+Gemini CLI 退役专项补充：
 
-1. 为 `gemini.google_oauth` 或 `claude.google_oauth` Provider 显式绑定一个 `gemini_cli` Account，另建一个未绑定账号作为负向候选。调用 `POST /api/providers/:id/fetch-models`，抓包确认只有绑定账号的 Bearer、Gemini CLI identity、`loadCodeAssist` 与 `retrieveUserQuota` 被使用，负向账号请求数为零。
-2. `retrieveUserQuota.buckets` 同时返回重复 Gemini id、`models/` 前缀、0% remaining、非 Gemini model 和非法 id。目录应去重、去前缀、保留 0% 元数据并排除非 Gemini/非法 id；响应必须包含 `source=authenticated_retrieve_user_quota`、`stale=false` 和 `fetchedAtMs`。
-3. 成功的空 buckets 是当前绑定的权威空目录，不得合入静态或其他账号模型。模拟 408、429、可重试 5xx 时，只可返回相同 `authIdentityGeneration` 的旧目录并标记 `source=same_account_cached_retrieve_user_quota`、`stale=true`。
-4. 模拟 401/403、删除/换绑、Account generation 变化、credential persistence degraded 和旧代际缓存。以上情况即使存在旧目录也必须失败关闭，且第二账号、静态目录和 models upstream 请求数均为零。首个 401 只有存在 refresh token 时可刷新并重放同账号一次；第二个 401 终止。
-5. 用目录返回的一个低成本模型完成 Gemini non-stream、stream、tool、image 和 quota；保存脱敏 receipt 的 model id、project/tier 摘要、source/stale/fetchedAt、终态与 usage，不保存 project id、raw quota body 或 token。未完成本项时保持 `live_pending`。
+1. 启动包含旧 `gemini_cli` Account/Provider 的历史存储，确认仍可读取、展示退役原因和删除；不能新建、登录导入、刷新、模型发现或推理，后台与手动调用均不得向上游发送请求。
+2. 旧凭据、Provider 和 Share 不自动迁移。明确建立新的 `agy_oauth` 登录及 Provider 绑定；普通 Gemini API Key 保持可用。
+3. Agy 使用独立 PKCE/scopes、CLI 身份及 daily `retrieveUserQuotaSummary`，Hub 保持原 client 和 `retrieveUserQuota`。Summary 的 5h/weekly 窗口不充当模型目录。旧 GM-01 证据只作历史，不再要求旧 Gemini CLI 真实凭据。
+4. 生成 API 优先验收 Gemini native（含工具、思考、图片、grounding、流/非流和 countTokens）；已有 Claude 兼容仍需回归。usage/空签名/空 STOP、异常 finishReason 不得伪装成功；输出后失败不重放或续写。
+5. 精确结构化 TOS 分别测试 HTTP、SSE prelude、midstream 和 EOF tail；只阻断对应账号及 inference/count_tokens 服务，不置 needsRelogin、不泄露 appeal metadata。管理员用当前 authIdentityGeneration 显式 reset 后可再试，旧请求晚到不能重新封禁；普通刷新和重启不自动解除。真实结果仍须逐 rail 的脱敏回执，缺输入保持 live_pending。
 
 Antigravity / Agy 单账号模型目录专项补充：
 

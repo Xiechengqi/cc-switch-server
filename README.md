@@ -58,13 +58,13 @@ Claude / Codex / Gemini client
 
 ## Code Agent 反代支持
 
-`cc-switch-server` 聚焦 **Claude Code / Codex CLI / Gemini CLI** 三类官方 CLI 客户端入口。下表路径全部相对于同一个 Router Share URL。
+`cc-switch-server` 聚焦 **Claude Code / Codex CLI / Gemini 格式 API（Agy CLI 方向）** 三类客户端入口。下表路径全部相对于同一个 Router Share URL。
 
 | Code Agent | 反代入口 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | **Claude Code** | `POST /v1/messages` | ✅ Native | Anthropic Messages 原生转发；支持 Claude/Codex/Gemini/OpenRouter 等跨协议 adapter |
 | **Codex CLI** | `POST /v1/responses`、`GET /v1/responses` (WebSocket)、`POST /v1/chat/completions`、`POST /v1/images/generations`、`POST /v1/images/edits` | ✅ Native | Responses/Chat 互转；Device + CLI OAuth；Images/Responses Cloudflare 心跳与持久化 capability URL；有界 WS cache 与提交前 HTTP/SSE fallback |
-| **Gemini CLI** | `POST /v1beta/*` | ✅ Native | Gemini Generative API 透传；`GET /v1beta/models` 等列表端点已覆盖 |
+| **Gemini 格式 API** | `POST /v1beta/*` | ✅ Native | Gemini Generative API 与 `GET /v1beta/models`；Agy CLI 客户端的真实接受性仍待独立验收 |
 | **OpenAI-compatible** | `GET /v1/models`、`GET /models` | ✅ Native | 模型列表与 OpenAI-compatible 探测 |
 | **Antigravity IDE** | 经 provider 预设映射到 Claude/Gemini 接口 | 🧪 Experimental | OAuth、模型、tier/search contract 已接入；无独立 `/antigravity/v1*` 路由组，待真实验收 |
 | **Cursor** | 作为 Claude/Codex/Gemini 上游桥（非 IDE MITM） | 🧪 Experimental | OAuth CLI / API Key SDK 双 rail；固定单凭据、官方 endpoint discovery，待分轨真实验收 |
@@ -84,7 +84,7 @@ Claude / Codex / Gemini client
 | --- | :---: | :---: | :---: | --- |
 | Claude API / Auth / OAuth | ✅ | — | — | Native |
 | Codex / OpenAI OAuth | ✅ | ✅ | — | Native |
-| Gemini / Gemini CLI OAuth | ✅ | ✅ | ✅ | Native |
+| Gemini API Key | ✅ | ✅ | ✅ | Native |
 | OpenRouter / Ollama / Nvidia / DeepSeek API | ✅ | ✅ | ✅ | Native |
 | Antigravity / Agy OAuth | 🧪 | — | 🧪 | Experimental（经预设映射，live-unverified） |
 | Cursor OAuth / API Key | 🧪 | 🧪 | 🧪 | Experimental（CLI/SDK 分轨、官方 endpoint discovery，live-unverified） |
@@ -96,6 +96,8 @@ Claude / Codex / Gemini client
 | Qoder OAuth | 🧪 | 🧪 | 🧪 | Experimental（固定账号与三 Surface contract，live-unverified） |
 
 完整 provider 类型与 preset 覆盖见 [`docs/provider/coverage.md`](docs/provider/coverage.md)；运行时矩阵可通过 `GET /api/provider-matrix` 获取。
+
+旧 `gemini_cli` OAuth 已退役，只保留历史数据读取，不再创建、导入、登录、刷新或推理；使用 Agy 需显式创建 `agy_oauth` 账号并重新绑定，不自动迁移旧凭据。Antigravity/Agy 增强优先 Gemini 原生 API，保留已有 Claude 兼容，不新增 OpenAI 入口，见 [当前合同](docs/provider/antigravity-oauth.md)。
 
 ## 快速开始
 

@@ -226,6 +226,10 @@ pub struct Account {
     pub codex_passive_quota: Option<super::codex_quota::CodexPassiveQuota>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub capability_observations: BTreeMap<String, AccountCapabilityObservation>,
+    /// Explicit service retries fence responses from requests admitted before
+    /// the administrator's reset. This is server-owned, not OAuth validity.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub antigravity_access_generations: BTreeMap<String, u64>,
 }
 
 pub const CLAUDE_FIVE_HOUR_QUOTA_TIER: &str = "five_hour";
@@ -1078,6 +1082,7 @@ impl AccountStore {
             quota_window_observations: BTreeMap::new(),
             codex_passive_quota: None,
             capability_observations: BTreeMap::new(),
+            antigravity_access_generations: BTreeMap::new(),
         };
 
         if let Some(existing) = self.accounts.iter_mut().find(|item| item.id == account.id) {
@@ -1133,6 +1138,8 @@ impl AccountStore {
                 account.quota_window_observations = existing.quota_window_observations.clone();
                 account.codex_passive_quota = existing.codex_passive_quota.clone();
                 account.capability_observations = existing.capability_observations.clone();
+                account.antigravity_access_generations =
+                    existing.antigravity_access_generations.clone();
             }
             if account.provider_type == ProviderType::CodexOAuth {
                 if let Some(profile) = account.profile.as_mut() {

@@ -261,17 +261,22 @@ function audit() {
         `Registry Profile ${profile.profileId} has unknown ProviderType ${profile.compatibilityProviderType}`,
       );
     }
-    if (
+    if (profile.visibility === "visible" && profile.creationPolicy === "create_allowed" && (
       !providerTypesByApp[profile.app]?.includes(
         profile.compatibilityProviderType,
       )
-    ) {
+    )) {
       errors.push(
         `Registry Profile ${profile.profileId} is outside the ${profile.app} UI Provider matrix`,
       );
     }
   }
   for (const family of families) {
+    const readerOnly = family.surfaces.length > 0 && family.surfaces.every((surface) => {
+      const profile = profileById.get(surface.profileId);
+      return profile?.visibility === "hidden" && profile.creationPolicy === "existing_only"
+        && profile.compatibilityProviderType === "gemini_cli";
+    });
     const surfaceProfileIds = new Set(
       family.surfaces.map((surface) => surface.profileId),
     );
@@ -300,10 +305,10 @@ function audit() {
           `Registry family ${family.familyId} surface ${surface.app} uses ${profile.app} Profile ${surface.profileId}`,
         );
       }
-      if (
+      if (!readerOnly && (
         profile.visibility !== "visible" ||
         profile.creationPolicy !== "create_allowed"
-      ) {
+      )) {
         errors.push(
           `Registry family ${family.familyId} exposes non-creatable Profile ${surface.profileId}`,
         );
@@ -391,7 +396,7 @@ function audit() {
   for (const snippet of [
     "ProviderType::CodexOAuth => Some(OAuthProviderSpec {\n            provider_type,\n            stage: OAuthSupportStage::NativeRefreshProfile",
     "ProviderType::ClaudeOAuth => Some(OAuthProviderSpec {\n            provider_type,\n            stage: OAuthSupportStage::NativeRefreshProfile",
-    "ProviderType::GeminiCli => Some(OAuthProviderSpec {\n            provider_type,\n            stage: OAuthSupportStage::NativeRefreshProfile",
+    "ProviderType::GeminiCli => Some(OAuthProviderSpec {\n            provider_type,\n            stage: OAuthSupportStage::ManualImportOnly",
     "ProviderType::CursorOAuth => Some(OAuthProviderSpec {\n            provider_type,\n            stage: OAuthSupportStage::NativeRefreshProfile",
     "ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => Some(OAuthProviderSpec {\n            provider_type,\n            stage: OAuthSupportStage::NativeRefreshProfile",
   ]) {

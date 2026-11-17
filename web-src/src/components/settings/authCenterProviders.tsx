@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import type { TFunction } from "i18next";
 import { Github, Sparkles } from "lucide-react";
-import { ClaudeIcon, CodexIcon, DeepSeekIcon, GeminiIcon } from "@/components/BrandIcons";
+import { ClaudeIcon, CodexIcon, DeepSeekIcon } from "@/components/BrandIcons";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import { AntigravityOAuthSection } from "@/components/providers/forms/AntigravityOAuthSection";
 import { AmazonQOAuthSection } from "@/components/providers/forms/AmazonQOAuthSection";
@@ -11,7 +11,6 @@ import { CodexOAuthSection } from "@/components/providers/forms/CodexOAuthSectio
 import { CopilotAuthSection } from "@/components/providers/forms/CopilotAuthSection";
 import { CursorOAuthSection } from "@/components/providers/forms/CursorOAuthSection";
 import { DeepSeekAccountSection } from "@/components/providers/forms/DeepSeekAccountSection";
-import { GeminiOAuthSection } from "@/components/providers/forms/GeminiOAuthSection";
 import { GrokOAuthSection } from "@/components/providers/forms/GrokOAuthSection";
 import { KiroOAuthSection } from "@/components/providers/forms/KiroOAuthSection";
 import { KimiOAuthSection } from "@/components/providers/forms/KimiOAuthSection";
@@ -163,14 +162,6 @@ export function getAuthCenterProviders(
       title: "Cursor OAuth",
       description: t("settings.authCenter.cursorOauthDescription"),
       content: <CursorOAuthSection showLoggedInAccounts />,
-    },
-    {
-      providerType: "gemini_cli",
-      value: "gemini",
-      icon: <GeminiIcon size={20} />,
-      title: "Google Gemini",
-      description: t("settings.authCenter.geminiOauthDescription"),
-      content: <GeminiOAuthSection showLoggedInAccounts />,
     },
     {
       providerType: "antigravity_oauth",

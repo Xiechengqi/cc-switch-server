@@ -597,6 +597,7 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/api/accounts/:id/refresh", post(refresh_account))
         .route("/api/accounts/:id/refresh-plan", get(account_refresh_plan))
         .route("/api/accounts/:id/quota", get(account_quota))
+        .route("/api/accounts/:id/antigravity/access/reset", post(reset_antigravity_service))
         .route(
             "/api/accounts/:id/checkin",
             get(account_checkin)
@@ -1690,6 +1691,38 @@ async fn proxy_models_for_selection(
     } else {
         None
     };
+    let opencode_zen_provider =
+        resolve_opencode_zen_catalog_provider(&providers, app, provider_id).cloned();
+    let opencode_zen_catalog = if opencode_zen_provider.is_some() {
+        let client = state.http_client().await;
+        Some(
+            crate::proxy::opencode_zen::refresh_catalog(&client)
+                .await
+                .map_err(|message| ApiError::new(StatusCode::BAD_GATEWAY, message))?,
+        )
+    } else {
+        None
+    };
+    if let (Some(provider), Some(catalog)) = (
+        opencode_zen_provider.as_ref(),
+        opencode_zen_catalog.as_ref(),
+    ) {
+        data.clear();
+        let owned_by = model_owner(provider);
+        for id in catalog {
+            data.push(OpenAiModel {
+                id: id.clone(),
+                object: "model",
+                owned_by: owned_by.clone(),
+                reasoning_efforts: None,
+                input_modalities: Some(vec!["text".to_string()]),
+                context_window: None,
+                supports_tools: Some(true),
+                max_output_tokens: None,
+            });
+        }
+        data.sort_by(|left, right| left.id.cmp(&right.id));
+    }
     if let (Some(provider), Some(catalog)) = (grok_provider.as_ref(), grok_catalog.as_ref()) {
         // A successful bound-account response is authoritative, including an empty catalog.
         data.clear();
@@ -1716,9 +1749,14 @@ async fn proxy_models_for_selection(
         catalog_entries: qoder_catalog
             .as_ref()
             .map(|catalog| catalog.entries.clone()),
-        source: grok_catalog
+        source: opencode_zen_catalog
             .as_ref()
-            .map(|catalog| catalog.source.to_string())
+            .map(|_| "opencode_zen_live_model_catalog".to_string())
+            .or_else(|| {
+                grok_catalog
+                    .as_ref()
+                    .map(|catalog| catalog.source.to_string())
+            })
             .or_else(|| trae_catalog.as_ref().map(|catalog| catalog.source.clone()))
             .or_else(|| {
                 qoder_catalog
@@ -1750,9 +1788,10 @@ async fn proxy_models_for_selection(
                     .as_ref()
                     .map(|_| "cursor_public_api".to_string())
             }),
-        stale: grok_catalog
+        stale: opencode_zen_catalog
             .as_ref()
-            .map(|catalog| catalog.stale)
+            .map(|_| false)
+            .or_else(|| grok_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| trae_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| qoder_catalog.as_ref().map(|_| false))
             .or_else(|| kimi_catalog.as_ref().map(|catalog| catalog.stale))
@@ -1760,8 +1799,10 @@ async fn proxy_models_for_selection(
             .or_else(|| amazon_q_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| claude_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| cursor_catalog.as_ref().map(|catalog| catalog.stale)),
-        fetched_at_ms: grok_catalog
-            .and_then(|catalog| catalog.fetched_at_ms)
+        fetched_at_ms: opencode_zen_catalog
+            .as_ref()
+            .and_then(|_| crate::proxy::opencode_zen::catalog_fetched_at_ms())
+            .or_else(|| grok_catalog.and_then(|catalog| catalog.fetched_at_ms))
             .or_else(|| trae_catalog.as_ref().map(|catalog| catalog.fetched_at_ms))
             .or_else(|| qoder_catalog.as_ref().map(|catalog| catalog.fetched_at_ms))
             .or_else(|| {
@@ -2650,6 +2691,21 @@ fn resolve_qoder_catalog_provider<'a>(
     let provider_id = provider_id.map(str::trim).filter(|id| !id.is_empty())?;
     let mut matches = providers.providers.iter().filter(|provider| {
         provider.provider_type == ProviderType::QoderCosy
+            && provider.provider.id == provider_id
+            && app.is_none_or(|app| provider.app == app)
+    });
+    let provider = matches.next()?;
+    matches.next().is_none().then_some(provider)
+}
+
+fn resolve_opencode_zen_catalog_provider<'a>(
+    providers: &'a crate::domain::providers::store::ProviderStore,
+    app: Option<AppKind>,
+    provider_id: Option<&str>,
+) -> Option<&'a StoredProvider> {
+    let provider_id = provider_id.map(str::trim).filter(|id| !id.is_empty())?;
+    let mut matches = providers.providers.iter().filter(|provider| {
+        provider.provider_type == ProviderType::OpenCodeZen
             && provider.provider.id == provider_id
             && app.is_none_or(|app| provider.app == app)
     });

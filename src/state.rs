@@ -168,6 +168,8 @@ use crate::logging::{
 use crate::proxy::cursor::session::CursorSessionManager;
 
 mod account_checkin;
+mod antigravity_access;
+pub(crate) use antigravity_access::AntigravityServiceFence;
 mod account_reset;
 pub use account_checkin::spawn_account_checkin;
 pub(crate) use account_checkin::CheckinControlError;
@@ -1683,13 +1685,6 @@ pub(crate) struct BoundAccountQuotaRefreshFailure {
     pub status_code: u16,
     pub retryable: bool,
     message: String,
-}
-
-impl BoundAccountQuotaRefreshFailure {
-    pub(crate) fn allows_same_generation_stale_catalog(&self) -> bool {
-        self.retryable
-            && (self.status_code == 408 || self.status_code == 429 || self.status_code >= 500)
-    }
 }
 
 #[derive(Debug)]
@@ -4616,6 +4611,10 @@ fn validate_and_resolve_provider_binding(
     existing: Option<&StoredProvider>,
     accounts: &AccountStore,
 ) -> Result<(), ProviderCommandError> {
+    candidate
+        .provider_type
+        .ensure_active()
+        .map_err(|error| ProviderCommandError::Invalid(error.to_string()))?;
     let Some(profile_id) = candidate
         .resource
         .profile_id
@@ -6547,6 +6546,7 @@ impl ServerStateInner {
         auth_identity_generation: u64,
         force: bool,
     ) -> anyhow::Result<Account> {
+        provider_type.ensure_active()?;
         if self.credential_persistence_degraded() {
             anyhow::bail!("managed account credentials are waiting for durable persistence");
         }
@@ -6727,7 +6727,7 @@ impl ServerStateInner {
         ) {
             anyhow::bail!("model catalog observations require Antigravity or Agy");
         }
-        if !catalog.client_identity.is_current() {
+        if !catalog.client_identity.is_current_for(provider_type) {
             return Ok(false);
         }
         let account_id = snapshot.id.as_str();
@@ -6743,7 +6743,7 @@ impl ServerStateInner {
             let current = accounts.find_for_provider(provider_type, Some(account_id));
             return Ok(
                 accounts.account_incarnation(account_id) == Some(account_incarnation)
-                    && catalog.client_identity.is_current()
+                    && catalog.client_identity.is_current_for(provider_type)
                     && current.is_some_and(|current| {
                         current.auth_identity_generation == auth_identity_generation
                             && current.token_refresh_generation == token_refresh_generation
@@ -6855,7 +6855,7 @@ impl ServerStateInner {
             return Ok(false);
         }
         let applied = self.try_mutate_accounts_immediate(move |accounts| {
-            if !client_identity.is_current() {
+            if !client_identity.is_current_for(provider_type) {
                 return Err("bound Antigravity client identity changed");
             }
             if accounts.account_incarnation(&account_id) != Some(account_incarnation) {
@@ -6886,7 +6886,7 @@ impl ServerStateInner {
         })
         .await?
         .map_err(anyhow::Error::msg);
-        if !catalog.client_identity.is_current() {
+        if !catalog.client_identity.is_current_for(provider_type) {
             return Ok(false);
         }
         if applied.is_ok() {
@@ -6899,7 +6899,7 @@ impl ServerStateInner {
             });
             publications.insert(publication_key, catalog.request_revision);
         }
-        applied.map(|()| catalog.client_identity.is_current())
+        applied.map(|()| catalog.client_identity.is_current_for(provider_type))
     }
 
     pub(crate) async fn refresh_codex_quota_for_account(
@@ -14159,6 +14159,13 @@ impl ServerStateInner {
             provider_type,
             expected_auth_identity_generation,
         )?;
+        provider_type
+            .ensure_active()
+            .map_err(|error| ManagedAccountRefreshError::Refresh {
+                status_code: 400,
+                message: error.to_string(),
+                retry_after_ms: None,
+            })?;
         if !force && !account_needs_native_refresh(&account, now) {
             return Ok(());
         }
@@ -14646,6 +14653,13 @@ impl ServerStateInner {
             provider_type,
             expected_auth_identity_generation,
         )?;
+        provider_type
+            .ensure_active()
+            .map_err(|error| ManagedAccountRefreshError::Refresh {
+                status_code: 400,
+                message: error.to_string(),
+                retry_after_ms: None,
+            })?;
         if gemini_v1internal_project_id(&initial).is_some() {
             return Ok(());
         }
@@ -14972,7 +14986,7 @@ impl ServerStateInner {
     ) {
         if !matches!(
             provider_type,
-            ProviderType::GeminiCli | ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
+            ProviderType::AntigravityOAuth | ProviderType::AgyOAuth
         ) {
             return;
         }
@@ -15749,7 +15763,9 @@ impl ServerStateInner {
         dimension: &'static str,
         observation: CurrentAccountCapabilityObservation,
     ) -> anyhow::Result<bool> {
-        let identity = crate::domain::antigravity_identity::antigravity_client_identity();
+        let identity = crate::domain::antigravity_identity::antigravity_client_identity_for(
+            snapshot.provider_type,
+        );
         self.record_antigravity_capability_observation_for_client_if_current(
             snapshot,
             account_incarnation,
@@ -15768,7 +15784,7 @@ impl ServerStateInner {
         observation: CurrentAccountCapabilityObservation,
         client_identity: &crate::domain::antigravity_identity::AntigravityClientIdentity,
     ) -> anyhow::Result<bool> {
-        if !client_identity.is_current() {
+        if !client_identity.is_current_for(observation.provider_type) {
             return Ok(false);
         }
         let provider_type = observation.provider_type;
@@ -15793,7 +15809,7 @@ impl ServerStateInner {
         let token_refresh_generation = snapshot.token_refresh_generation;
         let client_identity = client_identity.clone();
         self.mutate_accounts_immediate(move |accounts| {
-            if !client_identity.is_current() {
+            if !client_identity.is_current_for(provider_type) {
                 return false;
             }
             let current = accounts.find_for_provider(provider_type, Some(&account_id));
@@ -25032,6 +25048,7 @@ mod tests {
             needs_relogin: false,
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
+            antigravity_access_generations: Default::default(),
             quota_window_observations: Default::default(),
             codex_passive_quota: None,
         }
@@ -31509,6 +31526,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retired_gemini_cli_refuses_even_fresh_tokens_and_existing_projects() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let account = state
+            .mutate_accounts_immediate(|accounts| {
+                accounts.upsert(
+                    serde_json::from_value(json!({
+                        "id":"retired-google-account", "providerType":"gemini_cli",
+                        "accessToken":"legacy-access", "refreshToken":"legacy-refresh",
+                        "expiresAt": i64::MAX / 2, "raw":{"projectId":"existing-project"}
+                    }))
+                    .unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        for result in [
+            state
+                .refresh_managed_account_if_needed_for_generation(
+                    ProviderType::GeminiCli,
+                    &account.id,
+                    account.auth_identity_generation,
+                )
+                .await,
+            state
+                .ensure_gemini_v1internal_project_for_generation(
+                    ProviderType::GeminiCli,
+                    &account.id,
+                    account.auth_identity_generation,
+                )
+                .await,
+        ] {
+            assert!(
+                matches!(result, Err(ManagedAccountRefreshError::Refresh { status_code:400, ref message, .. }) if message.contains("retired"))
+            );
+        }
+        let after = state.find_account_by_id(&account.id).await.unwrap();
+        assert_eq!(after.access_token, account.access_token);
+        assert_eq!(after.refresh_token, account.refresh_token);
+        assert_eq!(after.provider_type, ProviderType::GeminiCli);
+        assert!(!after.needs_relogin);
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn generation_bound_operations_reject_replaced_account_identity() {
         let state = test_state();
         let config_dir = state.config_dir.clone();
@@ -34980,6 +35043,142 @@ mod tests {
             serde_json::to_value(share_request_log_entry(&state, &log).await.unwrap()).unwrap();
         assert_eq!(extended["cacheCreation5mTokens"], 10);
         assert_eq!(extended["cacheCreation1hTokens"], 20);
+    }
+
+    #[tokio::test]
+    async fn antigravity_service_blocks_are_scoped_durable_and_explicitly_reset() {
+        use crate::domain::accounts::antigravity_access::{
+            service_blocked, AntigravityService as Service,
+        };
+        let state = test_state();
+        for rail in [ProviderType::AntigravityOAuth, ProviderType::AgyOAuth] {
+            let account = state.mutate_accounts_immediate(|accounts| accounts.upsert(
+                serde_json::from_value(json!({"id":rail.as_str(),"providerType":rail.as_str(),"accessToken":"bearer","refreshToken":"refresh"})).unwrap()
+            )).await.unwrap();
+            let incarnation = state
+                .accounts_snapshot()
+                .await
+                .account_incarnation(&account.id)
+                .unwrap();
+            let fence = AntigravityServiceFence::capture(
+                &account,
+                incarnation,
+                crate::domain::antigravity_identity::antigravity_client_identity_for(rail),
+            )
+            .unwrap();
+            assert!(state
+                .block_antigravity_service(&fence, Service::Inference)
+                .await
+                .unwrap());
+            let persisted = AccountStore::load_or_default(&state.config_dir).unwrap();
+            let current = persisted
+                .find_for_provider(rail, Some(&account.id))
+                .unwrap();
+            assert!(service_blocked(current, Service::Inference));
+            assert!(!service_blocked(current, Service::CountTokens));
+            assert!(!current.needs_relogin);
+            assert_eq!(current.refresh_token.as_deref(), Some("refresh"));
+            state
+                .mutate_accounts_immediate(|accounts| {
+                    let current = accounts
+                        .accounts
+                        .iter_mut()
+                        .find(|a| a.id == account.id)
+                        .unwrap();
+                    current.token_refresh_generation += 1;
+                    current.access_token = Some("refreshed-bearer".into());
+                })
+                .await
+                .unwrap();
+            let current = state.find_account_by_id(&account.id).await.unwrap();
+            assert!(service_blocked(&current, Service::Inference));
+            assert!(!state
+                .block_antigravity_service(&fence, Service::CountTokens)
+                .await
+                .unwrap());
+            let fresh = AntigravityServiceFence::capture(
+                &current,
+                incarnation,
+                crate::domain::antigravity_identity::antigravity_client_identity_for(rail),
+            )
+            .unwrap();
+            assert!(state
+                .block_antigravity_service(&fresh, Service::CountTokens)
+                .await
+                .unwrap());
+            assert!(state
+                .reset_antigravity_service(
+                    &account.id,
+                    account.auth_identity_generation,
+                    Service::Inference
+                )
+                .await
+                .unwrap());
+            assert!(
+                !state
+                    .block_antigravity_service(&fresh, Service::Inference)
+                    .await
+                    .unwrap(),
+                "late responses cannot undo an explicit retry"
+            );
+            let current = state.find_account_by_id(&account.id).await.unwrap();
+            assert!(!service_blocked(&current, Service::Inference));
+            assert!(service_blocked(&current, Service::CountTokens));
+            assert!(state
+                .reset_antigravity_service(
+                    &account.id,
+                    account.auth_identity_generation + 1,
+                    Service::CountTokens
+                )
+                .await
+                .is_err());
+            assert_eq!(
+                current
+                    .antigravity_access_generations
+                    .get(Service::Inference.dimension()),
+                Some(&1)
+            );
+            let persisted = AccountStore::load_or_default(&state.config_dir).unwrap();
+            assert_eq!(
+                persisted
+                    .find_for_provider(rail, Some(&account.id))
+                    .unwrap()
+                    .antigravity_access_generations,
+                current.antigravity_access_generations
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn antigravity_service_restriction_fences_identity_incarnation_and_client() {
+        use crate::domain::accounts::antigravity_access::AntigravityService as Service;
+        use crate::domain::antigravity_identity::{
+            antigravity_client_identity_for, TestAntigravityIdentity,
+        };
+        let versions = TestAntigravityIdentity::new("2.2.1");
+        versions.scope(async {
+            for mutation in ["bearer", "auth", "refresh", "recreate", "client"] {
+                let state = test_state();
+                let input = || serde_json::from_value(json!({"id":"tos-fence","providerType":"agy_oauth","accessToken":"same-bearer"})).unwrap();
+                let account = state.mutate_accounts_immediate(|accounts| accounts.upsert(input())).await.unwrap();
+                let incarnation = state.accounts_snapshot().await.account_incarnation(&account.id).unwrap();
+                let fence = AntigravityServiceFence::capture(&account, incarnation, antigravity_client_identity_for(account.provider_type)).unwrap();
+                if mutation == "client" { assert!(versions.update("2.3.0")); }
+                else {
+                    state.mutate_accounts_immediate(|accounts| {
+                        if mutation == "recreate" { accounts.delete(&account.id); accounts.upsert(input()); return; }
+                        let current = accounts.accounts.iter_mut().find(|a| a.id == account.id).unwrap();
+                        match mutation {
+                            "bearer" => current.access_token = Some("different-bearer".into()),
+                            "auth" => current.auth_identity_generation += 1,
+                            "refresh" => current.token_refresh_generation += 1,
+                            _ => unreachable!(),
+                        }
+                    }).await.unwrap();
+                }
+                assert!(!state.block_antigravity_service(&fence, Service::Inference).await.unwrap(), "{mutation}");
+            }
+        }).await;
     }
 
     fn test_state() -> ServerState {

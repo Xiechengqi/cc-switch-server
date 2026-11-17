@@ -33,6 +33,10 @@
       "en": "WorkBuddy",
       "zh": "WorkBuddy"
     },
+    "opencode_zen": {
+      "en": "OpenCode Zen",
+      "zh": "OpenCode Zen"
+    },
     "trae": {
       "en": "Trae",
       "zh": "Trae"
@@ -146,6 +150,10 @@
     "family.workbuddy_oauth": {
       "category": "workbuddy",
       "icon": "workbuddy"
+    },
+    "family.opencode_zen": {
+      "category": "opencode_zen",
+      "icon": "custom"
     },
     "family.trae_solo": {
       "category": "trae",
@@ -696,5 +704,5 @@
       "sha256": "a4813730fcfa95f5c97821b451c1e04a9e5f3626b895ebfd63bd30f146629f2e"
     }
   },
-  "catalogVersion": "b47c7fa8158e76f1f23bf3bea1ec01b86ff651b8b72fd157f04ecfbce1eb7e95"
+  "catalogVersion": "841fd4c14539f6fbbd69777ac62d4e54476d14fb35878dd179e7cb0cd00e8d7e"
 }

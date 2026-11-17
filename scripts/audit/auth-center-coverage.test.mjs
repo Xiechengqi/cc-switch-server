@@ -13,7 +13,7 @@ const knownEntryGaps = JSON.parse(read("assets/contract/web-runtime-contract.jso
 const audit = (overrides = {}) => auditAuthCenterCoverage({ accountManagers, variantToId, registry, knownEntryGaps, ...overrides });
 
 test("AuthCenter covers all Rust managed accounts including the three Trae channels", () => {
-  assert.deepEqual(audit(), { errors: [], entryCount: 18, knownEntryGaps: [] });
+  assert.deepEqual(audit(), { errors: [], entryCount: 17, knownEntryGaps: [] });
 });
 
 for (const product of ["codebuddy_oauth", "workbuddy_oauth", "trae_solo", "trae_raw_chat", "trae_raw_chat_intl"]) {

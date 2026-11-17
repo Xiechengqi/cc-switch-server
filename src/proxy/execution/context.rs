@@ -558,6 +558,7 @@ mod tests {
             quota_window_observations: Default::default(),
             codex_passive_quota: None,
             capability_observations: Default::default(),
+            antigravity_access_generations: Default::default(),
         }
     }
 

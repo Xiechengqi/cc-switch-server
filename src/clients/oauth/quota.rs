@@ -214,6 +214,10 @@ pub async fn refresh_account_quota(
     success_cooldown_ms: i64,
     request_timeout_ms: i64,
 ) -> Result<QuotaRefreshResult, QuotaRefreshFailure> {
+    account
+        .provider_type
+        .ensure_active()
+        .map_err(|error| QuotaRefreshFailure::bad_request(error.to_string()))?;
     if !force {
         if let Some(next_refresh_at) = account.quota_next_refresh_at {
             if next_refresh_at > now_ms {
@@ -242,10 +246,6 @@ pub async fn refresh_account_quota(
         }
         ProviderType::ClaudeOAuth => {
             refresh_claude_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
-                .await?
-        }
-        ProviderType::GeminiCli => {
-            refresh_gemini_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
                 .await?
         }
         ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
@@ -2565,17 +2565,6 @@ fn merge_claude_profile_enrichments(
     profile
 }
 
-async fn refresh_gemini_quota(
-    http: &reqwest::Client,
-    account: &Account,
-    now_ms: i64,
-    success_cooldown_ms: i64,
-    request_timeout: Duration,
-) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
-    refresh_gemini_v1internal_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
-        .await
-}
-
 #[derive(Debug, Clone)]
 struct GeminiV1InternalLoadResult {
     body: Value,
@@ -2583,6 +2572,7 @@ struct GeminiV1InternalLoadResult {
     subscription_level: Option<String>,
     profile: Option<Value>,
     observed_at_ms: i64,
+    client_identity: crate::domain::antigravity_identity::AntigravityClientIdentity,
 }
 
 impl GeminiV1InternalLoadResult {
@@ -2633,6 +2623,9 @@ impl GeminiV1InternalLoadResult {
                 ),
             ]);
         }
+        for observation in &mut update.capability_observations {
+            observation.antigravity_client_identity = Some(self.client_identity.clone());
+        }
         update
     }
 }
@@ -2675,19 +2668,32 @@ async fn load_gemini_v1internal_project_with_timeout(
     now_ms: i64,
     request_timeout: Duration,
 ) -> Result<GeminiV1InternalLoadResult, QuotaRefreshFailure> {
-    let access_token = required_access_token(account)?;
+    account
+        .provider_type
+        .ensure_active()
+        .map_err(|error| QuotaRefreshFailure::bad_request(error.to_string()))?;
+    let client_identity =
+        crate::domain::antigravity_identity::antigravity_client_identity_for(account.provider_type);
     let metadata = gemini_code_assist_metadata(account.provider_type)?;
     let load_url = gemini_code_assist_url(account, "loadCodeAssist")?;
     let load_request = gemini_code_assist_post_request(
         http,
         account,
         &load_url,
-        access_token,
         &json!({"metadata": metadata}),
         request_timeout,
         true,
+        &client_identity,
     )?;
     let load_body = request_json(account.provider_type, load_request, now_ms).await?;
+    if !client_identity.is_current() {
+        return Err(QuotaRefreshFailure::bad_request(
+            "Antigravity project client identity changed; retry",
+        ));
+    }
+    if account.provider_type == ProviderType::AgyOAuth && agy_load_is_ineligible(&load_body) {
+        return Err(QuotaRefreshFailure::bad_request("agy_oauth account is not eligible for Antigravity; check region, age and subscription eligibility"));
+    }
     let load: GeminiLoadCodeAssistResponse = serde_json::from_value(load_body.clone())
         .map_err(|error| QuotaRefreshFailure::parse(account.provider_type, error, now_ms))?;
     let project_id = load
@@ -2695,7 +2701,13 @@ async fn load_gemini_v1internal_project_with_timeout(
         .as_ref()
         .and_then(extract_project_id)
         .or_else(|| gemini_v1internal_project_id(account));
-    let selected_tier = gemini_selected_tier(load.paid_tier.as_ref(), load.current_tier.as_ref());
+    let mut selected_tier =
+        gemini_selected_tier(load.paid_tier.as_ref(), load.current_tier.as_ref());
+    if account.provider_type == ProviderType::AgyOAuth {
+        if let Some(tier) = &mut selected_tier {
+            tier.label = agy_tier_label(&tier.value, &tier.label);
+        }
+    }
     let subscription_level = selected_tier.as_ref().map(|tier| tier.label.clone());
     let profile =
         gemini_v1internal_profile_from_load(account, project_id.as_deref(), selected_tier.as_ref());
@@ -2705,6 +2717,7 @@ async fn load_gemini_v1internal_project_with_timeout(
         subscription_level,
         profile,
         observed_at_ms: now_ms,
+        client_identity,
     })
 }
 
@@ -2717,6 +2730,17 @@ async fn refresh_gemini_v1internal_quota(
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
     let loaded =
         load_gemini_v1internal_project_with_timeout(http, account, now_ms, request_timeout).await?;
+    if account.provider_type == ProviderType::AgyOAuth {
+        return refresh_agy_summary(
+            http,
+            account,
+            loaded,
+            now_ms,
+            success_cooldown_ms,
+            request_timeout,
+        )
+        .await;
+    }
     let partial_update = loaded.account_update(account.provider_type);
     let access_token = required_access_token(account)?;
     let mut quota_body = json!({});
@@ -2729,10 +2753,10 @@ async fn refresh_gemini_v1internal_quota(
         http,
         account,
         &quota_url,
-        access_token,
         &quota_body,
         request_timeout,
         false,
+        &loaded.client_identity,
     )
     .map_err(|error| error.with_partial_update(partial_update.clone()))?;
     let body = request_json(account.provider_type, quota_request, now_ms)
@@ -2791,6 +2815,7 @@ async fn refresh_gemini_v1internal_quota(
                 access_token,
                 now_ms,
                 request_timeout,
+                &loaded.client_identity,
             )
             .await,
         );
@@ -2880,6 +2905,7 @@ async fn observe_antigravity_privacy(
     access_token: &str,
     observed_at_ms: i64,
     request_timeout: Duration,
+    client_identity: &crate::domain::antigravity_identity::AntigravityClientIdentity,
 ) -> AccountCapabilityObservationDraft {
     let Some(project_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) else {
         return antigravity_privacy_observation(
@@ -2903,10 +2929,7 @@ async fn observe_antigravity_privacy(
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, "application/json")
-        .header(
-            USER_AGENT,
-            crate::provider_identity::antigravity_user_agent(),
-        )
+        .header(USER_AGENT, &client_identity.user_agent)
         .timeout(request_timeout)
         .json(&json!({"project": project_id}));
     let body = match request_json(account.provider_type, request, observed_at_ms).await {
@@ -2965,10 +2988,9 @@ fn antigravity_privacy_observation(
 
 fn gemini_code_assist_metadata(provider_type: ProviderType) -> Result<Value, QuotaRefreshFailure> {
     match provider_type {
-        ProviderType::GeminiCli => Ok(crate::provider_identity::gemini_cli_code_assist_metadata()),
-        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
-            Ok(crate::provider_identity::antigravity_client_metadata())
-        }
+        ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => Ok(
+            crate::provider_identity::antigravity_client_metadata_for(provider_type),
+        ),
         _ => Err(QuotaRefreshFailure::bad_request(format!(
             "{} does not use the Gemini Code Assist protocol",
             provider_type.as_str()
@@ -2980,35 +3002,27 @@ fn gemini_code_assist_post_request(
     http: &reqwest::Client,
     account: &Account,
     url: &str,
-    access_token: &str,
     body: &Value,
     request_timeout: Duration,
     include_client_metadata: bool,
+    client_identity: &crate::domain::antigravity_identity::AntigravityClientIdentity,
 ) -> Result<reqwest::RequestBuilder, QuotaRefreshFailure> {
+    let access_token = required_access_token(account)?;
     let request = http
         .post(url)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(CONTENT_TYPE, "application/json")
         .timeout(request_timeout);
     let request = match account.provider_type {
-        ProviderType::GeminiCli => request
-            .header(
-                USER_AGENT,
-                crate::provider_identity::gemini_cli_user_agent(),
-            )
-            .header(
-                "x-goog-api-client",
-                crate::provider_identity::GEMINI_CLI_X_GOOG_API_CLIENT,
-            ),
         ProviderType::AntigravityOAuth | ProviderType::AgyOAuth => {
-            let request = request.header(
-                USER_AGENT,
-                crate::provider_identity::antigravity_user_agent(),
-            );
+            let request = request.header(USER_AGENT, &client_identity.user_agent);
             if include_client_metadata {
                 request.header(
                     "client-metadata",
-                    crate::provider_identity::antigravity_client_metadata().to_string(),
+                    crate::provider_identity::antigravity_client_metadata_for(
+                        account.provider_type,
+                    )
+                    .to_string(),
                 )
             } else {
                 request
@@ -3033,6 +3047,7 @@ fn gemini_code_assist_url(
         let explicit_key = match operation {
             "loadCodeAssist" => "testGeminiLoadCodeAssistUrl",
             "retrieveUserQuota" => "testGeminiRetrieveUserQuotaUrl",
+            "retrieveUserQuotaSummary" => "testAgyRetrieveUserQuotaSummaryUrl",
             _ => "",
         };
         if let Some(url) = raw
@@ -3057,8 +3072,16 @@ fn gemini_code_assist_url(
         }
     }
 
-    #[cfg(not(test))]
-    let _ = account;
+    if account.provider_type == ProviderType::AgyOAuth {
+        if !matches!(operation, "loadCodeAssist" | "retrieveUserQuotaSummary") {
+            return Err(QuotaRefreshFailure::bad_request(
+                "unsupported Agy Code Assist operation",
+            ));
+        }
+        return Ok(format!(
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:{operation}"
+        ));
+    }
     match operation {
         "loadCodeAssist" => Ok(GEMINI_LOAD_CODE_ASSIST_URL.to_string()),
         "retrieveUserQuota" => Ok(GEMINI_RETRIEVE_USER_QUOTA_URL.to_string()),
@@ -4540,9 +4563,29 @@ async fn refresh_antigravity_quota(
     success_cooldown_ms: i64,
     request_timeout: Duration,
 ) -> Result<AccountRefreshUpdate, QuotaRefreshFailure> {
-    refresh_gemini_v1internal_quota(http, account, now_ms, success_cooldown_ms, request_timeout)
-        .await
+    let identity =
+        crate::domain::antigravity_identity::antigravity_client_identity_for(account.provider_type);
+    let result = refresh_gemini_v1internal_quota(
+        http,
+        account,
+        now_ms,
+        success_cooldown_ms,
+        request_timeout,
+    )
+    .await;
+    if !identity.is_current() {
+        return Err(QuotaRefreshFailure::bad_request(
+            "Antigravity quota client identity changed; retry",
+        ));
+    }
+    let mut update = result?;
+    for observation in &mut update.capability_observations {
+        observation.antigravity_client_identity = Some(identity.clone());
+    }
+    Ok(update)
 }
+
+include!("quota/agy.rs");
 
 fn refresh_imported_snapshot_quota(
     account: &Account,
@@ -8793,7 +8836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_cli_project_load_uses_official_identity_and_merges_tier() {
+    async fn antigravity_project_load_uses_official_identity_and_merges_tier() {
         let (base_url, observations, server) = serve_gemini_code_assist(
             axum::http::StatusCode::OK,
             json!({
@@ -8806,7 +8849,7 @@ mod tests {
         )
         .await;
         let account = gemini_code_assist_account(
-            ProviderType::GeminiCli,
+            ProviderType::AntigravityOAuth,
             json!({"testGeminiCodeAssistBaseUrl": base_url}),
             Some(json!({
                 "email": "owner@example.com",
@@ -8819,7 +8862,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(update.subscription_level.as_deref(), Some("PAID_ID"));
-        assert_eq!(update.capability_observations.len(), 1);
+        assert!(!update.capability_observations.is_empty());
         assert_eq!(
             update.capability_observations[0].dimension,
             crate::domain::accounts::capability_evidence::PROJECT_PROVISIONING_DIMENSION
@@ -8837,7 +8880,7 @@ mod tests {
         assert_eq!(profile["selectedTierSource"], "paidTier");
         assert_eq!(profile["email"], "owner@example.com");
         assert_eq!(profile["opaque"], json!({"keep": true}));
-        assert!(profile.get("postExchangeEnrichment").is_none());
+        assert_eq!(profile["postExchangeEnrichment"], "project_loaded");
 
         let observations = observations.lock().unwrap();
         assert_eq!(observations.len(), 1);
@@ -8849,16 +8892,13 @@ mod tests {
         );
         assert_eq!(
             observation.user_agent,
-            crate::provider_identity::gemini_cli_user_agent()
+            crate::provider_identity::antigravity_user_agent()
         );
-        assert_eq!(
-            observation.x_goog_api_client.as_deref(),
-            Some(crate::provider_identity::GEMINI_CLI_X_GOOG_API_CLIENT)
-        );
-        assert!(observation.client_metadata.is_none());
+        assert_eq!(observation.x_goog_api_client.as_deref(), None);
+        assert!(observation.client_metadata.is_some());
         assert_eq!(
             observation.body,
-            json!({"metadata": {"ideType": "GEMINI_CLI", "pluginType": "GEMINI"}})
+            json!({"metadata": crate::provider_identity::antigravity_client_metadata()})
         );
         drop(observations);
         server.abort();
@@ -8883,12 +8923,12 @@ mod tests {
         )
         .await;
         let account = gemini_code_assist_account(
-            ProviderType::GeminiCli,
+            ProviderType::AntigravityOAuth,
             json!({"testGeminiCodeAssistBaseUrl": base_url}),
             None,
         );
 
-        let update = refresh_gemini_quota(
+        let update = refresh_antigravity_quota(
             &reqwest::Client::new(),
             &account,
             1_000,
@@ -8898,7 +8938,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(update.capability_observations.len(), 2);
+        assert!(update.capability_observations.len() >= 2);
         assert!(update.capability_observations.iter().any(|observation| {
             observation.dimension
                 == crate::domain::accounts::capability_evidence::PROJECT_PROVISIONING_DIMENSION
@@ -8914,9 +8954,10 @@ mod tests {
         }));
         assert_eq!(update.quota.as_ref().unwrap().tiers.len(), 1);
         let observations = observations.lock().unwrap();
-        assert_eq!(observations.len(), 2);
+        assert_eq!(observations.len(), 3);
         assert_eq!(observations[0].operation, "loadCodeAssist");
         assert_eq!(observations[1].operation, "retrieveUserQuota");
+        assert_eq!(observations[2].operation, "unknown"); // optional read-only privacy probe
         drop(observations);
         server.abort();
     }
@@ -8934,12 +8975,12 @@ mod tests {
         )
         .await;
         let account = gemini_code_assist_account(
-            ProviderType::GeminiCli,
+            ProviderType::AntigravityOAuth,
             json!({"testGeminiCodeAssistBaseUrl": base_url}),
             None,
         );
 
-        let update = refresh_gemini_quota(
+        let update = refresh_antigravity_quota(
             &reqwest::Client::new(),
             &account,
             1_000,
@@ -9003,23 +9044,27 @@ mod tests {
 
         let observations = observations.lock().unwrap();
         assert_eq!(observations.len(), 2);
-        for observation in observations.iter() {
+        for (observation, provider_type) in observations
+            .iter()
+            .zip([ProviderType::AntigravityOAuth, ProviderType::AgyOAuth])
+        {
             assert_eq!(
                 observation.user_agent,
-                crate::provider_identity::antigravity_user_agent()
+                crate::domain::antigravity_identity::antigravity_client_identity_for(provider_type)
+                    .user_agent
             );
             assert!(observation.x_goog_api_client.is_none());
             assert_eq!(
                 observation.client_metadata.as_deref(),
                 Some(
-                    crate::provider_identity::antigravity_client_metadata()
+                    crate::provider_identity::antigravity_client_metadata_for(provider_type)
                         .to_string()
                         .as_str()
                 )
             );
             assert_eq!(
                 observation.body,
-                json!({"metadata": crate::provider_identity::antigravity_client_metadata()})
+                json!({"metadata": crate::provider_identity::antigravity_client_metadata_for(provider_type)})
             );
         }
         drop(observations);
@@ -9115,7 +9160,7 @@ mod tests {
         )
         .await;
         let account = gemini_code_assist_account(
-            ProviderType::AgyOAuth,
+            ProviderType::AntigravityOAuth,
             json!({"testGeminiCodeAssistBaseUrl": base_url}),
             None,
         );
@@ -9265,12 +9310,12 @@ mod tests {
         )
         .await;
         let account = gemini_code_assist_account(
-            ProviderType::GeminiCli,
+            ProviderType::AntigravityOAuth,
             json!({"testGeminiCodeAssistBaseUrl": base_url}),
             None,
         );
 
-        let failure = refresh_gemini_quota(
+        let failure = refresh_antigravity_quota(
             &reqwest::Client::new(),
             &account,
             1_000,
@@ -9307,7 +9352,7 @@ mod tests {
         )
         .await;
         let account = gemini_code_assist_account(
-            ProviderType::GeminiCli,
+            ProviderType::AntigravityOAuth,
             json!({"testGeminiCodeAssistBaseUrl": base_url}),
             None,
         );
@@ -11981,6 +12026,7 @@ mod tests {
             needs_relogin: false,
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
+            antigravity_access_generations: Default::default(),
             quota_window_observations: Default::default(),
             codex_passive_quota: None,
         }

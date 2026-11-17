@@ -9,7 +9,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::domain::accounts::store::{gemini_v1internal_project_id, Account};
-use crate::domain::antigravity_identity::{antigravity_client_identity, AntigravityClientIdentity};
+#[cfg(test)]
+use crate::domain::antigravity_identity::antigravity_client_identity;
+use crate::domain::antigravity_identity::AntigravityClientIdentity;
 use crate::domain::providers::model::ProviderType;
 use crate::infra::resident_memory::{
     process_resident_memory, ResidentMemoryBudget, ResidentMemoryReservation,
@@ -293,7 +295,8 @@ pub async fn model_catalog(
     timeout: Duration,
     endpoint_override: Option<&str>,
 ) -> Result<AntigravityModelCatalog, AntigravityModelCatalogFailure> {
-    let client_identity = antigravity_client_identity();
+    let client_identity =
+        crate::domain::antigravity_identity::antigravity_client_identity_for(account.provider_type);
     model_catalog_for_identity(
         http,
         account,
@@ -334,7 +337,12 @@ async fn model_catalog_for_identity(
     let project_id = gemini_v1internal_project_id(account).ok_or_else(|| {
         AntigravityModelCatalogFailure::new(400, false, "bound account has no Code Assist project")
     })?;
-    let source_url = endpoint_override.unwrap_or(ANTIGRAVITY_MODELS_URL);
+    let source_url =
+        endpoint_override.unwrap_or(if account.provider_type == ProviderType::AgyOAuth {
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+        } else {
+            ANTIGRAVITY_MODELS_URL
+        });
     let source_url = reqwest::Url::parse(source_url).map_err(|error| {
         AntigravityModelCatalogFailure::new(
             400,
@@ -891,7 +899,10 @@ mod tests {
                     let empty = fetch(account.clone(), source_url.clone()).await.unwrap();
                     assert!(!empty.stale);
                     assert!(empty.descriptors.is_empty());
-                    assert_eq!(empty.client_identity, antigravity_client_identity());
+                    assert_eq!(
+                        empty.client_identity,
+                        crate::domain::antigravity_identity::antigravity_client_identity_for(rail)
+                    );
                     failure.store(true, Ordering::SeqCst);
                     let stale = fetch(account.clone(), source_url.clone()).await.unwrap();
                     assert!(stale.stale && stale.descriptors.is_empty());

@@ -551,7 +551,9 @@ impl ProviderRuntimeIndex {
     pub fn compile(store: &ProviderStore, accounts: &AccountStore) -> anyhow::Result<Self> {
         let mut plans = BTreeMap::new();
         for stored in &store.providers {
-            if !super::bundle::surface_enabled(&stored.provider) {
+            if stored.provider_type.is_retired()
+                || !super::bundle::surface_enabled(&stored.provider)
+            {
                 continue;
             }
             let plan = Arc::new(compile_runtime_plan_with_defaults(
@@ -636,6 +638,10 @@ pub fn compile_runtime_plan_with_defaults(
         )
     };
 
+    if stored.provider_type.is_retired() {
+        configuration_state = RuntimeConfigurationState::NeedsAttention;
+        warnings.push("gemini_cli is retired; bind a new agy_oauth account explicitly".to_string());
+    }
     let driver = provider_registry()
         .drivers
         .iter()
@@ -1541,6 +1547,7 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::Nvidia => Some("https://integrate.api.nvidia.com"),
         ProviderType::DeepSeekApi => Some("https://api.deepseek.com"),
         ProviderType::GrokOAuth => Some("https://api.x.ai/v1"),
+        ProviderType::OpenCodeZen => Some("https://opencode.ai"),
     }
 }
 
@@ -1740,6 +1747,7 @@ fn legacy_driver_id(stored: &StoredProvider) -> anyhow::Result<DriverId> {
             _ => "http.openai_chat",
         },
         ProviderType::GrokOAuth => "oauth.grok_responses",
+        ProviderType::OpenCodeZen => "special.opencode_zen",
     })
 }
 
@@ -2414,9 +2422,34 @@ mod tests {
 
         let index = ProviderRuntimeIndex::compile(&store, &accounts).unwrap();
 
-        assert_eq!(index.len(), provider_registry().profiles.len());
+        assert_eq!(
+            index.len(),
+            store
+                .providers
+                .iter()
+                .filter(|stored| !stored.provider_type.is_retired())
+                .count()
+        );
         for profile in &provider_registry().profiles {
             let provider_id = format!("profile-{}", profile.profile_id.as_str().replace('.', "-"));
+            if profile
+                .compatibility_provider_type
+                .is_some_and(ProviderType::is_retired)
+            {
+                assert!(index.get(profile.app, &provider_id).is_none());
+                let stored = store
+                    .providers
+                    .iter()
+                    .find(|stored| stored.app == profile.app && stored.provider.id == provider_id)
+                    .unwrap();
+                assert_eq!(
+                    compile_runtime_plan(stored, &accounts)
+                        .unwrap()
+                        .configuration_state,
+                    RuntimeConfigurationState::NeedsAttention
+                );
+                continue;
+            }
             let plan = index.get(profile.app, &provider_id).unwrap();
             assert_eq!(plan.profile_id, profile.profile_id);
             assert!(!plan.runtime_fingerprint.is_empty());

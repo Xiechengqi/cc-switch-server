@@ -913,11 +913,8 @@ mod tests {
     fn google_oauth_test_env() -> (MutexGuard<'static, ()>, Vec<EnvGuard>) {
         let guard = OAUTH_ENV_LOCK.lock().expect("oauth env lock");
         let vars = vec![
-            EnvGuard::set("CC_SWITCH_SERVER_GEMINI_CLIENT_ID", "gemini-client-fixture"),
-            EnvGuard::set(
-                "CC_SWITCH_SERVER_GEMINI_CLIENT_SECRET",
-                "gemini-secret-fixture",
-            ),
+            EnvGuard::set("CC_SWITCH_SERVER_AGY_CLIENT_ID", "agy-client-fixture"),
+            EnvGuard::set("CC_SWITCH_SERVER_AGY_CLIENT_SECRET", "agy-secret-fixture"),
             EnvGuard::set(
                 "CC_SWITCH_SERVER_ANTIGRAVITY_CLIENT_ID",
                 "antigravity-client-fixture",
@@ -1210,7 +1207,7 @@ mod tests {
         let mut store = OAuthLoginStore::default();
         let login = store
             .start(
-                ProviderType::GeminiCli,
+                ProviderType::AntigravityOAuth,
                 Some("http://localhost:15721/api/accounts/login/callback".to_string()),
                 1_000,
             )
@@ -1654,7 +1651,6 @@ mod tests {
         for provider_type in [
             ProviderType::CodexOAuth,
             ProviderType::ClaudeOAuth,
-            ProviderType::GeminiCli,
             ProviderType::CursorOAuth,
             ProviderType::AntigravityOAuth,
             ProviderType::AgyOAuth,

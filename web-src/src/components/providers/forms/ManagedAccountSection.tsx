@@ -16,7 +16,6 @@ import { CodeBuddyOAuthSection } from "./CodeBuddyOAuthSection";
 import { CopilotAuthSection } from "./CopilotAuthSection";
 import { CursorOAuthSection } from "./CursorOAuthSection";
 import { DeepSeekAccountSection } from "./DeepSeekAccountSection";
-import { GeminiOAuthSection } from "./GeminiOAuthSection";
 import { GrokOAuthSection } from "./GrokOAuthSection";
 import { KiroOAuthSection } from "./KiroOAuthSection";
 import { KimiOAuthSection } from "./KimiOAuthSection";
@@ -152,9 +151,7 @@ export function ManagedAccountSection({
     case "github_copilot":
       return <CopilotAuthSection {...common} />;
     case "gemini_cli":
-      return (
-        <GeminiOAuthSection {...common} allowDefaultAccountOption={false} />
-      );
+      return <p role="status">Gemini CLI is retired. Create an Agy account and bind it explicitly; old credentials are read-only.</p>;
     case "antigravity_oauth":
       return (
         <AntigravityOAuthSection {...common} authProvider="antigravity_oauth" />

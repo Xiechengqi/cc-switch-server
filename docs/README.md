@@ -48,7 +48,7 @@
 | [grok-oauth.md](provider/grok-oauth.md) | 权威 | Grok OAuth 单账号反代 |
 | [kiro-prompt-cache.md](provider/kiro-prompt-cache.md) | 权威 | Kiro Prompt Caching 语义、usage 来源与 SQLite 持久化边界 |
 | [kiro-images.md](provider/kiro-images.md) | 权威 | Kiro/Amazon Q 最终图片字段预算、动画保真、blocking 工作量与取消资源归属 |
-| [gemini-cli.md](provider/gemini-cli.md) | 权威 | Gemini CLI 既有项目发现、精确 OAuth 身份、首次开通研究门禁及双 App 边界 |
+| [gemini-cli.md](provider/gemini-cli.md) | 权威 | Gemini CLI 退役、历史只读兼容与显式切换 Agy 的边界 |
 | [copilot.md](provider/copilot.md) | 权威 | Copilot 精确账号目录、Messages/Responses/Chat 原生端点、请求语义保护与 scope fencing |
 | [kimi-code.md](provider/kimi-code.md) | 权威 | Kimi Code 单账号反代 |
 | [qoder-cosy.md](provider/qoder-cosy.md) | 权威 | Qoder COSY 单账号反代、站点/凭据 rail、chat/app 发现与推理权限、动态 capability 与签名边界 |

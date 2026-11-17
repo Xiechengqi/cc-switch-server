@@ -261,6 +261,10 @@ impl GenericForwardingAdapter {
         copilot_metadata: Option<&CopilotRequestMetadata>,
         prepared_copilot: Option<CopilotPreparedRequest>,
     ) -> Result<AdapterRequest, ProxyError> {
+        stored
+            .provider_type
+            .ensure_active()
+            .map_err(|error| ProxyError::bad_request(error.to_string()))?;
         let responses_tool_context = transforms::responses_tool_context_from_bytes(&body);
         let custom_tool_names = responses_tool_context.custom_tool_names();
         let downstream_stream_requested = is_stream_requested(&body);
@@ -444,6 +448,18 @@ impl GenericForwardingAdapter {
         route: ProxyRoute,
         request: &AdapterRequest,
     ) -> Result<Bytes, ProxyError> {
+        if has_antigravity_v1internal_identity(stored.provider_type)
+            && !request.is_gemini_count_tokens()
+        {
+            let value: Value = serde_json::from_slice(&body).map_err(|_| {
+                ProxyError::bad_gateway("Antigravity generation response is not valid JSON")
+            })?;
+            if google_embedded_error(&value).is_none() && !looks_like_error_response(&value) {
+                let mut terminal = super::gemini_semantics::GeminiTerminal::default();
+                terminal.observe(&unwrap_gemini_v1internal_value(value))?;
+                terminal.validate()?;
+            }
+        }
         if super::bedrock::is_profile(stored) {
             return super::bedrock::converse_json(
                 &body,
@@ -702,6 +718,7 @@ fn all_provider_types() -> impl Iterator<Item = ProviderType> {
         ProviderType::QoderCosy,
         ProviderType::CodeBuddyOAuth,
         ProviderType::WorkBuddyOAuth,
+        ProviderType::OpenCodeZen,
         ProviderType::TraeSolo,
         ProviderType::TraeRaw,
         ProviderType::TraeIntl,
@@ -802,6 +819,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Claude, ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth) => {
             ("claude_to_codebuddy_chat", AdapterSupport::Native)
         }
+        (AppKind::Claude, ProviderType::OpenCodeZen) => {
+            ("claude_to_opencode_zen", AdapterSupport::Native)
+        }
         (
             AppKind::Claude,
             ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl,
@@ -824,6 +844,9 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         }
         (AppKind::Codex, ProviderType::OllamaCloud) => {
             ("codex_ollama_openai_compatible", AdapterSupport::Native)
+        }
+        (AppKind::Codex, ProviderType::OpenCodeZen) => {
+            ("codex_to_opencode_zen", AdapterSupport::Native)
         }
         (
             AppKind::Codex,
@@ -912,6 +935,7 @@ fn adapter_profile(app: AppKind, provider_type: ProviderType) -> AdapterProfile 
         (AppKind::Gemini, ProviderType::CodeBuddyOAuth | ProviderType::WorkBuddyOAuth) => {
             ("gemini_to_codebuddy_chat", AdapterSupport::Native)
         }
+        (AppKind::Gemini, ProviderType::OpenCodeZen) => fallback("gemini_opencode_zen_unsupported"),
         (
             AppKind::Gemini,
             ProviderType::TraeSolo | ProviderType::TraeRaw | ProviderType::TraeIntl,
@@ -1198,6 +1222,7 @@ fn header_app_for(app: AppKind, provider_type: ProviderType) -> AppKind {
                 app
             }
         }
+        ProviderType::OpenCodeZen => app,
     }
 }
 
@@ -2354,7 +2379,8 @@ pub(super) fn finalize_runtime_protocol_auth(
     endpoint: &mut String,
     headers: &mut Vec<(String, String)>,
 ) -> Result<(), ProxyError> {
-    let identity = crate::domain::antigravity_identity::antigravity_client_identity();
+    let identity =
+        crate::domain::antigravity_identity::antigravity_client_identity_for(stored.provider_type);
     finalize_runtime_protocol_auth_for_antigravity_identity(
         plan,
         stored,
@@ -2375,6 +2401,10 @@ pub(super) fn finalize_runtime_protocol_auth_for_antigravity_identity(
     headers: &mut Vec<(String, String)>,
     identity: Option<&crate::domain::antigravity_identity::AntigravityClientIdentity>,
 ) -> Result<(), ProxyError> {
+    stored
+        .provider_type
+        .ensure_active()
+        .map_err(|error| ProxyError::bad_request(error.to_string()))?;
     if stored.provider_type == ProviderType::KimiCode {
         super::kimi::finalize_account_identity(plan, accounts, headers)?;
     }
@@ -2439,6 +2469,14 @@ pub(super) fn unwrap_gemini_v1internal_value(value: Value) -> Value {
 }
 
 pub(super) fn google_embedded_error(value: &Value) -> Option<ProxyError> {
+    if crate::domain::accounts::antigravity_access::is_tos_violation(value) {
+        return Some(ProxyError {
+            status: axum::http::StatusCode::FORBIDDEN,
+            message:
+                "Antigravity service denied with TOS_VIOLATION; resolve eligibility before retrying"
+                    .to_string(),
+        });
+    }
     let error = value
         .get("error")
         .filter(|error| super::response_semantics::error_value_is_substantive(error))
@@ -2608,9 +2646,11 @@ fn apply_gemini_v1internal_contract(
     sanitize_gemini_v1internal_request(&mut inner, antigravity_identity)?;
     let web_search = antigravity_identity && gemini_request_has_google_search(&inner);
     if web_search {
-        let identity = identity
-            .cloned()
-            .unwrap_or_else(crate::domain::antigravity_identity::antigravity_client_identity);
+        let identity = identity.cloned().unwrap_or_else(|| {
+            crate::domain::antigravity_identity::antigravity_client_identity_for(
+                expected_provider_type,
+            )
+        });
         let selected_model = select_antigravity_web_search_model_for_identity(
             account,
             &model,
@@ -2701,7 +2741,9 @@ fn select_antigravity_web_search_model(
         account,
         requested_model,
         now_ms,
-        &crate::domain::antigravity_identity::antigravity_client_identity(),
+        &crate::domain::antigravity_identity::antigravity_client_identity_for(
+            account.provider_type,
+        ),
     )
 }
 
@@ -5157,6 +5199,7 @@ mod tests {
             needs_relogin: false,
             capacity_pool_limits: Default::default(),
             capability_observations: Default::default(),
+            antigravity_access_generations: Default::default(),
             quota_window_observations: Default::default(),
             codex_passive_quota: None,
         }
@@ -5753,12 +5796,6 @@ mod tests {
     fn gemini_v1internal_providers_wrap_exact_bound_project_and_separate_identity() {
         for (provider_type, project_evidence, expected_project, antigravity_identity) in [
             (
-                ProviderType::GeminiCli,
-                json!({"profile": {"projectId": "gemini-cli-project"}}),
-                "gemini-cli-project",
-                false,
-            ),
-            (
                 ProviderType::AntigravityOAuth,
                 json!({"profile": {"projectId": "antigravity-project"}}),
                 "antigravity-project",
@@ -5870,16 +5907,16 @@ mod tests {
         let accounts = AccountStore {
             accounts: vec![serde_json::from_value(json!({
                 "id": account_id,
-                "providerType": "gemini_cli",
+                "providerType": "agy_oauth",
                 "accessToken": "access-token",
                 "raw": {"testGeminiAiStudioBaseUrl": "http://127.0.0.1:43210"}
             }))
             .unwrap()],
             ..Default::default()
         };
-        let stored = stored_provider(AppKind::Gemini, ProviderType::GeminiCli, json!({}));
-        let plan = gemini_v1internal_runtime_plan(ProviderType::GeminiCli, account_id);
-        let adapter = adapter_for(AppKind::Gemini, ProviderType::GeminiCli);
+        let stored = stored_provider(AppKind::Gemini, ProviderType::AgyOAuth, json!({}));
+        let plan = gemini_v1internal_runtime_plan(ProviderType::AgyOAuth, account_id);
+        let adapter = adapter_for(AppKind::Gemini, ProviderType::AgyOAuth);
         let mut request = adapter
             .transform_request_for_route(
                 Bytes::from_static(

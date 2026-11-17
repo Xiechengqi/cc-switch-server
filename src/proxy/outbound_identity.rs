@@ -37,6 +37,9 @@ pub(super) fn finalize_headers_for_antigravity_identity(
             set_user_agent(headers, user_agent);
         }
         OutboundIdentityPolicy::ManagedIdentity { family } => {
+            if family == ManagedIdentityFamily::GeminiCli {
+                return Err(ProxyError::bad_request("Gemini CLI identity is retired"));
+            }
             finalize_managed_identity(family, headers);
         }
         OutboundIdentityPolicy::ManagedVersion {
@@ -47,12 +50,28 @@ pub(super) fn finalize_headers_for_antigravity_identity(
                 headers,
                 identity
                     .map(|identity| identity.user_agent.clone())
-                    .unwrap_or_else(crate::provider_identity::antigravity_user_agent),
+                    .unwrap_or_else(|| {
+                        crate::domain::antigravity_identity::antigravity_client_identity_for(
+                            if plan.driver_id.as_str() == "special.agy" {
+                                crate::domain::providers::model::ProviderType::AgyOAuth
+                            } else {
+                                crate::domain::providers::model::ProviderType::AntigravityOAuth
+                            },
+                        )
+                        .user_agent
+                    }),
             );
             replace_header(
                 headers,
                 "client-metadata",
-                crate::provider_identity::antigravity_client_metadata().to_string(),
+                crate::provider_identity::antigravity_client_metadata_for(
+                    if plan.driver_id.as_str() == "special.agy" {
+                        crate::domain::providers::model::ProviderType::AgyOAuth
+                    } else {
+                        crate::domain::providers::model::ProviderType::AntigravityOAuth
+                    },
+                )
+                .to_string(),
             );
         }
         OutboundIdentityPolicy::LegacyFrozen => {}
@@ -104,14 +123,7 @@ fn finalize_managed_identity(family: ManagedIdentityFamily, headers: &mut Vec<(S
         ManagedIdentityFamily::CodexCli => {
             crate::codex_identity::finalize_owned_headers(headers);
         }
-        ManagedIdentityFamily::GeminiCli => {
-            set_user_agent(headers, crate::provider_identity::gemini_cli_user_agent());
-            replace_header(
-                headers,
-                "x-goog-api-client",
-                crate::provider_identity::GEMINI_CLI_X_GOOG_API_CLIENT.to_string(),
-            );
-        }
+        ManagedIdentityFamily::GeminiCli => {} // Serialized legacy policy, never finalized.
         ManagedIdentityFamily::GrokCli => {
             set_user_agent(headers, crate::domain::grok_cli::grok_cli_user_agent());
         }
@@ -282,10 +294,6 @@ mod tests {
                 crate::domain::grok_cli::grok_cli_user_agent(),
             ),
             (
-                ManagedIdentityFamily::GeminiCli,
-                crate::provider_identity::gemini_cli_user_agent(),
-            ),
-            (
                 ManagedIdentityFamily::KimiCli,
                 crate::domain::kimi_cli::KIMI_USER_AGENT.to_string(),
             ),
@@ -423,37 +431,14 @@ mod tests {
     }
 
     #[test]
-    fn gemini_identity_replaces_user_agent_and_api_client_as_one_tuple() {
-        let mut headers = vec![
-            ("User-Agent".to_string(), "untrusted/1".to_string()),
-            (
-                "X-Goog-Api-Client".to_string(),
-                "untrusted-sdk/1".to_string(),
-            ),
-        ];
-        finalize_headers(
+    fn retired_gemini_identity_cannot_be_finalized() {
+        assert!(finalize_headers(
             &plan(OutboundIdentityPolicy::ManagedIdentity {
                 family: ManagedIdentityFamily::GeminiCli,
             }),
-            &mut headers,
+            &mut Vec::new()
         )
-        .unwrap();
-
-        assert_eq!(
-            header(&headers, "user-agent"),
-            Some(crate::provider_identity::gemini_cli_user_agent().as_str())
-        );
-        assert_eq!(
-            header(&headers, "x-goog-api-client"),
-            Some(crate::provider_identity::GEMINI_CLI_X_GOOG_API_CLIENT)
-        );
-        assert_eq!(
-            headers
-                .iter()
-                .filter(|(name, _)| name.eq_ignore_ascii_case("x-goog-api-client"))
-                .count(),
-            1
-        );
+        .is_err());
     }
 
     #[test]

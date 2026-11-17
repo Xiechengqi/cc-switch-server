@@ -51,7 +51,7 @@ pub fn provider_capability(provider: ProviderType) -> AccountResetCapability {
         }
         OllamaCloud => ("unsupported", "quota_boundary_unavailable"),
         CursorApiKey | DeepSeekAccount | Claude | ClaudeAuth | Codex | Gemini | OpenRouter
-        | AwsBedrock | Nvidia | DeepSeekApi => ("unsupported", "profile_unsupported"),
+        | AwsBedrock | Nvidia | DeepSeekApi | OpenCodeZen => ("unsupported", "profile_unsupported"),
     };
     AccountResetCapability {
         support: support.into(),
