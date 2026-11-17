@@ -4823,6 +4823,10 @@ fn validate_profile_credentials(
         .iter()
         .any(|slot| !slot.starts_with("/settingsConfig/extraHeaders/"));
     match &profile.credential_policy {
+        CredentialPolicy::StaticSecret {
+            auth_scheme: crate::domain::providers::registry::AuthScheme::None,
+            slots,
+        } if slots.is_empty() => Ok(()),
         CredentialPolicy::StaticSecret { .. } if !primary_credential_configured => {
             Err(ProviderCommandError::Invalid(format!(
                 "Provider profile {} requires a credential",

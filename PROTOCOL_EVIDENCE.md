@@ -4,6 +4,27 @@
 
 只读对照 `/data/projects/proxy/OpenCode/zen-gate/internal/lane/upstream.go` 的单账号免费车道：`Bearer public`、可解码 session 前缀、`/inference/v1` 三条路径、官方 `read`/`shell` 工具原文、无 HTML 转义的 CLI 字段顺序。不引用 OpenCode Go API Key，不引用 9router / OmniRoute 的旧 `/zen/v1` 指纹。zen-gate 不是构建、测试或运行时输入。实现与 fixture 见 `src/proxy/opencode_zen.rs` 与 `docs/provider/opencode-zen.md`。真实目录拉取和真实推理保持 `live_pending`。
 
+2026-11-17 Zen runtime review: 只读参考 zen-gate HEAD `58fa1b7bd98662696ff92777c3c7e4957058b111`，目标基线 `9f84a22b6a3abb83fdb641228f9bd48b836af80b`。参考 `internal/lane/` SHA-256：
+
+| 文件 | SHA-256 |
+| --- | --- |
+| upstream.go | 9ceb32c401753d60e3151e7a4d1f59dac9bcb013fc33e3e9cb840b182abb1f3c |
+| messages.go | 93d09f173559af9b87872fa25ac6a4a053cac69e929ed4e42132c93213808cc8 |
+| stream.go | fb88a3ba50fc5cbf9d22777c57b00c4056ca044dbcb45fd30735f4fe9a21b957 |
+| http.go | 43afbdaa90989339f2e11f538aa38f230997640e68aea83ce3b108d049a6a83e |
+| client.go | 782ddb65920c96d33390307f2a38dec881219adebc0dfd21071a3f0639d7bad4 |
+| catalog.go | aa5be88f49b0f6da5cc82ee857959e235496a9b87155583a69a89a8f1bd1f24e |
+
+吸收行为而非源码依赖：三种上游解码与入口协议独立、工具往返、严格终态与 EOF、错误分类、有界目录及一次续写。Server 复用自身 transforms/stream bridge/request memory/usage settlement；禁止跨 Provider/账号/出口重放，不搬运池、桌面或 Key rail。每次续写独立 USD generation evidence，公开请求日志汇总；目录声明容量不等同实测能力。所有离线/loopback 测试数据均为本仓合成，不读取参考 checkout；无真实厂商/Router 回执，真实目录/生成仍为 `live_pending`。
+
+本轮实施与整体 review：修复无凭据 Profile 创建/运行时准入及 S1 bridge，模型协议与入口解耦，使用真正增量 SSE、严格终态/EOF、响应体持有的取消与计量生命周期、有界错误分类、共享/持久化目录和一次非流续写。复核后补齐终态后数据拒绝、分片解析预算、慢下游空闲时限，以及第二次准入失败的 attempt 编号；以真实本地 SQLite 账本验证每段独立计价，公共日志仅汇总一次。Chat 公共错误编码在 error 后发送 `[DONE]` 作为分隔符，不视为成功；超时回归同时验证显式错误、没有成功 finish_reason、没有首 token 和完成日志。
+
+最终 Rust src/tests 摘要为 `b6a168c2bbb48c917b776cdc9c1fdd544934712a026126709d71274bbe955fae`（排序路径、NUL、内容、NUL 后 SHA-256）。`RUST_MIN_STACK=67108864 cargo test -j 1 --all-targets --no-fail-fast -- --test-threads=8`：库 4479 passed / 2 failed / 3 ignored，API 集成 138/138、独立 fixture 各 1/1；Zen 相关 28/28，包含 18 个协议/模式组合与续写 USD 账本。两项失败均与此前 Agy 收口记录一致：`restored_router_ack_and_withdrawn_pending_tariff_converge_without_rewriting_grants` 的 ACK schema 预期 5/实际 6，及 `signed_conversion_commits_live_usage_and_calibrates_against_preview_then_replays_durably` 的 tampered 设置拒绝断言。未改动其业务实现或放宽断言；完整 Rust 套件未全绿。
+
+严格 all-targets Clippy（`-D warnings`）、cargo fmt 与全 src 独立 rustfmt、Node 后端审计 2205/2205、Phase 0 测试 6/6、smoke 脚本测试 13/13、生成 coverage/UI matrix、文档索引与 diff 检查通过。离线 readiness 使用 `RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0`，实际 `failures=0 warnings=2 blockers=9 internalBlockers=1`、`blocked_inputs`；其 local-contracts-unverified 表示脚本跳过本地套件，独立结果以上方记录为准。真实凭据、Router/Share 与部署输入缺失，不能据此宣称发布或供应商真实接受性通过。
+
+最终 `cargo check`、`cargo build -j 1` 和原 `scripts/smoke/smoke-local.sh` 的 10 个本地 HTTP 步骤通过；smoke 使用当前构建二进制与脚本临时配置，正常退出并清理。验证结束后 Rust 摘要未变。整体 review 未发现本轮新增的未解决阻断项；未提交、推送、部署或新增真实上游调用。
+
 R5 CORE-01 / CORE-02 / EVID-01（当前工作树）：本仓 Registry 与实际 forwarding/owner 审查补齐统一计时标签、特殊 Trae/DeepSeek/网页路径、DeepSeek session/Trae catalog/Web scope 的父预算和最后引用。新增 `assets/contract/r5-shared-core.json`；此次不采纳新的厂商wire，不把外仓作为测试/构建/运行依赖。`implementationCommit=null`，本地循环回归不证明真实厂商接受性；HTTP handoff不是socket写出，容量不是账号失效，所有真实rail/operation继续live_pending。
 
 ## 2026-11-10 R5 隐藏 Web Session 复核（WS-01）

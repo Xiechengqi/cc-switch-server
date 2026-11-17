@@ -88,8 +88,23 @@ impl StreamEventTransformer {
     where
         T: Into<transforms::ResponsesToolContext>,
     {
-        let responses_tool_context = responses_tool_context.into();
-        let upstream = upstream_format_for_route(stored, Some(route), &[]);
+        Self::new_with_formats(
+            stored,
+            route,
+            responses_tool_context.into(),
+            downstream_include_usage,
+            upstream_format_for_route(stored, Some(route), &[]),
+        )
+    }
+
+    /// Dedicated drivers select the upstream protocol from the resolved model.
+    pub(super) fn new_with_formats(
+        stored: &StoredProvider,
+        route: ProxyRoute,
+        responses_tool_context: transforms::ResponsesToolContext,
+        downstream_include_usage: bool,
+        upstream: Option<UpstreamFormat>,
+    ) -> Self {
         let downstream = downstream_format_for_route(route);
         let unwrap_v1internal =
             super::adapters::is_gemini_v1internal_provider_type(stored.provider_type);

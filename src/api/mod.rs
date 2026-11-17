@@ -1696,7 +1696,7 @@ async fn proxy_models_for_selection(
     let opencode_zen_catalog = if opencode_zen_provider.is_some() {
         let client = state.http_client().await;
         Some(
-            crate::proxy::opencode_zen::refresh_catalog(&client)
+            crate::proxy::opencode_zen::refresh_catalog(&client, &state.config_dir)
                 .await
                 .map_err(|message| ApiError::new(StatusCode::BAD_GATEWAY, message))?,
         )
@@ -1710,15 +1710,16 @@ async fn proxy_models_for_selection(
         data.clear();
         let owned_by = model_owner(provider);
         for id in catalog {
+            let metadata = crate::proxy::opencode_zen::catalog_metadata(id);
             data.push(OpenAiModel {
                 id: id.clone(),
                 object: "model",
                 owned_by: owned_by.clone(),
                 reasoning_efforts: None,
                 input_modalities: Some(vec!["text".to_string()]),
-                context_window: None,
+                context_window: metadata.get("context_window").and_then(Value::as_u64),
                 supports_tools: Some(true),
-                max_output_tokens: None,
+                max_output_tokens: metadata.get("max_output_tokens").and_then(Value::as_u64),
             });
         }
         data.sort_by(|left, right| left.id.cmp(&right.id));

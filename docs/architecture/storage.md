@@ -217,3 +217,7 @@ subscription reference graph；不会修改 stage。损坏 DB/WAL 必须 fail cl
 重新出现或损坏的 legacy 文件不得成为读取来源。
 
 Share 单位转换使用 SQLite schema 6：单位无关 facts、历史准备游标、永久转换 / settings 回执、调整映射和 Token shadow 区间不依赖报表 retention。异步 ownership 可引用未定价事实。策略、调整、回执在同一 IMMEDIATE 事务提交，详情见 [额度单位转换](../share/quota-unit-conversions.md)。schema 7 为 `value_quota_attempts` 增加可空 `unpriced_reason`（普通授权缺价的显式 $0 原因）及部分索引，见 [双口径额度 §3.1](../share/value-quotas.md#31-未定价用量普通授权-0)。
+
+## OpenCode Zen 可丢弃目录缓存
+
+`opencode-zen-catalog.json` 是固定公开免费车道的最后成功模型目录和受限容量声明缓存，不是凭据、Provider 配置或协议证据输入。原子落盘，读取上限 1 MiB；8 分钟 fresh、最多 24 小时 stale，过期/未来时间/非法快照不恢复。删除后重新在线拉取；不改变 SQLite 权威边界。见 [OpenCode Zen](../provider/opencode-zen.md)。

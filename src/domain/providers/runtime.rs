@@ -953,23 +953,24 @@ fn runtime_auth_ref(
         } => managed_account_auth_ref(stored, accounts, *account_provider_type, warnings),
         CredentialPolicy::StaticSecret { slots, auth_scheme } => {
             let summary = redact_provider(&stored.provider).1;
-            let (slots, auth_scheme, credential_configured) =
-                if let Some(contract) = profile.coding_plan.as_ref() {
-                    (
-                        vec![contract.inference.credential_slot.clone()],
-                        contract.inference.auth_scheme,
-                        summary
-                            .slots
-                            .iter()
-                            .any(|configured| configured == &contract.inference.credential_slot),
-                    )
-                } else {
-                    (
-                        normalized_slots(slots, &summary.slots),
-                        *auth_scheme,
-                        summary.configured,
-                    )
-                };
+            let (slots, auth_scheme, credential_configured) = if let Some(contract) =
+                profile.coding_plan.as_ref()
+            {
+                (
+                    vec![contract.inference.credential_slot.clone()],
+                    contract.inference.auth_scheme,
+                    summary
+                        .slots
+                        .iter()
+                        .any(|configured| configured == &contract.inference.credential_slot),
+                )
+            } else {
+                (
+                    normalized_slots(slots, &summary.slots),
+                    *auth_scheme,
+                    (*auth_scheme == AuthScheme::None && slots.is_empty()) || summary.configured,
+                )
+            };
             if !credential_configured {
                 warnings.push("Provider credential is not configured".to_string());
                 return RuntimeAuthRef::Missing;

@@ -7815,11 +7815,11 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         registry["registry"]["optionSchemas"]
             .as_array()
             .map(Vec::len),
-        Some(28)
+        Some(29)
     );
     assert_eq!(
         registry["registry"]["profiles"].as_array().unwrap().len(),
-        91
+        93
     );
     assert!(registry["registry"]["families"]
         .as_array()
@@ -7893,7 +7893,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
     assert_eq!(presets.status(), StatusCode::OK);
     let presets = json_body(presets).await;
     let presets = presets["presets"].as_array().unwrap();
-    assert_eq!(presets.len(), 30);
+    assert_eq!(presets.len(), 31);
     assert!(presets
         .iter()
         .all(|preset| preset["profileId"].as_str().is_some()));

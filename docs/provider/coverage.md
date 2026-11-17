@@ -102,6 +102,8 @@ The Server-owned requirements and Rust Provider Registry are authoritative. Lega
 
 ## Server implementation notes
 
+- OpenCode Zen uses the single public free lane on Claude/Codex only. The model-selected upstream wire is bridged independently to Messages/Chat/Responses, with bounded incremental SSE, strict terminal+EOF, scoped minted sessions, isolated continuation evidence, and bounded fresh/stale persisted catalog. Upstream capacity declarations are not measured capabilities. Offline and loopback fixtures do not promote live_pending; see docs/provider/opencode-zen.md and PROTOCOL_EVIDENCE.md.
+
 ### Claude/Codex/Gemini model routing contract
 
 - Typed Provider ownership is derived from immutable `profileId`; fixed Profiles ignore conflicting name, URL, category, and raw `meta.providerType` hints. Only S1/`legacy_compat` records retain endpoint/name heuristics. Native official Claude OAuth, Anthropic API Key, OpenAI OAuth, and OpenAI API Key Profiles default to `modelMapping.mode=passthrough` and may be switched explicitly to `single` with the Registry-owned `defaultUpstreamModel`. Native official Google Profiles remain locked to passthrough and retain the requested text model.

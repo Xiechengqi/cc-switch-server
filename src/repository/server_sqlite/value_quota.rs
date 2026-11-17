@@ -2036,6 +2036,27 @@ fn classify_log(
     force_terminal: bool,
 ) -> (ObservedOutcome, Option<ValueTokens>, Option<&'static str>) {
     use crate::domain::usage::store::RequestKind;
+    // A Zen continuation's public log sums both generations. Price only the
+    // attempt selected by attempt_count; prior attempts retain their facts.
+    let generation = log
+        .value_generation_usage
+        .filter(|_| log.provider_type == crate::domain::providers::model::ProviderType::OpenCodeZen)
+        .map(|usage| {
+            let mut generation = log.clone();
+            generation.raw_input_tokens = usage.raw_input_tokens;
+            generation.input_tokens = usage.input_tokens;
+            generation.output_tokens = usage.output_tokens;
+            generation.cache_read_tokens = usage.cache_read_tokens;
+            generation.cache_creation_tokens = usage.cache_creation_tokens;
+            generation.cache_creation_details = usage.cache_creation_details;
+            generation.total_tokens = usage.total_tokens;
+            generation.credit_usage = usage.credit_usage;
+            generation.value_streamed_text_bytes = None;
+            generation.value_resources = None;
+            generation.value_generation_usage = None;
+            generation
+        });
+    let log = generation.as_ref().unwrap_or(log);
     let actual = log.actual_model.as_deref().or(log.model.as_deref());
     let missing_workbuddy_model = log
         .profile_id

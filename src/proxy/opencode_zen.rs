@@ -76,7 +76,11 @@ pub fn endpoint_for(model: &str) -> &'static str {
 
 pub fn is_free_model(id: &str) -> bool {
     let base = base_model_id(id);
-    base.contains("free") || base == "union-alpha" || base == "space-bunny-free"
+    static FREE_TOKEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:^|[-_])free(?:$|[-_.])").expect("static free-lane pattern")
+    });
+    !base.rsplit('/').next().unwrap_or(base).starts_with("jev")
+        && (FREE_TOKEN.is_match(base) || base == "union-alpha")
 }
 
 /// Decode the low 36 bits of the millisecond stamp from the 12-hex prefix.
@@ -127,18 +131,9 @@ pub fn mint_session_id(stamp_ms: i64) -> String {
         *slot = ((value >> (40 - 8 * index)) & 0xFF) as u8;
     }
     let mut rnd = [0u8; 14];
-    fill_random(&mut rnd, (now_ms as u64) ^ (seq as u64));
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut rnd);
     format!("ses_{}{}", hex_encode(&raw), base62_from(&rnd))
-}
-
-fn fill_random(buf: &mut [u8], salt: u64) {
-    let mut state = salt ^ 0x9E37_79B9_7F4A_7C15;
-    for (index, slot) in buf.iter_mut().enumerate() {
-        state = state
-            .wrapping_mul(0x6C62_272E_EBCA_6F33)
-            .wrapping_add(index as u64 + 1);
-        *slot = (state >> 33) as u8;
-    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -152,19 +147,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// One downstream conversation keeps one upstream session until the freshness
-/// window (six days) expires. A full table is dropped rather than evicted.
+/// window (six days) expires. Capacity evicts the oldest minted entry only.
 pub fn session_for_conversation(seed: &str) -> String {
-    let seed = {
-        let trimmed = seed.trim();
-        if trimmed.is_empty() {
-            "global".to_string()
-        } else {
-            trimmed.to_string()
-        }
-    };
-    if decode_session_stamp(&seed).is_some() && seed.len() == 4 + 12 + 14 {
-        return seed;
-    }
+    // Fixed-size, opaque keys prevent caller-controlled conversation lengths
+    // from expanding the process cache. Namespacing is supplied by the driver.
+    use sha2::{Digest, Sha256};
+    let seed = hex::encode(Sha256::digest(seed.trim().as_bytes()));
     let now = now_ms();
     let mut guard = SESSIONS.lock().unwrap_or_else(|poison| poison.into_inner());
     let table = guard.get_or_insert_with(BTreeMap::new);
@@ -174,7 +162,13 @@ pub fn session_for_conversation(seed: &str) -> String {
         }
     }
     if table.len() >= SESSION_CAP {
-        table.clear();
+        if let Some(oldest) = table
+            .iter()
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(key, _)| key.clone())
+        {
+            table.remove(&oldest);
+        }
     }
     let id = mint_session_id(now);
     table.insert(seed, (id.clone(), now));
@@ -699,6 +693,203 @@ pub fn prepare_upstream(requested: &Value) -> Result<PreparedUpstream, PrepareEr
     })
 }
 
+/// This reviewed lane publishes text/tools only. Reject unsupported payloads
+/// before generic converters could drop or reshape them into empty text.
+pub(super) fn validate_source_request(request: &Value) -> Result<(), super::ProxyError> {
+    if request.get("n").is_some_and(|n| n.as_u64() != Some(1)) {
+        return Err(super::ProxyError::bad_request(
+            "OpenCode Zen supports one completion per request",
+        ));
+    }
+    for key in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+        if request
+            .get(key)
+            .is_some_and(|value| value.as_u64().is_none_or(|n| n == 0 || n > i32::MAX as u64))
+        {
+            return Err(super::ProxyError::bad_request(
+                "OpenCode Zen output ceiling must be a positive integer",
+            ));
+        }
+    }
+    fn media(value: &Value) -> bool {
+        match value {
+            Value::Array(items) => items.iter().any(media),
+            Value::Object(map) => {
+                map.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "image"
+                            | "image_url"
+                            | "input_image"
+                            | "audio"
+                            | "input_audio"
+                            | "file"
+                            | "input_file"
+                            | "document"
+                            | "video"
+                            | "input_video"
+                    )
+                }) || ["messages", "input", "content", "system"]
+                    .iter()
+                    .any(|key| map.get(*key).is_some_and(media))
+            }
+            _ => false,
+        }
+    }
+    if media(request) {
+        return Err(super::ProxyError::bad_request(
+            "OpenCode Zen media input has no reviewed capability receipt",
+        ));
+    }
+    Ok(())
+}
+
+/// Convert from the actual ingress protocol, never infer it from optional fields.
+pub(super) fn prepare_for_route(
+    requested: &Value,
+    route: super::ProxyRoute,
+) -> Result<PreparedUpstream, super::ProxyError> {
+    validate_source_request(requested)?;
+    if tool_choice_rejected(requested) {
+        return Err(super::ProxyError {
+            status: http::StatusCode::FORBIDDEN,
+            message: "OpenCode Zen rejects tool_choice none".to_string(),
+        });
+    }
+    use super::{adapters::UpstreamFormat as F, transforms as t};
+    let source = super::adapters::downstream_format_for_route(route);
+    let target = wire_for(
+        requested
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(DEFAULT_MODEL),
+    )
+    .format();
+    let mut converted = match (source, target) {
+        (F::AnthropicMessages, F::OpenAiChat) => t::anthropic_to_openai_chat(requested),
+        (F::AnthropicMessages, F::OpenAiResponses) => t::anthropic_to_openai_responses(requested),
+        (F::OpenAiChat, F::AnthropicMessages) => t::openai_chat_to_anthropic(requested),
+        (F::OpenAiChat, F::OpenAiResponses) => t::openai_chat_to_responses(requested),
+        (F::OpenAiResponses, F::OpenAiChat) => t::openai_responses_to_chat(requested),
+        (F::OpenAiResponses, F::AnthropicMessages) => t::openai_responses_to_anthropic(requested),
+        _ => Ok(requested.clone()),
+    }
+    .map_err(|error| super::ProxyError::bad_request(error.to_string()))?;
+    // Shared transforms have their own defaults. The caller's explicit ceiling
+    // wins, otherwise use the reviewed free-lane default for all protocols.
+    let limit = requested_limit(requested).unwrap_or(32_000);
+    for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+        converted
+            .as_object_mut()
+            .ok_or_else(|| {
+                super::ProxyError::bad_request("OpenCode Zen request must be an object")
+            })?
+            .remove(key);
+    }
+    let key = match target {
+        F::OpenAiChat => "max_completion_tokens",
+        F::OpenAiResponses => "max_output_tokens",
+        _ => "max_tokens",
+    };
+    converted[key] = Value::from(limit);
+    // Zen fingerprints body bytes: no active cache hints from generic converters.
+    strip_cache_hints(&mut converted);
+    prepare_upstream(&converted).map_err(|error| super::ProxyError {
+        status: if error == PrepareError::ToolChoiceNone {
+            http::StatusCode::FORBIDDEN
+        } else {
+            http::StatusCode::BAD_REQUEST
+        },
+        message: error.to_string(),
+    })
+}
+
+fn strip_cache_hints(value: &mut Value) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    map.remove("cache_control");
+    map.remove("prompt_cache_key");
+    for key in ["system", "tools"] {
+        if let Some(items) = map.get_mut(key).and_then(Value::as_array_mut) {
+            for item in items {
+                if let Some(item) = item.as_object_mut() {
+                    item.remove("cache_control");
+                }
+            }
+        }
+    }
+    for key in ["messages", "input"] {
+        if let Some(items) = map.get_mut(key).and_then(Value::as_array_mut) {
+            for item in items {
+                if let Some(parts) = item.get_mut("content").and_then(Value::as_array_mut) {
+                    for part in parts {
+                        if let Some(part) = part.as_object_mut() {
+                            part.remove("cache_control");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl ZenWire {
+    pub(super) fn format(self) -> super::adapters::UpstreamFormat {
+        use super::adapters::UpstreamFormat as F;
+        match self {
+            Self::Chat => F::OpenAiChat,
+            Self::Responses => F::OpenAiResponses,
+            Self::Messages => F::AnthropicMessages,
+        }
+    }
+    pub(super) fn semantics(self) -> crate::domain::usage::store::InputTokenSemantics {
+        use crate::domain::usage::store::InputTokenSemantics as S;
+        if self == Self::Messages {
+            S::Exclusive
+        } else {
+            S::Inclusive
+        }
+    }
+}
+
+pub(super) fn convert_response(
+    payload: &Value,
+    wire: ZenWire,
+    route: super::ProxyRoute,
+    context: &super::transforms::ResponsesToolContext,
+) -> Result<Value, super::ProxyError> {
+    use super::{adapters::UpstreamFormat as F, transforms as t};
+    let result = match (
+        wire.format(),
+        super::adapters::downstream_format_for_route(route),
+    ) {
+        (F::OpenAiChat, F::AnthropicMessages) => t::openai_chat_response_to_anthropic(payload),
+        (F::OpenAiChat, F::OpenAiResponses) => {
+            t::openai_chat_response_to_responses_with_tool_context(payload, context)
+        }
+        (F::OpenAiResponses, F::AnthropicMessages) => {
+            t::openai_responses_response_to_anthropic(payload)
+        }
+        (F::OpenAiResponses, F::OpenAiChat) => t::openai_responses_response_to_chat(payload),
+        (F::AnthropicMessages, F::OpenAiChat) => t::anthropic_response_to_openai_chat(payload),
+        (F::AnthropicMessages, F::OpenAiResponses) => {
+            t::anthropic_response_to_openai_responses_with_tool_context(payload, context)
+        }
+        _ => Ok(payload.clone()),
+    };
+    let mut value = result.map_err(|error| super::ProxyError::bad_gateway(error.to_string()))?;
+    if super::adapters::downstream_format_for_route(route) == F::OpenAiChat
+        && value
+            .get("created")
+            .and_then(super::openai_chat_compat::valid_created)
+            .is_none()
+    {
+        value["created"] = Value::from(super::openai_chat_compat::unix_timestamp_seconds());
+    }
+    Ok(value)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum PrepareError {
     PaidModel,
@@ -794,7 +985,7 @@ fn messages_shaped(model: &str, requested: &Value, stream: bool) -> Value {
     );
     let max_tokens = requested_limit(requested).unwrap_or(32_000);
     body.insert("max_tokens".to_string(), Value::from(max_tokens));
-    if requested.get("messages").is_some() && requested.get("system").is_some() {
+    if requested.get("messages").is_some() {
         body.insert(
             "messages".to_string(),
             requested
@@ -802,10 +993,9 @@ fn messages_shaped(model: &str, requested: &Value, stream: bool) -> Value {
                 .cloned()
                 .unwrap_or(Value::Array(vec![])),
         );
-        body.insert(
-            "system".to_string(),
-            requested.get("system").cloned().unwrap_or(Value::Null),
-        );
+        if let Some(system) = requested.get("system") {
+            body.insert("system".to_string(), system.clone());
+        }
     } else {
         let (system, messages) = chat_to_claude_messages(requested);
         body.insert("messages".to_string(), messages);
@@ -1218,10 +1408,12 @@ pub fn continuation_messages(
     Some(Value::Array(messages))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CatalogSnapshot {
     ids: Vec<String>,
     fetched_at_ms: i64,
+    #[serde(default)]
+    metadata: BTreeMap<String, Value>,
 }
 
 static CATALOG: Mutex<Option<CatalogSnapshot>> = Mutex::new(None);
@@ -1231,7 +1423,17 @@ pub fn filter_free_ids(ids: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<St
     let mut kept = Vec::new();
     for id in ids {
         let id = id.as_ref().trim();
-        if !id.is_empty() && is_free_model(id) && !kept.iter().any(|seen| seen == id) {
+        if kept.len() >= 512 {
+            break;
+        }
+        if !id.is_empty()
+            && id.len() <= 256
+            && id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':')
+            })
+            && is_free_model(id)
+            && !kept.iter().any(|seen| seen == id)
+        {
             kept.push(id.to_string());
         }
     }
@@ -1267,6 +1469,7 @@ pub fn store_catalog(ids: Vec<String>, fetched_at_ms: i64) -> Vec<String> {
     *guard = Some(CatalogSnapshot {
         ids: ids.clone(),
         fetched_at_ms,
+        metadata: BTreeMap::new(),
     });
     ids
 }
@@ -1293,6 +1496,10 @@ pub fn generation_allowed(model: &str) -> Result<(), &'static str> {
     if !is_free_model(model) {
         return Err("OpenCode Zen only forwards free-lane models");
     }
+    if catalog_fetched_at_ms().is_some_and(|at| now_ms().saturating_sub(at) > CATALOG_MAX_STALE_MS)
+    {
+        return Err("OpenCode Zen catalog has expired");
+    }
     match current_catalog() {
         Some(ids)
             if ids
@@ -1308,45 +1515,166 @@ pub fn generation_allowed(model: &str) -> Result<(), &'static str> {
 
 pub const CATALOG_PATH: &str = "/zen/v1/models";
 
-/// Fetch the live listing. A transport or HTTP failure keeps the previous
-/// catalog. A cold start with no previous catalog returns the error.
-pub async fn refresh_catalog(client: &reqwest::Client) -> Result<Vec<String>, String> {
-    let session = session_for_conversation("catalog:opencode-zen");
-    let url = format!("{ORIGIN}{CATALOG_PATH}");
-    let mut request = client.get(url);
-    for (name, value) in gateway_headers(&session, false) {
-        if name == "content-type" {
-            continue;
+const CATALOG_FRESH_MS: i64 = 8 * 60 * 1000;
+const CATALOG_MAX_STALE_MS: i64 = 24 * 60 * 60 * 1000;
+static CATALOG_FETCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static CATALOG_RETRY_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn catalog_is_stale() -> bool {
+    catalog_fetched_at_ms().is_none_or(|at| now_ms().saturating_sub(at) >= CATALOG_FRESH_MS)
+}
+
+/// Fresh cached reads and concurrent callers share one bounded refresh. Explicit
+/// discovery also uses the freshness window, so a UI refresh cannot amplify IO.
+pub async fn refresh_catalog(
+    client: &reqwest::Client,
+    config_dir: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let _flight = CATALOG_FETCH.lock().await;
+    let cache_path = config_dir.join("opencode-zen-catalog.json");
+    if current_catalog().is_none() {
+        let path = cache_path.clone();
+        if let Ok(Some(snapshot)) =
+            tokio::task::spawn_blocking(move || load_catalog_cache(&path)).await
+        {
+            *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot);
         }
-        request = request.header(name, value);
     }
-    let response = request
+    if !catalog_is_stale() {
+        return Ok(current_catalog().unwrap_or_default());
+    }
+    let stale = || {
+        catalog_fetched_at_ms()
+            .filter(|at| now_ms().saturating_sub(*at) <= CATALOG_MAX_STALE_MS)
+            .and_then(|_| current_catalog())
+    };
+    if now_ms() < CATALOG_RETRY_AT.load(std::sync::atomic::Ordering::Relaxed) {
+        return stale().ok_or_else(|| "OpenCode Zen catalog refresh is cooling down".to_string());
+    }
+    let result = fetch_catalog(client).await;
+    match result {
+        Ok(snapshot) => {
+            CATALOG_RETRY_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+            let ids = snapshot.ids.clone();
+            *CATALOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(snapshot.clone());
+            // A cache write failure cannot invalidate an accepted upstream listing.
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::infra::storage::write_json_pretty(&cache_path, &snapshot)
+            })
+            .await;
+            Ok(ids)
+        }
+        Err(error) => {
+            CATALOG_RETRY_AT.store(now_ms() + 30_000, std::sync::atomic::Ordering::Relaxed);
+            stale().ok_or(error)
+        }
+    }
+}
+
+async fn fetch_catalog(client: &reqwest::Client) -> Result<CatalogSnapshot, String> {
+    let session = session_for_conversation("catalog:opencode-zen");
+    let mut request = client
+        .get(format!("{ORIGIN}{CATALOG_PATH}"))
+        .timeout(std::time::Duration::from_secs(15));
+    for (name, value) in gateway_headers(&session, false) {
+        if name != "content-type" {
+            request = request.header(name, value);
+        }
+    }
+    let mut response = request
         .send()
         .await
-        .map_err(|error| format!("OpenCode Zen catalog request failed: {error}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let kind = classify_upstream_status(status.as_u16());
-        if let Some(previous) = current_catalog() {
-            return Ok(previous);
-        }
+        .map_err(|_| "OpenCode Zen catalog transport failed".to_string())?;
+    if !response.status().is_success() {
         return Err(format!(
-            "OpenCode Zen catalog {kind}: HTTP {}",
-            status.as_u16()
+            "OpenCode Zen catalog {}: HTTP {}",
+            classify_upstream_status(response.status().as_u16()),
+            response.status().as_u16()
         ));
     }
-    let payload = response
-        .json::<Value>()
+    let bytes = crate::infra::http::read_response_body_limited(&mut response, 1024 * 1024)
         .await
-        .map_err(|error| format!("OpenCode Zen catalog body failed: {error}"))?;
+        .map_err(|_| "OpenCode Zen catalog body invalid or exceeds 1 MiB".to_string())?;
+    let payload: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "OpenCode Zen catalog invalid JSON".to_string())?;
     let ids = filter_free_ids(parse_model_ids(&payload));
     if ids.is_empty() {
-        if let Some(previous) = current_catalog() {
-            return Ok(previous);
-        }
         return Err("OpenCode Zen catalog listed no free-lane models".to_string());
     }
-    Ok(store_catalog(ids, now_ms()))
+    let mut metadata = BTreeMap::new();
+    if let Some(rows) = payload
+        .get("data")
+        .or_else(|| payload.get("models"))
+        .and_then(Value::as_array)
+        .or_else(|| payload.as_array())
+    {
+        for row in rows {
+            if let Some(id) = row
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| ids.iter().any(|item| item == id))
+            {
+                let mut safe = Map::new();
+                for key in ["context_window", "max_output_tokens"] {
+                    if let Some(value) = row
+                        .get(key)
+                        .and_then(Value::as_u64)
+                        .filter(|n| *n > 0 && *n <= 100_000_000)
+                    {
+                        safe.insert(key.to_string(), Value::from(value));
+                    }
+                }
+                if !safe.is_empty() {
+                    metadata.insert(id.to_string(), Value::Object(safe));
+                }
+            }
+        }
+    }
+    Ok(CatalogSnapshot {
+        ids,
+        metadata,
+        fetched_at_ms: now_ms(),
+    })
+}
+
+fn load_catalog_cache(path: &std::path::Path) -> Option<CatalogSnapshot> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 1024 * 1024 {
+        return None;
+    }
+    let mut snapshot: CatalogSnapshot = serde_json::from_slice(&bytes).ok()?;
+    let age = now_ms().checked_sub(snapshot.fetched_at_ms)?;
+    if !(0..=CATALOG_MAX_STALE_MS).contains(&age) {
+        return None;
+    }
+    snapshot.ids = filter_free_ids(snapshot.ids);
+    snapshot.metadata.retain(|id, value| {
+        snapshot.ids.contains(id)
+            && value.as_object().is_some_and(|map| {
+                map.len() <= 2
+                    && map.iter().all(|(key, value)| {
+                        matches!(key.as_str(), "context_window" | "max_output_tokens")
+                            && value.as_u64().is_some_and(|n| n > 0 && n <= 100_000_000)
+                    })
+            })
+    });
+    (!snapshot.ids.is_empty()).then_some(snapshot)
+}
+
+pub fn catalog_metadata(id: &str) -> Value {
+    CATALOG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|snapshot| snapshot.metadata.get(id))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}))
 }
 
 #[cfg(test)]
@@ -1354,12 +1682,12 @@ fn clear_catalog() {
     *CATALOG.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
 }
 
-/// 429 stays a hard failure on this lane. Quota is per session, so a retry
-/// of the same model is a second burn. 403 FreeTierError is a gate miss.
+/// Quota failures are not replayed. The reference observes free quota by
+/// egress IP; neither reminting sessions nor retrying invents more allowance.
 pub fn classify_upstream_status(status: u16) -> &'static str {
     match status {
         429 => "quota",
-        403 => "free_tier_gate",
+        403 => "forbidden",
         401 => "rejected",
         _ => "upstream",
     }
@@ -1504,7 +1832,7 @@ mod tests {
     #[test]
     fn quota_is_not_retried() {
         assert_eq!(classify_upstream_status(429), "quota");
-        assert_eq!(classify_upstream_status(403), "free_tier_gate");
+        assert_eq!(classify_upstream_status(403), "forbidden");
     }
 
     #[test]
@@ -1616,6 +1944,7 @@ mod tests {
 
     #[test]
     fn catalog_keeps_the_previous_list_and_filters_paid_ids() {
+        let _lock = CATALOG_TEST_LOCK.blocking_lock();
         clear_catalog();
         let first = store_catalog(
             vec![
@@ -1623,7 +1952,7 @@ mod tests {
                 "gpt-5.4".to_string(),
                 "union-alpha".to_string(),
             ],
-            10,
+            now_ms(),
         );
         assert_eq!(
             first,
@@ -1653,5 +1982,81 @@ mod tests {
             prepare_upstream(&requested).err(),
             Some(PrepareError::PaidModel)
         );
+    }
+}
+
+#[path = "opencode_zen/stream.rs"]
+mod stream;
+pub(super) use stream::ZenStream;
+
+#[cfg(test)]
+pub(crate) static CATALOG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+mod catalog_lifecycle_tests {
+    use super::*;
+    #[test]
+    fn opencode_zen_disk_cache_accepts_recent_success_only() {
+        let path =
+            std::env::temp_dir().join(format!("zen-catalog-{}.json", mint_session_id(now_ms())));
+        let mut snapshot = CatalogSnapshot {
+            ids: vec!["chat-free".into(), "paid".into(), "jev-free".into()],
+            fetched_at_ms: now_ms(),
+            metadata: BTreeMap::from([(
+                "chat-free".into(),
+                serde_json::json!({"context_window":32768}),
+            )]),
+        };
+        crate::infra::storage::write_json_pretty(&path, &snapshot).unwrap();
+        let loaded = load_catalog_cache(&path).unwrap();
+        assert_eq!(loaded.ids, vec!["chat-free"]);
+        assert_eq!(loaded.metadata["chat-free"]["context_window"], 32768);
+        snapshot.fetched_at_ms = now_ms() - CATALOG_MAX_STALE_MS - 1;
+        crate::infra::storage::write_json_pretty(&path, &snapshot).unwrap();
+        assert!(load_catalog_cache(&path).is_none());
+        snapshot.fetched_at_ms = now_ms() + 10000;
+        crate::infra::storage::write_json_pretty(&path, &snapshot).unwrap();
+        assert!(load_catalog_cache(&path).is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn opencode_zen_cold_catalog_refresh_is_single_flight_with_backoff() {
+        use futures_util::StreamExt;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let _lock = CATALOG_TEST_LOCK.lock().await;
+        clear_catalog();
+        CATALOG_RETRY_AT.store(0, Ordering::Relaxed);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let router = axum::Router::new().fallback(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            async { http::StatusCode::BAD_GATEWAY }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(proxy).unwrap())
+            .build()
+            .unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("zen-catalog-flight-{}", mint_session_id(now_ms())));
+        let mut requests = futures_util::stream::FuturesUnordered::new();
+        for _ in 0..16 {
+            requests.push(refresh_catalog(&client, &directory));
+        }
+        while let Some(result) = requests.next().await {
+            assert!(result.is_err());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        CATALOG_RETRY_AT.store(0, Ordering::Relaxed);
+        clear_catalog();
+        server.abort();
     }
 }

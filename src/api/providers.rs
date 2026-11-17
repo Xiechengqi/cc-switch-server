@@ -3456,7 +3456,7 @@ pub(in crate::api) async fn fetch_provider_models_inner(
         }
         ensure_provider_outbound_allowed(state, execution).await?;
         let client = state.http_client().await;
-        let ids = crate::proxy::opencode_zen::refresh_catalog(&client)
+        let ids = crate::proxy::opencode_zen::refresh_catalog(&client, &state.config_dir)
             .await
             .map_err(ApiError::bad_gateway)?;
         return Ok(ProviderModelsFetchResult {
@@ -3473,6 +3473,8 @@ pub(in crate::api) async fn fetch_provider_models_inner(
                     raw: serde_json::json!({
                         "id": id,
                         "source": "opencode_zen_live_model_catalog",
+                        "upstreamDeclared": crate::proxy::opencode_zen::catalog_metadata(&id),
+                        "capabilitySource": "reviewed_text_tools_only",
                         "capabilities": {
                             "stream": true,
                             "tools": true,
@@ -3484,7 +3486,7 @@ pub(in crate::api) async fn fetch_provider_models_inner(
                 })
                 .collect(),
             source: Some("opencode_zen_live_model_catalog".to_string()),
-            stale: Some(false),
+            stale: Some(crate::proxy::opencode_zen::catalog_is_stale()),
             fetched_at_ms: crate::proxy::opencode_zen::catalog_fetched_at_ms(),
         });
     }
@@ -5088,6 +5090,7 @@ fn s1_provider_for_profile(
         }
         "codex.kiro_oauth" => ("Kiro OAuth", json!({})),
         "claude.kimi_code" | "codex.kimi_code" | "gemini.kimi_code" => ("Kimi OAuth", json!({})),
+        "claude.opencode_zen" | "codex.opencode_zen" => ("OpenCode Zen", json!({})),
         "claude.qoder_cosy" | "codex.qoder_cosy" | "gemini.qoder_cosy" => {
             ("Qoder OAuth", json!({}))
         }

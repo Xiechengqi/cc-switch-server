@@ -388,6 +388,10 @@ pub struct UsageLog {
     pub value_streamed_text_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_resources: Option<super::value_pricing::ResourceUsage>,
+    /// Local evidence for the current attempt when public Token totals cover
+    /// multiple generations. Never use aggregate totals to price one attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_generation_usage: Option<TokenUsage>,
     #[serde(default)]
     pub share_name: Option<String>,
     #[serde(default)]
@@ -525,6 +529,8 @@ impl ResponseModelEvidence {
                     | "claude.workbuddy_oauth"
                     | "codex.workbuddy_oauth"
                     | "gemini.workbuddy_oauth"
+                    | "claude.opencode_zen"
+                    | "codex.opencode_zen"
             ),
             None => matches!(
                 log.provider_type,
@@ -1189,6 +1195,7 @@ impl UsageLog {
             usage_estimated: false,
             value_streamed_text_bytes: None,
             value_resources: None,
+            value_generation_usage: None,
             share_name: None,
             user_country: None,
             user_country_iso3: None,
@@ -1390,7 +1397,7 @@ pub struct UsageModelMetadata {
     pub actual_model_source: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub raw_input_tokens: Option<u64>,
     pub input_tokens: Option<u64>,

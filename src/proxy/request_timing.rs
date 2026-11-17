@@ -1160,8 +1160,8 @@ mod tests {
             types.insert(kind.as_str());
             labels.insert(expected);
         }
-        assert_eq!(types.len(), 28);
-        assert_eq!(labels.len(), 30);
+        assert_eq!(types.len(), 29);
+        assert_eq!(labels.len(), 31);
         let slot = TimingSlot::default();
         let first = slot
             .begin_for_driver(
