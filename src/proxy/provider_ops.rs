@@ -1271,7 +1271,8 @@ fn runtime_model_is_body_field(execution: &ProviderExecution) -> bool {
         UpstreamProtocol::GeminiNative => false,
         UpstreamProtocol::Special => matches!(
             execution.plan.driver_id.as_str(),
-            "special.cursor"
+            "special.opencode_zen"
+                | "special.cursor"
                 | "special.copilot"
                 | "special.kiro"
                 | "special.deepseek_account"

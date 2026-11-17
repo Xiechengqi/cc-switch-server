@@ -73,7 +73,11 @@ pub fn provider_identity(provider: &StoredProvider) -> Option<ProviderIdentity> 
         family_id: family.family_id.clone(),
         category: presentation.category.clone(),
         display_name: provider.provider.name.clone(),
-        icon: Some(extra_string("icon").unwrap_or_else(|| presentation.icon.clone())),
+        icon: Some(
+            extra_string("icon")
+                .filter(|icon| !(family.family_id == "family.opencode_zen" && icon == "custom"))
+                .unwrap_or_else(|| presentation.icon.clone()),
+        ),
         icon_color: extra_string("iconColor"),
         catalog_version: catalog().catalog_version.clone(),
         revision: provider.resource.revision,

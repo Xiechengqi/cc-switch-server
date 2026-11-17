@@ -40,7 +40,7 @@
     "family.qoder_cosy": { "category": "qoder", "icon": "qoder" },
     "family.codebuddy_oauth": { "category": "codebuddy", "icon": "codebuddy" },
     "family.workbuddy_oauth": { "category": "workbuddy", "icon": "workbuddy" },
-    "family.opencode_zen": { "category": "opencode_zen", "icon": "custom" },
+    "family.opencode_zen": { "category": "opencode_zen", "icon": "opencode" },
     "family.trae_solo": { "category": "trae", "icon": "custom" },
     "family.trae_raw_chat": { "category": "trae", "icon": "custom" },
     "family.trae_raw_chat_intl": { "category": "trae", "icon": "custom" },

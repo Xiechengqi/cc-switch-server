@@ -3309,3 +3309,15 @@ OpenCode Zen 注册/USD 计价/share tariff 工作树改动，与本变更无关
 
 参考证据与本地 fixture 都不等于真实接受性。CN / Intl × CodeBuddy / WorkBuddy 的
 DeepSeek Harness 完整会话仍为 `live_pending`，未部署、未发起真实推理调用。
+
+## OpenCode Zen Bundle 管理修复（2026-11-17）
+
+本轮由 Web 实际保存问题触发：隔离 Server 复现 `upsert_provider_bundle` 返回 500、回读 404，日志为 `seal Provider credentials before commit`。源码显示无凭据 StaticSecret Profile 被共享凭据来源函数当成需要密文的 Bundle，S2 seal 因找不到主 Surface 的凭据材料失败。本轮按显式 `authScheme:none + slots=[]` 跳过密文别名；公开 Share 身份仅在同一 Zen Bundle 内一致，不跨 Bundle 复用。管理就绪状态与运行时免凭据语义统一。
+
+补齐两个 Zen Profile 的 single/passthrough 能力声明与专用转发的公共模型策略执行；固定策略先于免费目录校验和上游协议选择，保留下游请求模型证据，续写沿用实际模型。前端不再丢弃保存/回读的安全状态诊断，也不自动重放不确定写入。presentation 源和生成资产注册 OpenCode 静态 SVG，来源为官方 favicon，移除背景/样式/嵌套包装并将颜色映射至主题 currentColor；旧 Zen `custom` 占位仅作定向显示兼容。没有新增外部仓库构建/运行输入，没有调用真实推理。
+
+整体 review 已核对无凭据存储、Share 来源身份隔离、固定策略执行顺序、requested/actual 模型证据、流式/续写计量、旧图标兼容和不确定写入不重放。注册表允许 single 的 Profile 同时声明 `defaultUpstreamModel:chat-free`，默认策略仍为 passthrough。Server Web 边界将 Zen 图标纳入必须可达的生产图，不放开桌面 OpenCode 入口。注册表指纹通过生成器更新 coding-plan 清单，未手改证据哈希。
+
+本轮最终本地回执：Node 20.20.2 下完整 `scripts/static-checks.sh` 通过（严格 Clippy、后端审计 2205/2205、smoke 脚本测试 13/13、边界与纪律检查）；Web 类型检查通过，最终生产构建与 405/405 测试通过。`cargo check`、`cargo build -j1`、带 `RUST_MIN_STACK=67108864` 的 `scripts/smoke/smoke-local.sh` 均通过。最终 `CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 RUST_MIN_STACK=67108864 cargo test -j1 --all-targets --no-fail-fast -- --test-threads=4`：lib 4480 通过 / 2 失败 / 3 忽略，API 契约 139/139、另两个集成目标各 1/1；Zen 固定模型 3×3 路由矩阵、流式取消/续写计量和 Web Bundle 保存/重载/Share 新增回归通过。
+
+全量 lib 仍有本轮修改前已记录的两项失败：`restored_router_ack_and_withdrawn_pending_tariff_converge_without_rewriting_grants`（ACK schema 预期 5，实际 6）与 `signed_conversion_commits_live_usage_and_calibrates_against_preview_then_replays_durably`（tampered settings 拒绝断言）。本轮未改动这两个测试或相关额度实现；不声称全量测试通过。过程中旧构建曾因资源终止，以及前端重建造成旧嵌入路径失效，均未计作最终回执；最终测试使用固定 Web 产物。离线 readiness 为 `blocked_inputs`，真实凭据/Router/部署输入未提供；保持 `live_pending`，未部署、未发起真实推理调用。

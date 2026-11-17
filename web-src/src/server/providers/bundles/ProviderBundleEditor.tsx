@@ -2046,6 +2046,7 @@ export function ProviderBundleEditor({
                 error.latest
                   ? "providerBundle.saveUncertainReadBack"
                   : "providerBundle.saveUncertain",
+                { diagnostics: error.diagnostics },
               )
             : isBundleRefreshConflict(error)
               ? t("providerBundle.saveConflict", { error: message })

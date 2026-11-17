@@ -58,6 +58,7 @@ async fn opencode_zen_loopback_is_incremental_and_unread_bodies_settle_cancellat
             async move {
                 assert_eq!(headers["authorization"], "Bearer public");
                 let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["model"], "chat-free");
                 assert!(body["tools"].as_array().unwrap().len() >= 2);
                 Response::builder().header(CONTENT_TYPE, "text/event-stream").body(Body::from_stream(async_stream::stream! {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: {\"id\":\"chat_1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"},\"finish_reason\":null}]}\n\n"));
@@ -71,11 +72,15 @@ async fn opencode_zen_loopback_is_incremental_and_unread_bodies_settle_cancellat
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        let options = zen_test_options(
+        let mut options = zen_test_options(
             &state,
-            json!({"model":"chat-free","stream":true,"messages":[{"role":"user","content":"hi"}]}),
+            json!({"model":"downstream-alias","stream":true,"messages":[{"role":"user","content":"hi"}]}),
         )
         .await;
+        Arc::make_mut(&mut options.execution.plan).model_policy =
+            crate::domain::providers::runtime::RuntimeModelPolicy::Single {
+                upstream_model: "chat-free".into(),
+            };
         let response = forward_opencode_zen_at(options, &origin).await.unwrap();
         if unread {
             drop(response);
@@ -179,6 +184,7 @@ async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() 
         let n = count.fetch_add(1, Ordering::SeqCst);
         async move {
             let sent: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(sent["model"], "chat-free");
             if n == 1 { assert!(sent["messages"].to_string().contains("partial")); }
             axum::Json(json!({"id":"chat_1","object":"chat.completion","model":"chat-free","choices":[{"index":0,"message":{"role":"assistant","content":if n==0 {"partial"} else {" rest"}},"finish_reason":if n==0 {"length"} else {"stop"}}],"usage":{"prompt_tokens":10,"completion_tokens":100,"total_tokens":110}}))
         }
@@ -188,7 +194,11 @@ async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() 
     let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    let mut options = zen_test_options(&state, json!({"model":"chat-free","stream":false,"max_tokens":2048,"messages":[{"role":"user","content":"hi"}]})).await;
+    let mut options = zen_test_options(&state, json!({"model":"downstream-alias","stream":false,"max_tokens":2048,"messages":[{"role":"user","content":"hi"}]})).await;
+    Arc::make_mut(&mut options.execution.plan).model_policy =
+        crate::domain::providers::runtime::RuntimeModelPolicy::Single {
+            upstream_model: "chat-free".into(),
+        };
     state.mutate_shares_immediate(|store| {
         store.shares.push(serde_json::from_value(json!({
             "id":"zen-share","app":"codex","providerId":"zen-loopback","providerType":"opencode_zen","ownerEmail":"owner@example.test","enabled":true,"status":"active",
@@ -366,4 +376,64 @@ async fn opencode_zen_role_only_stream_cannot_extend_first_semantic_deadline() {
     assert_eq!(log.first_token_ms, None);
     assert_ne!(log.stream_status.as_deref(), Some("completed"));
     server.abort();
+}
+
+#[tokio::test]
+async fn opencode_zen_fixed_models_choose_upstream_wire_before_conversion() {
+    use super::super::opencode_zen as zen;
+    let _lock = zen::CATALOG_TEST_LOCK.lock().await;
+    for model in ["chat-free", "muse-spark-free", "union-alpha"] {
+        for route in [
+            ProxyRoute::ClaudeMessages,
+            ProxyRoute::CodexChatCompletions,
+            ProxyRoute::CodexResponses,
+        ] {
+            let state = forwarder_test_state("zen-fixed-wire");
+            let router = axum::Router::new().fallback(axum::routing::post(move |uri: axum::http::Uri, body: Bytes| async move {
+                assert_eq!(uri.path(), zen::endpoint_for(model));
+                let sent: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(sent["model"], model);
+                let payload = match zen::wire_for(model) {
+                    zen::ZenWire::Chat => json!({"id":"chat_test","model":model,"choices":[{"index":0,"message":{"role":"assistant","content":"fixed"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}),
+                    zen::ZenWire::Responses => json!({"id":"resp_test","object":"response","model":model,"status":"completed","output":[{"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"fixed","annotations":[]}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}),
+                    zen::ZenWire::Messages => json!({"id":"msg_test","type":"message","model":model,"role":"assistant","content":[{"type":"text","text":"fixed"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}),
+                };
+                axum::Json(payload)
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let request = match route {
+                ProxyRoute::CodexResponses => {
+                    json!({"model":"downstream-alias","input":"hi","stream":false})
+                }
+                _ => {
+                    json!({"model":"downstream-alias","messages":[{"role":"user","content":"hi"}],"max_tokens":128,"stream":false})
+                }
+            };
+            let mut options = zen_test_options(&state, request).await;
+            options.route = route;
+            Arc::make_mut(&mut options.execution.plan).model_policy =
+                crate::domain::providers::runtime::RuntimeModelPolicy::Single {
+                    upstream_model: model.into(),
+                };
+            zen::store_catalog(vec![model.to_string()], current_time_ms() as i64);
+            let response = forward_opencode_zen_at(options, &origin).await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains("fixed"));
+            let log = state
+                .usage_snapshot()
+                .await
+                .request_detail("zen-receipt")
+                .unwrap()
+                .clone();
+            assert_eq!(log.requested_model.as_deref(), Some("downstream-alias"));
+            assert_eq!(log.actual_model.as_deref(), Some(model));
+            server.abort();
+        }
+    }
 }

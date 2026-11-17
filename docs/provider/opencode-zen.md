@@ -49,3 +49,13 @@ Chat 必须有合法 finish_reason 与 `[DONE]`；Responses/Messages 使用公�
 整体 review 修正了无凭据 Profile 的创建与运行时准入、Responses 终态后数据校验、慢下游对空闲超时的影响、分片事件解析前的内存预留，以及续写准入失败时的 attempt 编号。SQLite loopback 同时核对一条公开日志的汇总用量与两个独立 USD attempt，防止最后一个 attempt 重复计入首段。Chat 错误帧按公共协议携带错误后以 `[DONE]` 结束；该分隔符本身不是成功证据，成功还须有效终态、干净 EOF 和完成日志。
 
 2026-11-17 最终验证：Zen 相关 28/28、API 集成 138/138、Node 审计 2205/2205；严格 Clippy、check、build、完整格式检查与本地 HTTP smoke 通过。全量 Rust library 为 4479 passed / 2 failed / 3 ignored，两项为既有额度基线失败，完整套件未全绿；具体名称与最终源码摘要见 `PROTOCOL_EVIDENCE.md` 的 Zen 条目。离线 readiness 为 blocked_inputs，真实目录/推理及 Router/Share 验收继续 live_pending。
+
+## Bundle 管理与固定模型
+
+Zen 的 `authScheme:none`、空凭据槽表示认证条件已满足，无须配置 API Key。该 Profile 不生成 S2 密文凭据或共享密文别名；管理视图 `credentialConfigured=true` 表示认证条件就绪，`credentialSlots=[]` 仍明确没有凭据。Share 的公开来源身份限定于同一显式 Zen Bundle，不能把所有免凭据供应商或不同 Bundle 当成同一账号。
+
+Claude/Codex 均支持透传与固定上游模型，默认保持透传；允许全局或按应用配置。固定策略在目录准入和协议选择前由公共运行时策略执行：下游模型名保留为 requested_model，实际模型用于出站路径、免费目录校验、续写与 USD 计量。保存配置不调用真实目录；生成时仍拒绝付费或不在有效目录中的模型。
+
+保存遇到服务端异常或传输中断时，保留输入并回读，但不自动重放。提示展示脱敏的保存/回读状态及受限错误码，不回显响应正文、凭据或任意异常 URL；回读 404 不再被直接解释为断网。
+
+OpenCode 图标取自官方 `https://opencode.ai/favicon.svg` 的图形，内联 SVG 只保留静态几何，并使用 currentColor 适配主题。旧 Zen 预设持久化的 `custom` 占位在 Web 和服务端身份投影中解析为 OpenCode；其他明确自定义图标保持不变，其他供应商不受影响。

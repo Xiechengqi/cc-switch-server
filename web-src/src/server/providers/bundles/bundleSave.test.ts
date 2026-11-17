@@ -130,3 +130,17 @@ describe("Bundle Provider save orchestration", () => {
       .toBe("replacement-kept-in-draft");
   });
 });
+
+it("retains bounded save and read-back diagnostics without leaking bodies", async () => {
+  const bundle = customBundleFixture();
+  const draft = editProviderBundleDraft(bundle);
+  draft.notes = "changed";
+  api.upsertBundle.mockRejectedValue(new HttpResponseError("private provider body", 500, {code:"cc_switch_internal_error"}));
+  api.getBundle.mockRejectedValue(new HttpResponseError("private read-back body", 404));
+  await expect(prepareBundleProviderSave(draft, bundle)).rejects.toMatchObject({
+    diagnostics:"HTTP 500 (cc_switch_internal_error) / HTTP 404", latest:undefined,
+  });
+  expect(api.upsertBundle).toHaveBeenCalledTimes(1);
+  const unsafe = new BundleSaveUncertainError(undefined, new HttpResponseError("secret", 502, {code:"<private>"}), new TypeError("private url"));
+  expect(unsafe.diagnostics).toBe("HTTP 502 / transport");
+});

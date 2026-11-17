@@ -29,3 +29,12 @@ describe("Custom Provider icon", () => {
     expect(resolveBundleIcon("family.not_known")).toBeUndefined();
   });
 });
+
+it("replaces the old Zen placeholder while preserving custom choices", () => {
+  expect(resolveBundleIcon("family.opencode_zen", "custom")).toBe("opencode");
+  expect(resolveBundleIcon("family.opencode_zen")).toBe("opencode");
+  expect(resolveBundleIcon("family.opencode_zen", "openai")).toBe("openai");
+  expect(hasIcon("opencode")).toBe(true);
+  expect(getIcon("opencode")).toContain("currentColor");
+  expect(searchIcons("OpenCode")).toContain("opencode");
+});

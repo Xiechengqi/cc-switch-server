@@ -1,3 +1,4 @@
+import { resolveBundleIcon } from "./bundleIcon";
 import type {
   ProviderBundleSurfaceWriteDraft,
   ProviderBundleView,
@@ -710,7 +711,7 @@ export function editProviderBundleDraft(
     name: identity.name,
     websiteUrl: identity.websiteUrl,
     notes: bundle.notes ?? "",
-    icon: bundle.icon,
+    icon: resolveBundleIcon(bundle.familyId, bundle.icon),
     iconColor: bundle.iconColor,
     buddyLoginSite: bundle.buddyLoginSite,
     expectedRevision: bundle.revision,

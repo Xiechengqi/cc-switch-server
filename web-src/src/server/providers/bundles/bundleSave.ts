@@ -18,11 +18,18 @@ export interface BundleRebindConfirmation {
 }
 
 export class BundleSaveUncertainError extends Error {
-  constructor(public readonly latest?: ProviderBundleView) {
+  public readonly diagnostics: string;
+  constructor(public readonly latest?: ProviderBundleView, writeError?: unknown, readBackError?: unknown) {
     super(
       "Provider save result is uncertain; review the latest configuration before retrying",
     );
     this.name = "BundleSaveUncertainError";
+    const describe = (error: unknown) => {
+      if (!(error instanceof HttpResponseError)) return "transport";
+      const code = error.code && /^[a-zA-Z0-9_-]{1,96}$/.test(error.code) ? ` (${error.code})` : "";
+      return `HTTP ${error.status}${code}`;
+    };
+    this.diagnostics = `${describe(writeError)} / ${latest ? "HTTP 200" : describe(readBackError)}`;
   }
 }
 
@@ -101,8 +108,12 @@ async function writeProvider(
     ) {
       throw error;
     }
-    const latest = await providersApi.getBundle(id).catch(() => undefined);
-    throw new BundleSaveUncertainError(latest);
+    let readBackError: unknown;
+    const latest = await providersApi.getBundle(id).catch((failure: unknown) => {
+      readBackError = failure;
+      return undefined;
+    });
+    throw new BundleSaveUncertainError(latest, error, readBackError);
   }
 }
 

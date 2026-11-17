@@ -161,7 +161,7 @@ export const serverProviderPresets: Readonly<
     "category": "official"
   },
   "claude.opencode_zen": {
-    "icon": "custom",
+    "icon": "opencode",
     "name": "OpenCode Zen",
     "websiteUrl": "https://opencode.ai",
     "notes": "Free lane. No API key.",
@@ -703,7 +703,7 @@ export const serverProviderPresets: Readonly<
     "category": "official"
   },
   "codex.opencode_zen": {
-    "icon": "custom",
+    "icon": "opencode",
     "name": "OpenCode Zen",
     "websiteUrl": "https://opencode.ai",
     "notes": "Free lane. No API key.",

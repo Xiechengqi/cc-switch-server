@@ -1141,3 +1141,18 @@ describe("Trae raw channel configuration", () => {
     expect(edited.surfaces.every(surface => surface.driverOptions.traeToolSimulationEnabled === true)).toBe(true);
   });
 });
+
+it("Zen supports global and per-App fixed models without credentials", () => {
+  const family = familyById("family.opencode_zen")!;
+  const initial = createProviderBundleDraft(family);
+  expect(modelPoliciesForFamily(family)).toEqual(["single", "passthrough"]);
+  expect(initial.modelPolicy).toBe("passthrough");
+  expect(initial.icon).toBe("opencode");
+  expect(initial.secrets).toEqual({});
+  const fixed = updateBundleModel(initial, "single", "chat-free");
+  expect(toProviderBundleWriteDraft(fixed)).toMatchObject({modelPolicy:"single",upstreamModel:"chat-free",credentialPatches:{}});
+  expect(validateProviderBundleDraft(fixed)).toBeNull();
+  const perApp = changeModelPolicyScope(fixed, "per_app");
+  expect(perApp.modelPolicyScope).toBe("per_app");
+  expect(toProviderBundleWriteDraft(perApp).surfaces.every(surface => surface.modelPolicy === "single" && surface.upstreamModel === "chat-free")).toBe(true);
+});

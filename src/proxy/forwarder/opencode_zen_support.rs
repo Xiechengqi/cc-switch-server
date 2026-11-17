@@ -54,7 +54,12 @@ async fn forward_opencode_zen_at(
             super::request_memory::json_parse_working_bytes(&body).saturating_mul(3),
         )
         .map_err(|e| e.into_proxy_error())?;
-    let mut requested: Value = serde_json::from_slice(&body)
+    let mut routed = super::adapters::AdapterRequest {
+        body,
+        ..Default::default()
+    };
+    execution.enforce_model_policy(&mut routed)?;
+    let mut requested: Value = serde_json::from_slice(&routed.body)
         .map_err(|_| ProxyError::bad_request("OpenCode Zen request must be a JSON object"))?;
     let map = requested
         .as_object_mut()
@@ -103,10 +108,13 @@ async fn forward_opencode_zen_at(
     let wire = zen::wire_for(&model);
     let tool_context = super::transforms::responses_tool_context(&requested);
     let metadata = routed_model_metadata(
-        &model,
+        routed.requested_model.as_deref().unwrap_or(&model),
         zen::base_model_id(&model),
         None,
-        "opencode_zen.request",
+        routed
+            .actual_model_source
+            .as_deref()
+            .unwrap_or("opencode_zen.request"),
     );
     request_context.is_streaming = prepared.stream;
     request_context.usage_state = Some(UsageState::Pending);

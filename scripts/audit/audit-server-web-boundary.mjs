@@ -36,7 +36,8 @@ const forbiddenExistingPaths = Object.freeze([
   "web-src/src/hooks/useTauriEvent.ts",
   "web-src/src/icons/extracted/hermes.png",
   "web-src/src/icons/extracted/openclaw.svg",
-  "web-src/src/icons/extracted/opencode.svg",
+  // The desktop OpenCode logo stays excluded; the Zen Provider glyph below
+  // is part of the supported Server production graph.
   "web-src/src/icons/extracted/opencode-logo-light.svg",
 ]);
 
@@ -46,6 +47,7 @@ const requiredReachablePaths = Object.freeze([
   "web-src/src/server/directProviderPresets.ts",
   "web-src/src/server/providers/bundles/ProviderBundlesPage.tsx",
   "web-src/src/server/providers/bundles/ProviderBundleEditor.tsx",
+  "web-src/src/icons/extracted/opencode.svg",
 ]);
 
 const forbiddenSourcePatterns = Object.freeze([

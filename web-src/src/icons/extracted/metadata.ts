@@ -5,6 +5,7 @@ export interface IconMetadata {
 }
 
 export const iconMetadata: Record<string, IconMetadata> = {
+  opencode: { name: "opencode", displayName: "OpenCode", defaultColor: "currentColor" },
   custom: {
     name: "custom",
     displayName: "Custom Provider",

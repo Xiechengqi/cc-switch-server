@@ -1309,6 +1309,9 @@ pub fn shared_credential_source_key(
                 family.family_id, family.credential_profile_id
             )
         })?;
+    if credential_profile.uses_no_credentials() {
+        return Ok(None);
+    }
     if !matches!(
         credential_profile.credential_policy,
         CredentialPolicy::StaticSecret { .. } | CredentialPolicy::Aws { .. }

@@ -103,6 +103,7 @@ struct AdapterProfile {
     support: AdapterSupport,
 }
 
+#[derive(Default)]
 pub struct AdapterRequest {
     pub body: Bytes,
     pub upstream_endpoint: Option<String>,

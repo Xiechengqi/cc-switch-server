@@ -269,7 +269,13 @@ impl ProviderView {
             custom_binding: stored.resource.custom_binding.clone(),
             identity: provider_identity_view(stored),
             order_index,
-            credential_configured: credentials.configured,
+            credential_configured: credentials.configured
+                || stored
+                    .resource
+                    .profile_id
+                    .as_ref()
+                    .and_then(|id| profile_by_id(id.as_str()))
+                    .is_some_and(|profile| profile.uses_no_credentials()),
             credential_slots: credentials.slots,
             cursor_account: cursor_account_view(stored),
             runtime,

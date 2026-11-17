@@ -21,7 +21,7 @@
     },
     {
       "path": "src/domain/providers/credentials.rs",
-      "sha256": "d1fe3f21f5e5e82137e2531f3d021daf1a0ddb3fff1252d273d583cf6705a5d9"
+      "sha256": "681f785d19340e74d5bb98c071386b1b0db16479660a0f154db0effaf20ba43f"
     },
     {
       "path": "src/domain/providers/migrate.rs",

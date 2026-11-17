@@ -298,6 +298,11 @@ pub enum ModelPolicyKind {
 }
 
 impl ProfileSpec {
+    /// A public driver has no secret to validate, seal, or alias.
+    pub fn uses_no_credentials(&self) -> bool {
+        matches!(&self.credential_policy, CredentialPolicy::StaticSecret { slots, auth_scheme: AuthScheme::None } if slots.is_empty())
+    }
+
     pub fn allows_model_policy(&self, policy: ModelPolicyKind) -> bool {
         if self.allowed_model_policies.is_empty() {
             self.model_policy == policy

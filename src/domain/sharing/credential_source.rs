@@ -519,6 +519,20 @@ pub fn resolve_stored_provider_credential_source(
             )
             .into_bytes()
         }
+        CredentialPolicy::StaticSecret { .. } if profile.uses_no_credentials() => {
+            // Public Zen has no key material. Only the two Surfaces of the same
+            // explicit Bundle share this identity; never merge all public users.
+            if profile.compatibility_provider_type
+                != Some(crate::domain::providers::model::ProviderType::OpenCodeZen)
+                || !crate::domain::providers::bundle::is_explicit_bundle_surface(&stored.provider)
+            {
+                return Ok(None);
+            }
+            let Some(id) = crate::domain::providers::bundle::bundle_id(&stored.provider) else {
+                return Ok(None);
+            };
+            format!("public-bundle\0{id}").into_bytes()
+        }
         CredentialPolicy::StaticSecret { .. } | CredentialPolicy::Aws { .. } => {
             let materialized = providers.materialize_provider_record(stored)?;
             let (_, credentials) = split_provider_credentials(&materialized.provider)?;

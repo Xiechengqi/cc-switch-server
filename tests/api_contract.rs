@@ -3,6 +3,7 @@
 
 include!("api_contract/buddy_login_site.rs");
 include!("api_contract/workbuddy_checkin.rs");
+include!("api_contract/opencode_zen.rs");
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
