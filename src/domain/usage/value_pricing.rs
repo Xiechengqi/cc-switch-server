@@ -95,7 +95,8 @@ pub fn value_metering_strategy(driver: &str) -> Option<&'static str> {
         | "http.openai_responses"
         | "oauth.gemini_native"
         | "oauth.gemini_code_assist"
-        | "http.gemini_native" => Some("http"),
+        | "http.gemini_native"
+        | "special.opencode_zen" => Some("http"),
         "special.qoder_cosy" => Some("qoder"),
         "special.codebuddy_oauth" | "special.workbuddy_oauth" => Some("buddy"),
         "special.trae_solo" | "special.trae_raw_chat" | "special.trae_raw_chat_intl" => {

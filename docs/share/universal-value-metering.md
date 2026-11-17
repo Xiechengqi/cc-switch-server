@@ -6,9 +6,9 @@
 
 ## 支持与就绪
 
-Provider Registry 是运行时权威：39 families、91 Profiles、28 Drivers，Custom HTTP 展开 99 个 Profile/Driver 组合。所有支持转发的组合均提供美元额度选项，API Key、OAuth、Coding Plan、Web Session、Legacy 不作为身份白名单。
+Provider Registry 是运行时权威：40 families、93 Profiles、29 Drivers，Custom HTTP 展开 101 个 Profile/Driver 组合。所有支持转发的组合均提供美元额度选项，API Key、OAuth、Coding Plan、Web Session、Legacy 不作为身份白名单。
 
-`value_metering_strategy` 声明 Driver 生命周期责任。`scripts/audit/audit-value-metering.mjs` 从 Registry 生成 `assets/contract/value-metering-coverage.json`，约束策略和关键钩子。它是静态覆盖清单，不能证明 99 对已在真实上游执行通过；表中的 transport 是现有入口分类，legacy 以最终解析的 Driver 为准。
+`value_metering_strategy` 声明 Driver 生命周期责任。`scripts/audit/audit-value-metering.mjs` 从 Registry 生成 `assets/contract/value-metering-coverage.json`，约束策略和关键钩子。它是静态覆盖清单，不能证明 101 对已在真实上游执行通过；表中的 transport 是现有入口分类，legacy 以最终解析的 Driver 为准。
 
 单用户、批量、市场席位和美元试用共用规则。`$` 可选择并保留草稿，保存与准入检查存储、Router 协商、已激活价目、模型映射及操作资源价格。已支持、配置是否就绪、本次用量精度分别诊断。模型、资源或档位缺价只影响相关操作，不将整类 Provider 标为不支持：Market 席位拒绝，普通授权按带原因的 $0 计量（[§3.1](value-quotas.md#31-未定价用量普通授权-0)）。
 

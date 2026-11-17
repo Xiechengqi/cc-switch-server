@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "authority": "assets/contract/provider-registry.json",
   "counts": {
-    "families": 39,
-    "profiles": 91,
-    "drivers": 28,
-    "pairs": 99
+    "families": 40,
+    "profiles": 93,
+    "drivers": 29,
+    "pairs": 101
   },
   "pairs": [
     {
@@ -94,6 +94,16 @@
       "profileId": "claude.workbuddy_oauth",
       "driverId": "special.workbuddy_oauth",
       "strategy": "buddy",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "claude.opencode_zen",
+      "driverId": "special.opencode_zen",
+      "strategy": "http",
       "transports": [
         "http",
         "sse"
@@ -366,6 +376,16 @@
       "profileId": "codex.workbuddy_oauth",
       "driverId": "special.workbuddy_oauth",
       "strategy": "buddy",
+      "transports": [
+        "http",
+        "sse"
+      ],
+      "acceptance": "live_pending"
+    },
+    {
+      "profileId": "codex.opencode_zen",
+      "driverId": "special.opencode_zen",
+      "strategy": "http",
       "transports": [
         "http",
         "sse"

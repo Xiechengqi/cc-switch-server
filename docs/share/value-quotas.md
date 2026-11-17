@@ -11,7 +11,7 @@
 1. Router reader ≥10 且 heartbeat 显式声明 `usdEquivalentQuotaV1`，能力与 Router URL、installation 绑定，缓存有效期 300 秒。
 2. 本地 SQLite authority 已经 `committed`；shadow 安装只能沿用 Token。
 3. Router 从模型价格（LiteLLM 派生价 + 模型价格表中的管理员定价）自动派生并发布执行价目；Server 通过签名请求取得、校验、持久化，并收到匹配 ACK 后激活。
-4. Share 已启用绑定须是 Registry 支持转发且具有统一计量生命周期策略的 Profile/Driver；凭据类别和 Coding Plan 不构成美元额度白名单。当前 Registry 为 39 families、91 Profiles、28 Drivers，Custom HTTP 展开 99 对。文本使用 v10/v1；已有媒体、音频内容及内置付费工具使用显式选择的 v11/v2 资源策略，按具体操作检查价格。重试的每次新生成独立准入，未知执行不能视为免费。
+4. Share 已启用绑定须是 Registry 支持转发且具有统一计量生命周期策略的 Profile/Driver；凭据类别和 Coding Plan 不构成美元额度白名单。当前 Registry 为 40 families、93 Profiles、29 Drivers，Custom HTTP 展开 101 对。文本使用 v10/v1；已有媒体、音频内容及内置付费工具使用显式选择的 v11/v2 资源策略，按具体操作检查价格。重试的每次新生成独立准入，未知执行不能视为免费。
 5. 已启用且通过上述能力检查的 Single 绑定，其实际 upstream model 应在当前 active 快照中具备 standard tier 价格。预览输出 `model_price_coverage`（模型／App／修订／排期时间）。普通授权缺价不阻断：该检查为 `ready:true, state:"unpriced"` 并保留 `reasonCode`，用量按 §3.1 记 $0；Share Market 席位仍为 `ready:false`，保存时再次检查；只在排期快照有价时提示等待生效（`tariff_not_effective`）。没有已确认价目仍阻断。Passthrough 输出 `scope=request_time`，不承诺所有调用方模型均有价，每次准入仍核实实际模型和 tier。后台保存已有授权不因该覆盖检查中断，也不清空历史。
 
 灰度部署还必须独立核对每个启用转发面 7 个自然日、至少 100 条真实完成文本请求。缺样本的面维持 Token；本地单测通过不等于 `live_verified`。

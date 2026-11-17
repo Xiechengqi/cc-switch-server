@@ -419,6 +419,6 @@ Server-owned capability based on protocol evidence reviewed through 2026-09-28:
 
 ### USD-equivalent metering
 
-All Registry-supported forwarding bindings share USD admission and settlement, independently of API key, OAuth, Coding Plan or Web Session credentials. The generated [metering inventory](../../assets/contract/value-metering-coverage.json) declares 39 families, 91 Profiles, 28 Drivers and 99 expanded Profile/Driver pairs. It checks lifecycle ownership and hooks; it is not live execution evidence. Resolved legacy runtimes use their actual Driver.
+All Registry-supported forwarding bindings share USD admission and settlement, independently of API key, OAuth, Coding Plan or Web Session credentials. The generated [metering inventory](../../assets/contract/value-metering-coverage.json) declares 40 families, 93 Profiles, 29 Drivers and 101 expanded Profile/Driver pairs. It checks lifecycle ownership and hooks; it is not live execution evidence. Resolved legacy runtimes use their actual Driver.
 
 Text uses the v10/v1 contract. Existing media, hosted tools and audio payloads require the explicit v11/v2 resource policy and a priced execution model/dimension. Missing model identities, resource prices or trustworthy usage are diagnosed separately from Provider eligibility. See [universal USD metering](../share/universal-value-metering.md) for evidence precision, retry/cancellation and rollout boundaries. All pairs remain live_pending.

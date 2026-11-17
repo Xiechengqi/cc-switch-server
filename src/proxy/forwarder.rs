@@ -20045,16 +20045,25 @@ struct OpencodeZenForwardOptions {
 }
 
 async fn forward_opencode_zen(options: OpencodeZenForwardOptions) -> Result<Response, ProxyError> {
+    let mut value_attempt = None;
+    let result = forward_opencode_zen_metered(options, &mut value_attempt).await;
+    result.map(|response| crate::proxy::value_metering::response(response, value_attempt))
+}
+
+async fn forward_opencode_zen_metered(
+    options: OpencodeZenForwardOptions,
+    value_attempt: &mut Option<crate::state::ValueAttemptGuard>,
+) -> Result<Response, ProxyError> {
     let OpencodeZenForwardOptions {
         state,
-        execution: _execution,
+        execution,
         stored,
         route,
         body,
-        request_context,
+        mut request_context,
         account_in_flight_guard: _account_in_flight_guard,
         share_invocation_guard: _share_invocation_guard,
-        started: _started,
+        started,
         timing: _timing,
     } = options;
     if !matches!(
@@ -20105,21 +20114,44 @@ async fn forward_opencode_zen(options: OpencodeZenForwardOptions) -> Result<Resp
             },
             _ => ProxyError::bad_request(error.to_string()),
         })?;
+    ensure_share_model_available(
+        &state,
+        &execution,
+        request_context.share_id.as_deref(),
+        Some(&model),
+    )
+    .await?;
+    *value_attempt =
+        super::value_metering::admit(&state, &execution, &request_context, &model, &prepared.body)
+            .await?;
+    super::value_metering::mark_sent(value_attempt);
     let seed = request_context
         .session_id
         .clone()
         .unwrap_or_else(|| stored.provider.id.clone());
     let session = crate::proxy::opencode_zen::session_for_conversation(&seed);
     let url = format!("{}{}", crate::proxy::opencode_zen::ORIGIN, prepared.path);
-    let response = opencode_zen_post(
+    let response = match opencode_zen_post(
         &state,
         &url,
         &session,
         prepared.stream,
         prepared.body.clone(),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some(attempt) = value_attempt.as_ref() {
+                attempt.mark_not_sent();
+            }
+            return Err(error);
+        }
+    };
     let status = response.status();
+    if let Some(attempt) = value_attempt.as_ref() {
+        attempt.mark_upstream_status(status.as_u16());
+    }
     if status.as_u16() == 429 || status.as_u16() == 403 {
         let kind = crate::proxy::opencode_zen::classify_upstream_status(status.as_u16());
         let text = response.text().await.unwrap_or_default();
@@ -20143,36 +20175,95 @@ async fn forward_opencode_zen(options: OpencodeZenForwardOptions) -> Result<Resp
     let bytes = response.bytes().await.map_err(|error| {
         ProxyError::bad_gateway(format!("OpenCode Zen upstream body failed: {error}"))
     })?;
+    let mut observer = StreamUsageAccumulator::new(InputTokenSemantics::Inclusive);
     if prepared.stream {
+        observer.push(&bytes);
+    }
+    let (body_bytes, json_object) = if prepared.stream {
         let text = String::from_utf8_lossy(&bytes);
         let restored = crate::proxy::opencode_zen::restore_sse(&text, &prepared.rename);
-        return Response::builder()
-            .status(status)
-            .header(http::header::CONTENT_TYPE, content_type)
-            .body(Body::from(restored))
-            .map_err(|error| ProxyError::bad_gateway(error.to_string()));
-    }
-    let mut payload: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    if payload.is_object() {
-        if let Some(kind) = crate::proxy::opencode_zen::continuation_kind(&payload) {
-            if let Some(continued) =
-                opencode_zen_continue(&state, &requested, &session, kind, &payload).await
-            {
-                payload = continued;
+        (restored.into_bytes(), false)
+    } else {
+        let mut payload: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        if payload.is_object() {
+            if let Some(kind) = crate::proxy::opencode_zen::continuation_kind(&payload) {
+                if let Some(continued) =
+                    opencode_zen_continue(&state, &requested, &session, kind, &payload).await
+                {
+                    payload = continued;
+                }
             }
+            crate::proxy::opencode_zen::restore_tool_names(&mut payload, &prepared.rename);
+            observer.observe_json(&payload);
+            let encoded = serde_json::to_vec(&payload).unwrap_or_else(|_| bytes.to_vec());
+            (encoded, true)
+        } else {
+            (bytes.to_vec(), false)
         }
-        crate::proxy::opencode_zen::restore_tool_names(&mut payload, &prepared.rename);
-        let encoded = serde_json::to_vec(&payload).unwrap_or_else(|_| bytes.to_vec());
-        return Response::builder()
-            .status(status)
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(encoded))
-            .map_err(|error| ProxyError::bad_gateway(error.to_string()));
+    };
+    let observed = observer.finish_with_status();
+    request_context.response_model = Some(observed.response_model);
+    request_context.value_resources = observed.resources;
+    request_context.value_streamed_text_bytes = Some(observed.streamed_text_bytes);
+    request_context.usage_estimated = observed.usage_estimated;
+    request_context.usage_state = Some(if observed.parse_error {
+        UsageState::ParseError
+    } else if observed.usage.has_observation() {
+        UsageState::Observed
+    } else {
+        UsageState::Missing
+    });
+    request_context.outcome = Some(UsageOutcome::from_status(status.as_u16()));
+    if prepared.stream {
+        request_context.stream_status = Some(
+            if status.is_success() {
+                "completed"
+            } else {
+                "upstream_error"
+            }
+            .to_string(),
+        );
     }
+    log_usage(
+        &state,
+        &stored,
+        status.as_u16(),
+        started.elapsed().as_millis(),
+        UsageModelMetadata {
+            model: Some(model.clone()),
+            requested_model: Some(model.clone()),
+            actual_model: Some(model.clone()),
+            actual_model_source: Some("opencode_zen.request".into()),
+        },
+        observed.usage,
+        request_context.clone(),
+    )
+    .await;
+    record_share_invocation_result(
+        &state,
+        request_context.share_id.as_deref(),
+        request_context.user_email.as_deref(),
+        request_context.started_at_ms,
+        observed.usage,
+    )
+    .await;
+    record_provider_outcome(
+        &state,
+        &stored,
+        provider_outcome_from_status(status.as_u16()),
+    )
+    .await;
     Response::builder()
         .status(status)
-        .header(http::header::CONTENT_TYPE, content_type)
-        .body(Body::from(bytes))
+        .header(
+            http::header::CONTENT_TYPE,
+            if json_object {
+                "application/json".to_string()
+            } else {
+                content_type
+            },
+        )
+        .body(Body::from(body_bytes))
         .map_err(|error| ProxyError::bad_gateway(error.to_string()))
 }
 
