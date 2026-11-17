@@ -3233,13 +3233,29 @@ Thread 只持久化协议 betas、政策摘要和工具别名，不保存 token�
 
 产品选择：`gemini_cli` 只保留旧数据 reader，不再创建、登录、刷新或推理，不自动转换为 Agy 凭据；普通 Gemini API-key 不受影响。Agy 与 Hub 保持独立 OAuth client、身份、账号和能力证据；Agy 控制面使用独立 PKCE/scopes、daily 站点和 `retrieveUserQuotaSummary`，额度 bucket 不充当模型目录。Gemini native 为增强主线，Claude 已有兼容保持，不增加 OpenAI Surface。Schema object union、原生流首帧/异常终态和精确 TOS 分类均以本仓合成回归验收，不迁入换号、prompt 文本清洗、输出后重放或自动 onboarding。
 
-`docs/provider/coverage.md` 已核对为生成件，退役支持面由 requirements/registry 源修改后重新生成。真实 OAuth、项目、额度、模型与推理接受性仍为 `live_pending`；本地验证结果在本轮完成后记录，不提前宣称通过。
+`docs/provider/coverage.md` 已核对为生成件，退役支持面由 requirements/registry 源修改后重新生成。真实 OAuth、项目、额度、模型与推理接受性仍为 `live_pending`；本地验证结果见本节收口记录。
 
 整体 review 已修正通用能力查询误用 Hub 身份检查 Agy 证据、旧 Gemini CLI 有效 token / 已有 project 的提前成功分支，以及 HTTP 200 内嵌 TOS 沿用成功状态记账的问题。TOS 恢复使用持久化的逐服务 generation，恢复前的在途错误不得重新封禁；正常 token 刷新、客户端版本变化和重启不解除已有阻断。首语义阶段保留原始字节的内存所有权直到 pending chunk 接管；错误前后均不追加重放。Schema 合并保持顺序无关和父层约束，不把 quota bucket 推为模型权限。源码、支持面和 Web 构建同步退役入口，旧 Account / Provider / Share 数据保留，无自动凭据迁移。
 
 交付前补充 review 修正了 TOS fence 错用刷新前账号租约快照的边界：先检查持久化服务阻断，再允许主动 token 刷新/项目发现；实际发送的 TOS fence 与构造出站认证的刷新后账号快照一致。双 rail、双 App 的回环覆盖刷新后 TOS 持久化；既有 TOS 矩阵也核对 token 过期后仍在刷新前拒绝。旧 Gemini 合成夹具迁至 Agy 后按既有 Antigravity 合同移除客户端 safety 覆盖，原生截断错误保留 terminal candidate 与 finishReason 的明确说明；没有放宽成功、终态或无重放断言。
 
 上述新增回环初次执行进一步暴露了租约前凭据有效性校验早于刷新机会的问题：已过期但具有 refresh token 的双 rail 账号也会先被本地拒绝。现将精确服务检查前移至该凭据准入之前，只有未阻断账号才允许固定身份的受控刷新，然后再走原租约验证及最终认证；不以忽略过期时间、绕过认证或弱化回归断言处理。
+
+2026-11-17 收口验收分开记录两份源码。中断前冻结 Rust 源摘要（src/tests）为 `3a3949ffcfbc5ad5761f6b4ffd01fea860942759418bdf89a3cc2ea5982b2539`，留存的完整 all-targets 日志为库 4442 passed / 2 failed / 3 ignored，API 集成 138/138、两个独立 fixture 各 1/1；本类回归全部通过，两项失败为下述额度基线。该成绩只代表当时冻结树。
+
+本次恢复后针对 HEAD `cdc5d37` 的当前集成树重新验证，已包含随后收录的 OpenCode Zen 与 Buddy 改动。Rust 源摘要为 `72daac8dc988fd7d802fefd05925cd1dcde6bfef4a4ab17bdd851cba49346190`，从 check、严格 all-targets Clippy、完整测试到 build/HTTP smoke 后保持一致。使用 `CARGO_INCREMENTAL=0`、单 Cargo 编译进程；完整测试命令为 `RUST_MIN_STACK=67108864 cargo test -j 1 --all-targets --no-fail-fast -- --test-threads=8`。结果为库 4466 passed / 3 failed / 3 ignored，API 集成 136 passed / 2 failed，两个独立 fixture 各 1/1，文档测试 0 项且通过。五项失败的范围如下：
+
+- `state::tests::restored_router_ack_and_withdrawn_pending_tariff_converge_without_rewriting_grants`：既有额度基线，tariff ACK schema 预期 5、实际 6。
+- `state::tests::value_usage_initialization_tests::signed_conversion_commits_live_usage_and_calibrates_against_preview_then_replays_durably`：既有额度基线，tampered 设置应拒绝的断言失败。
+- `proxy::request_timing::tests::r5_timing_all_registry_types_and_experimental_drivers_have_static_labels`：OpenCode Zen 登记后 Provider 实际 29，固定断言仍为 28；独立核对静态 timing labels 为 31，原断言为 30。
+- `provider_registry_and_resource_views_publish_stable_identity`：OpenCode Zen 登记后数量断言仍预期 28、实际 29。
+- `every_create_allowed_provider_profile_has_a_working_creation_bridge`：`claude.opencode_zen` 经旧 S1 `/api/providers/from-preset` 创建返回 400，提示缺少 S1 creation bridge，断言预期 200。
+
+上述失败保留原实现与断言，完整 Rust 全套未通过。本轮旧 Gemini CLI 退役、Agy OAuth/额度、Schema、首语义绝对 deadline、双 rail × 双 App 流/非流 TOS 与脱敏、服务级持久化/显式恢复、刷新后出站身份和重试身份代次回归全部通过。整体 review 未发现本轮增强的新增阻断问题；后续 OpenCode Zen 合同失败与本轮 Antigravity 实现分开登记。
+
+当前树的 `cargo check`、严格 all-targets Clippy（`-D warnings`）、`cargo build`、cargo fmt 及全部 include 源文件独立 rustfmt 检查通过；Node 后端审计 2205/2205、smoke 脚本测试 13/13、Phase 0 测试 6/6 通过。按 `scripts/static-checks.sh` 单独执行的 30 项静态审计，以及脚本语法、JSON、Web 资源引用、状态写入和依赖边界检查通过。Web 类型检查、57 文件 / 402 测试和生产构建通过，内嵌资产已重建。新构建二进制执行原 `scripts/smoke/smoke-local.sh` 的 10 个 HTTP 步骤通过；使用脚本自建临时配置，正常退出并清理，18082 端口已释放，smoke 日志权限为 0600。
+
+离线 readiness 使用 `RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0`，结果为 `failures=0 warnings=2 blockers=9 internalBlockers=1`、`blocked_inputs`；其内部 `local-contracts-unverified` 表示该次门禁跳过本地套件，不覆盖上方单独执行的结果，也不代表完整 Rust 测试通过。真实账号、Router、Share 与部署输入未齐备，真实双 rail 接受性保持 `live_pending`。本轮未部署或新增真实上游调用。
 
 ## 2026-11-17 WorkBuddy 11128 与 DeepSeek Harness 自述指纹
 
