@@ -178,6 +178,7 @@ mod codex_quota;
 mod grok_media_resident;
 mod in_flight;
 mod provider_bundle;
+mod share_capability;
 mod share_value_quota;
 
 pub(crate) use grok_media_resident::GrokMediaMemoryCapacity;
@@ -994,7 +995,19 @@ type CachedRouterShareCapabilities = (
     String,
     String,
     std::time::Instant,
-    (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool),
+    (
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+    ),
 );
 
 #[derive(Clone, Copy)]
@@ -19579,6 +19592,12 @@ impl ServerStateInner {
             Ok(result) => result,
             Err(error) => return Ok(Err(error)),
         };
+        self.validate_capability_transition(
+            &value_previous,
+            &candidate,
+            &value_providers,
+            &value_config,
+        )?;
         let writes_account_reset = candidate.shares.iter().any(|share| {
             share.user_grants.iter().any(|(email, grant)| {
                 grant.active
@@ -19656,6 +19675,19 @@ impl ServerStateInner {
                     shares: candidate.clone(),
                     initializations,
                     conversions: prepared_conversions,
+                    settings_receipt: candidate
+                        .applied_settings_operations
+                        .get(&request.operation_id)
+                        .cloned()
+                        .zip(value_config.registered_router_identity())
+                        .map(|(receipt, identity)| {
+                            crate::repository::server_sqlite::capability_context::SettingsReceipt {
+                                router_url: value_config.router_api_base().unwrap_or("").into(),
+                                installation_id: identity.installation_id.clone(),
+                                share_id: request.share_id.clone(),
+                                receipt,
+                            }
+                        }),
                     actor: request.actor,
                     now,
                 },
@@ -19707,6 +19739,11 @@ impl ServerStateInner {
                         capability.resource_value_quotas(),
                         capability.quota_unit_conversion(),
                         capability.value_quota_unpriced(),
+                        capability.share_contract_version >= 13
+                            && capability
+                                .capabilities
+                                .iter()
+                                .any(|c| c == "shareCapabilityPolicyV1"),
                     ),
                 )
             });
@@ -20127,7 +20164,8 @@ impl ServerStateInner {
                 ),
             ));
         }
-        if patch.user_value_usage_initializations.is_some()
+        if patch.capability_policy.is_some()
+            || patch.user_value_usage_initializations.is_some()
             || patch.user_quota_conversions.is_some()
         {
             if let Some(context) = &mut patch.edit_context {
@@ -20164,7 +20202,7 @@ impl ServerStateInner {
         patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
     ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
         use crate::domain::sharing::router_contract::ShareTokenPeriod;
-        if patch.user_quota_conversions.is_some() {
+        if patch.user_quota_conversions.is_some() || patch.capability_policy.is_some() {
             if let Some(context) = &patch.edit_context {
                 if let Some(receipt) =
                     crate::repository::server_sqlite::value_quota::conversion::settings_receipt(
@@ -20250,6 +20288,7 @@ impl ServerStateInner {
                 }
             }
         }
+        let patch = self.prepare_capability_patch(share_id, patch).await?;
         let Some(support) = patch.support.clone() else {
             return self
                 .try_mutate_share_quota_with_value_initializations(
@@ -33872,6 +33911,7 @@ mod tests {
     }
 
     include!("state/share_value_quota/resource_policy_tests.rs");
+    include!("state/share_capability_tests.rs");
 
     #[tokio::test]
     async fn value_quota_readiness_ignores_bound_but_disabled_apps() {
@@ -34175,6 +34215,7 @@ mod tests {
                 let mut policy = grant.policy.clone();
                 policy.token_limit = None;
                 policy.value_quota = Some(ValueQuota {
+                    unpriced_usage: Default::default(),
                     limit_usd_micros: "1000000".into(),
                     tariff_policy_id: "api-equivalent-v1".into(),
                 });
@@ -34374,6 +34415,7 @@ mod tests {
         }
         let usd_policy = |micros: &str| ShareUserPolicy {
             value_quota: Some(ValueQuota {
+                unpriced_usage: Default::default(),
                 limit_usd_micros: micros.into(),
                 tariff_policy_id: "api-equivalent-v1".into(),
             }),
@@ -34552,6 +34594,13 @@ mod tests {
                 input.enabled = Some(true);
                 input.status = Some("active".into());
                 store.upsert(input).unwrap();
+                // Preserve the pre-v13 contract exercised by this legacy fixture.
+                store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "free-value-share")
+                    .unwrap()
+                    .capability_policy = None;
                 let share = store
                     .shares
                     .iter_mut()
@@ -34565,6 +34614,7 @@ mod tests {
                         active: false,
                         policy: ShareUserPolicy {
                             value_quota: Some(ValueQuota {
+                                unpriced_usage: Default::default(),
                                 limit_usd_micros: "1000000".into(),
                                 tariff_policy_id: "api-equivalent-v1".into(),
                             }),
@@ -34686,6 +34736,13 @@ mod tests {
                 input.enabled = Some(true);
                 input.status = Some("active".into());
                 store.upsert(input).unwrap();
+                // Preserve the pre-v13 contract exercised by this legacy fixture.
+                store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "retry-share")
+                    .unwrap()
+                    .capability_policy = None;
                 let grant = store
                     .shares
                     .iter_mut()
@@ -34698,6 +34755,7 @@ mod tests {
                 grant.policy.token_period = ShareTokenPeriod::Lifetime;
                 grant.policy.parallel_limit = Some(1);
                 grant.policy.value_quota = Some(ValueQuota {
+                    unpriced_usage: Default::default(),
                     limit_usd_micros: "1000000".into(),
                     tariff_policy_id: "api-equivalent-v1".into(),
                 });
@@ -34836,6 +34894,13 @@ mod tests {
                 input.enabled = Some(true);
                 input.status = Some("active".into());
                 store.upsert(input).unwrap();
+                // Preserve the pre-v13 contract exercised by this legacy fixture.
+                store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "trial-usd-share")
+                    .unwrap()
+                    .capability_policy = None;
                 let share = store
                     .shares
                     .iter_mut()
@@ -34849,6 +34914,7 @@ mod tests {
                         active: true,
                         policy: ShareUserPolicy {
                             value_quota: Some(ValueQuota {
+                                unpriced_usage: Default::default(),
                                 limit_usd_micros: "10000000".into(),
                                 tariff_policy_id: "api-equivalent-v1".into(),
                             }),
@@ -35287,6 +35353,13 @@ mod tests {
                 input.enabled = Some(true);
                 input.status = Some("active".into());
                 let created = store.upsert(input).unwrap();
+                // Preserve the pre-v13 contract exercised by this legacy fixture.
+                store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "trial-state")
+                    .unwrap()
+                    .capability_policy = None;
                 let share = store
                     .shares
                     .iter_mut()

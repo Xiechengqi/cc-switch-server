@@ -29,7 +29,7 @@ fn tool_resource(tool: &Value) -> Option<&'static str> {
             .any(|key| tool.get(*key).is_some())
     {
         Some("tool.code_execution")
-    } else if kind.starts_with("computer") {
+    } else if kind == "computer_use_preview" {
         Some("tool.computer")
     } else if kind == "mcp" {
         Some("tool.mcp")
@@ -120,7 +120,53 @@ pub fn resource_request_plan(body: &Value, operation: InferenceOperation) -> Res
         .unwrap_or(body);
     let mut plan = ResourcePlan {
         text_tokens: true,
-        requires_v2: !is_metered_text_value(body),
+        requires_v2: false,
+        text_output_only: [
+            "/generationConfig/responseModalities",
+            "/generation_config/response_modalities",
+        ]
+        .iter()
+        .any(|path| {
+            body.pointer(path)
+                .and_then(Value::as_array)
+                .is_some_and(|modes| {
+                    !modes.is_empty()
+                        && modes.iter().all(|mode| {
+                            mode.as_str()
+                                .is_some_and(|m| m.eq_ignore_ascii_case("text"))
+                        })
+                })
+        }),
+        gemini_image_input: body
+            .get("contents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|content| {
+                content
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_none_or(|role| role == "user")
+            })
+            .any(|content| {
+                content
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|part| {
+                        ["inlineData", "inline_data", "fileData", "file_data"]
+                            .iter()
+                            .any(|key| {
+                                part.get(*key).is_some_and(|data| {
+                                    data.get("mimeType")
+                                        .or_else(|| data.get("mime_type"))
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|mime| mime.starts_with("image/"))
+                                })
+                            })
+                    })
+            }),
         ..Default::default()
     };
     match operation {
@@ -190,6 +236,12 @@ pub fn resource_request_plan(body: &Value, operation: InferenceOperation) -> Res
         plan.quantities
             .insert("audio.output_token".into(), AUDIO_TOKEN_BOUND);
     }
+    if output_modality(body, "video") {
+        plan.requires_v2 = true;
+        plan.quantities
+            .entry("video.output_millisecond".into())
+            .or_insert(15_000);
+    }
     if output_modality(body, "image") {
         plan.requires_v2 = true;
         plan.quantities.entry("image.output".into()).or_insert(
@@ -199,6 +251,79 @@ pub fn resource_request_plan(body: &Value, operation: InferenceOperation) -> Res
                 .clamp(1, 100),
         );
     }
+    for key in [
+        "n",
+        "duration",
+        "duration_seconds",
+        "max_tokens",
+        "max_output_tokens",
+        "max_completion_tokens",
+    ] {
+        if let Some(value) = body.get(key) {
+            let maximum = if key == "n" {
+                100
+            } else if key.starts_with("duration") {
+                3600
+            } else {
+                u32::MAX as u64
+            };
+            if value.as_u64().is_none_or(|n| n == 0 || n > maximum) {
+                plan.invalid_reason = Some(format!("invalid {key}"));
+            }
+        }
+    }
+    if body
+        .pointer("/generationConfig/candidateCount")
+        .is_some_and(|v| v.as_u64().is_none_or(|n| n == 0 || n > 100))
+    {
+        plan.invalid_reason = Some("invalid candidateCount".into());
+    }
+    plan.invalid_reason = plan.invalid_reason.or_else(|| {
+        crate::domain::sharing::capability_intent::invalid_control(body).map(str::to_owned)
+    });
+    plan.operations = crate::domain::sharing::capability_intent::operations(body, operation);
+    if plan.gemini_image_input
+        && plan
+            .operations
+            .contains(&crate::domain::sharing::capabilities::ShareOperation::ImageGenerate)
+    {
+        plan.operations
+            .push(crate::domain::sharing::capabilities::ShareOperation::ImageEdit);
+    }
+    // Every identified operation reserves a native dimension, including control
+    // fields outside tools and inherited session declarations.
+    for op in &plan.operations {
+        if !plan
+            .quantities
+            .keys()
+            .any(|key| key.split('/').next() == Some(op.resource()))
+        {
+            plan.quantities.insert(
+                op.resource().into(),
+                match op {
+                    crate::domain::sharing::capabilities::ShareOperation::VideoGenerate => 15_000,
+                    crate::domain::sharing::capabilities::ShareOperation::AudioGenerate => {
+                        AUDIO_TOKEN_BOUND
+                    }
+                    _ => TOOL_CALL_BOUND,
+                },
+            );
+        }
+        plan.requires_v2 = true;
+    }
+    plan.previous_response_id = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    plan.continuation = body
+        .get("previous_response_id")
+        .is_some_and(|v| !v.is_null());
+    if body.get("cachedContent").is_some_and(|v| !v.is_null())
+        || body.get("cached_content").is_some_and(|v| !v.is_null())
+    {
+        plan.continuation = true;
+    }
+
     plan
 }
 
@@ -206,6 +331,7 @@ pub fn resource_request_plan(body: &Value, operation: InferenceOperation) -> Res
 /// and the number of retained IDs are bounded independently of response size.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceUsageObserver {
+    response_id: Option<String>,
     quantities: BTreeMap<String, u64>,
     items: BTreeMap<String, String>,
     overflow: bool,
@@ -214,6 +340,7 @@ impl ResourceUsageObserver {
     pub fn replace_usage(&mut self, usage: Option<ResourceUsage>) {
         *self = Self::default();
         if let Some(usage) = usage {
+            self.response_id = usage.response_id;
             self.quantities = usage.quantities;
             self.overflow = usage.estimated;
         }
@@ -242,6 +369,13 @@ impl ResourceUsageObserver {
             .get("response")
             .or_else(|| value.get("message"))
             .unwrap_or(value);
+        if let Some(id) = root
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 256)
+        {
+            self.response_id = Some(id.into());
+        }
         for (path, key) in [
             (
                 "/usage/server_tool_use/web_search_requests",
@@ -443,7 +577,7 @@ impl ResourceUsageObserver {
         !self.items.is_empty() || self.quantities.values().any(|count| *count > 0)
     }
     pub fn usage(&self) -> Option<ResourceUsage> {
-        if self.quantities.is_empty() && self.items.is_empty() {
+        if self.quantities.is_empty() && self.items.is_empty() && self.response_id.is_none() {
             return None;
         }
         let mut quantities = self.quantities.clone();
@@ -456,6 +590,7 @@ impl ResourceUsageObserver {
             *old = (*old).max(count);
         }
         Some(ResourceUsage {
+            response_id: self.response_id.clone(),
             quantities,
             source: "upstream.protocol".into(),
             estimated: self.overflow,

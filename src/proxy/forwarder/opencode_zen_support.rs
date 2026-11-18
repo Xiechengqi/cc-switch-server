@@ -177,6 +177,7 @@ async fn forward_opencode_zen_at(
                 &evidence_context,
                 zen::base_model_id(&model),
                 &prepared.body,
+                &execution.plan.runtime_fingerprint,
             )
             .await?;
         series.lock().await.sent();
@@ -256,6 +257,7 @@ async fn forward_opencode_zen_at(
                                 &evidence_context,
                                 zen::base_model_id(&model),
                                 &continuation.body,
+                                &execution.plan.runtime_fingerprint,
                             )
                             .await?;
                         state

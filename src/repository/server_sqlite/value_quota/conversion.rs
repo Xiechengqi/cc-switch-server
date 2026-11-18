@@ -406,6 +406,10 @@ pub(crate) fn settings_receipt(
         return Ok(None);
     };
     let conn = open_database(&database_path(dir), true)?;
+    let durable:Option<String>=conn.query_row("SELECT receipt_json FROM share_settings_receipts WHERE router_url=?1 AND installation_id=?2 AND operation_id=?3 AND share_id=?4",params![config.router_api_base().unwrap_or(""),identity.installation_id,operation,share],|r|r.get(0)).optional()?;
+    if let Some(json) = durable {
+        return Ok(Some(serde_json::from_str(&json)?));
+    }
     let row:Option<String>=conn.query_row("SELECT settings_receipt_json FROM quota_conversion_receipts WHERE operation_id=?1 AND json_extract(scope,'$.shareId')=?2 AND json_extract(scope,'$.routerUrl')=?3 AND json_extract(scope,'$.installationId')=?4 AND settings_receipt_json IS NOT NULL LIMIT 1",params![operation,share,config.router_api_base().unwrap_or(""),identity.installation_id],|r|r.get(0)).optional()?;
     row.map(|j| serde_json::from_str(&j).map_err(Into::into))
         .transpose()

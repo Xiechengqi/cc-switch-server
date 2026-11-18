@@ -1,3 +1,4 @@
+import type {ShareOperation} from "@/lib/share-capabilities";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -59,8 +60,10 @@ import {
 } from "@/lib/share-value-quota";
 
 type PolicyDraft = {
+  allowedOperations?: ShareOperation[];
   quotaUnit: "tokens" | "usdEquivalent";
   resourceMetering: boolean;
+  rejectUnpriced: boolean;
   email: string;
   parallelLimit: string;
   tokenLimit: string;
@@ -99,6 +102,7 @@ function fixedPeriodDurationMs(period: ShareTokenPeriod): number | undefined {
  * grant change.
  */
 type ShareUserGrantsEditorProps = {
+  independentCapabilities?: boolean;
   shareId?: string;
   configRevision?: number;
   value: ShareUserGrantMap;
@@ -156,7 +160,9 @@ function formatUtcWindow(value: number): string {
 function policyDraft(email: string, policy: ShareUserPolicy): PolicyDraft {
   return {
     email,
+    allowedOperations: policy.allowedOperations,
     resourceMetering: policy.valueQuota?.tariffPolicyId === "api-equivalent-v2",
+    rejectUnpriced: policy.valueQuota?.unpricedUsage === "reject",
     quotaUnit: policy.valueQuota ? "usdEquivalent" : "tokens",
     parallelLimit: policy.parallelLimit == null ? "" : String(policy.parallelLimit),
     tokenLimit: policy.valueQuota ? valueLimitInput(policy.valueQuota.limitUsdMicros) : policy.tokenLimit == null ? "" : String(policy.tokenLimit),
@@ -245,6 +251,7 @@ function batchPolicyDraft(grant: ShareUserGrant): BatchPolicyDraft {
   return {
     quotaUnit: draft.quotaUnit,
     resourceMetering: draft.resourceMetering,
+    rejectUnpriced: draft.rejectUnpriced,
     parallelLimit: draft.parallelLimit,
     tokenLimit: draft.tokenLimit,
     tokenPeriod: draft.tokenPeriod,
@@ -277,7 +284,7 @@ function anchorInvalid(period: ShareTokenPeriod, anchorAtMs: number | undefined)
 }
 
 /** The policy a valid USD draft saves; preview and save share it so intents match exactly. */
-function usdPolicyFor(draft: Pick<PolicyDraft, "resourceMetering" | "parallelLimit" | "tokenLimit" | "tokenPeriod" | "tokenPeriodAnchor" | "expiresAt">): ShareUserPolicy | undefined {
+function usdPolicyFor(draft: Pick<PolicyDraft, "allowedOperations" | "rejectUnpriced" | "resourceMetering" | "parallelLimit" | "tokenLimit" | "tokenPeriod" | "tokenPeriodAnchor" | "expiresAt">): ShareUserPolicy | undefined {
   const amount = parseValueLimitInput(draft.tokenLimit);
   if (!amount.ok) return undefined;
   const parallelLimit = draft.parallelLimit.trim() ? Number(draft.parallelLimit) : undefined;
@@ -286,9 +293,10 @@ function usdPolicyFor(draft: Pick<PolicyDraft, "resourceMetering" | "parallelLim
   if ((parallelLimit != null && (!Number.isInteger(parallelLimit) || parallelLimit < 1))
     || (expiresAt != null && !Number.isFinite(expiresAt)) || anchorInvalid(draft.tokenPeriod, tokenPeriodAnchorAtMs)) return undefined;
   return {
+    allowedOperations:draft.allowedOperations,
     parallelLimit,
     tokenLimit: undefined,
-    valueQuota: { limitUsdMicros: amount.micros, tariffPolicyId: draft.resourceMetering ? "api-equivalent-v2" : "api-equivalent-v1" },
+    valueQuota: { limitUsdMicros: amount.micros, ...(draft.rejectUnpriced?{unpricedUsage:"reject" as const}:{}), tariffPolicyId: draft.resourceMetering ? "api-equivalent-v2" : "api-equivalent-v1" },
     tokenPeriod: draft.tokenPeriod,
     tokenPeriodAnchorAtMs,
     expiresAt,
@@ -305,7 +313,7 @@ function batchPatchFor(draft: BatchPolicyDraft): ShareUserPolicyBatchPatch {
     ...(draft.applyParallelLimit ? { parallelLimit: { value: parallelLimit } } : {}),
     ...(draft.applyTokenLimit ? { tokenLimit: {
       value: tokenLimit,
-      ...(amount?.ok ? { valueQuota: { limitUsdMicros: amount.micros, tariffPolicyId: draft.resourceMetering ? "api-equivalent-v2" as const : "api-equivalent-v1" as const } } : {}),
+      ...(amount?.ok ? { valueQuota: { limitUsdMicros: amount.micros, ...(draft.rejectUnpriced?{unpricedUsage:"reject" as const}:{}), tariffPolicyId: draft.resourceMetering ? "api-equivalent-v2" as const : "api-equivalent-v1" as const } } : {}),
       period: draft.tokenPeriod,
       periodAnchorAtMs,
     } } : {}),
@@ -314,6 +322,7 @@ function batchPatchFor(draft: BatchPolicyDraft): ShareUserPolicyBatchPatch {
 }
 
 export function ShareUserGrantsEditor({
+  independentCapabilities,
   shareId,
   configRevision,
   value,
@@ -440,6 +449,7 @@ export function ShareUserGrantsEditor({
     const email = draft.email.trim().toLowerCase();
     if (!isValidShareEmail(email)) return undefined;
     const policy: ShareUserPolicy | undefined = draft.quotaUnit === "usdEquivalent" ? usdPolicyFor(draft) : {
+      allowedOperations:draft.allowedOperations,
       parallelLimit: draft.parallelLimit.trim() ? Number(draft.parallelLimit) : undefined,
       tokenLimit: draft.tokenLimit.trim() ? Number(draft.tokenLimit) : undefined,
       tokenPeriod: draft.tokenPeriod,
@@ -1229,6 +1239,7 @@ export function ShareUserGrantsEditor({
                       tokenLimit: draft.tokenLimit, consumedTokens: draft.consumedTokens, usageAction: draft.usageAction,
                     }};
                     setAmountAttempted(false); setDraft({...draft, quotaUnit: unit, unitDrafts,
+                      ...(independentCapabilities&&unit==="usdEquivalent"?{resourceMetering:true,rejectUnpriced:true}:{}),
                       ...(unitDrafts[unit] ?? {tokenLimit: "", usageAction: "unchanged", consumedTokens: ""})});
                   }} />
                 <ShareValueReadiness state={readiness} id="share-user-usd-readiness" />
@@ -1237,7 +1248,8 @@ export function ShareUserGrantsEditor({
                 <ShareValueLimitField id="share-user-token" unit={draft.quotaUnit} value={draft.tokenLimit}
                   label={draft.quotaUnit === "usdEquivalent" ? t("share.userLimit.valueQuota.limit") : t("share.tokenLimit")}
                   error={limitError(draft.quotaUnit, draft.tokenLimit)} onChange={(tokenLimit) => setDraft({ ...draft, tokenLimit })} />
-                {draft.quotaUnit === "usdEquivalent" ? <ShareValueResourceToggle value={draft.resourceMetering} onChange={resourceMetering=>setDraft({...draft,resourceMetering})} /> : null}
+                {!independentCapabilities && draft.quotaUnit === "usdEquivalent" ? <ShareValueResourceToggle value={draft.resourceMetering} onChange={resourceMetering=>setDraft({...draft,resourceMetering})} /> : null}
+                {draft.quotaUnit === "usdEquivalent"?<label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={draft.rejectUnpriced} onChange={e=>setDraft({...draft,rejectUnpriced:e.target.checked})}/>{i18n.language.startsWith("zh")?"拒绝缺价请求（对文本与资源均生效）":"Reject unpriced requests (text and resources)"}</label>:null}
                 {singleUsdPolicies ? <ShareValuePreviewLine state={singlePreview} calibrations={{[editedEmail]:{amount: draft.quotaUnit === "usdEquivalent" ? draft.consumedValue : draft.consumedTokens, reason: draft.valueReason}}} /> : null}
               </div>
               <div className={draft.quotaUnit==="usdEquivalent"?"hidden":"space-y-2 sm:col-span-2"}>
@@ -1468,6 +1480,7 @@ export function ShareUserGrantsEditor({
                 <ShareValueUnitToggle disabled={!batchDraft.applyTokenLimit} readinessId="share-batch-usd-readiness" value={batchDraft.quotaUnit} usdDisabled={readiness.unavailable}
                   usdBlockedReason={shareSaved ? undefined : t("share.userLimit.valueQuota.saveFirst")}
                   onChange={(unit) => { if (unit === batchDraft.quotaUnit) return; setAmountAttempted(false); setBatchDraft({...batchDraft, quotaUnit:unit, applyConsumedTokens:false,
+                    ...(independentCapabilities&&unit==="usdEquivalent"?{resourceMetering:true,rejectUnpriced:true}:{}),
                     unitDrafts:{...batchDraft.unitDrafts,[batchDraft.quotaUnit]:{tokenLimit:batchDraft.tokenLimit,consumedTokens:batchDraft.consumedTokens,usageAction:batchDraft.usageAction}},
                     ...(batchDraft.unitDrafts?.[unit] ?? {tokenLimit:"",consumedTokens:"",usageAction:"unchanged"}),
                     calibrationDrafts:{...batchDraft.calibrationDrafts,[batchDraft.quotaUnit]:batchDraft.calibrations ?? {}},calibrations:batchDraft.calibrationDrafts?.[unit] ?? {}}); }} />
@@ -1476,7 +1489,8 @@ export function ShareUserGrantsEditor({
                   label={batchDraft.quotaUnit === "usdEquivalent" ? t("share.userLimit.valueQuota.limit") : t("share.tokenLimit")}
                   error={batchDraft.applyTokenLimit ? limitError(batchDraft.quotaUnit, batchDraft.tokenLimit) : undefined}
                   onChange={(tokenLimit) => setBatchDraft({ ...batchDraft, tokenLimit })} />
-                {batchDraft.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" ? <ShareValueResourceToggle value={batchDraft.resourceMetering} onChange={resourceMetering=>setBatchDraft({...batchDraft,resourceMetering})} /> : null}
+                {!independentCapabilities && batchDraft.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" ? <ShareValueResourceToggle value={batchDraft.resourceMetering} onChange={resourceMetering=>setBatchDraft({...batchDraft,resourceMetering})} /> : null}
+                {batchDraft.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent"?<label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={batchDraft.rejectUnpriced} onChange={e=>setBatchDraft({...batchDraft,rejectUnpriced:e.target.checked})}/>{i18n.language.startsWith("zh")?"拒绝缺价请求（对文本与资源均生效）":"Reject unpriced requests (text and resources)"}</label>:null}
                 {batchUsdPolicies ? <ShareValuePreviewLine state={batchPreview} calibrations={batchDraft.calibrations} /> : null}
                 {batchPreview.preview?.rows.filter(row => row.calibrationRequired).map(row => <div key={row.email} className="grid gap-2">
                   <Label>{row.email} · {t("share.userLimit.valueQuota.conversionCalibrationRequired")}</Label>

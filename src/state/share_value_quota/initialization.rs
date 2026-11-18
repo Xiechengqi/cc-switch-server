@@ -21,7 +21,8 @@ impl ValueUsageInitializationRequest {
         share_id: &str,
         patch: &ShareSettingsPatch,
     ) -> anyhow::Result<Option<Self>> {
-        if patch.user_value_usage_initializations.is_none()
+        if patch.capability_policy.is_none()
+            && patch.user_value_usage_initializations.is_none()
             && patch.user_quota_conversions.is_none()
         {
             return Ok(None);
@@ -212,6 +213,7 @@ pub(crate) struct InitializedShareSnapshot {
     pub conversions: Vec<ledger::conversion::Conversion>,
     pub actor: String,
     pub now: i64,
+    pub settings_receipt: Option<server_sqlite::capability_context::SettingsReceipt>,
 }
 impl PersistedStateSnapshot for InitializedShareSnapshot {
     const NAME: &'static str = "shares and initial USD usage";
@@ -223,6 +225,7 @@ impl PersistedStateSnapshot for InitializedShareSnapshot {
             &self.conversions,
             &self.actor,
             self.now,
+            self.settings_receipt.as_ref(),
         )
     }
     fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
@@ -232,6 +235,7 @@ impl PersistedStateSnapshot for InitializedShareSnapshot {
             conversions: Vec::new(),
             actor: String::new(),
             now: 0,
+            settings_receipt: None,
         })
     }
     fn reconciliation_value(&self) -> Option<Value> {

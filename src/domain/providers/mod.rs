@@ -18,3 +18,5 @@ pub mod storage_migration;
 pub mod store;
 mod store_v2;
 pub mod web_session;
+
+pub mod share_operations;

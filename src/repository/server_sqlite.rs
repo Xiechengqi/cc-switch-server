@@ -23,6 +23,7 @@ use crate::domain::providers::store::{providers_path, ProviderStore};
 use crate::domain::sharing::shares::{shares_path, ShareStore};
 use crate::domain::usage::store::{usage_directory, UsageLog, UsageStore};
 
+pub(crate) mod capability_context;
 pub(crate) mod market_termination;
 mod payload;
 mod quota;
@@ -40,7 +41,7 @@ use wal::validate_wal_if_present;
 pub(crate) const DATABASE_FILE_NAME: &str = "server-store.sqlite3";
 pub(crate) const MARKER_FILE_NAME: &str = "server-store-migration.json";
 pub(crate) const ACTIVATION_REQUEST_FILE_NAME: &str = "server-store-activation-request.json";
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -922,7 +923,7 @@ fn persist_accounts_with_hook(
 }
 
 pub(crate) fn persist_shares(config_dir: &Path, shares: &ShareStore) -> anyhow::Result<()> {
-    persist_shares_with_value_initializations(config_dir, shares, &[], &[], "", 0)
+    persist_shares_with_value_initializations(config_dir, shares, &[], &[], "", 0, None)
 }
 
 pub(crate) fn persist_shares_with_value_initializations(
@@ -932,6 +933,7 @@ pub(crate) fn persist_shares_with_value_initializations(
     conversions: &[value_quota::conversion::Conversion],
     actor: &str,
     now: i64,
+    settings_receipt: Option<&capability_context::SettingsReceipt>,
 ) -> anyhow::Result<()> {
     let mut observation = CommitObservation::start("shares");
     assert_committed(config_dir)?;
@@ -950,6 +952,9 @@ pub(crate) fn persist_shares_with_value_initializations(
         value_quota::initialize_in_tx(&transaction, initializations, actor, now)?;
     }
     value_quota::conversion::finalize_in_tx(&transaction, conversions, shares)?;
+    if let Some(receipt) = settings_receipt {
+        capability_context::persist_settings_receipt(&transaction, receipt)?;
+    }
     transaction.execute("DELETE FROM share_bindings", [])?;
     transaction.execute("DELETE FROM shares", [])?;
     import_share_rows(&transaction, shares, &payloads)?;
@@ -1094,6 +1099,7 @@ pub(crate) fn upsert_usage_log(config_dir: &Path, log: &UsageLog) -> anyhow::Res
     upsert_usage_row(&transaction, log)?;
     quota::upsert_log(&transaction, log)?;
     value_quota::evidence::capture_log(&transaction, log, None)?;
+    capability_context::observe(&transaction, log)?;
     let value_degraded = value_quota::settle_usage_log_isolated(&transaction, log)?;
     market_termination::finalize_log_in(&transaction, log)?;
     bump_repository_generation(&transaction)?;

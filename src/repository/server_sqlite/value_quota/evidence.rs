@@ -258,6 +258,14 @@ pub(crate) fn capture_log(
             .into(),
         estimate: None,
         resource_plan: log.value_resources.as_ref().map(|r| ResourcePlan {
+            text_output_only: false,
+            gemini_image_input: false,
+            invalid_reason: None,
+            policy_revision: None,
+            previous_response_id: None,
+            operations: Vec::new(),
+            binding_fingerprint: None,
+            continuation: false,
             quantities: r.quantities.clone(),
             text_tokens: log.request_kind == crate::domain::usage::store::RequestKind::Text,
             requires_v2: true,
@@ -385,6 +393,7 @@ pub(super) fn materialize(
         metered_from_ms: 0,
     };
     let quota = ValueQuota {
+        unpriced_usage: Default::default(),
         limit_usd_micros: "1".into(),
         tariff_policy_id: if resource_plan.as_ref().is_some_and(|p| p.requires_v2) {
             crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY

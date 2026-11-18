@@ -36,6 +36,14 @@ fn resource_admission<'a>(
         attribution: None,
         policy_epoch: "epoch",
         resource_plan: Some(crate::domain::usage::value_pricing::ResourcePlan {
+            text_output_only: false,
+            gemini_image_input: false,
+            invalid_reason: None,
+            policy_revision: None,
+            previous_response_id: None,
+            binding_fingerprint: None,
+            continuation: false,
+            operations: Vec::new(),
             quantities: BTreeMap::from([(resource.0.into(), resource.1)]),
             requires_v2: true,
             text_tokens: text,
@@ -207,6 +215,7 @@ fn estimated_resources_keep_the_bound_until_trusted_evidence_arrives() {
     ] {
         log.usage_revision = revision;
         log.value_resources = Some(ResourceUsage {
+            response_id: None,
             quantities: BTreeMap::from([("image.output".into(), count)]),
             source: "upstream.protocol".into(),
             estimated,
@@ -257,6 +266,7 @@ fn unexpected_unpriced_market_resources_retain_risk_and_fence_only_their_window(
     log.request_kind = RequestKind::Image;
     log.attempt_count = 1;
     log.value_resources = Some(ResourceUsage {
+        response_id: None,
         quantities: BTreeMap::from([("tool.web_search".into(), 1)]),
         source: "upstream.protocol".into(),
         estimated: false,
@@ -341,6 +351,7 @@ fn unexpected_unpriced_owner_resources_charge_priced_dimensions_with_a_reason() 
     log.attempt_count = 1;
     log.image_count = Some(1);
     log.value_resources = Some(ResourceUsage {
+        response_id: None,
         quantities: BTreeMap::from([("tool.web_search".into(), 1)]),
         source: "upstream.protocol".into(),
         estimated: false,
@@ -465,4 +476,116 @@ fn async_task_polling_survives_reopen_deduplicates_and_preserves_original_owner(
     tx.commit().unwrap();
     drop(conn);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn capability_response_identity_without_quantities_keeps_resource_risk_until_observed() {
+    use crate::domain::usage::value_pricing::ResourceUsageObserver;
+    let (mut conn, scope, window, quota, revision) = resource_fixture();
+    let tx = conn.transaction().unwrap();
+    admit_in_tx(
+        &tx,
+        &resource_admission(
+            &scope,
+            &window,
+            &quota,
+            &revision,
+            "identity-only",
+            ("image.output", 3),
+            false,
+        ),
+    )
+    .unwrap();
+    let mut observer = ResourceUsageObserver::default();
+    observer.observe(&serde_json::json!({"id":"response-identity","status":"completed"}));
+    let mut log = log_for(&scope, "identity-only");
+    log.attempt_count = 1;
+    log.effective_service_tier = Some("standard".into());
+    log.value_resources = observer.usage();
+    assert!(settle_log_in_tx(&tx, &log, false).unwrap());
+    let status = status_in_tx(&tx, &scope, &window).unwrap();
+    assert_eq!(status.used_picos, "3000000000");
+    assert_eq!(status.metering_status, "conservative");
+    log.usage_revision += 1;
+    log.image_count = Some(1);
+    assert!(settle_log_in_tx(&tx, &log, false).unwrap());
+    assert_eq!(
+        status_in_tx(&tx, &scope, &window).unwrap().used_picos,
+        "1000000000"
+    );
+}
+
+#[test]
+fn capability_partial_prices_charge_known_text_and_resources_independently() {
+    use crate::domain::usage::value_pricing::{ResourceUsage, RESOURCE_ESTIMATE_VERSION};
+    let (mut conn, scope, window, quota, revision) = resource_fixture();
+    let tx = conn.transaction().unwrap();
+    let mut admission = resource_admission(
+        &scope,
+        &window,
+        &quota,
+        &revision,
+        "partial-prices",
+        ("image.output", 1),
+        true,
+    );
+    admission
+        .resource_plan
+        .as_mut()
+        .unwrap()
+        .quantities
+        .insert("tool.web_search".into(), 8);
+    admit_in_tx(&tx, &admission).unwrap();
+    let mut log = unpriced_log(&scope, "partial-prices", "model", Some((10, 2)));
+    log.effective_service_tier = Some("standard".into());
+    log.value_resources = Some(ResourceUsage {
+        response_id: None,
+        quantities: BTreeMap::from([("image.output".into(), 2), ("tool.web_search".into(), 1)]),
+        source: "upstream.protocol".into(),
+        estimated: false,
+        version: RESOURCE_ESTIMATE_VERSION.into(),
+    });
+    settle_log_in_tx(&tx, &log, false).unwrap();
+    let (amount, _, reason) = attempt_state(&tx, "partial-prices");
+    assert_eq!(amount, "2012000000"); // 12 text tokens plus two priced images.
+    assert_eq!(reason.as_deref(), Some("resource_unpriced"));
+    assert!(!settle_log_in_tx(&tx, &log, false).unwrap());
+}
+
+#[test]
+fn capability_resource_price_survives_a_missing_text_tariff() {
+    let (mut conn, scope, window, quota, old) = resource_fixture();
+    let json: String = conn
+        .query_row(
+            "SELECT payload_json FROM value_pricing_snapshots WHERE revision=?1",
+            [old],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut snapshot: PricingSnapshot = serde_json::from_str(&json).unwrap();
+    snapshot.models.get_mut("model").unwrap().rates.clear();
+    let revision = snapshot.revision().unwrap();
+    let tx = conn.transaction().unwrap();
+    install_in_tx(&tx, &scope, &revision, &snapshot, 2).unwrap();
+    let admission = resource_admission(
+        &scope,
+        &window,
+        &quota,
+        &revision,
+        "resource-only-price",
+        ("image.output", 2),
+        true,
+    );
+    assert_eq!(
+        admit_in_tx(&tx, &admission).unwrap().reserved_picos,
+        2_000_000_000
+    );
+    let mut log = unpriced_log(&scope, "resource-only-price", "model", Some((10, 2)));
+    log.image_count = Some(1);
+    log.effective_service_tier = Some("standard".into());
+    settle_log_in_tx(&tx, &log, false).unwrap();
+    let (amount, status, reason) = attempt_state(&tx, "resource-only-price");
+    assert_eq!(amount, "1000000000");
+    assert_eq!(status, "conservative");
+    assert!(reason.is_some());
 }

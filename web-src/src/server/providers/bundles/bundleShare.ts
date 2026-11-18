@@ -1,3 +1,4 @@
+import {capabilityIntent, capabilityQuotaContext, type ShareCapabilityPolicy, type CapabilityConsent} from "@/lib/share-capabilities";
 import {
   shareApi,
   type ShareRecord,
@@ -22,7 +23,11 @@ import i18n from "@/i18n";
 import { HttpResponseError } from "@/lib/runtime";
 
 export interface ProviderBundleShareDraft {
+  capabilityPolicy?:ShareCapabilityPolicy;
+  capabilityConsent?:CapabilityConsent;
+  capabilityConsentScope?:string;
   baseline?: {
+    capabilityPolicy?:ShareCapabilityPolicy;
     shareId: string;
     configRevision: number;
     userGrants: ShareUserGrantMap;
@@ -135,6 +140,7 @@ export function createBundleShareDraft(
   const parallelLimit = share && share.parallelLimit >= 0 ? String(share.parallelLimit) : "";
   return {
     baseline: share ? {
+      capabilityPolicy:share.capabilityPolicy,
       shareId: share.id,
       configRevision: share.configRevision ?? 0,
       userGrants: { ...canonicalUserGrants, ...buildShareUserGrants({
@@ -174,6 +180,7 @@ export function createBundleShareDraft(
     previousResponseCacheEnabled: share
       ? Boolean(share.previousResponseCacheEnabled)
       : true,
+    capabilityPolicy: share?.capabilityPolicy,
     grokMediaPolicy: share?.grokMediaPolicy ?? {
       imageGenerationEnabled: false,
       imageEditEnabled: false,
@@ -274,6 +281,10 @@ export async function saveBundleShare(
   draft: ProviderBundleShareDraft,
   existing?: ShareRecord,
 ): Promise<ShareRecord | undefined> {
+  if ((capabilityIntent(draft.capabilityPolicy)!==capabilityIntent(draft.baseline?.capabilityPolicy) ||
+      !!draft.capabilityPolicy?.allowedOperations.length && capabilityQuotaContext(draft.capabilityPolicy,draft.userGrants,Number(draft.tokenLimit))!==capabilityQuotaContext(draft.baseline?.capabilityPolicy,draft.baseline?.userGrants??{},Number(draft.baseline?.tokenLimit??-1))) && (!draft.capabilityConsent || draft.capabilityConsentScope!==capabilityQuotaContext(draft.capabilityPolicy,draft.userGrants,Number(draft.tokenLimit)))) {
+    throw new Error(i18n.language.startsWith("zh")?"请先确认扩展能力与额度覆盖预览":"Confirm the capability and quota coverage preview first");
+  }
   const subdomain = draft.subdomain.trim();
   if (draft.enabled && subdomain && !isValidShareSlug(subdomain)) {
     throw new Error("Share slug is invalid");
@@ -356,13 +367,14 @@ export async function saveBundleShare(
     autoConsumeBankedReset: draft.autoConsumeBankedReset,
     bankedResetExpiryLeadMinutes,
     previousResponseCacheEnabled: draft.previousResponseCacheEnabled,
+    ...(draft.capabilityConsent?{capabilityPolicy:draft.capabilityPolicy,capabilityConsent:draft.capabilityConsent}:{}),
     grokMediaPolicy: draft.grokMediaPolicy,
     userGrants: draft.baseline ? undefined : userGrants,
     userGrantEdits,
     userUsageEdits,
     ...(Object.keys(initializations).length ? {userValueUsageInitializations: initializations} : {}),
     ...(Object.keys(conversions).length ? {userQuotaConversions: conversions} : {}),
-    ...(Object.keys(initializations).length || Object.keys(conversions).length ? {valueUsageOperationId: draft.valueUsageOperationId} : {}),
+    ...(draft.capabilityConsent || Object.keys(initializations).length || Object.keys(conversions).length ? {valueUsageOperationId: draft.valueUsageOperationId} : {}),
   });
 }
 

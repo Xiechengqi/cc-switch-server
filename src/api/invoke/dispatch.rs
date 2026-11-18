@@ -724,6 +724,11 @@ async fn web_invoke_dispatch(
             let emails=serde_json::from_value(args.get("emails").cloned().ok_or_else(||ApiError::bad_request("emails are required"))?).map_err(ApiError::bad_request)?;
             state.prepare_share_quota_history(&id,revision,emails,args.get("restart").and_then(Value::as_bool).unwrap_or(false)).await.map_err(ApiError::value_quota_preview)
         }
+        "preview_share_capabilities" => {
+            let id=web_arg_share_id(&args)?;
+            let mut input=args.clone(); input.as_object_mut().unwrap().remove("shareId");
+            state.preview_share_capabilities(&id,serde_json::from_value(input).map_err(ApiError::bad_request)?).await.map_err(ApiError::value_quota)
+        }
         "preview_share_value_quota" => {
             let id=web_arg_share_id(&args)?;
             let revision=web_optional_u64(&args,&["expectedConfigRevision"]).ok_or_else(||ApiError::bad_request("expectedConfigRevision is required"))?;

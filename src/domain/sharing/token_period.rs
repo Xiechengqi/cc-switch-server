@@ -26,6 +26,9 @@ impl ShareTokenPeriod {
 }
 
 pub fn validate_user_policy(policy: &ShareUserPolicy, now_ms: i64) -> Result<(), String> {
+    if let Some(operations) = &policy.allowed_operations {
+        super::capabilities::validate_operations(operations)?;
+    }
     if let Some(quota) = &policy.value_quota {
         if policy.token_limit.is_some() {
             return Err("tokenLimit and valueQuota are mutually exclusive".into());

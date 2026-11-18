@@ -88,6 +88,13 @@ pub struct ShareSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grok_media_policy: Option<GrokMediaPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_policy: Option<super::capabilities::ShareCapabilityPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_consent: Option<super::capabilities::CapabilityConsent>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub validated_capability_policy: Option<super::capabilities::ShareCapabilityPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub support: Option<ShareSupport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
@@ -335,7 +342,7 @@ pub fn supported_share_token_periods() -> Vec<ShareTokenPeriod> {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ShareUserPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_limit: Option<u32>,
@@ -354,6 +361,8 @@ pub struct ShareUserPolicy {
     /// bound yet, so enabling them later does not require replacing the grant.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_apps: Vec<AppKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_operations: Option<Vec<super::capabilities::ShareOperation>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -651,6 +660,8 @@ pub struct ShareDescriptor {
     pub previous_response_cache_enabled: bool,
     #[serde(default, skip_serializing_if = "is_default_grok_media_policy")]
     pub grok_media_policy: GrokMediaPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_policy: Option<super::capabilities::ShareCapabilityPolicy>,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
     pub config_revision: u64,
     #[serde(default, skip_serializing_if = "is_zero_revision")]
@@ -1379,7 +1390,9 @@ pub fn descriptor_for_share_with_accounts_and_usage(
     }
     ShareDescriptor {
         termination_archive_since_ms: None,
-        contract_version: if user_grants
+        contract_version: if share.capability_policy.is_some() {
+            super::capabilities::CAPABILITY_CONTRACT_VERSION
+        } else if user_grants
             .values()
             .any(|g| g.quota_conversion_id.is_some())
         {
@@ -1450,6 +1463,7 @@ pub fn descriptor_for_share_with_accounts_and_usage(
         banked_reset_expiry_lead_minutes: share.banked_reset_expiry_lead_minutes,
         previous_response_cache_enabled: share.previous_response_cache_enabled,
         grok_media_policy: share.grok_media_policy,
+        capability_policy: share.capability_policy.clone(),
         config_revision: share.config_revision,
         descriptor_generation: share.descriptor_generation,
         descriptor_fingerprint: share.descriptor_fingerprint.clone().unwrap_or_default(),
@@ -2740,6 +2754,7 @@ mod tests {
                 active: true,
                 policy: ShareUserPolicy {
                     value_quota: Some(crate::domain::usage::value_pricing::ValueQuota {
+                        unpriced_usage: Default::default(),
                         limit_usd_micros: "1000000".into(),
                         tariff_policy_id: "api-equivalent-v1".into(),
                     }),

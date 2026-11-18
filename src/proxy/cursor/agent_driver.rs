@@ -4651,6 +4651,7 @@ async fn begin_cursor_value_generation(
             context.request_context,
             &context.plan.model_id,
             &payload,
+            context.runtime_fingerprint,
         )
         .await?;
     meter.sent();

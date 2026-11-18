@@ -82,6 +82,24 @@ pub fn price_resources(
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourcePlan {
+    /// Gemini explicitly requests only text output; image understanding stays
+    /// available even on image-capable models.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_output_only: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gemini_image_input: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<crate::domain::sharing::capabilities::ShareOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub continuation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_reason: Option<String>,
     pub quantities: BTreeMap<String, u64>,
     /// Media generation has no text-token debit; media carried by a text
     /// request retains the model's token debit, including vision input.
@@ -92,6 +110,8 @@ pub struct ResourcePlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
     pub quantities: BTreeMap<String, u64>,
     pub source: String,
     pub estimated: bool,
@@ -224,6 +244,7 @@ mod tests {
             ..Default::default()
         };
         let mut usage = ResourceUsage {
+            response_id: None,
             quantities: BTreeMap::from([
                 ("audio.input_token".into(), 60),
                 ("audio.output_token".into(), 10),

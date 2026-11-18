@@ -1300,6 +1300,29 @@ pub(crate) struct ControlClientLogTailResponse {
     content: String,
 }
 
+pub(crate) async fn control_preview_share_capabilities(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    verify_control_request(&state, "/_ctl/preview_share_capabilities", &headers, &body).await?;
+    let mut input: Value = serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+    let share_id = input
+        .get("shareId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("shareId is required"))?
+        .to_owned();
+    input.as_object_mut().unwrap().remove("shareId");
+    state
+        .preview_share_capabilities(
+            &share_id,
+            serde_json::from_value(input).map_err(ApiError::bad_request)?,
+        )
+        .await
+        .map(Json)
+        .map_err(ApiError::value_quota)
+}
+
 #[cfg(test)]
 mod control_log_tests {
     use super::*;

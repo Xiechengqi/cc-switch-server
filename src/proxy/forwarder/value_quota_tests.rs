@@ -244,6 +244,7 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
             store.shares.push(serde_json::from_value(json!({
                 "id":"fixture-value-share","app":app.as_str(),"providerId":"value-native-provider",
                 "providerType":stored.provider_type,"ownerEmail":"owner@example.test","enabled":true,"status":"active",
+                "capabilityPolicy":{"version":1,"allowedOperations":[],"operationBindings":{}},
                 "bindings":[{"app":app.as_str(),"providerId":"value-native-provider","providerType":stored.provider_type}],
                 "userGrants":{"owner@example.test":{"email":"owner@example.test","role":"owner","active":true,
                     "policy":{"tokenPeriod":"lifetime","valueQuota":{"limitUsdMicros":"100","tariffPolicyId":"api-equivalent-v1"}}}}
@@ -279,6 +280,61 @@ async fn value_quota_native_text_surfaces_admit_before_send_and_settle_exactly()
                         "x-cc-switch-user-email",
                         HeaderValue::from_static("owner@example.test"),
                     );
+
+                    if protocol.is_none() && !streaming && !mismatched_model {
+                        let mut hosted = request.clone();
+                        match route {
+                            ProxyRoute::ClaudeMessages => {
+                                hosted["tools"] =
+                                    json!([{"type":"web_search_20250305","name":"web_search"}])
+                            }
+                            ProxyRoute::CodexChatCompletions => {
+                                hosted["web_search_options"] = json!({})
+                            }
+                            ProxyRoute::Gemini => hosted["tools"] = json!([{"googleSearch":{}}]),
+                            _ => hosted["tools"] = json!([{"type":"web_search"}]),
+                        }
+                        let hosted = Bytes::from(serde_json::to_vec(&hosted).unwrap());
+                        if matches!(route, ProxyRoute::CodexChatCompletions) {
+                            // This compatibility adapter does not implement Chat's
+                            // web_search_options. Check the wire body rather than
+                            // claiming a hosted operation survives conversion.
+                            let providers = state.providers_snapshot().await;
+                            let runtime_stored =
+                                ProviderExecution::from_store(&providers, stored.clone())
+                                    .unwrap()
+                                    .runtime_stored_view();
+                            let prepared = adapters::adapter_for(app, runtime_stored.provider_type)
+                                .transform_request_for_route(hosted, &runtime_stored, route, None)
+                                .unwrap();
+                            let outbound: Value = serde_json::from_slice(&prepared.body).unwrap();
+                            assert!(outbound.get("web_search_options").is_none());
+                            assert!(crate::domain::sharing::capability_intent::operations(
+                                &outbound,
+                                crate::domain::usage::store::InferenceOperation::Responses
+                            )
+                            .is_empty());
+                        } else {
+                            let error = forward(
+                                state.clone(),
+                                route,
+                                gemini_path.clone(),
+                                headers.clone(),
+                                hosted,
+                            )
+                            .await
+                            .expect_err(&format!("disabled hosted operation: {app:?} {route:?}"));
+                            assert!(
+                                error.status.is_client_error(),
+                                "{app:?} {route:?}: {error:?}"
+                            );
+                        }
+                        assert_eq!(
+                            calls.load(Ordering::SeqCst),
+                            0,
+                            "disabled hosted operation reached upstream"
+                        );
+                    }
 
                     if app == AppKind::Gemini {
                         if protocol.is_none() || protocol == Some("gemini_native") {

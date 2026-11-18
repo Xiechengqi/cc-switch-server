@@ -3321,3 +3321,10 @@ DeepSeek Harness 完整会话仍为 `live_pending`，未部署、未发起真实
 本轮最终本地回执：Node 20.20.2 下完整 `scripts/static-checks.sh` 通过（严格 Clippy、后端审计 2205/2205、smoke 脚本测试 13/13、边界与纪律检查）；Web 类型检查通过，最终生产构建与 405/405 测试通过。`cargo check`、`cargo build -j1`、带 `RUST_MIN_STACK=67108864` 的 `scripts/smoke/smoke-local.sh` 均通过。最终 `CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 RUST_MIN_STACK=67108864 cargo test -j1 --all-targets --no-fail-fast -- --test-threads=4`：lib 4480 通过 / 2 失败 / 3 忽略，API 契约 139/139、另两个集成目标各 1/1；Zen 固定模型 3×3 路由矩阵、流式取消/续写计量和 Web Bundle 保存/重载/Share 新增回归通过。
 
 全量 lib 仍有本轮修改前已记录的两项失败：`restored_router_ack_and_withdrawn_pending_tariff_converge_without_rewriting_grants`（ACK schema 预期 5，实际 6）与 `signed_conversion_commits_live_usage_and_calibrates_against_preview_then_replays_durably`（tampered settings 拒绝断言）。本轮未改动这两个测试或相关额度实现；不声称全量测试通过。过程中旧构建曾因资源终止，以及前端重建造成旧嵌入路径失效，均未计作最终回执；最终测试使用固定 Web 产物。离线 readiness 为 `blocked_inputs`，真实凭据/Router/部署输入未提供；保持 `live_pending`，未部署、未发起真实推理调用。
+
+
+## 2026-11-17 Share 独立扩展能力
+
+- 本轮仅改变本地权限、计量覆盖、持久化与管理交互，不新增或宣称已真实验证任何上游媒体/工具接口。实际实现由编译 Registry runtime 和 Driver 合同派生；未知账号、模型和传输保持 live_pending。
+- 只读研究 sub2api、TokenRouter、new-api、LiteLLM 的设计证据已登记在 Router `docs/share-capability-policy-implementation-plan.md §13`，这些外部仓库不作为构建、测试或同步输入。借鉴操作/计量分离、原生资源单位、幂等结算；不采用缺价泛化默认价、未知用量按免费或事后删媒体等做法。
+- 本地协议控制夹具、SQLite/state 原子/重放测试、组件和浏览器证明本地边界，不将其提升为真实供应商执行、计费精度或灰度通过。权威实现说明见 `docs/share/extended-capabilities.md`。

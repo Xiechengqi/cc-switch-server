@@ -1,3 +1,5 @@
+pub mod capabilities;
+pub mod capability_intent;
 pub mod credential_source;
 pub mod invariants;
 pub(crate) mod legacy_token_market_migration;

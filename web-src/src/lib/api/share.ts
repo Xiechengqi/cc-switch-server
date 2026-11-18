@@ -1,3 +1,5 @@
+import { parseCapabilityPreview } from "@/lib/share-capabilities";
+import type { ShareOperation, ShareCapabilityPolicy, CapabilityConsent } from "@/lib/share-capabilities";
 import { invokeCommand, readToken } from "@/lib/runtime";
 import { readRouterAccessToken } from "@/lib/routerAuth";
 import {
@@ -44,9 +46,10 @@ export type AccountResetPreview = {
 };
 
 export type ShareUserPolicy = {
+  allowedOperations?: ShareOperation[];
   parallelLimit?: number;
   tokenLimit?: number;
-  valueQuota?: {limitUsdMicros:string;tariffPolicyId:"api-equivalent-v1" | "api-equivalent-v2"};
+  valueQuota?: {limitUsdMicros:string;tariffPolicyId:"api-equivalent-v1" | "api-equivalent-v2";unpricedUsage?:"zero"|"reject"};
   tokenPeriod: ShareTokenPeriod;
   tokenPeriodAnchorAtMs?: number;
   expiresAt?: number;
@@ -204,6 +207,8 @@ export interface ShareRecord {
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: number;
   previousResponseCacheEnabled: boolean;
+  capabilityPolicy?: ShareCapabilityPolicy;
+  capabilityConsent?: CapabilityConsent;
   grokMediaPolicy?: GrokMediaPolicy;
   userGrants: ShareUserGrantMap;
 }
@@ -228,6 +233,8 @@ export interface CreateShareParams {
   autoConsumeBankedReset?: boolean;
   bankedResetExpiryLeadMinutes?: number;
   previousResponseCacheEnabled?: boolean;
+  capabilityPolicy?: ShareCapabilityPolicy;
+  capabilityConsent?: CapabilityConsent;
   grokMediaPolicy?: GrokMediaPolicy;
   userGrants?: ShareUserGrantMap;
 }
@@ -302,6 +309,8 @@ export interface SaveProviderShareParams {
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: number;
   previousResponseCacheEnabled: boolean;
+  capabilityPolicy?: ShareCapabilityPolicy;
+  capabilityConsent?: CapabilityConsent;
   grokMediaPolicy?: GrokMediaPolicy;
   userGrants: ShareUserGrantMap;
   userUsageEdits?: ShareUserUsageEditMap;
@@ -726,6 +735,12 @@ async function getClientTunnelStatus(): Promise<ShareTunnelStatus> {
 }
 
 export const shareApi = {
+  previewCapabilities: async (shareId:string, input:unknown, signal?:AbortSignal) => {
+    const token=readToken(),router=readRouterAccessToken();
+    const result=await invokeCommand<import("../share-capabilities").CapabilityPreview>("preview_share_capabilities",{shareId,...input as object},{signal,cache:"no-store"});
+    if(token!==readToken()||router!==readRouterAccessToken())throw new DOMException("Sign-in session changed","AbortError");
+    return parseCapabilityPreview(result,shareId,input);
+  },
   preflightProviderBundleShare: (bundleId: string) =>
     invokeCommand<BundleSharePreflight>("get_provider_bundle_share_preflight", { bundleId }, { cache: "no-store" }),
   editValueUsage: async (shareId:string,expectedConfigRevision:number,edits:Record<string,import("../share-value-quota").ValueUsageEdit>) => {

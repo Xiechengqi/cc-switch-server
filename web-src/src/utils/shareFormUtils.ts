@@ -12,7 +12,8 @@ export function sharePolicyKey(policy: ShareUserPolicy): string {
   return JSON.stringify([
     policy.parallelLimit ?? null, policy.tokenLimit ?? null,
     policy.valueQuota?.limitUsdMicros ?? null, policy.valueQuota?.tariffPolicyId ?? null,
-    policy.tokenPeriod ?? "lifetime", policy.tokenPeriodAnchorAtMs ?? null, policy.expiresAt ?? null,
+    policy.tokenPeriod ?? "lifetime", policy.tokenPeriodAnchorAtMs ?? null, policy.expiresAt ?? null, policy.allowedOperations ?? null,
+    policy.valueQuota?.unpricedUsage ?? null,
   ]);
 }
 

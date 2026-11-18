@@ -1348,7 +1348,8 @@ async fn control_apply_share_settings_accepts_router_share_market_managed_grant(
                     "parallelLimit": 2,
                     "tokenLimit": 1000,
                     "tokenPeriod": "day",
-                    "allowedApps": ["claude", "codex", "gemini"]
+                    "allowedApps": ["claude", "codex", "gemini"],
+                    "allowedOperations": []
                 }
             }
         }
@@ -2965,7 +2966,7 @@ async fn non_stream_proxy_preserves_upstream_error_status_body_and_usage() {
         axum::serve(listener, upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     let app = app_router(state.clone());
     upsert_shared_test_provider(
         &state,
@@ -3064,30 +3065,8 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
     let (proxy_addr, upstream_server, proxy_server) =
         spawn_kiro_fixed_endpoint_tls_mock(upstream).await;
 
-    let state = test_state();
+    let state = committed_test_state();
     let app = app_router(state.clone());
-    upsert_shared_test_provider(
-        &state,
-        AppKind::Codex,
-        Provider {
-            id: "copilot-managed".to_string(),
-            name: "Copilot Managed".to_string(),
-            settings_config: json!({}),
-            category: None,
-            meta: Some(ProviderMeta {
-                provider_type: Some("github_copilot".to_string()),
-                auth_binding: Some(AuthBinding {
-                    source: Some("managed_account".to_string()),
-                    auth_provider: Some("github_copilot".to_string()),
-                    account_id: Some("acct-copilot".to_string()),
-                    auth_identity_generation: Some(1),
-                }),
-                ..Default::default()
-            }),
-            extra: Default::default(),
-        },
-    )
-    .await;
     state
         .mutate_accounts_immediate(|accounts| {
             accounts.upsert(UpsertAccountInput {
@@ -3121,6 +3100,28 @@ async fn copilot_managed_account_uses_cached_internal_token_and_endpoint() {
         })
         .await
         .unwrap();
+    upsert_shared_test_provider(
+        &state,
+        AppKind::Codex,
+        Provider {
+            id: "copilot-managed".to_string(),
+            name: "Copilot Managed".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("github_copilot".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("github_copilot".to_string()),
+                    account_id: Some("acct-copilot".to_string()),
+                    auth_identity_generation: Some(1),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
     install_kiro_fixed_endpoint_test_client(&state, proxy_addr).await;
 
     let response = app
@@ -3283,30 +3284,8 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
     let (proxy_addr, upstream_server, proxy_server) =
         spawn_kiro_fixed_endpoint_tls_mock(upstream).await;
 
-    let state = test_state();
+    let state = committed_test_state();
     let app = app_router(state.clone());
-    upsert_shared_test_provider(
-        &state,
-        AppKind::Claude,
-        Provider {
-            id: "kiro-managed".to_string(),
-            name: "Kiro Managed".to_string(),
-            settings_config: json!({}),
-            category: None,
-            meta: Some(ProviderMeta {
-                provider_type: Some("kiro_oauth".to_string()),
-                auth_binding: Some(AuthBinding {
-                    source: Some("managed_account".to_string()),
-                    auth_provider: Some("kiro_oauth".to_string()),
-                    account_id: Some("acct-kiro".to_string()),
-                    auth_identity_generation: Some(1),
-                }),
-                ..Default::default()
-            }),
-            extra: Default::default(),
-        },
-    )
-    .await;
     state
         .mutate_accounts_immediate(|accounts| {
             accounts.upsert(UpsertAccountInput {
@@ -3347,6 +3326,28 @@ async fn claude_kiro_managed_account_bridges_non_stream_response() {
         })
         .await
         .unwrap();
+    upsert_shared_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "kiro-managed".to_string(),
+            name: "Kiro Managed".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("kiro_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("kiro_oauth".to_string()),
+                    account_id: Some("acct-kiro".to_string()),
+                    auth_identity_generation: Some(1),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
     install_kiro_fixed_endpoint_test_client(&state, proxy_addr).await;
 
     let response = app
@@ -3477,30 +3478,8 @@ async fn claude_kiro_managed_account_bridges_stream_response() {
     let (proxy_addr, upstream_server, proxy_server) =
         spawn_kiro_fixed_endpoint_tls_mock(upstream).await;
 
-    let state = test_state();
+    let state = committed_test_state();
     let app = app_router(state.clone());
-    upsert_shared_test_provider(
-        &state,
-        AppKind::Claude,
-        Provider {
-            id: "kiro-managed-stream".to_string(),
-            name: "Kiro Managed Stream".to_string(),
-            settings_config: json!({}),
-            category: None,
-            meta: Some(ProviderMeta {
-                provider_type: Some("kiro_oauth".to_string()),
-                auth_binding: Some(AuthBinding {
-                    source: Some("managed_account".to_string()),
-                    auth_provider: Some("kiro_oauth".to_string()),
-                    account_id: Some("acct-kiro-stream".to_string()),
-                    auth_identity_generation: Some(1),
-                }),
-                ..Default::default()
-            }),
-            extra: Default::default(),
-        },
-    )
-    .await;
     state
         .mutate_accounts_immediate(|accounts| {
             accounts.upsert(UpsertAccountInput {
@@ -3541,6 +3520,28 @@ async fn claude_kiro_managed_account_bridges_stream_response() {
         })
         .await
         .unwrap();
+    upsert_shared_test_provider(
+        &state,
+        AppKind::Claude,
+        Provider {
+            id: "kiro-managed-stream".to_string(),
+            name: "Kiro Managed Stream".to_string(),
+            settings_config: json!({}),
+            category: None,
+            meta: Some(ProviderMeta {
+                provider_type: Some("kiro_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: Some("managed_account".to_string()),
+                    auth_provider: Some("kiro_oauth".to_string()),
+                    account_id: Some("acct-kiro-stream".to_string()),
+                    auth_identity_generation: Some(1),
+                }),
+                ..Default::default()
+            }),
+            extra: Default::default(),
+        },
+    )
+    .await;
     install_kiro_fixed_endpoint_test_client(&state, proxy_addr).await;
 
     let response = app
@@ -3607,7 +3608,7 @@ async fn non_stream_proxy_timeout_records_bad_gateway() {
         axum::serve(listener, upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     let app = app_router(state.clone());
     upsert_shared_test_provider(
         &state,
@@ -3735,7 +3736,7 @@ async fn claude_oauth_legacy_forward_and_typed_plan_share_the_contract() {
         axum::serve(listener, upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     state
         .mutate_accounts_immediate(|accounts| {
             let mut typed =
@@ -4232,7 +4233,7 @@ async fn anthropic_semantic_guard_rejects_invalid_documents_and_truncated_stream
         axum::serve(listener, upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     upsert_shared_test_provider(
         &state,
         AppKind::Claude,
@@ -4376,7 +4377,7 @@ async fn claude_client_disconnect_cancels_upstream_without_provider_failure() {
         axum::serve(listener, upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     upsert_shared_test_provider(
         &state,
         AppKind::Claude,
@@ -4470,7 +4471,7 @@ async fn claude_message_stop_finishes_without_waiting_for_upstream_eof() {
     });
 
     let provider_id = "claude-terminal-stop";
-    let state = test_state();
+    let state = committed_test_state();
     upsert_shared_test_provider(
         &state,
         AppKind::Claude,
@@ -4566,7 +4567,7 @@ async fn claude_message_stop_is_accounted_before_downstream_drops_body() {
     });
 
     let provider_id = "claude-terminal-drop";
-    let state = test_state();
+    let state = committed_test_state();
     upsert_shared_test_provider(
         &state,
         AppKind::Claude,
@@ -4678,7 +4679,7 @@ async fn claude_connect_failure_retries_only_the_pinned_provider() {
         axum::serve(listener, upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     for (id, base_url) in [
         ("claude-dead", format!("http://{closed_addr}")),
         ("claude-live", format!("http://{upstream_addr}")),
@@ -4763,7 +4764,7 @@ async fn claude_rate_limit_body_read_failure_is_not_replayed() {
         axum::serve(listener, upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     for (id, base_url) in [
         ("claude-broken-429", format!("http://{broken_addr}")),
         ("claude-live-after-429", format!("http://{live_addr}")),
@@ -4869,7 +4870,7 @@ async fn claude_http_429_is_returned_without_same_account_replay() {
         axum::serve(live_listener, live_upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     upsert_shared_test_provider(
         &state,
         AppKind::Claude,
@@ -4969,7 +4970,7 @@ async fn claude_http_529_is_returned_without_same_account_replay() {
         axum::serve(live_listener, live_upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     upsert_shared_test_provider(
         &state,
         AppKind::Claude,
@@ -5037,7 +5038,7 @@ async fn explicit_claude_provider_never_fails_over() {
         axum::serve(live_listener, live_upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     upsert_shared_test_provider(
         &state,
         AppKind::Claude,
@@ -5105,7 +5106,7 @@ async fn claude_share_never_fails_over() {
         axum::serve(live_listener, live_upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     configure_share_router_identity(&state).await;
     upsert_test_provider(
         &state,
@@ -5228,7 +5229,7 @@ async fn claude_oauth_body_retry_stays_on_original_provider() {
             .unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     upsert_shared_test_provider(
         &state,
         AppKind::Claude,
@@ -5313,7 +5314,7 @@ async fn claude_split_first_error_event_is_not_replayed() {
         axum::serve(listener, upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     upsert_shared_test_provider(
         &state,
         AppKind::Claude,
@@ -5419,7 +5420,7 @@ async fn claude_stream_failure_after_first_event_does_not_replay_on_next_provide
             .unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     upsert_shared_test_provider(
         &state,
         AppKind::Claude,
@@ -5492,7 +5493,7 @@ async fn native_claude_signature_error_does_not_run_oauth_body_retry() {
         axum::serve(listener, upstream).await.unwrap();
     });
 
-    let state = test_state();
+    let state = committed_test_state();
     upsert_shared_test_provider(
         &state,
         AppKind::Claude,
@@ -5541,7 +5542,7 @@ async fn native_claude_signature_error_does_not_run_oauth_body_retry() {
 #[tokio::test]
 async fn stream_proxy_marks_upstream_chunk_error() {
     let upstream_addr = spawn_broken_chunked_upstream().await;
-    let state = test_state();
+    let state = committed_test_state();
     let app = app_router(state.clone());
     upsert_shared_test_provider(
         &state,
@@ -9637,7 +9638,7 @@ async fn custom_shared_bundle_routes_each_app_with_the_verified_key() {
     let upstream_task = tokio::spawn(async move {
         axum::serve(listener, upstream).await.unwrap();
     });
-    let state = test_state();
+    let state = committed_test_state();
     let app = app_router(state.clone());
     let token = setup_and_login(&app).await;
     let id = "custom-loopback";
@@ -12298,14 +12299,37 @@ fn test_state_with_cursor_api_key_verifier() -> ServerState {
 }
 
 fn test_state_with_host(host: IpAddr) -> ServerState {
+    test_state_with_store_authority(host, false)
+}
+
+fn committed_test_state() -> ServerState {
+    test_state_with_store_authority(IpAddr::V4(Ipv4Addr::LOCALHOST), true)
+}
+
+fn test_state_with_store_authority(host: IpAddr, committed: bool) -> ServerState {
     let suffix = unique_test_state_suffix();
     let config_dir = std::env::temp_dir().join(format!("cc-switch-server-http-test-{suffix}"));
     let config = cc_switch_server::domain::settings::config::ServerConfig::empty();
     config.save(&config_dir).unwrap();
+    if committed {
+        // New Shares use v13 and persist execution evidence, including text-only
+        // attempts. Exercise the normal startup activation flow without changing
+        // the process-wide fresh-install flag or older persistence fixtures.
+        std::fs::write(
+            config_dir.join("server-store-activation-request.json"),
+            serde_json::to_vec(&json!({
+                "status": "pending",
+                "requestedAtMs": now_ms(),
+                "requestedBy": "api-contract-fixture"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
     let log_capture = Arc::new(cc_switch_server::logging::LogCapture::new(
         cc_switch_server::logging::RING_BUFFER_CAPACITY,
     ));
-    ServerStateInner::load(
+    let state = ServerStateInner::load(
         Cli {
             host,
             port: 0,
@@ -12316,7 +12340,15 @@ fn test_state_with_host(host: IpAddr) -> ServerState {
         },
         log_capture,
     )
-    .unwrap()
+    .unwrap();
+    if committed {
+        let marker: Value = serde_json::from_slice(
+            &std::fs::read(state.config_dir.join("server-store-migration.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker["authority"], "committed");
+    }
+    state
 }
 
 fn test_state_with_external_web_dist() -> ServerState {

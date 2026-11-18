@@ -54,6 +54,7 @@ async fn value_quota_resource_readiness_is_per_grant_and_fences_scheduled_activa
     let mut previous = state.shares.read().await.clone();
     let policy = |tariff: &str| ShareUserPolicy {
         value_quota: Some(ValueQuota {
+            unpriced_usage: Default::default(),
             limit_usd_micros: "1000000".into(),
             tariff_policy_id: tariff.into(),
         }),

@@ -575,11 +575,25 @@ pub fn usd_to_micros(raw: &str) -> Result<String, ValueError> {
     Ok(micros.to_string())
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UnpricedUsage {
+    #[default]
+    Zero,
+    Reject,
+}
+impl UnpricedUsage {
+    pub fn is_zero(&self) -> bool {
+        *self == Self::Zero
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ValueQuota {
     pub limit_usd_micros: String,
     pub tariff_policy_id: String,
+    #[serde(default, skip_serializing_if = "UnpricedUsage::is_zero")]
+    pub unpriced_usage: UnpricedUsage,
 }
 impl ValueQuota {
     pub fn limit_picos(&self) -> Result<i128, ValueError> {
@@ -1592,6 +1606,7 @@ mod tests {
         assert_eq!(usd_to_micros("10.000001").unwrap(), "10000001");
         assert_eq!(
             ValueQuota {
+                unpriced_usage: Default::default(),
                 limit_usd_micros: "10000000".into(),
                 tariff_policy_id: TARIFF_POLICY.into()
             }
@@ -1600,6 +1615,7 @@ mod tests {
             10 * PICOS_PER_USD
         );
         assert!(ValueQuota {
+            unpriced_usage: Default::default(),
             limit_usd_micros: "0".into(),
             tariff_policy_id: TARIFF_POLICY.into()
         }

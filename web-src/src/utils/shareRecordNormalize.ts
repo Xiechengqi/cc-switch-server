@@ -1,3 +1,4 @@
+import {SHARE_OPERATIONS, type ShareOperation, type ShareCapabilityPolicy} from "@/lib/share-capabilities";
 import type {
   ShareBindings,
   ShareRecord,
@@ -132,7 +133,8 @@ function strictValueQuota(value: unknown): ShareUserPolicy["valueQuota"] | null 
   const tariff = raw.tariffPolicyId ?? raw.tariff_policy_id;
   if (typeof amount !== "string" || !/^[1-9]\d*$/.test(amount) || amount.length > 16 ||
       BigInt(amount) > 1000000000000000n || (tariff !== "api-equivalent-v1" && tariff !== "api-equivalent-v2")) return null;
-  return { limitUsdMicros: amount, tariffPolicyId: tariff };
+  if (raw.unpricedUsage !== undefined && raw.unpricedUsage !== "zero" && raw.unpricedUsage !== "reject") return null;
+  return { limitUsdMicros: amount, tariffPolicyId: tariff, ...(raw.unpricedUsage ? {unpricedUsage:raw.unpricedUsage as "zero"|"reject"}: {}) };
 }
 
 function normalizeValueQuota(value: unknown, email: string, flag: MalformedFlag): ShareUserPolicy["valueQuota"] {
@@ -144,6 +146,9 @@ function normalizePolicy(policyRaw: RawRecord, email: string, flag: MalformedFla
   return {
     parallelLimit: readNumber(policyRaw, "parallelLimit", "parallel_limit"),
     tokenLimit: readNumber(policyRaw, "tokenLimit", "token_limit"),
+    allowedOperations: policyRaw.allowedOperations === undefined ? undefined :
+      Array.isArray(policyRaw.allowedOperations) && policyRaw.allowedOperations.every(op=>SHARE_OPERATIONS.includes(op as ShareOperation)) && new Set(policyRaw.allowedOperations).size===policyRaw.allowedOperations.length
+        ? policyRaw.allowedOperations as ShareOperation[] : keepMalformed("allowedOperations",email,policyRaw.allowedOperations,flag),
     valueQuota: normalizeValueQuota(policyRaw.valueQuota ?? policyRaw.value_quota, email, flag),
     tokenPeriod: normalizeTokenPeriod(policyRaw.tokenPeriod ?? policyRaw.token_period),
     tokenPeriodAnchorAtMs: readNumber(policyRaw, "tokenPeriodAnchorAtMs", "token_period_anchor_at_ms"),
@@ -411,6 +416,7 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
 
   return {
     id,
+    capabilityPolicy: record.capabilityPolicy as ShareCapabilityPolicy | undefined,
     capacityPoolId:
       readString(record, "capacityPoolId", "capacity_pool_id") ?? id,
     name: readString(record, "name", "displayName", "display_name") ?? id,

@@ -10,7 +10,7 @@ Provider Registry 是运行时权威：40 families、93 Profiles、29 Drivers，
 
 `value_metering_strategy` 声明 Driver 生命周期责任。`scripts/audit/audit-value-metering.mjs` 从 Registry 生成 `assets/contract/value-metering-coverage.json`，约束策略和关键钩子。它是静态覆盖清单，不能证明 101 对已在真实上游执行通过；表中的 transport 是现有入口分类，legacy 以最终解析的 Driver 为准。
 
-单用户、批量、市场席位和美元试用共用规则。`$` 可选择并保留草稿，保存与准入检查存储、Router 协商、已激活价目、模型映射及操作资源价格。已支持、配置是否就绪、本次用量精度分别诊断。模型、资源或档位缺价只影响相关操作，不将整类 Provider 标为不支持：Market 席位拒绝，普通授权按带原因的 $0 计量（[§3.1](value-quotas.md#31-未定价用量普通授权-0)）。
+单用户、批量、市场席位和美元试用共用规则。`$` 可选择并保留草稿，保存与准入检查存储、Router 协商、已激活价目、模型映射及操作资源价格。已支持、配置是否就绪、本次用量精度分别诊断。模型、资源或档位缺价只影响相关操作，不将整类 Provider 标为不支持：Market 席位拒绝，普通授权按显式 unpricedUsage=zero/reject 处理；zero 仅对缺价维度记带原因的 $0（[§3.1](value-quotas.md#31-未定价用量普通授权-0)）。
 
 ## 生成与结算
 
@@ -58,13 +58,13 @@ Server schema 6 的 `value_async_tasks` 保存 task 到 scope、原 request/atte
 
 Router 迁移 111 并行保存两类价目及独立资源价格编辑历史。管理页以整数换算每张/次、每秒、每百万 Token，支持模型资源价和 exact alias，CAS 防止覆盖并发修改，冲突保留草稿。两个策略的价格与 alias 从同一当前目录派生并在事务中发布；不可变 hash、生效延迟、ACK、active receipt 和历史冻结保持原语义。
 
-Router 永久保留每个资源修订的类型标记，历史快照正文归档不撤销 schema 5 的 ACK/active 要求。新建或 Token 草稿默认保留文本策略，资源计量仅在 owner 显式勾选时开启；既有 v2 草稿保持原选择。
+Router 永久保留每个资源修订的类型标记，历史快照正文归档不撤销 schema 5 的 ACK/active 要求。v13 将扩展权限独立为 capabilityPolicy；新 Share 默认全关。选择能力时才为相应 USD 草稿采用 v2，新草稿默认 reject，既有 v2 和显式 zero 保留。旧资源总开关只读，见 [独立扩展能力](extended-capabilities.md)。
 
 市场席位及 subscription 保存 `value_tariff_policy_id`，报价、租用、续约、试用与转换使用冻结合同策略。修改席位不会改已有租约的计价策略。普通/批量/市场编辑器均保留原 v1 选择，资源策略须显式选择，不能由升级后台自动打开。
 
 ## 验证与发布
 
-CI 应执行新增的资源计划/证据、audio 去重及长上下文、持久账本修订/取消/异步重启、双价目下发/旧签名/alias CAS、市场冻结和精确 UI 金额回归，连同现有 Driver/跨协议/Token/窗口/试用套件。本地仅编译测试目标和执行类型、格式、静态审计，不执行产品测试、浏览器自动化、截图或真实模型请求。
+CI 应执行新增的资源计划/证据、audio 去重及长上下文、持久账本修订/取消/异步重启、双价目下发/旧签名/alias CAS、市场冻结和精确 UI 金额回归，连同现有 Driver/跨协议/Token/窗口/试用套件。原交付仅编译目标的历史记录保留。2026-11-17 能力实施已实际运行本地产品回归与组件/浏览器验证；不调用真实付费上游，结果与边界见 [独立扩展能力](extended-capabilities.md)。
 
 先发布 Router，再发布 Server；等待协商、资源价格和 active receipt 后显式启用新策略。`woegum--f11pf11rf7` 的 Claude/Codex OpenAI OAuth 两绑定须在生产独立验证：预览、保存、实际请求入账及耗尽拦截。每个开放面继续满足既有 7 个自然日、至少 100 条完成请求的灰度对账门槛，缺输入不得标为 live_verified。
 
@@ -83,3 +83,6 @@ WebSocket 每次生成重新读取当前策略并记录独立事实，Token 模�
 复核状态写入仍经 ServerStateInner 域方法封装，未新增存储锁逆序、Provider 凭据白名单或钱包写入。严格 Clippy（全部目标）、两端类型检查、include! 源格式、Provider writer 证据、Registry/USD 覆盖、SQLite authority、Web 边界和文档索引静态检查通过。发布门槛仍包括 CI 产品回归与上述真实灰度，不能以静态覆盖代替。
 
 普通授权单位 / USD 窗口改动使用 v12 签名转换，保存立即承接当前窗口消费、人工调整与在途风险；Token 模式持续保存金额事实，往返不清零。schema 6 事实与永久回执不随报表保留期清理，详见 [即时转换规范](quota-unit-conversions.md)。
+
+
+2026-11-17：核心 schema8 / v13 将执行权限与额度单位分离。部分缺价按维度结算，response ID 不代表资源零量，严格缺价不可豁免，异常执行隔离与永久设置回执见 [独立扩展能力](extended-capabilities.md)。

@@ -1521,6 +1521,14 @@
       "notes": "Server-native Web compatibility command."
     },
     {
+      "name": "preview_share_capabilities",
+      "support": "native",
+      "implemented": true,
+      "feature": "shares",
+      "endpoint": "POST /web-api/invoke/preview_share_capabilities",
+      "notes": "Read-only Share operation permissions and per-user Token/USD/unlimited measurement coverage preview; no upstream requests."
+    },
+    {
       "name": "preview_share_value_quota",
       "support": "native",
       "implemented": true,

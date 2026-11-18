@@ -68,3 +68,6 @@ Grok OAuth 媒体与文本共用同一终态 Usage 记录模型，但媒体没�
 - Router Share 同步合同 v5 携带上述字段。Router 普通请求列表排除签名的 `HealthProbe`，并可按 `requestKind=text|image|video` 在数据库查询前过滤和分页。
 
 Cursor required/named tool semantic retry 最多有三个同绑定 attempt。当前客户端 success usage 使用最终被提交 attempt 的估算值；每次被丢弃的 attempt 通过 `cursor_tool_retry_total{rail,reason,attempt}` 和脱敏 warning 审计，不把早期 prose 暴露给客户端。该 usage 是估算值并持续设置 `usageEstimated=true`。在上游提供逐 attempt 可归属的权威 usage 前，不将丢弃 attempt 伪装为客户端 token usage；订阅侧的实际消耗可能高于最终响应中的估算值。
+
+
+2026-11-17 独立能力增量：Token/USD/无限额均受 Share 操作权限控制；切换额度单位不改变操作集合，也不重置历史用量。部分缺价仅标记缺价维度，已知费用继续记账；资源原生量不伪造 Token。核心 schema8 增加能力/续接/异常证据与永久能力设置回执，详见 [独立扩展能力](../share/extended-capabilities.md)。本轮已实际执行本地回归与组件/浏览器验证，原文历史仅编译记录不代表本轮验证范围；真实验收仍 live_pending。

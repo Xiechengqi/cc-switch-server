@@ -1,3 +1,5 @@
+import {capabilityQuotaContext} from "@/lib/share-capabilities";
+import {ShareCapabilitiesEditor} from "@/components/providers/ShareCapabilitiesEditor";
 import {
   Fragment,
   useEffect,
@@ -1266,14 +1268,14 @@ function BundleShareEditor({
               }
             />
           </div>
-          {showGrokMedia ? (
+          {showGrokMedia && !draft.capabilityPolicy ? (
             <div className="space-y-2 md:col-span-2">
               <Label>
                 {t("grokOauth.shareMediaPolicy", {
                   defaultValue: "Share 媒体权限",
                 })}
               </Label>
-              <GrokFeatureOptions
+              <fieldset disabled><GrokFeatureOptions
                 values={{
                   grokImageGenerationEnabled:
                     draft.grokMediaPolicy.imageGenerationEnabled,
@@ -1295,7 +1297,7 @@ function BundleShareEditor({
                     },
                   });
                 }}
-              />
+              /></fieldset>
             </div>
           ) : null}
           {/* Outside in: who may call, the Share-wide limits, then each user's own. */}
@@ -1461,7 +1463,15 @@ function BundleShareEditor({
             </div>
           </div>
           <div className="border-t border-border-default/70 pt-4 md:col-span-2">
-            <ShareUserGrantsEditor
+            <ShareCapabilitiesEditor shareId={draft.baseline?.shareId} revision={draft.baseline?.configRevision}
+              policy={draft.capabilityPolicy} savedPolicy={draft.baseline?.capabilityPolicy} grants={draft.userGrants}
+              tokenLimit={Number(draft.tokenLimit)||-1} disabled={disabled}
+              onChange={(capabilityPolicy,capabilityConsent)=>onChange(current=>{
+                const userGrants=Object.fromEntries(Object.entries(current.userGrants).map(([email,g])=>[email,g.active&&g.manager!=="routerShareMarket"&&g.policy.valueQuota&&capabilityPolicy.allowedOperations.some(op=>g.policy.allowedOperations?.includes(op)??true)?{...g,policy:{...g.policy,valueQuota:{...g.policy.valueQuota,tariffPolicyId:"api-equivalent-v2" as const}}}:g]));
+                return {...current,capabilityPolicy,capabilityConsent,userGrants,capabilityConsentScope:capabilityConsent?capabilityQuotaContext(capabilityPolicy,userGrants,Number(current.tokenLimit)):undefined};
+              })}
+              onGrantOperationsChange={(email,allowedOperations)=>onChange(current=>({...current,capabilityConsent:undefined,userGrants:{...current.userGrants,[email]:{...current.userGrants[email],policy:{...current.userGrants[email].policy,allowedOperations}}}}))}/>
+            <ShareUserGrantsEditor independentCapabilities={!!draft.capabilityPolicy}
               shareId={draft.baseline?.shareId}
               configRevision={draft.baseline?.configRevision}
               disabled={disabled}

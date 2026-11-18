@@ -77,6 +77,7 @@ jobs:
           cargo test --locked opening_usd --lib
           cargo test --locked domain::usage::value_pricing:: --lib
           cargo test --locked value_quota --lib
+          cargo test --locked capability --lib
           cargo test --locked workbuddy_value --lib
           cargo test --locked codex_websocket_large_upload --lib -- --test-threads=1
 

@@ -469,7 +469,11 @@ impl ApiError {
     }
 
     pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
-        if error.to_string().starts_with("VALUE_QUOTA_")
+        if crate::domain::sharing::capabilities::CapabilityRejection::from_message(
+            &error.to_string(),
+        )
+        .is_some()
+            || error.to_string().starts_with("VALUE_QUOTA_")
             || error.to_string().starts_with("QUOTA_CONVERSION_")
             || error.to_string() == "price_unavailable"
         {
@@ -532,6 +536,19 @@ impl ApiError {
     }
 
     pub(crate) fn value_quota(error: impl std::fmt::Display) -> Self {
+        if let Some(rejection) =
+            crate::domain::sharing::capabilities::CapabilityRejection::from_message(
+                &error.to_string(),
+            )
+        {
+            let mut error = Self::new(
+                StatusCode::from_u16(rejection.status).unwrap(),
+                rejection.code,
+            );
+            error.code = Some(rejection.code);
+            return error;
+        }
+
         let message = error.to_string();
         if message.starts_with("QUOTA_CONVERSION_") {
             return Self::conflict_code("quota_conversion_conflict", message);
@@ -1079,6 +1096,46 @@ mod tests {
         ));
         assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
         assert_eq!(invalid.code, Some("quota_target_invalid"));
+    }
+
+    #[test]
+    fn capability_rejections_keep_machine_codes_on_every_inference_surface() {
+        use crate::domain::sharing::capabilities::CapabilityRejection;
+        for code in [
+            "SHARE_CAPABILITY_DISABLED",
+            "CAPABILITY_NOT_SUPPORTED",
+            "CAPABILITY_CONTEXT_REQUIRED",
+            "CAPABILITY_REQUEST_INVALID",
+            "CAPABILITY_EXECUTION_QUARANTINED",
+            "CAPABILITY_STATE_CHANGED",
+            "CAPABILITY_UPGRADE_REQUIRED",
+            "QUOTA_COVERAGE_REQUIRED",
+            "CAPABILITY_PREVIEW_EXPIRED",
+            "MARKET_CAPABILITY_CONFLICT",
+        ] {
+            let rejection = CapabilityRejection::from_message(code).unwrap();
+            let status = StatusCode::from_u16(rejection.status).unwrap();
+            for surface in [
+                InferenceSurface::OpenAi,
+                InferenceSurface::Anthropic,
+                InferenceSurface::Gemini,
+            ] {
+                let proxy = || crate::proxy::ProxyError {
+                    status,
+                    message: code.into(),
+                };
+                for error in [
+                    InferenceApiError::proxy(surface, None, proxy()),
+                    InferenceApiError::api(surface, None, ApiError::proxy(proxy())),
+                    InferenceApiError::api(surface, None, ApiError::value_quota(code)),
+                ] {
+                    assert_eq!(error.code, code);
+                    assert_eq!(error.status, status);
+                    assert!(!error.retryable);
+                    assert!(error.body().to_string().contains(code));
+                }
+            }
+        }
     }
 
     #[test]

@@ -683,6 +683,7 @@ fn unpriced_async_generation_keeps_ownership_and_terminal_resource_evidence() {
     poll.parent_request_id = Some("unpriced-async".into());
     poll.media_status = Some("completed".into());
     poll.value_resources = Some(crate::domain::usage::value_pricing::ResourceUsage {
+        response_id: None,
         quantities: BTreeMap::from([("video.output_millisecond".into(), 3000)]),
         source: "fixture".into(),
         estimated: false,

@@ -95,7 +95,7 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
         hex::encode(Sha256::digest(include_bytes!("value_quota_schema.sql")))
     );
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    anyhow::ensure!((1..=7).contains(&version),
+    anyhow::ensure!((1..=8).contains(&version),
         "unsupported Server SQLite schema {version}; use a matching Server binary/backup (never downgrade)");
     let checksum: String = connection.query_row(
         "SELECT checksum FROM schema_migrations WHERE version=1",
@@ -289,6 +289,40 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
     anyhow::ensure!(
         checksum == unpriced_checksum,
         "Server SQLite v7 migration checksum mismatch"
+    );
+    let capability_checksum = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(include_bytes!(
+            "capability_context_schema.sql"
+        )))
+    );
+    if version < 8 {
+        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> anyhow::Result<()> {
+            connection.execute_batch(include_str!("capability_context_schema.sql"))?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES(8,'share_capability_policy',0,?1)",
+                [&capability_checksum],
+            )?;
+            connection.execute_batch("PRAGMA user_version=8;")?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => connection.execute_batch("COMMIT;")?,
+            Err(e) => {
+                connection.execute_batch("ROLLBACK;")?;
+                return Err(e);
+            }
+        }
+    }
+    let checksum: String = connection.query_row(
+        "SELECT checksum FROM schema_migrations WHERE version=8",
+        [],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        checksum == capability_checksum,
+        "Server SQLite v8 migration checksum mismatch"
     );
     Ok(())
 }

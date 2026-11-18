@@ -43,6 +43,13 @@ mod value_usage_initialization_tests {
                 input.enabled = Some(true);
                 input.status = Some("active".into());
                 store.upsert(input).unwrap();
+                // This fixture represents a v12 Share before policy adoption.
+                store
+                    .shares
+                    .iter_mut()
+                    .find(|s| s.id == "initial-value-share")
+                    .unwrap()
+                    .capability_policy = None;
             })
             .await
             .unwrap();
@@ -525,6 +532,19 @@ mod value_usage_initialization_tests {
         assert_eq!(result["quotaConversions"].as_array().unwrap().len(), 1);
         let mut tampered = edit.clone();
         tampered.edit_context.as_mut().unwrap().operation_id = "tampered".into();
+        // Reach credential validation rather than the earlier revision-conflict guard.
+        tampered
+            .edit_context
+            .as_mut()
+            .unwrap()
+            .expected_config_revision = saved.config_revision;
+        tampered
+            .user_grant_edits
+            .as_mut()
+            .unwrap()
+            .get_mut("owner@example.com")
+            .unwrap()
+            .expected_revision = saved.user_grants["owner@example.com"].revision;
         tampered
             .user_quota_conversions
             .as_mut()
@@ -550,9 +570,14 @@ mod value_usage_initialization_tests {
             .await
             .is_err());
         // The same operation cannot be discovered after rebinding the Router.
-        let mut config = state.config_snapshot().await;
-        config.router.identity.as_mut().unwrap().installation_id = "other-installation".into();
-        state.replace_config(config).await.unwrap();
+        state
+            .mutate_config_immediate(|config| {
+                config.router.identity.as_mut().unwrap().installation_id =
+                    "other-installation".into();
+                Ok(())
+            })
+            .await
+            .unwrap();
         assert_eq!(
             state
                 .share_quota_conversion_result(&share.id, "live-conversion")

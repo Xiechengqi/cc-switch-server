@@ -581,6 +581,10 @@ function serverEvidenceNotes(qoderVerification) {
     "",
     "Text uses the v10/v1 contract. Existing media, hosted tools and audio payloads require the explicit v11/v2 resource policy and a priced execution model/dimension. Missing model identities, resource prices or trustworthy usage are diagnosed separately from Provider eligibility. See [universal USD metering](../share/universal-value-metering.md) for evidence precision, retry/cancellation and rollout boundaries. All pairs remain live_pending.",
     "",
+    "### Share operation policy v13 (2026-11-17)",
+    "",
+    "Independent capability policy applies to Token, USD and unlimited Shares. Executable operations derive from the compiled Driver/upstream protocol/options; account support, control, measurement and price coverage remain separate facts. Understanding inputs and client-executed tools retain base access. No new upstream endpoint or live provider support is introduced. Hosted computer/remote MCP remain unavailable, video remains limited to the implemented Grok path, and every unverified model/transport combination remains live_pending. See [extended capabilities](../share/extended-capabilities.md).",
+    "",
   ];
 }
 

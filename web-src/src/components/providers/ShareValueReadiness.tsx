@@ -286,11 +286,10 @@ export function ShareValueScheduledLine({ limitMicros, effectiveFromMs }: { limi
   </div>;
 }
 
-export function ShareValueResourceToggle({value,onChange,disabled}: {value:boolean;onChange:(value:boolean)=>void;disabled?:boolean}) {
-  const {t}=useTranslation();
-  const id = useId();
-  return <div className="flex items-start gap-2 text-xs text-muted-foreground">
-    <Checkbox id={id} className="mt-0.5" checked={value} disabled={disabled} onCheckedChange={checked=>onChange(checked === true)} />
-    <label htmlFor={id}>{t("share.userLimit.valueQuota.resources")}<span className="mt-1 block">{t("share.userLimit.valueQuota.resourcesHint")}</span></label>
-  </div>;
+/** Legacy pricing remains readable, but cannot act as a second permission source. */
+export function ShareValueResourceToggle({value}: {value:boolean;onChange?:(value:boolean)=>void;disabled?:boolean}) {
+  const {i18n}=useTranslation();
+  return <p className="text-xs text-muted-foreground">{i18n.language.startsWith("zh")
+    ? `旧计价策略：${value?"包含已配置的资源价格":"文本价卡"}。请在独立能力配置中预览并采用。`
+    : `Legacy pricing: ${value?"includes configured resource rates":"text tariff"}. Preview and adopt independent capability control to manage extensions.`}</p>;
 }

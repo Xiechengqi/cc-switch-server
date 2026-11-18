@@ -377,14 +377,27 @@ fn estimate_picos(
 ) -> anyhow::Result<i128> {
     let text = if plan.is_none_or(|p| p.text_tokens) {
         model
-            .price_or_highest_tier(tier, &estimate.tokens())?
+            .price_or_highest_tier(tier, &estimate.tokens())
+            .or_else(|error| {
+                if error == crate::domain::usage::value_pricing::ValueError::PriceUnavailable {
+                    Ok(crate::domain::usage::value_pricing::PricedValue {
+                        usage_picos: 0,
+                        conservative_cache_ttl: true,
+                    })
+                } else {
+                    Err(error)
+                }
+            })?
             .usage_picos
     } else {
         0
     };
     let resources = plan
         .map(|p| {
-            crate::domain::usage::value_pricing::price_resources(&model.resources, &p.quantities)
+            crate::domain::usage::value_pricing::price_resources(
+                &model.resources,
+                &priced_quantities(&model.resources, &p.quantities),
+            )
         })
         .transpose()?
         .unwrap_or(0);
@@ -419,7 +432,8 @@ fn read_attempt_meta(
             |r| r.get(0),
         )
         .optional()?;
-    Ok(raw.and_then(|raw| serde_json::from_str(&raw).ok()))
+    raw.map(|raw| serde_json::from_str(&raw).context("VALUE_QUOTA_ATTEMPT_METADATA_CORRUPT"))
+        .transpose()
 }
 
 /// SQLite busy/locked is a transient contention signal, not a quota fact.
@@ -1368,12 +1382,20 @@ fn admit_with_trial_in_tx(
             a.effective_tier,
             reason,
         );
-        if a.scope.entitlement_id.is_none() {
+        if a.scope.entitlement_id.is_none()
+            && a.quota.unpriced_usage != crate::domain::usage::value_pricing::UnpricedUsage::Reject
+        {
             Ok(rejection.reason_code)
         } else {
             Err(rejection.into())
         }
     };
+    if a.resource_plan.as_ref().is_some_and(|p| p.requires_v2) {
+        ensure!(
+            a.quota.tariff_policy_id == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY,
+            "VALUE_QUOTA_RESOURCE_POLICY_REQUIRED"
+        );
+    }
     let mut unpriced_reason: Option<&'static str> = None;
     let model = match snapshot.model(a.effective_model) {
         Ok(model) => Some(model),
@@ -1425,7 +1447,7 @@ fn admit_with_trial_in_tx(
             unpriced_reason = Some(unpriced("tier_unpriced")?);
         }
     }
-    let model = model.filter(|_| unpriced_reason.is_none());
+    // A missing resource price must never discard the known text/model tariff.
     // policy_epoch is deliberately not part of the identity: a retry after a
     // policy edit is the same request in the same real window.
     let existing: Option<(String, String, String, String, String, i64)> = tx
@@ -1523,10 +1545,12 @@ fn admit_with_trial_in_tx(
         }
         // Bounded reservation: price(input estimate + output ceiling) at the
         // context tier implied by the estimate, never more than remains. An
-        // unpriced attempt reserves nothing: it settles at $0.
+        // A wholly unpriced attempt reserves nothing; known dimensions still reserve value.
         match model {
             Some(model) => {
-                let text = if a.resource_plan.as_ref().is_none_or(|plan| plan.text_tokens) {
+                let text = if a.resource_plan.as_ref().is_none_or(|plan| plan.text_tokens)
+                    && model.supported_tiers().next().is_some()
+                {
                     model
                         .price_or_highest_tier(a.effective_tier, &a.estimate.tokens())
                         .map(|price| price.usage_picos)
@@ -1540,7 +1564,7 @@ fn admit_with_trial_in_tx(
                     .map(|plan| {
                         crate::domain::usage::value_pricing::price_resources(
                             &model.resources,
-                            &plan.quantities,
+                            &priced_quantities(&model.resources, &plan.quantities),
                         )
                     })
                     .transpose()?
@@ -2296,6 +2320,7 @@ fn resource_usage_for_log(
         return None;
     }
     Some(ResourceUsage {
+        response_id: None,
         quantities,
         source: if estimated {
             "request.resource_bound"
@@ -2613,11 +2638,13 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
         }
         None => o,
     };
+    let text_unpriced =
+        plan.is_none_or(|plan| plan.text_tokens) && tariff.supported_tiers().next().is_none();
     let price_at = |tier: &str| {
-        let text = if plan.is_some_and(|plan| !plan.text_tokens) {
+        let text = if plan.is_some_and(|plan| !plan.text_tokens) || text_unpriced {
             Some(crate::domain::usage::value_pricing::PricedValue {
                 usage_picos: 0,
-                conservative_cache_ttl: false,
+                conservative_cache_ttl: text_unpriced,
             })
         } else {
             o.tokens.as_ref().and_then(|tokens| {
@@ -2650,7 +2677,7 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
     let tier_fallback =
         |tier: &str| text_tier && scope.entitlement_id.is_none() && !tariff.supports_tier(tier);
     let price = |tier: &str| {
-        if !tier_fallback(tier) {
+        if text_unpriced || !tier_fallback(tier) {
             return price_at(tier);
         }
         tariff
@@ -2720,6 +2747,8 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
         None
     } else if resource_unpriced {
         Some("resource_unpriced")
+    } else if text_unpriced {
+        Some("tier_unpriced")
     } else if state == "conservative" && amount == 0 && reserved == 0 && !observed_usage(original) {
         Some(crate::domain::usage::value_pricing::USAGE_UNOBSERVED)
     } else {
@@ -3271,6 +3300,49 @@ pub(crate) fn diagnostics(dir: &Path, share_id: &str) -> anyhow::Result<serde_js
         "retention":"attempt identities and latest revisions are never deleted; terminal duplicate tariffs and superseded revisions compact after 30 days"}),
     )
 }
+/// Read-only diagnostics; activation remains owned by normal tariff scheduling.
+pub(crate) fn capability_snapshot(
+    config_dir: &Path,
+    scope: &Scope,
+) -> anyhow::Result<Option<(String, PricingSnapshot)>> {
+    assert_committed(config_dir)?;
+    let conn = open_database(&database_path(config_dir), true)?;
+    let revision: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [format!(
+                "value_tariff:{}:{}",
+                scope.router_url, scope.installation_id
+            )],
+            |r| r.get(0),
+        )
+        .optional()?;
+    revision
+        .map(|revision| {
+            let snapshot =
+                cached_snapshot(&conn, &scope.router_url, &scope.installation_id, &revision)?;
+            Ok((revision, snapshot.as_ref().clone()))
+        })
+        .transpose()
+}
+
+fn priced_quantities(
+    rates: &BTreeMap<String, String>,
+    quantities: &BTreeMap<String, u64>,
+) -> BTreeMap<String, u64> {
+    quantities
+        .iter()
+        .filter(|(key, _)| {
+            rates.contains_key(*key)
+                || key
+                    .split('/')
+                    .next()
+                    .is_some_and(|base| rates.contains_key(base))
+        })
+        .map(|(key, count)| (key.clone(), *count))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4354,6 +4426,7 @@ mod tests {
         )
         .unwrap();
         let quota = ValueQuota {
+            unpriced_usage: Default::default(),
             limit_usd_micros: "1000000".into(),
             tariff_policy_id: TARIFF_POLICY.into(),
         };

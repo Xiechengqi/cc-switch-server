@@ -129,6 +129,14 @@ fn zero_quantity_audio_dimensions_price_through_the_normal_text_path() {
     ]);
     let a = Admission {
         resource_plan: Some(crate::domain::usage::value_pricing::ResourcePlan {
+            text_output_only: false,
+            gemini_image_input: false,
+            invalid_reason: None,
+            policy_revision: None,
+            previous_response_id: None,
+            binding_fingerprint: None,
+            continuation: false,
+            operations: Vec::new(),
             quantities: zero.clone(),
             text_tokens: true,
             requires_v2: true,
@@ -138,6 +146,7 @@ fn zero_quantity_audio_dimensions_price_through_the_normal_text_path() {
     evidence::record_admission(&tx, &a, true).unwrap();
     let mut log = unpriced_log(&scope, "audio-zero", "model", Some((100, 50)));
     log.value_resources = Some(crate::domain::usage::value_pricing::ResourceUsage {
+        response_id: None,
         quantities: zero,
         source: "upstream.protocol".into(),
         estimated: false,
@@ -236,6 +245,7 @@ fn capture_never_downgrades_a_not_sent_fact_and_counts_post_cutoff_rejections() 
     let mut resource = unpriced_log(&scope, "hole-resource", "model", None);
     resource.status_code = 429;
     resource.value_resources = Some(crate::domain::usage::value_pricing::ResourceUsage {
+        response_id: None,
         quantities: BTreeMap::from([("tool.web_search".into(), 1)]),
         source: "upstream.protocol".into(),
         estimated: false,

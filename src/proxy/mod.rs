@@ -517,6 +517,11 @@ impl ProxyError {
 
     pub fn error_code(&self) -> &'static str {
         let message = self.message_without_retry_metadata();
+        if let Some(rejection) =
+            crate::domain::sharing::capabilities::CapabilityRejection::from_message(message)
+        {
+            return rejection.code;
+        }
         for code in [
             "value_quota_exhausted",
             "value_quota_busy",
@@ -671,6 +676,12 @@ impl ProxyError {
 
     pub fn retryable(&self) -> bool {
         let message = self.message_without_retry_metadata();
+        if crate::domain::sharing::capabilities::CapabilityRejection::from_message(message)
+            .is_some()
+        {
+            // A policy conflict or quarantined runtime needs management action.
+            return false;
+        }
         match self.error_code() {
             "value_quota_busy" => return true,
             // Only transient storage contention (with Retry-After) retries.

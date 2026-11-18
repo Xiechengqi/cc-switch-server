@@ -1843,6 +1843,12 @@ pub async fn forward_codex_alpha_search(
         request_context.operation,
     );
     plan.requires_v2 = true;
+    plan.binding_fingerprint =
+        Some(crate::domain::sharing::capability_intent::binding_fingerprint(&execution.plan));
+    plan.operations
+        .push(crate::domain::sharing::capabilities::ShareOperation::WebSearch);
+    plan.operations.sort();
+    plan.operations.dedup();
     plan.quantities.entry("tool.web_search".into()).or_insert(8);
     loop {
         let context =
@@ -2535,7 +2541,6 @@ async fn forward_with_attempt_inner(
                     .as_deref()
                     .is_some_and(|path| path.rsplit(':').next() == Some("countTokens")));
         let value_metering = request_context.share_id.is_some()
-            && request_context.user_email.is_some()
             && route != ProxyRoute::ClaudeCountTokens
             && !(route == ProxyRoute::Gemini
                 && gemini_path
@@ -3510,11 +3515,14 @@ async fn forward_with_attempt_inner(
                     .map(|facts| facts.estimate)
                     .unwrap_or_default(),
                 value_text_capable,
-                serde_json::from_slice(&adapter_request.body).ok().map(|body| crate::domain::usage::value_pricing::resource_request_plan(&body, request_context.operation)),
+                serde_json::from_slice(&adapter_request.body).ok().map(|body| { let mut plan = crate::domain::usage::value_pricing::resource_request_plan(&body, request_context.operation); plan.binding_fingerprint = Some(crate::domain::sharing::capability_intent::binding_fingerprint(&execution.plan)); plan }),
             )
             .await
             .map_err(|error| {
-                if let Some(price) = error.downcast_ref::<crate::domain::usage::value_pricing::PriceRejection>() {
+                if let Some(rejection) = crate::domain::sharing::capabilities::CapabilityRejection::from_message(&error.to_string()) {
+        return ProxyError { status: StatusCode::from_u16(rejection.status).unwrap(), message: rejection.code.into() };
+    }
+    if let Some(price) = error.downcast_ref::<crate::domain::usage::value_pricing::PriceRejection>() {
                     tracing::warn!(request_id=?request_context.request_id,share_id=?request_context.share_id,
                         model=%price.model,tier=%price.tier,reason_code=price.reason_code,
                         active_pricing_revision=?price.active_pricing_revision,pending_pricing_revision=?price.pending_pricing_revision,
@@ -8719,12 +8727,14 @@ async fn forward_grok_media_with_execution_inner(
     if request_context.operation == InferenceOperation::VideoStatus {
         request_context.media_task_id = upstream_path.rsplit('/').next().map(str::to_string);
     }
-    ensure_grok_media_policy(&state, &execution, share_id.as_deref(), capability).await?;
+    if request_context.operation != InferenceOperation::VideoStatus {
+        ensure_grok_media_policy(&state, &execution, share_id.as_deref(), capability).await?;
+    }
     let provider_probe = request_context.is_health_check
         && share_id
             .as_deref()
             .is_some_and(|share_id| share_id.starts_with("test-share:"));
-    if !provider_probe {
+    if !provider_probe && request_context.operation != InferenceOperation::VideoStatus {
         ensure_grok_account_capability(&state, &execution, capability).await?;
     }
     if let Err(error) = refresh_execution_managed_account_if_needed(&state, &execution).await {
@@ -10111,6 +10121,9 @@ async fn forward_codex_images_request(
                 )
             });
         if let Some(plan) = resource_plan.as_mut() {
+            plan.binding_fingerprint = Some(
+                crate::domain::sharing::capability_intent::binding_fingerprint(&execution.plan),
+            );
             plan.text_tokens = true;
         }
         value_attempt = state
@@ -12537,6 +12550,9 @@ struct ResponsesWebsocketUsageTurn {
     armed: bool,
     value_attempt: Option<crate::state::ValueAttemptGuard>,
     generation_count: u32,
+    capability_binding: Option<String>,
+    inherited_invalid_control: Option<String>,
+    inherited_operations: Vec<crate::domain::sharing::capabilities::ShareOperation>,
 }
 
 struct PendingWebsocketTurnAudit {
@@ -12698,7 +12714,17 @@ impl ResponsesWebsocketUsageTurn {
         model: UsageModelMetadata,
         mut request_context: UsageLogContext,
         connection_id: &str,
+        runtime_fingerprint: Option<&str>,
     ) -> Result<Self, ProxyError> {
+        let capability_binding = state
+            .providers
+            .read()
+            .await
+            .runtime_plan(stored.app, &stored.provider.id)
+            .filter(|runtime| Some(runtime.runtime_fingerprint.as_str()) == runtime_fingerprint)
+            .map(|runtime| {
+                crate::domain::sharing::capability_intent::binding_fingerprint(&runtime)
+            });
         let sent_model = model.actual_model.clone().or_else(|| model.model.clone());
         let parent_request_id = request_context.request_id.clone();
         let turn_id = new_audit_correlation_id("turn");
@@ -12815,6 +12841,9 @@ impl ResponsesWebsocketUsageTurn {
             armed: true,
             value_attempt: None,
             generation_count: 0,
+            capability_binding,
+            inherited_invalid_control: None,
+            inherited_operations: Vec::new(),
         })
     }
 
@@ -12822,8 +12851,7 @@ impl ResponsesWebsocketUsageTurn {
         // Reconnecting to an existing response does not call this method.
         // Every actual new generation, including HTTP fallback, does.
         // Every generation records evidence and re-reads the current policy.
-        let value_metering =
-            self.request_context.share_id.is_some() && self.request_context.user_email.is_some();
+        let value_metering = self.request_context.share_id.is_some();
         if !value_metering {
             return Ok(());
         }
@@ -12869,10 +12897,39 @@ impl ResponsesWebsocketUsageTurn {
         // large Token frame here delays WebSocket Ping/cancel processing.
         let estimate =
             crate::domain::usage::value_pricing::RiskEstimate::from_request(body_len, Some(body));
-        let plan = crate::domain::usage::value_pricing::resource_request_plan(
+        let mut plan = crate::domain::usage::value_pricing::resource_request_plan(
             body,
             self.request_context.operation,
         );
+        plan.binding_fingerprint = self.capability_binding.clone();
+        plan.invalid_reason = plan
+            .invalid_reason
+            .or(self.inherited_invalid_control.clone());
+        plan.operations
+            .extend(self.inherited_operations.iter().copied());
+        plan.operations.sort();
+        plan.operations.dedup();
+        for op in &plan.operations {
+            if !plan
+                .quantities
+                .keys()
+                .any(|key| key.split('/').next() == Some(op.resource()))
+            {
+                plan.quantities.insert(
+                    op.resource().into(),
+                    match op {
+                        crate::domain::sharing::capabilities::ShareOperation::VideoGenerate => {
+                            15_000
+                        }
+                        crate::domain::sharing::capabilities::ShareOperation::AudioGenerate => {
+                            128_000
+                        }
+                        _ => 8,
+                    },
+                );
+            }
+            plan.requires_v2 = true;
+        }
         let tier = crate::domain::usage::value_pricing::canonical_service_tier(
             body.get("service_tier")
                 .and_then(Value::as_str)
@@ -13426,6 +13483,8 @@ async fn bridge_responses_websocket_inner(
     let mut active_grok_reasoning_recovery_attempted = false;
     let mut active_response_started_at: Option<Instant> = None;
     let mut active_usage_turn: Option<ResponsesWebsocketUsageTurn> = None;
+    let mut capability_session_operations = std::collections::BTreeSet::new();
+    let mut capability_session_invalid_control = None;
     let mut codex_session_model = single_upstream_model.clone();
     let mut active_attempt = ForwardAttemptContext {
         timing: timing_slot.clone(),
@@ -13442,92 +13501,855 @@ async fn bridge_responses_websocket_inner(
     let connection_id = new_audit_correlation_id("connection");
     loop {
         tokio::select! {
-            downstream_message = downstream.next() => {
-                let Some(message) = downstream_message else {
-                    if let Some(timing) = active_attempt.request_memory().and_then(RequestMemoryBudget::timing) {
-                        timing.finish(TimingResult::Cancelled);
-                    }
-                    finish_active_websocket_usage(
-                        &mut active_usage_turn,
-                        499,
-                        "client_cancelled",
-                        Some("downstream websocket closed".to_string()),
-                    )
-                    .await;
-                    break;
-                };
-                let message = message
-                    .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
-                match &message {
-                    AxumWsMessage::Close(_) => {
-                        if let Some(timing) = active_attempt.request_memory().and_then(RequestMemoryBudget::timing) {
-                            timing.finish(TimingResult::Cancelled);
-                        }
-                        finish_active_websocket_usage(
-                            &mut active_usage_turn,
-                            499,
-                            "client_cancelled",
-                            Some("downstream websocket closed".to_string()),
-                        )
-                        .await;
-                        break;
-                    }
-                    AxumWsMessage::Ping(bytes) => {
-                        downstream
-                            .send(AxumWsMessage::Pong(bytes.clone()))
-                            .await
-                            .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
-                        continue;
-                    }
-                    AxumWsMessage::Pong(_) => continue,
-                    AxumWsMessage::Text(_) | AxumWsMessage::Binary(_) => {}
-                }
-                let inbound_received_at = Instant::now();
-                let inbound_message_bytes = axum_websocket_message_payload_len(&message);
-                let mut incoming_turn_memory = if response_in_flight {
-                    None
-                } else {
-                    let budget = RequestMemoryBudget::new(
-                        state.request_body_limits.memory_budget_bytes,
-                    );
-                    let reservation = match budget.reserve(
-                        RequestMemoryComponent::InboundRaw,
-                        inbound_message_bytes,
-                    ) {
-                        Ok(reservation) => reservation,
-                        Err(error) => {
-                            let error = error.into_proxy_error();
-                            let error_body = websocket_stream_error_body(
-                                error.client_message(),
-                                error.error_code(),
-                            );
-                            return terminate_responses_websocket_with_error(
-                                &mut downstream,
-                                &mut output_patcher,
-                                mode,
-                                state,
-                                &execution,
-                                &mut pending_lifecycle_messages,
-                                error,
-                                Some("memory_capacity"),
-                                error_body,
-                                None,
+                    downstream_message = downstream.next() => {
+                        let Some(message) = downstream_message else {
+                            if let Some(timing) = active_attempt.request_memory().and_then(RequestMemoryBudget::timing) {
+                                timing.finish(TimingResult::Cancelled);
+                            }
+                            finish_active_websocket_usage(
                                 &mut active_usage_turn,
+                                499,
+                                "client_cancelled",
+                                Some("downstream websocket closed".to_string()),
                             )
                             .await;
+                            break;
+                        };
+                        let message = message
+                            .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                        match &message {
+                            AxumWsMessage::Close(_) => {
+                                if let Some(timing) = active_attempt.request_memory().and_then(RequestMemoryBudget::timing) {
+                                    timing.finish(TimingResult::Cancelled);
+                                }
+                                finish_active_websocket_usage(
+                                    &mut active_usage_turn,
+                                    499,
+                                    "client_cancelled",
+                                    Some("downstream websocket closed".to_string()),
+                                )
+                                .await;
+                                break;
+                            }
+                            AxumWsMessage::Ping(bytes) => {
+                                downstream
+                                    .send(AxumWsMessage::Pong(bytes.clone()))
+                                    .await
+                                    .map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                                continue;
+                            }
+                            AxumWsMessage::Pong(_) => continue,
+                            AxumWsMessage::Text(_) | AxumWsMessage::Binary(_) => {}
                         }
-                    };
-                    Some((budget, reservation))
-                };
-                let _active_incoming_memory = if response_in_flight {
-                    match active_attempt.request_memory() {
-                        Some(budget) => match budget.reserve(
-                            RequestMemoryComponent::TransportPending,
-                            inbound_message_bytes,
+                        let inbound_received_at = Instant::now();
+                        let inbound_message_bytes = axum_websocket_message_payload_len(&message);
+                        let mut incoming_turn_memory = if response_in_flight {
+                            None
+                        } else {
+                            let budget = RequestMemoryBudget::new(
+                                state.request_body_limits.memory_budget_bytes,
+                            );
+                            let reservation = match budget.reserve(
+                                RequestMemoryComponent::InboundRaw,
+                                inbound_message_bytes,
+                            ) {
+                                Ok(reservation) => reservation,
+                                Err(error) => {
+                                    let error = error.into_proxy_error();
+                                    let error_body = websocket_stream_error_body(
+                                        error.client_message(),
+                                        error.error_code(),
+                                    );
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        Some("memory_capacity"),
+                                        error_body,
+                                        None,
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                            };
+                            Some((budget, reservation))
+                        };
+                        let _active_incoming_memory = if response_in_flight {
+                            match active_attempt.request_memory() {
+                                Some(budget) => match budget.reserve(
+                                    RequestMemoryComponent::TransportPending,
+                                    inbound_message_bytes,
+                                ) {
+                                    Ok(reservation) => Some(reservation),
+                                    Err(error) => {
+                                        let error = error.into_proxy_error();
+                                        let _failed_entry = entry.take();
+                                        let error_body = websocket_stream_error_body(
+                                            error.client_message(),
+                                            error.error_code(),
+                                        );
+                                        return terminate_responses_websocket_with_error(
+                                            &mut downstream,
+                                            &mut output_patcher,
+                                            mode,
+                                            state,
+                                            &execution,
+                                            &mut pending_lifecycle_messages,
+                                            error,
+                                            Some("memory_capacity"),
+                                            error_body,
+                                            None,
+                                            &mut active_usage_turn,
+                                        )
+                                        .await;
+                                    }
+                                },
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if matches!(mode, ResponsesWebsocketMode::Codex) {
+                            let interrupt_id = match codex_websocket_interrupt_id(&message) {
+                                Ok(id) => id,
+                                Err(error) => {
+                                    downstream
+                                        .send(AxumWsMessage::Text(websocket_proxy_error_body(&error)))
+                                        .await
+                                        .map_err(|send_error| ProxyError::bad_gateway(send_error.to_string()))?;
+                                    continue;
+                                }
+                            };
+                            if let Some(interrupt_id) = interrupt_id {
+                                if entry.as_ref().is_some_and(|entry| {
+                                    terminal_response_ids.contains(entry.created_at, &interrupt_id)
+                                }) {
+                                    continue;
+                                }
+                                if !response_in_flight || entry.is_none() {
+                                    let error = ProxyError::bad_request(
+                                        "response.interrupt has no active upstream response",
+                                    );
+                                    downstream
+                                        .send(AxumWsMessage::Text(websocket_proxy_error_body(&error)))
+                                        .await
+                                        .map_err(|send_error| ProxyError::bad_gateway(send_error.to_string()))?;
+                                    continue;
+                                }
+                                match codex_interrupt.request(
+                                    entry.as_ref().expect("active connection").created_at,
+                                    &interrupt_id,
+                                    tokio::time::Instant::now(),
+                                    interrupt_ack_timeout,
+                                ) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(error) => {
+                                        downstream.send(AxumWsMessage::Text(websocket_proxy_error_body(&error)))
+                                            .await.map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        let original_response_body = axum_responses_websocket_http_body(&message)?
+                            .or_else(|| {
+                                matches!(mode, ResponsesWebsocketMode::Grok)
+                                    .then(|| axum_grok_bare_responses_websocket_body(&message))
+                                    .flatten()
+                            });
+                        let raw_starts_response = original_response_body.is_some();
+                        if raw_starts_response {
+                            if codex_interrupt.awaiting_ack() {
+                                let error = ProxyError::bad_request("response.create cannot start while an interrupt acknowledgement is pending");
+                                downstream.send(AxumWsMessage::Text(websocket_proxy_error_body(&error)))
+                                    .await.map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                                continue;
+                            }
+                            if response_in_flight {
+                                return Err(ProxyError::bad_request(
+                                    "responses websocket received response.create while a response is in flight",
+                                ));
+                            }
+                            if let Some((budget, _)) = &incoming_turn_memory {
+                                if let Some(request) = RequestTiming::responses_websocket(inbound_received_at, execution.stored.provider_type) {
+                                    let timing = request.attempt(inbound_received_at);
+                                    timing_slot.adopt_websocket_attempt(timing.clone());
+                                    budget.set_timing(timing);
+                                }
+                            }
+                            ensure_responses_websocket_turn_allowed(
+                                state,
+                                &execution,
+                                mode,
+                                Some(authorization_from_owned_headers(&headers).unwrap_or("")),
+                            )
+                            .await?;
+                            if let Some(timing) = incoming_turn_memory.as_ref().and_then(|(budget, _)| budget.timing()) {
+                                timing.mark(Milestone::Admission);
+                            }
+                        }
+                        let grok_reasoning_capability = if raw_starts_response
+                            && matches!(mode, ResponsesWebsocketMode::Grok)
+                        {
+                            let requested_model = single_upstream_model.as_deref().or_else(|| {
+                                original_response_body
+                                    .as_ref()
+                                    .and_then(|body| body.get("model"))
+                                    .and_then(Value::as_str)
+                            });
+                            let normalized_model = super::grok::normalized_model(requested_model);
+                            fresh_grok_reasoning_capability(state, &execution, &normalized_model).await
+                        } else {
+                            None
+                        };
+                        let mut message = match axum_ws_message_to_tungstenite(
+                            message,
+                            mode,
+                            grok_session_id.as_deref(),
+                            single_upstream_model.as_deref(),
+                            grok_reasoning_capability.as_ref(),
                         ) {
-                            Ok(reservation) => Some(reservation),
-                            Err(error) => {
-                                let error = error.into_proxy_error();
+                            Ok(Some(message)) => message,
+                            Ok(None) => break,
+                            Err(error) if raw_starts_response && error.is_protocol_incompatible() => {
+                                let requested = original_response_body
+                                    .as_ref()
+                                    .expect("a raw response start has a request body");
+                                active_usage_turn = Some(
+                                    ResponsesWebsocketUsageTurn::start(
+                                        state,
+                                        &execution.runtime_stored_view(),
+                                        codex_websocket_model_metadata(requested, requested),
+                                        request_context.clone(),
+                                        &connection_id,
+                                                                    Some(execution.plan.runtime_fingerprint.as_str()),
+        )
+                                    .await?,
+                                );
+                                let error_body = websocket_proxy_error_body(&error);
+                                return terminate_responses_websocket_with_error(
+                                    &mut downstream,
+                                    &mut output_patcher,
+                                    mode,
+                                    state,
+                                    &execution,
+                                    &mut pending_lifecycle_messages,
+                                    error,
+                                    Some("client_protocol_incompatible"),
+                                    error_body,
+                                    None,
+                                    &mut active_usage_turn,
+                                )
+                                .await;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        let starts_response = responses_websocket_request_starts_response(&message);
+                        if starts_response && !raw_starts_response {
+                            ensure_responses_websocket_turn_allowed(
+                                state,
+                                &execution,
+                                mode,
+                                Some(authorization_from_owned_headers(&headers).unwrap_or("")),
+                            )
+                            .await?;
+                        }
+                        let previous_response_cache_scope = if starts_response
+                            && matches!(mode, ResponsesWebsocketMode::Codex)
+                        {
+                            codex_previous_response_cache_scope(
+                                state,
+                                &execution,
+                                &request_context,
+                                Some(authorization_from_owned_headers(&headers).unwrap_or("")),
+                            )
+                            .await
+                        } else {
+                            None
+                        };
+                        let mut previous_context_wire_memory = None;
+                        if let Some(scope) = previous_response_cache_scope.as_ref() {
+                            previous_context_wire_memory = match inject_previous_response_context_into_websocket_message_with_memory(
+                                state,
+                                scope,
+                                original_response_body
+                                    .as_ref()
+                                    .and_then(previous_response_id_from_value)
+                                    ,
+                                &mut message,
+                                incoming_turn_memory.as_ref().map(|(budget, _)| budget),
+                            ) {
+                                Ok(memory) => memory,
+                                Err(error) if error.is_request_memory_exhausted() => {
+                                    let error_body = websocket_stream_error_body(
+                                        error.client_message(), error.error_code(),
+                                    );
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream, &mut output_patcher, mode, state,
+                                        &execution, &mut pending_lifecycle_messages, error,
+                                        Some("memory_capacity"), error_body, None,
+                                        &mut active_usage_turn,
+                                    ).await;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                        }
+                        if let Some(raw)=websocket_message_payload(&message) {
+                            if let Ok(value)=serde_json::from_slice::<Value>(raw) {
+                                if let Some(session)=value.get("session") {
+                                    capability_session_operations.extend(crate::domain::sharing::capability_intent::operations(session,InferenceOperation::Responses));
+                                    capability_session_invalid_control = capability_session_invalid_control.or_else(|| crate::domain::sharing::capability_intent::invalid_control(session).map(str::to_owned));
+                                }
+                            }
+                        }
+                        if matches!(mode, ResponsesWebsocketMode::Codex) {
+                            if let Some(model) = codex_websocket_session_update_model(&message) {
+                                codex_session_model = Some(model);
+                            }
+                        }
+                        let intent = original_response_body
+                            .as_ref()
+                            .map(super::codex_request_policy::extract_intent)
+                            .unwrap_or_default();
+                        let metadata_scope = if starts_response
+                            && matches!(mode, ResponsesWebsocketMode::Codex)
+                        {
+                            let accounts = accounts_snapshot_for_execution_auth(state, &execution).await?;
+                            codex_metadata_scope(&execution, &accounts)
+                        } else {
+                            None
+                        };
+                        let (message, policy_metadata) = if matches!(mode, ResponsesWebsocketMode::Codex) {
+                            prepare_codex_responses_websocket_request(
+                                message,
+                                &execution.runtime_stored_view(),
+                                codex_fast_mode_enabled(&execution),
+                                codex_session_model.as_deref(),
+                                &intent,
+                                metadata_scope.as_ref(),
+                            )
+                            .await?
+                        } else {
+                            (message, None)
+                        };
+                        let mut message = message;
+                        if starts_response {
+                            let grok_reasoning_retry_memory = if matches!(mode, ResponsesWebsocketMode::Grok)
+                            {
+                                let budget = incoming_turn_memory
+                                    .as_ref()
+                                    .map(|(budget, _)| budget)
+                                    .ok_or_else(|| {
+                                        ProxyError::bad_gateway(
+                                            "Grok websocket turn memory was not initialized",
+                                        )
+                                    })?;
+                                match budget.reserve(
+                                    RequestMemoryComponent::ReasoningReplay,
+                                    websocket_message_payload_len(&message),
+                                ) {
+                                    Ok(reservation) => Some(reservation),
+                                    Err(error) => {
+                                        let error = error.into_proxy_error();
+                                        let error_body = websocket_stream_error_body(
+                                            error.client_message(),
+                                            error.error_code(),
+                                        );
+                                        return terminate_responses_websocket_with_error(
+                                            &mut downstream,
+                                            &mut output_patcher,
+                                            mode,
+                                            state,
+                                            &execution,
+                                            &mut pending_lifecycle_messages,
+                                            error,
+                                            Some("memory_capacity"),
+                                            error_body,
+                                            None,
+                                            &mut active_usage_turn,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let grok_reasoning_retry_message =
+                                matches!(mode, ResponsesWebsocketMode::Grok).then(|| message.clone());
+                            let grok_reasoning_replay = if matches!(mode, ResponsesWebsocketMode::Grok) {
+                                match prepare_grok_reasoning_replay_websocket(
+                                    state,
+                                    &execution,
+                                    &request_context,
+                                    grok_turn_index,
+                                    grok_session_id.as_deref(),
+                                    &ws_url,
+                                    &mut message,
+                                    incoming_turn_memory.as_ref().map(|(budget, _)| budget),
+                                )
+                                .await
+                                {
+                                    Ok(replay) => replay,
+                                    Err(error) if error.is_request_memory_exhausted() => {
+                                        let error_body = websocket_stream_error_body(
+                                            error.client_message(),
+                                            error.error_code(),
+                                        );
+                                        return terminate_responses_websocket_with_error(
+                                            &mut downstream,
+                                            &mut output_patcher,
+                                            mode,
+                                            state,
+                                            &execution,
+                                            &mut pending_lifecycle_messages,
+                                            error,
+                                            Some("memory_capacity"),
+                                            error_body,
+                                            None,
+                                            &mut active_usage_turn,
+                                        )
+                                        .await;
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            } else {
+                                None
+                            };
+                            let effective_response_body = responses_websocket_http_body(&message)?;
+                            let requested_response_body = original_response_body
+                                .as_ref()
+                                .unwrap_or(&effective_response_body);
+                            if matches!(mode, ResponsesWebsocketMode::Codex) {
+                                if let Some(model) = codex_model_from_value(&effective_response_body) {
+                                    codex_session_model = Some(model);
+                                }
+                                ensure_share_model_available(
+                                    state,
+                                    &execution,
+                                    request_context.share_id.as_deref(),
+                                    codex_session_model.as_deref(),
+                                )
+                                .await?;
+                            }
+                            let grok_tool_context = matches!(mode, ResponsesWebsocketMode::Grok)
+                                .then(|| transforms::responses_tool_context(requested_response_body))
+                                .filter(transforms::ResponsesToolContext::requires_grok_emulation);
+                            output_patcher.begin_response(
+                                previous_response_cache_scope.map(|scope| {
+                                    PreviousResponseCacheWriteContext::from_body(
+                                        state,
+                                        scope,
+                                        &effective_response_body,
+                                    )
+                                }),
+                                grok_tool_context.clone(),
+                            );
+                            active_response_intent = Some(intent.clone());
+                            active_grok_reasoning_retry_message = grok_reasoning_replay
+                                .as_ref()
+                                .and(grok_reasoning_retry_message);
+                            active_grok_reasoning_retry_memory = grok_reasoning_replay
+                                .as_ref()
+                                .and(grok_reasoning_retry_memory);
+                            active_grok_reasoning_replay = match grok_reasoning_replay
+                                .map(grok_provider::ReplayStreamWrite::new)
+                                .transpose()
+                            {
+                                Ok(replay) => replay,
+                                Err(error) => {
+                                    let error_body = websocket_stream_error_body(
+                                        error.client_message(),
+                                        error.error_code(),
+                                    );
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        Some("memory_capacity"),
+                                        error_body,
+                                        None,
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                            };
+                            active_grok_quality_observer = matches!(mode, ResponsesWebsocketMode::Grok)
+                                .then(|| Box::new(super::grok::GrokQualityObserver::new(true)));
+                            active_grok_reasoning_recovery_attempted = false;
+                            active_response_started_at = Some(Instant::now());
+                            let mut turn_context = request_context.clone();
+                            if let Some(metadata) = policy_metadata {
+                                apply_codex_policy_metadata(&mut turn_context, metadata);
+                            }
+                            active_usage_turn = Some(
+                                ResponsesWebsocketUsageTurn::start(
+                                    state,
+                                    &execution.runtime_stored_view(),
+                                    codex_websocket_model_metadata(
+                                        requested_response_body,
+                                        &effective_response_body,
+                                    ),
+                                    turn_context,
+                                    &connection_id,
+                                                            Some(execution.plan.runtime_fingerprint.as_str()),
+        )
+                                .await?,
+                            );
+                            active_response_body = Some(effective_response_body);
+                            let accounts = state.accounts_snapshot().await;
+                            active_attempt = ForwardAttemptContext { timing: timing_slot.clone(), ..Default::default() };
+                            let Some((request_memory, raw_memory)) = incoming_turn_memory.take() else {
+                                let error = ProxyError::bad_gateway(
+                                    "responses websocket turn memory was not initialized",
+                                );
+                                let error_body = websocket_stream_error_body(
+                                    error.client_message(),
+                                    "upstream_protocol_error",
+                                );
+                                return terminate_responses_websocket_with_error(
+                                    &mut downstream,
+                                    &mut output_patcher,
+                                    mode,
+                                    state,
+                                    &execution,
+                                    &mut pending_lifecycle_messages,
+                                    error,
+                                    Some("protocol_error"),
+                                    error_body,
+                                    None,
+                                    &mut active_usage_turn,
+                                )
+                                .await;
+                            };
+                            active_attempt.request_memory = Some(request_memory.clone());
+                            active_attempt.raw_body_memory = Some(raw_memory);
+                            match reserve_responses_websocket_turn_memory(
+                                &request_memory,
+                                websocket_message_payload_len(&message),
+                                previous_context_wire_memory.take(),
+                            ) {
+                                Ok((normalized, semantic_prelude, tool_arguments)) => {
+                                    active_normalized_memory = Some(normalized);
+                                    active_semantic_prelude_memory = Some(semantic_prelude);
+                                    active_tool_argument_memory = Some(tool_arguments);
+                                }
+                                Err(error) => {
+                                    let _failed_entry = entry.take();
+                                    let error_body = websocket_stream_error_body(
+                                        error.client_message(),
+                                        error.error_code(),
+                                    );
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        Some("memory_capacity"),
+                                        error_body,
+                                        None,
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                            }
+                            active_attempt
+                                .ensure_binding(&execution, &accounts)
+                                .map_err(binding_snapshot_error_to_proxy_error)?;
+                            let snapshot = state.account_in_flight.snapshot();
+                            account_in_flight_guard = acquire_account_in_flight(
+                                state,
+                                &execution.stored,
+                                &accounts,
+                                &snapshot,
+                            )?;
+                            response_in_flight = true;
+                            codex_interrupt.begin_response();
+                            response_create_committed = false;
+                            emitted_business_event = false;
+                            if matches!(mode, ResponsesWebsocketMode::Grok) {
+                                response_repeat_tracker = Some(ResponsesRepeatTracker::default());
+                            }
+                            pending_lifecycle_messages.clear();
+                            if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                                let _ = reservation.resize(0);
+                            }
+                            semantic_provider_outcome_recorded = false;
+                            if entry.is_none() {
+                                if refresh_target_before_connect {
+                                    let forwarded_headers = codex_client_headers_from_owned(&headers);
+                                    let target = prepare_responses_websocket_target(
+                                        state,
+                                        &execution,
+                                        mode,
+                                        grok_session_id.as_deref(),
+                                        grok_turn_index,
+                                    )
+                                    .await?;
+                                    headers = target.headers;
+                                    merge_owned_headers(&mut headers, forwarded_headers);
+                                    ws_url = target.ws_url;
+                                    pool_key = target.pool_key;
+                                    refresh_target_before_connect = false;
+                                }
+                                (entry, entry_was_cached) = acquire_cached_responses_websocket(&pool_key);
+                            }
+                            if entry.is_none() {
+                                match connect_responses_websocket(
+                                    state,
+                                    &mut execution,
+                                    mode,
+                                    grok_session_id.as_deref(),
+                                    request_context.share_id.as_deref(),
+                                    codex_session_model.as_deref(),
+                                    connect_timeout,
+                                    &mut headers,
+                                    &mut ws_url,
+                                    &mut pool_key,
+                                    &mut active_attempt,
+                                    &mut active_usage_turn,
+                                )
+                                .await
+                                {
+                                    Ok(connected) => {
+                                        entry = Some(connected);
+                                        entry_was_cached = false;
+                                    }
+                                    Err(failure) => {
+                                        let Some(source) = failure.fallback_source else {
+                                            if response_in_flight {
+                                                let error_code = if failure.error.status
+                                                    == StatusCode::UNAUTHORIZED
+                                                {
+                                                    "upstream_auth_error"
+                                                } else if failure.error.status
+                                                    == StatusCode::GATEWAY_TIMEOUT
+                                                {
+                                                    "upstream_connect_timeout"
+                                                } else {
+                                                    "upstream_connect_error"
+                                                };
+                                                let error_body = websocket_stream_error_body(
+                                                    failure.error.client_message(),
+                                                    error_code,
+                                                );
+                                                let provider_outcome = provider_outcome_from_status(
+                                                    failure.error.status.as_u16(),
+                                                );
+                                                return terminate_responses_websocket_with_error(
+                                                    &mut downstream,
+                                                    &mut output_patcher,
+                                                    mode,
+                                                    state,
+                                                    &execution,
+                                                    &mut pending_lifecycle_messages,
+                                                    failure.error,
+                                                    Some("connect_error"),
+                                                    error_body,
+                                                    Some(provider_outcome),
+                                                    &mut active_usage_turn,
+                                                )
+                                                .await;
+                                            }
+                                            return Err(failure.error);
+                                        };
+                                        let body = active_response_body.as_ref().ok_or_else(|| {
+                                            ProxyError::bad_request(
+                                                "response.create body is unavailable for HTTP fallback",
+                                            )
+                                        })?;
+                                        pending_lifecycle_messages.clear();
+                                        if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                                            let _ = reservation.resize(0);
+                                        }
+                                        let outcome = run_codex_websocket_http_fallback(
+                                            &mut downstream,
+                                            state,
+                                            &mut execution,
+                                            body,
+                                            grok_session_id.as_deref(),
+                                            grok_turn_index,
+                                            first_byte_timeout,
+                                            stream_idle_timeout,
+                                            source,
+                                            &mut active_attempt,
+                                            &mut output_patcher,
+                                            active_response_intent.as_ref().expect("active response intent"),
+                                            &mut active_usage_turn,
+                                        )
+                                        .await?;
+                                        if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                                            return Ok(());
+                                        }
+                                        response_in_flight = false;
+                                        response_create_committed = false;
+                                        account_in_flight_guard.take();
+                                        active_response_body = None;
+                                        active_response_intent = None;
+                                        release_responses_websocket_turn_memory(
+                                            entry.as_ref(),
+                                            &mut active_attempt,
+                                            &mut active_normalized_memory,
+                                            &mut active_semantic_prelude_memory,
+                                            &mut active_tool_argument_memory,
+                                            &mut active_grok_reasoning_replay,
+                                            &mut active_grok_reasoning_retry_message,
+                                            &mut active_grok_reasoning_retry_memory,
+                                        );
+                                        refresh_target_before_connect = true;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        if entry.is_none() {
+                            return Err(ProxyError::bad_request(
+                                "the first responses websocket request must be response.create",
+                            ));
+                        }
+                        if starts_response
+                            && matches!(mode, ResponsesWebsocketMode::Grok)
+                            && active_grok_reasoning_replay.as_ref().is_some()
+                            && !active_grok_reasoning_replay
+                                .as_ref()
+                                .expect("checked Grok replay context")
+                                .binding_is_current(state)
+                                .await
+                        {
+                            let original = active_grok_reasoning_retry_message.take().ok_or_else(|| {
+                                    ProxyError::conflict(
+                                        "Grok replay binding changed before the request was sent",
+                                    )
+                                })?;
+                            message = original.clone();
+                            let refreshed = match prepare_grok_reasoning_replay_websocket(
+                                state,
+                                &execution,
+                                &request_context,
+                                grok_turn_index,
+                                grok_session_id.as_deref(),
+                                &ws_url,
+                                &mut message,
+                                active_attempt.request_memory(),
+                            )
+                            .await
+                            {
+                                Ok(replay) => replay,
+                                Err(error) if error.is_request_memory_exhausted() => {
+                                    let _failed_entry = entry.take();
+                                    let error_body = websocket_stream_error_body(
+                                        error.client_message(),
+                                        error.error_code(),
+                                    );
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        Some("memory_capacity"),
+                                        error_body,
+                                        None,
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                            .ok_or_else(|| {
+                                ProxyError::conflict(
+                                    "Grok replay scope changed before the request was sent",
+                                )
+                            })?;
+                            if !grok_provider::binding_is_current(state, &refreshed).await {
+                                return Err(ProxyError::conflict(
+                                    "Grok Provider or Account changed before the request was sent",
+                                ));
+                            }
+                            active_response_body = Some(responses_websocket_http_body(&message)?);
+                            active_grok_reasoning_replay =
+                                Some(grok_provider::ReplayStreamWrite::new(refreshed)?);
+                            active_grok_reasoning_retry_message = Some(original);
+                            crate::metrics::record_grok_reasoning_replay("binding_reprepared", 1);
+                        }
+                        if starts_response {
+                            if let (Some(turn), Some(body)) = (active_usage_turn.as_mut(), active_response_body.as_ref()) {
+                                capability_session_operations.extend(crate::domain::sharing::capability_intent::operations(body,request_context.operation));
+                                turn.inherited_operations=capability_session_operations.iter().copied().collect();
+                                turn.inherited_invalid_control=capability_session_invalid_control.clone();
+                                turn.admit_generation(body, websocket_message_payload_len(&message)).await?;
+                            }
+                        }
+                        let send_result = {
+                            let _account_read_guard = if starts_response {
+                                Some(
+                                    lock_responses_websocket_turn_accounts(state, &execution, mode)
+                                        .await?,
+                                )
+                            } else {
+                                None
+                            };
+                            entry
+                                .as_ref()
+                                .expect("upstream websocket is connected")
+                                .socket
+                                .set_request_memory(active_attempt.request_memory().cloned());
+                            send_responses_upstream_while_serving_downstream(
+                                &entry
+                                    .as_ref()
+                                    .expect("upstream websocket is connected")
+                                    .socket,
+                                &mut downstream,
+                                message,
+                                active_attempt.request_memory(),
+                                matches!(mode, ResponsesWebsocketMode::Codex),
+                                matches!(mode, ResponsesWebsocketMode::Codex).then(|| {
+                                    (
+                                        &mut codex_interrupt,
+                                        &terminal_response_ids,
+                                        entry.as_ref().expect("upstream websocket is connected").created_at,
+                                    )
+                                }),
+                                interrupt_ack_timeout,
+                            )
+                                .await
+                        };
+                        let send_error = match send_result {
+                            Ok(ResponsesWebsocketSendOutcome::Sent) => None,
+                            Ok(ResponsesWebsocketSendOutcome::DownstreamClosed) => {
+                                finish_active_websocket_usage(
+                                    &mut active_usage_turn,
+                                    499,
+                                    "client_cancelled",
+                                    Some("downstream websocket closed during upstream write".to_string()),
+                                )
+                                .await;
+                                let _cancelled_entry = entry.take();
+                                break;
+                            }
+                            Err(ResponsesWebsocketSendFailure::Downstream(error)) => return Err(error),
+                            Err(ResponsesWebsocketSendFailure::InterruptAckTimeout) => {
+                                let _expired_entry = entry.take();
+                                return terminate_codex_interrupt_ack_timeout(
+                                    &mut downstream, &mut output_patcher, mode, state, &execution,
+                                    &mut pending_lifecycle_messages, &mut active_usage_turn,
+                                    &codex_interrupt, response_in_flight,
+                                ).await;
+                            }
+                            Err(ResponsesWebsocketSendFailure::Memory(error)) => {
                                 let _failed_entry = entry.take();
                                 let error_body = websocket_stream_error_body(
                                     error.client_message(),
@@ -13548,249 +14370,73 @@ async fn bridge_responses_websocket_inner(
                                 )
                                 .await;
                             }
-                        },
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-                if matches!(mode, ResponsesWebsocketMode::Codex) {
-                    let interrupt_id = match codex_websocket_interrupt_id(&message) {
-                        Ok(id) => id,
-                        Err(error) => {
-                            downstream
-                                .send(AxumWsMessage::Text(websocket_proxy_error_body(&error)))
-                                .await
-                                .map_err(|send_error| ProxyError::bad_gateway(send_error.to_string()))?;
-                            continue;
-                        }
-                    };
-                    if let Some(interrupt_id) = interrupt_id {
-                        if entry.as_ref().is_some_and(|entry| {
-                            terminal_response_ids.contains(entry.created_at, &interrupt_id)
-                        }) {
-                            continue;
-                        }
-                        if !response_in_flight || entry.is_none() {
-                            let error = ProxyError::bad_request(
-                                "response.interrupt has no active upstream response",
-                            );
-                            downstream
-                                .send(AxumWsMessage::Text(websocket_proxy_error_body(&error)))
-                                .await
-                                .map_err(|send_error| ProxyError::bad_gateway(send_error.to_string()))?;
-                            continue;
-                        }
-                        match codex_interrupt.request(
-                            entry.as_ref().expect("active connection").created_at,
-                            &interrupt_id,
-                            tokio::time::Instant::now(),
-                            interrupt_ack_timeout,
-                        ) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(error) => {
-                                downstream.send(AxumWsMessage::Text(websocket_proxy_error_body(&error)))
-                                    .await.map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                            Err(ResponsesWebsocketSendFailure::Upstream(error)) => Some(error),
+                        };
+                        if let Some(error) = send_error {
+                            let _failed_entry = entry.take();
+                            if response_in_flight
+                                && responses_websocket_http_replay_allowed(
+                                    mode,
+                                    emitted_business_event,
+                                    response_create_committed,
+                                )
+                            {
+                                let body = active_response_body.as_ref().ok_or_else(|| {
+                                    ProxyError::bad_request(
+                                        "response.create body is unavailable for HTTP fallback",
+                                    )
+                                })?;
+                                let source = if entry_was_cached {
+                                    "cached_stale"
+                                } else {
+                                    "send_failure"
+                                };
+                                pending_lifecycle_messages.clear();
+                                if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                                    let _ = reservation.resize(0);
+                                }
+                                let outcome = run_codex_websocket_http_fallback(
+                                    &mut downstream,
+                                    state,
+                                    &mut execution,
+                                    body,
+                                    grok_session_id.as_deref(),
+                                    grok_turn_index,
+                                    first_byte_timeout,
+                                    stream_idle_timeout,
+                                    source,
+                                    &mut active_attempt,
+                                    &mut output_patcher,
+                                    active_response_intent.as_ref().expect("active response intent"),
+                                    &mut active_usage_turn,
+                                )
+                                .await?;
+                                if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                                    return Ok(());
+                                }
+                                response_in_flight = false;
+                                response_create_committed = false;
+                                account_in_flight_guard.take();
+                                active_response_body = None;
+                                active_response_intent = None;
+                                release_responses_websocket_turn_memory(
+                                    entry.as_ref(),
+                                    &mut active_attempt,
+                                    &mut active_normalized_memory,
+                                    &mut active_semantic_prelude_memory,
+                                    &mut active_tool_argument_memory,
+                                    &mut active_grok_reasoning_replay,
+                                    &mut active_grok_reasoning_retry_message,
+                                    &mut active_grok_reasoning_retry_memory,
+                                );
+                                refresh_target_before_connect = true;
                                 continue;
                             }
-                        }
-                    }
-                }
-                let original_response_body = axum_responses_websocket_http_body(&message)?
-                    .or_else(|| {
-                        matches!(mode, ResponsesWebsocketMode::Grok)
-                            .then(|| axum_grok_bare_responses_websocket_body(&message))
-                            .flatten()
-                    });
-                let raw_starts_response = original_response_body.is_some();
-                if raw_starts_response {
-                    if codex_interrupt.awaiting_ack() {
-                        let error = ProxyError::bad_request("response.create cannot start while an interrupt acknowledgement is pending");
-                        downstream.send(AxumWsMessage::Text(websocket_proxy_error_body(&error)))
-                            .await.map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
-                        continue;
-                    }
-                    if response_in_flight {
-                        return Err(ProxyError::bad_request(
-                            "responses websocket received response.create while a response is in flight",
-                        ));
-                    }
-                    if let Some((budget, _)) = &incoming_turn_memory {
-                        if let Some(request) = RequestTiming::responses_websocket(inbound_received_at, execution.stored.provider_type) {
-                            let timing = request.attempt(inbound_received_at);
-                            timing_slot.adopt_websocket_attempt(timing.clone());
-                            budget.set_timing(timing);
-                        }
-                    }
-                    ensure_responses_websocket_turn_allowed(
-                        state,
-                        &execution,
-                        mode,
-                        Some(authorization_from_owned_headers(&headers).unwrap_or("")),
-                    )
-                    .await?;
-                    if let Some(timing) = incoming_turn_memory.as_ref().and_then(|(budget, _)| budget.timing()) {
-                        timing.mark(Milestone::Admission);
-                    }
-                }
-                let grok_reasoning_capability = if raw_starts_response
-                    && matches!(mode, ResponsesWebsocketMode::Grok)
-                {
-                    let requested_model = single_upstream_model.as_deref().or_else(|| {
-                        original_response_body
-                            .as_ref()
-                            .and_then(|body| body.get("model"))
-                            .and_then(Value::as_str)
-                    });
-                    let normalized_model = super::grok::normalized_model(requested_model);
-                    fresh_grok_reasoning_capability(state, &execution, &normalized_model).await
-                } else {
-                    None
-                };
-                let mut message = match axum_ws_message_to_tungstenite(
-                    message,
-                    mode,
-                    grok_session_id.as_deref(),
-                    single_upstream_model.as_deref(),
-                    grok_reasoning_capability.as_ref(),
-                ) {
-                    Ok(Some(message)) => message,
-                    Ok(None) => break,
-                    Err(error) if raw_starts_response && error.is_protocol_incompatible() => {
-                        let requested = original_response_body
-                            .as_ref()
-                            .expect("a raw response start has a request body");
-                        active_usage_turn = Some(
-                            ResponsesWebsocketUsageTurn::start(
-                                state,
-                                &execution.runtime_stored_view(),
-                                codex_websocket_model_metadata(requested, requested),
-                                request_context.clone(),
-                                &connection_id,
-                            )
-                            .await?,
-                        );
-                        let error_body = websocket_proxy_error_body(&error);
-                        return terminate_responses_websocket_with_error(
-                            &mut downstream,
-                            &mut output_patcher,
-                            mode,
-                            state,
-                            &execution,
-                            &mut pending_lifecycle_messages,
-                            error,
-                            Some("client_protocol_incompatible"),
-                            error_body,
-                            None,
-                            &mut active_usage_turn,
-                        )
-                        .await;
-                    }
-                    Err(error) => return Err(error),
-                };
-                let starts_response = responses_websocket_request_starts_response(&message);
-                if starts_response && !raw_starts_response {
-                    ensure_responses_websocket_turn_allowed(
-                        state,
-                        &execution,
-                        mode,
-                        Some(authorization_from_owned_headers(&headers).unwrap_or("")),
-                    )
-                    .await?;
-                }
-                let previous_response_cache_scope = if starts_response
-                    && matches!(mode, ResponsesWebsocketMode::Codex)
-                {
-                    codex_previous_response_cache_scope(
-                        state,
-                        &execution,
-                        &request_context,
-                        Some(authorization_from_owned_headers(&headers).unwrap_or("")),
-                    )
-                    .await
-                } else {
-                    None
-                };
-                let mut previous_context_wire_memory = None;
-                if let Some(scope) = previous_response_cache_scope.as_ref() {
-                    previous_context_wire_memory = match inject_previous_response_context_into_websocket_message_with_memory(
-                        state,
-                        scope,
-                        original_response_body
-                            .as_ref()
-                            .and_then(previous_response_id_from_value)
-                            ,
-                        &mut message,
-                        incoming_turn_memory.as_ref().map(|(budget, _)| budget),
-                    ) {
-                        Ok(memory) => memory,
-                        Err(error) if error.is_request_memory_exhausted() => {
-                            let error_body = websocket_stream_error_body(
-                                error.client_message(), error.error_code(),
-                            );
-                            return terminate_responses_websocket_with_error(
-                                &mut downstream, &mut output_patcher, mode, state,
-                                &execution, &mut pending_lifecycle_messages, error,
-                                Some("memory_capacity"), error_body, None,
-                                &mut active_usage_turn,
-                            ).await;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                }
-                if matches!(mode, ResponsesWebsocketMode::Codex) {
-                    if let Some(model) = codex_websocket_session_update_model(&message) {
-                        codex_session_model = Some(model);
-                    }
-                }
-                let intent = original_response_body
-                    .as_ref()
-                    .map(super::codex_request_policy::extract_intent)
-                    .unwrap_or_default();
-                let metadata_scope = if starts_response
-                    && matches!(mode, ResponsesWebsocketMode::Codex)
-                {
-                    let accounts = accounts_snapshot_for_execution_auth(state, &execution).await?;
-                    codex_metadata_scope(&execution, &accounts)
-                } else {
-                    None
-                };
-                let (message, policy_metadata) = if matches!(mode, ResponsesWebsocketMode::Codex) {
-                    prepare_codex_responses_websocket_request(
-                        message,
-                        &execution.runtime_stored_view(),
-                        codex_fast_mode_enabled(&execution),
-                        codex_session_model.as_deref(),
-                        &intent,
-                        metadata_scope.as_ref(),
-                    )
-                    .await?
-                } else {
-                    (message, None)
-                };
-                let mut message = message;
-                if starts_response {
-                    let grok_reasoning_retry_memory = if matches!(mode, ResponsesWebsocketMode::Grok)
-                    {
-                        let budget = incoming_turn_memory
-                            .as_ref()
-                            .map(|(budget, _)| budget)
-                            .ok_or_else(|| {
-                                ProxyError::bad_gateway(
-                                    "Grok websocket turn memory was not initialized",
-                                )
-                            })?;
-                        match budget.reserve(
-                            RequestMemoryComponent::ReasoningReplay,
-                            websocket_message_payload_len(&message),
-                        ) {
-                            Ok(reservation) => Some(reservation),
-                            Err(error) => {
-                                let error = error.into_proxy_error();
+                            let error = ProxyError::bad_gateway(error.to_string());
+                            if response_in_flight {
                                 let error_body = websocket_stream_error_body(
                                     error.client_message(),
-                                    error.error_code(),
+                                    "upstream_stream_transport_error",
                                 );
                                 return terminate_responses_websocket_with_error(
                                     &mut downstream,
@@ -13800,301 +14446,361 @@ async fn bridge_responses_websocket_inner(
                                     &execution,
                                     &mut pending_lifecycle_messages,
                                     error,
-                                    Some("memory_capacity"),
+                                    Some("transport_error"),
                                     error_body,
-                                    None,
+                                    Some(ProviderOutcome::NetworkFailure),
                                     &mut active_usage_turn,
                                 )
                                 .await;
                             }
+                            return Err(error);
                         }
-                    } else {
-                        None
-                    };
-                    let grok_reasoning_retry_message =
-                        matches!(mode, ResponsesWebsocketMode::Grok).then(|| message.clone());
-                    let grok_reasoning_replay = if matches!(mode, ResponsesWebsocketMode::Grok) {
-                        match prepare_grok_reasoning_replay_websocket(
-                            state,
-                            &execution,
-                            &request_context,
-                            grok_turn_index,
-                            grok_session_id.as_deref(),
-                            &ws_url,
-                            &mut message,
-                            incoming_turn_memory.as_ref().map(|(budget, _)| budget),
-                        )
-                        .await
-                        {
-                            Ok(replay) => replay,
-                            Err(error) if error.is_request_memory_exhausted() => {
-                                let error_body = websocket_stream_error_body(
-                                    error.client_message(),
-                                    error.error_code(),
-                                );
-                                return terminate_responses_websocket_with_error(
-                                    &mut downstream,
-                                    &mut output_patcher,
-                                    mode,
-                                    state,
-                                    &execution,
-                                    &mut pending_lifecycle_messages,
-                                    error,
-                                    Some("memory_capacity"),
-                                    error_body,
-                                    None,
-                                    &mut active_usage_turn,
-                                )
-                                .await;
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    } else {
-                        None
-                    };
-                    let effective_response_body = responses_websocket_http_body(&message)?;
-                    let requested_response_body = original_response_body
-                        .as_ref()
-                        .unwrap_or(&effective_response_body);
-                    if matches!(mode, ResponsesWebsocketMode::Codex) {
-                        if let Some(model) = codex_model_from_value(&effective_response_body) {
-                            codex_session_model = Some(model);
-                        }
-                        ensure_share_model_available(
-                            state,
-                            &execution,
-                            request_context.share_id.as_deref(),
-                            codex_session_model.as_deref(),
-                        )
-                        .await?;
-                    }
-                    let grok_tool_context = matches!(mode, ResponsesWebsocketMode::Grok)
-                        .then(|| transforms::responses_tool_context(requested_response_body))
-                        .filter(transforms::ResponsesToolContext::requires_grok_emulation);
-                    output_patcher.begin_response(
-                        previous_response_cache_scope.map(|scope| {
-                            PreviousResponseCacheWriteContext::from_body(
-                                state,
-                                scope,
-                                &effective_response_body,
-                            )
-                        }),
-                        grok_tool_context.clone(),
-                    );
-                    active_response_intent = Some(intent.clone());
-                    active_grok_reasoning_retry_message = grok_reasoning_replay
-                        .as_ref()
-                        .and(grok_reasoning_retry_message);
-                    active_grok_reasoning_retry_memory = grok_reasoning_replay
-                        .as_ref()
-                        .and(grok_reasoning_retry_memory);
-                    active_grok_reasoning_replay = match grok_reasoning_replay
-                        .map(grok_provider::ReplayStreamWrite::new)
-                        .transpose()
-                    {
-                        Ok(replay) => replay,
-                        Err(error) => {
-                            let error_body = websocket_stream_error_body(
-                                error.client_message(),
-                                error.error_code(),
-                            );
-                            return terminate_responses_websocket_with_error(
-                                &mut downstream,
-                                &mut output_patcher,
-                                mode,
-                                state,
-                                &execution,
-                                &mut pending_lifecycle_messages,
-                                error,
-                                Some("memory_capacity"),
-                                error_body,
-                                None,
-                                &mut active_usage_turn,
-                            )
-                            .await;
-                        }
-                    };
-                    active_grok_quality_observer = matches!(mode, ResponsesWebsocketMode::Grok)
-                        .then(|| Box::new(super::grok::GrokQualityObserver::new(true)));
-                    active_grok_reasoning_recovery_attempted = false;
-                    active_response_started_at = Some(Instant::now());
-                    let mut turn_context = request_context.clone();
-                    if let Some(metadata) = policy_metadata {
-                        apply_codex_policy_metadata(&mut turn_context, metadata);
-                    }
-                    active_usage_turn = Some(
-                        ResponsesWebsocketUsageTurn::start(
-                            state,
-                            &execution.runtime_stored_view(),
-                            codex_websocket_model_metadata(
-                                requested_response_body,
-                                &effective_response_body,
-                            ),
-                            turn_context,
-                            &connection_id,
-                        )
-                        .await?,
-                    );
-                    active_response_body = Some(effective_response_body);
-                    let accounts = state.accounts_snapshot().await;
-                    active_attempt = ForwardAttemptContext { timing: timing_slot.clone(), ..Default::default() };
-                    let Some((request_memory, raw_memory)) = incoming_turn_memory.take() else {
-                        let error = ProxyError::bad_gateway(
-                            "responses websocket turn memory was not initialized",
-                        );
-                        let error_body = websocket_stream_error_body(
-                            error.client_message(),
-                            "upstream_protocol_error",
-                        );
-                        return terminate_responses_websocket_with_error(
-                            &mut downstream,
-                            &mut output_patcher,
-                            mode,
-                            state,
-                            &execution,
-                            &mut pending_lifecycle_messages,
-                            error,
-                            Some("protocol_error"),
-                            error_body,
-                            None,
-                            &mut active_usage_turn,
-                        )
-                        .await;
-                    };
-                    active_attempt.request_memory = Some(request_memory.clone());
-                    active_attempt.raw_body_memory = Some(raw_memory);
-                    match reserve_responses_websocket_turn_memory(
-                        &request_memory,
-                        websocket_message_payload_len(&message),
-                        previous_context_wire_memory.take(),
-                    ) {
-                        Ok((normalized, semantic_prelude, tool_arguments)) => {
-                            active_normalized_memory = Some(normalized);
-                            active_semantic_prelude_memory = Some(semantic_prelude);
-                            active_tool_argument_memory = Some(tool_arguments);
-                        }
-                        Err(error) => {
-                            let _failed_entry = entry.take();
-                            let error_body = websocket_stream_error_body(
-                                error.client_message(),
-                                error.error_code(),
-                            );
-                            return terminate_responses_websocket_with_error(
-                                &mut downstream,
-                                &mut output_patcher,
-                                mode,
-                                state,
-                                &execution,
-                                &mut pending_lifecycle_messages,
-                                error,
-                                Some("memory_capacity"),
-                                error_body,
-                                None,
-                                &mut active_usage_turn,
-                            )
-                            .await;
+                        if starts_response {
+                            response_create_committed = true;
+                            upstream_read_deadline = first_byte_timeout
+                                .map(|timeout| tokio::time::Instant::now() + timeout);
                         }
                     }
-                    active_attempt
-                        .ensure_binding(&execution, &accounts)
-                        .map_err(binding_snapshot_error_to_proxy_error)?;
-                    let snapshot = state.account_in_flight.snapshot();
-                    account_in_flight_guard = acquire_account_in_flight(
-                        state,
-                        &execution.stored,
-                        &accounts,
-                        &snapshot,
-                    )?;
-                    response_in_flight = true;
-                    codex_interrupt.begin_response();
-                    response_create_committed = false;
-                    emitted_business_event = false;
-                    if matches!(mode, ResponsesWebsocketMode::Grok) {
-                        response_repeat_tracker = Some(ResponsesRepeatTracker::default());
-                    }
-                    pending_lifecycle_messages.clear();
-                    if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
-                        let _ = reservation.resize(0);
-                    }
-                    semantic_provider_outcome_recorded = false;
-                    if entry.is_none() {
-                        if refresh_target_before_connect {
-                            let forwarded_headers = codex_client_headers_from_owned(&headers);
-                            let target = prepare_responses_websocket_target(
-                                state,
-                                &execution,
-                                mode,
-                                grok_session_id.as_deref(),
-                                grok_turn_index,
-                            )
-                            .await?;
-                            headers = target.headers;
-                            merge_owned_headers(&mut headers, forwarded_headers);
-                            ws_url = target.ws_url;
-                            pool_key = target.pool_key;
-                            refresh_target_before_connect = false;
-                        }
-                        (entry, entry_was_cached) = acquire_cached_responses_websocket(&pool_key);
-                    }
-                    if entry.is_none() {
-                        match connect_responses_websocket(
-                            state,
-                            &mut execution,
-                            mode,
-                            grok_session_id.as_deref(),
-                            request_context.share_id.as_deref(),
-                            codex_session_model.as_deref(),
-                            connect_timeout,
-                            &mut headers,
-                            &mut ws_url,
-                            &mut pool_key,
-                            &mut active_attempt,
-                            &mut active_usage_turn,
-                        )
-                        .await
-                        {
-                            Ok(connected) => {
-                                entry = Some(connected);
-                                entry_was_cached = false;
-                            }
-                            Err(failure) => {
-                                let Some(source) = failure.fallback_source else {
-                                    if response_in_flight {
-                                        let error_code = if failure.error.status
-                                            == StatusCode::UNAUTHORIZED
-                                        {
-                                            "upstream_auth_error"
-                                        } else if failure.error.status
-                                            == StatusCode::GATEWAY_TIMEOUT
-                                        {
-                                            "upstream_connect_timeout"
-                                        } else {
-                                            "upstream_connect_error"
-                                        };
-                                        let error_body = websocket_stream_error_body(
-                                            failure.error.client_message(),
-                                            error_code,
-                                        );
-                                        let provider_outcome = provider_outcome_from_status(
-                                            failure.error.status.as_u16(),
-                                        );
-                                        return terminate_responses_websocket_with_error(
-                                            &mut downstream,
-                                            &mut output_patcher,
-                                            mode,
-                                            state,
-                                            &execution,
-                                            &mut pending_lifecycle_messages,
-                                            failure.error,
-                                            Some("connect_error"),
-                                            error_body,
-                                            Some(provider_outcome),
-                                            &mut active_usage_turn,
+                    upstream_read = next_responses_websocket_message(&mut entry, codex_interrupt.read_deadline(upstream_read_deadline), active_attempt.request_memory()) => {
+                        let upstream_message = match upstream_read {
+                            ResponsesWebsocketRead::Message(message) => message,
+                            ResponsesWebsocketRead::TimedOut => {
+                                if codex_interrupt.ack_expired(tokio::time::Instant::now()) {
+                                    let _expired_entry = entry.take();
+                                    return terminate_codex_interrupt_ack_timeout(
+                                        &mut downstream, &mut output_patcher, mode, state, &execution,
+                                        &mut pending_lifecycle_messages, &mut active_usage_turn,
+                                        &codex_interrupt, response_in_flight,
+                                    ).await;
+                                }
+                                let _timed_out_entry = entry.take();
+                                if response_in_flight
+                                    && responses_websocket_http_replay_allowed(
+                                        mode,
+                                        emitted_business_event,
+                                        response_create_committed,
+                                    )
+                                {
+                                    let body = active_response_body.as_ref().ok_or_else(|| {
+                                        ProxyError::bad_request(
+                                            "response.create body is unavailable for HTTP fallback",
                                         )
-                                        .await;
+                                    })?;
+                                    pending_lifecycle_messages.clear();
+                                    if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                                        let _ = reservation.resize(0);
                                     }
-                                    return Err(failure.error);
+                                    let outcome = run_codex_websocket_http_fallback(
+                                        &mut downstream,
+                                        state,
+                                        &mut execution,
+                                        body,
+                                        grok_session_id.as_deref(),
+                                        grok_turn_index,
+                                        first_byte_timeout,
+                                        stream_idle_timeout,
+                                        "first_byte_timeout",
+                                        &mut active_attempt,
+                                        &mut output_patcher,
+                                        active_response_intent.as_ref().expect("active response intent"),
+                                        &mut active_usage_turn,
+                                    )
+                                    .await?;
+                                    if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                                        return Ok(());
+                                    }
+                                    response_in_flight = false;
+                                    response_create_committed = false;
+                                    account_in_flight_guard.take();
+                                    active_response_body = None;
+                                    active_response_intent = None;
+                                    release_responses_websocket_turn_memory(
+                                        entry.as_ref(),
+                                        &mut active_attempt,
+                                        &mut active_normalized_memory,
+                                        &mut active_semantic_prelude_memory,
+                                        &mut active_tool_argument_memory,
+                                        &mut active_grok_reasoning_replay,
+                                        &mut active_grok_reasoning_retry_message,
+                                        &mut active_grok_reasoning_retry_memory,
+                                    );
+                                    upstream_read_deadline = None;
+                                    refresh_target_before_connect = true;
+                                    continue;
+                                }
+                                let error = ProxyError {
+                                    status: StatusCode::GATEWAY_TIMEOUT,
+                                    message: if emitted_business_event {
+                                        "responses websocket stream idle timeout".to_string()
+                                    } else {
+                                        "responses websocket first byte timeout".to_string()
+                                    },
                                 };
+                                let error_body = websocket_stream_error_body(
+                                    error.client_message(),
+                                    "upstream_stream_timeout",
+                                );
+                                return terminate_responses_websocket_with_error(
+                                    &mut downstream,
+                                    &mut output_patcher,
+                                    mode,
+                                    state,
+                                    &execution,
+                                    &mut pending_lifecycle_messages,
+                                    error,
+                                    Some("transport_error"),
+                                    error_body,
+                                    Some(ProviderOutcome::NetworkFailure),
+                                    &mut active_usage_turn,
+                                )
+                                .await;
+                            }
+                        };
+                        let Some(message) = upstream_message else {
+                            let _closed_entry = entry.take();
+                            if response_in_flight
+                                && responses_websocket_http_replay_allowed(
+                                    mode,
+                                    emitted_business_event,
+                                    response_create_committed,
+                                )
+                            {
+                                let body = active_response_body.as_ref().ok_or_else(|| {
+                                    ProxyError::bad_request(
+                                        "response.create body is unavailable for HTTP fallback",
+                                    )
+                                })?;
+                                let source = if entry_was_cached {
+                                    "cached_stale"
+                                } else {
+                                    "closed_before_event"
+                                };
+                                pending_lifecycle_messages.clear();
+                                if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                                    let _ = reservation.resize(0);
+                                }
+                                let outcome = run_codex_websocket_http_fallback(
+                                    &mut downstream,
+                                    state,
+                                    &mut execution,
+                                    body,
+                                    grok_session_id.as_deref(),
+                                    grok_turn_index,
+                                    first_byte_timeout,
+                                    stream_idle_timeout,
+                                    source,
+                                    &mut active_attempt,
+                                    &mut output_patcher,
+                                    active_response_intent.as_ref().expect("active response intent"),
+                                    &mut active_usage_turn,
+                                )
+                                .await?;
+                                if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                                    return Ok(());
+                                }
+                                response_in_flight = false;
+                                response_create_committed = false;
+                                account_in_flight_guard.take();
+                                active_response_body = None;
+                                active_response_intent = None;
+                                release_responses_websocket_turn_memory(
+                                    entry.as_ref(),
+                                    &mut active_attempt,
+                                    &mut active_normalized_memory,
+                                    &mut active_semantic_prelude_memory,
+                                    &mut active_tool_argument_memory,
+                                    &mut active_grok_reasoning_replay,
+                                    &mut active_grok_reasoning_retry_message,
+                                    &mut active_grok_reasoning_retry_memory,
+                                );
+                                refresh_target_before_connect = true;
+                                continue;
+                            }
+                            if response_in_flight {
+                                return terminate_responses_websocket_without_terminal(
+                                    &mut downstream,
+                                    &mut output_patcher,
+                                    mode,
+                                    state,
+                                    &execution,
+                                    &mut pending_lifecycle_messages,
+                                    None,
+                                    &mut active_usage_turn,
+                                )
+                                .await;
+                            }
+                            refresh_target_before_connect = true;
+                            continue;
+                        };
+                        let ResponsesWebSocketReadMessage {
+                            result: message,
+                            _memory: _read_queue_memory,
+                        } = message;
+                        let message = match message {
+                            Err(ResponsesWebSocketReadError::Memory(error)) => {
+                                let _failed_entry = entry.take();
+                                let error_body = websocket_stream_error_body(
+                                    error.client_message(),
+                                    error.error_code(),
+                                );
+                                if response_in_flight {
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        Some("memory_capacity"),
+                                        error_body,
+                                        None,
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                                return Err(error);
+                            }
+                            Ok(message) => message,
+                            Err(ResponsesWebSocketReadError::Transport(error))
+                                if response_in_flight
+                                    && responses_websocket_http_replay_allowed(
+                                        mode,
+                                        emitted_business_event,
+                                        response_create_committed,
+                                    )
+                                    && websocket_read_fallback_source(&error, entry_was_cached).is_some() =>
+                            {
+                                let source = websocket_read_fallback_source(&error, entry_was_cached)
+                                    .expect("checked websocket fallback source");
+                                let _failed_entry = entry.take();
+                                let body = active_response_body.as_ref().ok_or_else(|| {
+                                    ProxyError::bad_request(
+                                        "response.create body is unavailable for HTTP fallback",
+                                    )
+                                })?;
+                                pending_lifecycle_messages.clear();
+                                if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                                    let _ = reservation.resize(0);
+                                }
+                                let outcome = run_codex_websocket_http_fallback(
+                                    &mut downstream,
+                                    state,
+                                    &mut execution,
+                                    body,
+                                    grok_session_id.as_deref(),
+                                    grok_turn_index,
+                                    first_byte_timeout,
+                                    stream_idle_timeout,
+                                        source,
+                                        &mut active_attempt,
+                                        &mut output_patcher,
+                                        active_response_intent.as_ref().expect("active response intent"),
+                                        &mut active_usage_turn,
+                                )
+                                .await?;
+                                if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                                    return Ok(());
+                                }
+                                response_in_flight = false;
+                                response_create_committed = false;
+                                account_in_flight_guard.take();
+                                active_response_body = None;
+                                active_response_intent = None;
+                                release_responses_websocket_turn_memory(
+                                    entry.as_ref(),
+                                    &mut active_attempt,
+                                    &mut active_normalized_memory,
+                                    &mut active_semantic_prelude_memory,
+                                    &mut active_tool_argument_memory,
+                                    &mut active_grok_reasoning_replay,
+                                    &mut active_grok_reasoning_retry_message,
+                                    &mut active_grok_reasoning_retry_memory,
+                                );
+                                refresh_target_before_connect = true;
+                                continue;
+                            }
+                            Err(ResponsesWebSocketReadError::Transport(error))
+                                if websocket_message_too_big(&error) =>
+                            {
+                                let body = websocket_message_too_big_error_body();
+                                let error = ProxyError {
+                                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                                    message: "upstream websocket message too big".to_string(),
+                                };
+                                if response_in_flight {
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        Some("transport_error"),
+                                        body,
+                                        Some(ProviderOutcome::Failure { status_code: 413 }),
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                                let _ = downstream.send(AxumWsMessage::Text(body)).await;
+                                return Err(error);
+                            }
+                            Err(ResponsesWebSocketReadError::Transport(error))
+                                if websocket_expected_reset(&error) && !response_in_flight =>
+                            {
+                                let _closed_entry = entry.take();
+                                refresh_target_before_connect = true;
+                                continue;
+                            }
+                            Err(ResponsesWebSocketReadError::Transport(error)) => {
+                                let error = ProxyError::bad_gateway(error.to_string());
+                                if response_in_flight {
+                                    let error_body = websocket_stream_error_body(
+                                        error.client_message(),
+                                        "upstream_stream_transport_error",
+                                    );
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        Some("transport_error"),
+                                        error_body,
+                                        Some(ProviderOutcome::NetworkFailure),
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                                return Err(error);
+                            }
+                        };
+                        match &message {
+                            TungsteniteMessage::Text(text) => codex::record_quota_websocket_payload(state, &execution, text.as_bytes()),
+                            TungsteniteMessage::Binary(bytes) => codex::record_quota_websocket_payload(state, &execution, bytes),
+                            _ => {}
+                        }
+                        let upstream_closed = matches!(message, TungsteniteMessage::Close(_));
+                        if upstream_closed {
+                            let fallback_source = websocket_close_fallback_source(
+                                &message,
+                                entry_was_cached,
+                            );
+                            let _closed_entry = entry.take();
+                            if let Some(source) = fallback_source
+                                .filter(|_| {
+                                    response_in_flight
+                                        && responses_websocket_http_replay_allowed(
+                                            mode,
+                                            emitted_business_event,
+                                            response_create_committed,
+                                        )
+                                })
+                            {
                                 let body = active_response_body.as_ref().ok_or_else(|| {
                                     ProxyError::bad_request(
                                         "response.create body is unavailable for HTTP fallback",
@@ -14141,686 +14847,477 @@ async fn bridge_responses_websocket_inner(
                                 refresh_target_before_connect = true;
                                 continue;
                             }
-                        }
-                    }
-                }
-                if entry.is_none() {
-                    return Err(ProxyError::bad_request(
-                        "the first responses websocket request must be response.create",
-                    ));
-                }
-                if starts_response
-                    && matches!(mode, ResponsesWebsocketMode::Grok)
-                    && active_grok_reasoning_replay.as_ref().is_some()
-                    && !active_grok_reasoning_replay
-                        .as_ref()
-                        .expect("checked Grok replay context")
-                        .binding_is_current(state)
-                        .await
-                {
-                    let original = active_grok_reasoning_retry_message.take().ok_or_else(|| {
-                            ProxyError::conflict(
-                                "Grok replay binding changed before the request was sent",
-                            )
-                        })?;
-                    message = original.clone();
-                    let refreshed = match prepare_grok_reasoning_replay_websocket(
-                        state,
-                        &execution,
-                        &request_context,
-                        grok_turn_index,
-                        grok_session_id.as_deref(),
-                        &ws_url,
-                        &mut message,
-                        active_attempt.request_memory(),
-                    )
-                    .await
-                    {
-                        Ok(replay) => replay,
-                        Err(error) if error.is_request_memory_exhausted() => {
-                            let _failed_entry = entry.take();
-                            let error_body = websocket_stream_error_body(
-                                error.client_message(),
-                                error.error_code(),
-                            );
-                            return terminate_responses_websocket_with_error(
+                            if !response_in_flight {
+                                refresh_target_before_connect = true;
+                                continue;
+                            }
+                            return terminate_responses_websocket_without_terminal(
                                 &mut downstream,
                                 &mut output_patcher,
                                 mode,
                                 state,
                                 &execution,
                                 &mut pending_lifecycle_messages,
-                                error,
-                                Some("memory_capacity"),
-                                error_body,
-                                None,
+                                Some(&message),
                                 &mut active_usage_turn,
                             )
                             .await;
                         }
-                        Err(error) => return Err(error),
-                    }
-                    .ok_or_else(|| {
-                        ProxyError::conflict(
-                            "Grok replay scope changed before the request was sent",
-                        )
-                    })?;
-                    if !grok_provider::binding_is_current(state, &refreshed).await {
-                        return Err(ProxyError::conflict(
-                            "Grok Provider or Account changed before the request was sent",
-                        ));
-                    }
-                    active_response_body = Some(responses_websocket_http_body(&message)?);
-                    active_grok_reasoning_replay =
-                        Some(grok_provider::ReplayStreamWrite::new(refreshed)?);
-                    active_grok_reasoning_retry_message = Some(original);
-                    crate::metrics::record_grok_reasoning_replay("binding_reprepared", 1);
-                }
-                if starts_response {
-                    if let (Some(turn), Some(body)) = (active_usage_turn.as_mut(), active_response_body.as_ref()) {
-                        turn.admit_generation(body, websocket_message_payload_len(&message)).await?;
-                    }
-                }
-                let send_result = {
-                    let _account_read_guard = if starts_response {
-                        Some(
-                            lock_responses_websocket_turn_accounts(state, &execution, mode)
-                                .await?,
-                        )
-                    } else {
-                        None
-                    };
-                    entry
-                        .as_ref()
-                        .expect("upstream websocket is connected")
-                        .socket
-                        .set_request_memory(active_attempt.request_memory().cloned());
-                    send_responses_upstream_while_serving_downstream(
-                        &entry
-                            .as_ref()
-                            .expect("upstream websocket is connected")
-                            .socket,
-                        &mut downstream,
-                        message,
-                        active_attempt.request_memory(),
-                        matches!(mode, ResponsesWebsocketMode::Codex),
-                        matches!(mode, ResponsesWebsocketMode::Codex).then(|| {
-                            (
-                                &mut codex_interrupt,
-                                &terminal_response_ids,
-                                entry.as_ref().expect("upstream websocket is connected").created_at,
-                            )
-                        }),
-                        interrupt_ack_timeout,
-                    )
-                        .await
-                };
-                let send_error = match send_result {
-                    Ok(ResponsesWebsocketSendOutcome::Sent) => None,
-                    Ok(ResponsesWebsocketSendOutcome::DownstreamClosed) => {
-                        finish_active_websocket_usage(
-                            &mut active_usage_turn,
-                            499,
-                            "client_cancelled",
-                            Some("downstream websocket closed during upstream write".to_string()),
-                        )
-                        .await;
-                        let _cancelled_entry = entry.take();
-                        break;
-                    }
-                    Err(ResponsesWebsocketSendFailure::Downstream(error)) => return Err(error),
-                    Err(ResponsesWebsocketSendFailure::InterruptAckTimeout) => {
-                        let _expired_entry = entry.take();
-                        return terminate_codex_interrupt_ack_timeout(
-                            &mut downstream, &mut output_patcher, mode, state, &execution,
-                            &mut pending_lifecycle_messages, &mut active_usage_turn,
-                            &codex_interrupt, response_in_flight,
-                        ).await;
-                    }
-                    Err(ResponsesWebsocketSendFailure::Memory(error)) => {
-                        let _failed_entry = entry.take();
-                        let error_body = websocket_stream_error_body(
-                            error.client_message(),
-                            error.error_code(),
-                        );
-                        return terminate_responses_websocket_with_error(
-                            &mut downstream,
-                            &mut output_patcher,
-                            mode,
-                            state,
-                            &execution,
-                            &mut pending_lifecycle_messages,
-                            error,
-                            Some("memory_capacity"),
-                            error_body,
-                            None,
-                            &mut active_usage_turn,
-                        )
-                        .await;
-                    }
-                    Err(ResponsesWebsocketSendFailure::Upstream(error)) => Some(error),
-                };
-                if let Some(error) = send_error {
-                    let _failed_entry = entry.take();
-                    if response_in_flight
-                        && responses_websocket_http_replay_allowed(
-                            mode,
-                            emitted_business_event,
-                            response_create_committed,
-                        )
-                    {
-                        let body = active_response_body.as_ref().ok_or_else(|| {
-                            ProxyError::bad_request(
-                                "response.create body is unavailable for HTTP fallback",
-                            )
-                        })?;
-                        let source = if entry_was_cached {
-                            "cached_stale"
+                        let semantic_observation = if response_in_flight {
+                            match classify_responses_websocket_message_with_timing(
+                                &message,
+                                response_repeat_tracker.as_mut(),
+                                active_attempt.request_memory().and_then(RequestMemoryBudget::timing).as_ref(),
+                            ) {
+                                Ok(observation) => observation,
+                                Err(error) => {
+                                    crate::metrics::record_proxy_semantic_guard(
+                                        "websocket",
+                                        "protocol_error",
+                                    );
+                                    if responses_websocket_http_replay_allowed(
+                                        mode,
+                                        emitted_business_event,
+                                        response_create_committed,
+                                    ) {
+                                        let failed = execution.runtime_stored_view();
+                                        record_provider_outcome(
+                                            state,
+                                            &failed,
+                                            ProviderOutcome::Failure { status_code: 502 },
+                                        )
+                                        .await;
+                                        let _failed_entry = entry.take();
+                                        {
+                                            pending_lifecycle_messages.clear();
+                                            if let Some(reservation) =
+                                                active_semantic_prelude_memory.as_ref()
+                                            {
+                                                let _ = reservation.resize(0);
+                                            }
+                                            output_patcher.clear_output_items();
+                                            let body = active_response_body.as_ref().ok_or_else(|| {
+                                                ProxyError::bad_request(
+                                                    "response.create body is unavailable for HTTP fallback",
+                                                )
+                                            })?;
+                                            let outcome = run_codex_websocket_http_fallback(
+                                                &mut downstream,
+                                                state,
+                                                &mut execution,
+                                                body,
+                                                grok_session_id.as_deref(),
+                                                grok_turn_index,
+                                                first_byte_timeout,
+                                                stream_idle_timeout,
+                                                "semantic_protocol_error",
+                                                &mut active_attempt,
+                                                &mut output_patcher,
+                                                active_response_intent.as_ref().expect("active response intent"),
+                                                &mut active_usage_turn,
+                                            )
+                                            .await?;
+                                            if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
+                                                return Ok(());
+                                            }
+                                            response_in_flight = false;
+                                            response_create_committed = false;
+                                            account_in_flight_guard.take();
+                                            active_response_body = None;
+                                            active_response_intent = None;
+                                            release_responses_websocket_turn_memory(
+                                                entry.as_ref(),
+                                                &mut active_attempt,
+                                                &mut active_normalized_memory,
+                                                &mut active_semantic_prelude_memory,
+                                                &mut active_tool_argument_memory,
+                                                &mut active_grok_reasoning_replay,
+                                                &mut active_grok_reasoning_retry_message,
+                                                &mut active_grok_reasoning_retry_memory,
+                                            );
+                                            upstream_read_deadline = None;
+                                            refresh_target_before_connect = true;
+                                            continue;
+                                        }
+                                    }
+                                    let error_body = websocket_stream_error_body(
+                                        error.client_message(),
+                                        "upstream_protocol_error",
+                                    );
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        None,
+                                        error_body,
+                                        Some(ProviderOutcome::Failure { status_code: 502 }),
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                            }
                         } else {
-                            "send_failure"
+                            // These exact, shape-checked frames belong to the account,
+                            // not the next response lease. Unknown idle frames retain
+                            // their existing delivery contract. Quota observation above
+                            // is separate from downstream visibility and token usage.
+                            let idle_observation = matches!(mode, ResponsesWebsocketMode::Codex)
+                                .then(|| websocket_message_payload(&message)
+                                    .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+                                    .map(|value| response_semantics::classify_value(&value))).flatten();
+                            match idle_observation {
+                                Some(SemanticObservation::Metadata) => continue,
+                                Some(SemanticObservation::Control) => Some(SemanticObservation::Control),
+                                _ => None,
+                            }
                         };
-                        pending_lifecycle_messages.clear();
-                        if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
-                            let _ = reservation.resize(0);
+                        if matches!(mode, ResponsesWebsocketMode::Codex) {
+                            if semantic_observation == Some(SemanticObservation::Control) {
+                                let value = serde_json::from_slice::<Value>(websocket_message_payload(&message).expect("control payload"))
+                                    .expect("classified control JSON");
+                                if !entry.as_ref().is_some_and(|entry| codex_interrupt.observe_ack(entry.created_at, &value)) {
+                                    crate::metrics::record_proxy_semantic_guard("websocket", "unmatched_control");
+                                    continue;
+                                }
+                            } else if response_in_flight {
+                                if let Some(id) = codex_websocket_response_id(&message) {
+                                    if codex_interrupt.observe_response_id(entry.as_ref().expect("active connection").created_at, &id).is_err() {
+                                        let _failed_entry = entry.take();
+                                        let error = ProxyError::bad_gateway("upstream response identity changed during a turn");
+                                        let body = websocket_stream_error_body(error.client_message(), "upstream_protocol_error");
+                                        return terminate_responses_websocket_with_error(
+                                            &mut downstream,
+                                            &mut output_patcher,
+                                            mode,
+                                            state,
+                                            &execution,
+                                            &mut pending_lifecycle_messages,
+                                            error,
+                                            None,
+                                            body,
+                                            Some(ProviderOutcome::Failure { status_code: 502 }),
+                                            &mut active_usage_turn,
+                                        ).await;
+                                    }
+                                }
+                            }
                         }
-                        let outcome = run_codex_websocket_http_fallback(
-                            &mut downstream,
-                            state,
-                            &mut execution,
-                            body,
-                            grok_session_id.as_deref(),
-                            grok_turn_index,
-                            first_byte_timeout,
-                            stream_idle_timeout,
-                            source,
-                            &mut active_attempt,
-                            &mut output_patcher,
-                            active_response_intent.as_ref().expect("active response intent"),
-                            &mut active_usage_turn,
-                        )
-                        .await?;
-                        if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
-                            return Ok(());
+                        if response_in_flight {
+                            if let Some(bytes) = websocket_message_payload(&message) {
+                                if let Some(replay) = active_grok_reasoning_replay.as_mut() {
+                                    if let Err(error) = replay.inspect(bytes) {
+                                        let _failed_entry = entry.take();
+                                        let error_body = websocket_stream_error_body(
+                                            error.client_message(),
+                                            error.error_code(),
+                                        );
+                                        return terminate_responses_websocket_with_error(
+                                            &mut downstream,
+                                            &mut output_patcher,
+                                            mode,
+                                            state,
+                                            &execution,
+                                            &mut pending_lifecycle_messages,
+                                            error,
+                                            Some("memory_capacity"),
+                                            error_body,
+                                            None,
+                                            &mut active_usage_turn,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
                         }
-                        response_in_flight = false;
-                        response_create_committed = false;
-                        account_in_flight_guard.take();
-                        active_response_body = None;
-                        active_response_intent = None;
-                        release_responses_websocket_turn_memory(
-                            entry.as_ref(),
-                            &mut active_attempt,
-                            &mut active_normalized_memory,
-                            &mut active_semantic_prelude_memory,
-                            &mut active_tool_argument_memory,
-                            &mut active_grok_reasoning_replay,
-                            &mut active_grok_reasoning_retry_message,
-                            &mut active_grok_reasoning_retry_memory,
-                        );
-                        refresh_target_before_connect = true;
-                        continue;
-                    }
-                    let error = ProxyError::bad_gateway(error.to_string());
-                    if response_in_flight {
-                        let error_body = websocket_stream_error_body(
-                            error.client_message(),
-                            "upstream_stream_transport_error",
-                        );
-                        return terminate_responses_websocket_with_error(
-                            &mut downstream,
-                            &mut output_patcher,
-                            mode,
-                            state,
-                            &execution,
-                            &mut pending_lifecycle_messages,
-                            error,
-                            Some("transport_error"),
-                            error_body,
-                            Some(ProviderOutcome::NetworkFailure),
-                            &mut active_usage_turn,
-                        )
-                        .await;
-                    }
-                    return Err(error);
-                }
-                if starts_response {
-                    response_create_committed = true;
-                    upstream_read_deadline = first_byte_timeout
-                        .map(|timeout| tokio::time::Instant::now() + timeout);
-                }
-            }
-            upstream_read = next_responses_websocket_message(&mut entry, codex_interrupt.read_deadline(upstream_read_deadline), active_attempt.request_memory()) => {
-                let upstream_message = match upstream_read {
-                    ResponsesWebsocketRead::Message(message) => message,
-                    ResponsesWebsocketRead::TimedOut => {
-                        if codex_interrupt.ack_expired(tokio::time::Instant::now()) {
-                            let _expired_entry = entry.take();
-                            return terminate_codex_interrupt_ack_timeout(
-                                &mut downstream, &mut output_patcher, mode, state, &execution,
-                                &mut pending_lifecycle_messages, &mut active_usage_turn,
-                                &codex_interrupt, response_in_flight,
-                            ).await;
-                        }
-                        let _timed_out_entry = entry.take();
-                        if response_in_flight
-                            && responses_websocket_http_replay_allowed(
-                                mode,
-                                emitted_business_event,
-                                response_create_committed,
+                        if matches!(mode, ResponsesWebsocketMode::Grok)
+                            && !emitted_business_event
+                            && !active_grok_reasoning_recovery_attempted
+                            && active_response_started_at.is_some_and(|started| {
+                                started.elapsed().as_millis() < MAX_FORWARD_RETRY_ELAPSED_MS
+                            })
+                            && active_grok_reasoning_replay
+                                .as_ref()
+                                .is_some_and(grok_provider::ReplayStreamWrite::replay_applied)
+                            && grok_reasoning_rejection_from_websocket_message(&message)
+                            && active_attempt.reserve_in_place(
+                                &execution,
+                                "body",
+                                "grok_reasoning_rejected",
+                                RecoveryStage::Reasoning,
+                                DelaySource::Immediate,
                             )
                         {
-                            let body = active_response_body.as_ref().ok_or_else(|| {
-                                ProxyError::bad_request(
-                                    "response.create body is unavailable for HTTP fallback",
-                                )
-                            })?;
+                            let Some(retry_message) = active_grok_reasoning_retry_message.take() else {
+                                return Err(ProxyError::bad_gateway(
+                                    "Grok reasoning recovery request was not retained",
+                                ));
+                            };
+                            let grok_reasoning_retry_memory =
+                                active_grok_reasoning_retry_memory.take();
+                            let retry_timing = active_attempt.request_memory().and_then(RequestMemoryBudget::timing);
+                            if let Some(previous) = &retry_timing {
+                                previous.finish_attempt(TimingResult::Retried);
+                            }
+                            let retry_wait = retry_timing.as_ref().map(|timing| timing.wait(WaitKind::Retry));
+                            let retry_body = responses_websocket_http_body(&retry_message)?;
+                            if let Some(replay) = active_grok_reasoning_replay.as_mut() {
+                                if let Err(error) = replay.clear_rejected_and_reset(state).await {
+                                    let _failed_entry = entry.take();
+                                    let error_body = websocket_stream_error_body(
+                                        error.client_message(),
+                                        error.error_code(),
+                                    );
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        Some("memory_capacity"),
+                                        error_body,
+                                        None,
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                            }
                             pending_lifecycle_messages.clear();
                             if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
                                 let _ = reservation.resize(0);
                             }
-                            let outcome = run_codex_websocket_http_fallback(
-                                &mut downstream,
-                                state,
-                                &mut execution,
-                                body,
-                                grok_session_id.as_deref(),
-                                grok_turn_index,
-                                first_byte_timeout,
-                                stream_idle_timeout,
-                                "first_byte_timeout",
-                                &mut active_attempt,
-                                &mut output_patcher,
-                                active_response_intent.as_ref().expect("active response intent"),
-                                &mut active_usage_turn,
-                            )
-                            .await?;
-                            if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
-                                return Ok(());
-                            }
-                            response_in_flight = false;
-                            response_create_committed = false;
-                            account_in_flight_guard.take();
-                            active_response_body = None;
-                            active_response_intent = None;
-                            release_responses_websocket_turn_memory(
-                                entry.as_ref(),
-                                &mut active_attempt,
-                                &mut active_normalized_memory,
-                                &mut active_semantic_prelude_memory,
-                                &mut active_tool_argument_memory,
-                                &mut active_grok_reasoning_replay,
-                                &mut active_grok_reasoning_retry_message,
-                                &mut active_grok_reasoning_retry_memory,
+                            output_patcher.begin_response(
+                                None,
+                                Some(transforms::responses_tool_context(&retry_body))
+                                    .filter(transforms::ResponsesToolContext::requires_grok_emulation),
                             );
-                            upstream_read_deadline = None;
-                            refresh_target_before_connect = true;
+                            active_response_body = Some(retry_body);
+                            response_repeat_tracker = Some(ResponsesRepeatTracker::default());
+                            active_grok_quality_observer =
+                                Some(Box::new(super::grok::GrokQualityObserver::new(true)));
+                            active_grok_reasoning_recovery_attempted = true;
+                            record_forward_retry(
+                                ProxyRoute::CodexResponses,
+                                "body",
+                                "grok_reasoning_rejected",
+                            );
+                            if let Some(turn) = active_usage_turn.as_mut() {
+                                turn.record_retry("body", "grok_reasoning_rejected");
+                            }
+                            let _account_read_guard =
+                                lock_responses_websocket_turn_accounts(state, &execution, mode).await?;
+                            drop(retry_wait);
+                            if let (Some(previous), Some(budget)) = (&retry_timing, active_attempt.request_memory()) {
+                                let next = previous.request().attempt(Instant::now());
+                                next.mark(Milestone::Admission);
+                                active_attempt.timing.adopt_websocket_attempt(next.clone());
+                                budget.set_timing(next);
+                            }
+                            if let (Some(turn), Some(body)) = (active_usage_turn.as_mut(), active_response_body.as_ref()) {
+                                turn.admit_generation(body, websocket_message_payload_len(&retry_message)).await?;
+                            }
+                            let retry_send = send_responses_upstream_while_serving_downstream(
+                                &entry
+                                    .as_ref()
+                                    .expect("upstream websocket is connected")
+                                    .socket,
+                                &mut downstream,
+                                retry_message,
+                                active_attempt.request_memory(),
+                                false,
+                                None,
+                                interrupt_ack_timeout,
+                            )
+                            .await;
+                            drop(grok_reasoning_retry_memory);
+                            let error = match retry_send {
+                                Ok(ResponsesWebsocketSendOutcome::Sent) => None,
+                                Ok(ResponsesWebsocketSendOutcome::DownstreamClosed) => {
+                                    finish_active_websocket_usage(
+                                        &mut active_usage_turn,
+                                        499,
+                                        "client_cancelled",
+                                        Some(
+                                            "downstream websocket closed during upstream retry write"
+                                                .to_string(),
+                                        ),
+                                    )
+                                    .await;
+                                    let _cancelled_entry = entry.take();
+                                    break;
+                                }
+                                Err(ResponsesWebsocketSendFailure::Downstream(error)) => return Err(error),
+                                Err(ResponsesWebsocketSendFailure::InterruptAckTimeout) => {
+                                    return Err(ProxyError::bad_gateway("unexpected interrupt wait on Grok retry"));
+                                }
+                                Err(ResponsesWebsocketSendFailure::Memory(error)) => {
+                                    let _failed_entry = entry.take();
+                                    let error_body = websocket_stream_error_body(
+                                        error.client_message(),
+                                        error.error_code(),
+                                    );
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        Some("memory_capacity"),
+                                        error_body,
+                                        None,
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                                Err(ResponsesWebsocketSendFailure::Upstream(error)) => Some(error),
+                            };
+                            if let Some(error) = error {
+                                let error = ProxyError::bad_gateway(error.to_string());
+                                let error_body = websocket_stream_error_body(
+                                    error.client_message(),
+                                    "upstream_stream_transport_error",
+                                );
+                                return terminate_responses_websocket_with_error(
+                                    &mut downstream,
+                                    &mut output_patcher,
+                                    mode,
+                                    state,
+                                    &execution,
+                                    &mut pending_lifecycle_messages,
+                                    error,
+                                    Some("transport_error"),
+                                    error_body,
+                                    Some(ProviderOutcome::NetworkFailure),
+                                    &mut active_usage_turn,
+                                )
+                                .await;
+                            }
+                            response_create_committed = true;
+                            upstream_read_deadline = first_byte_timeout
+                                .map(|timeout| tokio::time::Instant::now() + timeout);
                             continue;
                         }
-                        let error = ProxyError {
-                            status: StatusCode::GATEWAY_TIMEOUT,
-                            message: if emitted_business_event {
-                                "responses websocket stream idle timeout".to_string()
-                            } else {
-                                "responses websocket first byte timeout".to_string()
-                            },
-                        };
-                        let error_body = websocket_stream_error_body(
-                            error.client_message(),
-                            "upstream_stream_timeout",
-                        );
-                        return terminate_responses_websocket_with_error(
-                            &mut downstream,
-                            &mut output_patcher,
-                            mode,
-                            state,
-                            &execution,
-                            &mut pending_lifecycle_messages,
-                            error,
-                            Some("transport_error"),
-                            error_body,
-                            Some(ProviderOutcome::NetworkFailure),
-                            &mut active_usage_turn,
-                        )
-                        .await;
-                    }
-                };
-                let Some(message) = upstream_message else {
-                    let _closed_entry = entry.take();
-                    if response_in_flight
-                        && responses_websocket_http_replay_allowed(
-                            mode,
-                            emitted_business_event,
-                            response_create_committed,
-                        )
-                    {
-                        let body = active_response_body.as_ref().ok_or_else(|| {
-                            ProxyError::bad_request(
-                                "response.create body is unavailable for HTTP fallback",
-                            )
-                        })?;
-                        let source = if entry_was_cached {
-                            "cached_stale"
-                        } else {
-                            "closed_before_event"
-                        };
-                        pending_lifecycle_messages.clear();
-                        if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
-                            let _ = reservation.resize(0);
+                        if matches!(mode, ResponsesWebsocketMode::Grok) && response_in_flight {
+                            if let (Some(observer), Some(bytes)) = (
+                                active_grok_quality_observer.as_mut(),
+                                websocket_message_payload(&message),
+                            ) {
+                                observer.observe_json_bytes(bytes);
+                            }
                         }
-                        let outcome = run_codex_websocket_http_fallback(
-                            &mut downstream,
-                            state,
-                            &mut execution,
-                            body,
-                            grok_session_id.as_deref(),
-                            grok_turn_index,
-                            first_byte_timeout,
-                            stream_idle_timeout,
-                            source,
-                            &mut active_attempt,
-                            &mut output_patcher,
-                            active_response_intent.as_ref().expect("active response intent"),
-                            &mut active_usage_turn,
-                        )
-                        .await?;
-                        if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
-                            return Ok(());
-                        }
-                        response_in_flight = false;
-                        response_create_committed = false;
-                        account_in_flight_guard.take();
-                        active_response_body = None;
-                        active_response_intent = None;
-                        release_responses_websocket_turn_memory(
-                            entry.as_ref(),
-                            &mut active_attempt,
-                            &mut active_normalized_memory,
-                            &mut active_semantic_prelude_memory,
-                            &mut active_tool_argument_memory,
-                            &mut active_grok_reasoning_replay,
-                            &mut active_grok_reasoning_retry_message,
-                            &mut active_grok_reasoning_retry_memory,
-                        );
-                        refresh_target_before_connect = true;
-                        continue;
-                    }
-                    if response_in_flight {
-                        return terminate_responses_websocket_without_terminal(
-                            &mut downstream,
-                            &mut output_patcher,
-                            mode,
-                            state,
-                            &execution,
-                            &mut pending_lifecycle_messages,
-                            None,
-                            &mut active_usage_turn,
-                        )
-                        .await;
-                    }
-                    refresh_target_before_connect = true;
-                    continue;
-                };
-                let ResponsesWebSocketReadMessage {
-                    result: message,
-                    _memory: _read_queue_memory,
-                } = message;
-                let message = match message {
-                    Err(ResponsesWebSocketReadError::Memory(error)) => {
-                        let _failed_entry = entry.take();
-                        let error_body = websocket_stream_error_body(
-                            error.client_message(),
-                            error.error_code(),
-                        );
-                        if response_in_flight {
-                            return terminate_responses_websocket_with_error(
-                                &mut downstream,
-                                &mut output_patcher,
-                                mode,
-                                state,
-                                &execution,
-                                &mut pending_lifecycle_messages,
-                                error,
-                                Some("memory_capacity"),
-                                error_body,
-                                None,
-                                &mut active_usage_turn,
-                            )
-                            .await;
-                        }
-                        return Err(error);
-                    }
-                    Ok(message) => message,
-                    Err(ResponsesWebSocketReadError::Transport(error))
-                        if response_in_flight
-                            && responses_websocket_http_replay_allowed(
-                                mode,
-                                emitted_business_event,
-                                response_create_committed,
-                            )
-                            && websocket_read_fallback_source(&error, entry_was_cached).is_some() =>
-                    {
-                        let source = websocket_read_fallback_source(&error, entry_was_cached)
-                            .expect("checked websocket fallback source");
-                        let _failed_entry = entry.take();
-                        let body = active_response_body.as_ref().ok_or_else(|| {
-                            ProxyError::bad_request(
-                                "response.create body is unavailable for HTTP fallback",
-                            )
-                        })?;
-                        pending_lifecycle_messages.clear();
-                        if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
-                            let _ = reservation.resize(0);
-                        }
-                        let outcome = run_codex_websocket_http_fallback(
-                            &mut downstream,
-                            state,
-                            &mut execution,
-                            body,
-                            grok_session_id.as_deref(),
-                            grok_turn_index,
-                            first_byte_timeout,
-                            stream_idle_timeout,
-                                source,
-                                &mut active_attempt,
-                                &mut output_patcher,
-                                active_response_intent.as_ref().expect("active response intent"),
-                                &mut active_usage_turn,
-                        )
-                        .await?;
-                        if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
-                            return Ok(());
-                        }
-                        response_in_flight = false;
-                        response_create_committed = false;
-                        account_in_flight_guard.take();
-                        active_response_body = None;
-                        active_response_intent = None;
-                        release_responses_websocket_turn_memory(
-                            entry.as_ref(),
-                            &mut active_attempt,
-                            &mut active_normalized_memory,
-                            &mut active_semantic_prelude_memory,
-                            &mut active_tool_argument_memory,
-                            &mut active_grok_reasoning_replay,
-                            &mut active_grok_reasoning_retry_message,
-                            &mut active_grok_reasoning_retry_memory,
-                        );
-                        refresh_target_before_connect = true;
-                        continue;
-                    }
-                    Err(ResponsesWebSocketReadError::Transport(error))
-                        if websocket_message_too_big(&error) =>
-                    {
-                        let body = websocket_message_too_big_error_body();
-                        let error = ProxyError {
-                            status: StatusCode::PAYLOAD_TOO_LARGE,
-                            message: "upstream websocket message too big".to_string(),
-                        };
-                        if response_in_flight {
-                            return terminate_responses_websocket_with_error(
-                                &mut downstream,
-                                &mut output_patcher,
-                                mode,
-                                state,
-                                &execution,
-                                &mut pending_lifecycle_messages,
-                                error,
-                                Some("transport_error"),
-                                body,
-                                Some(ProviderOutcome::Failure { status_code: 413 }),
-                                &mut active_usage_turn,
-                            )
-                            .await;
-                        }
-                        let _ = downstream.send(AxumWsMessage::Text(body)).await;
-                        return Err(error);
-                    }
-                    Err(ResponsesWebSocketReadError::Transport(error))
-                        if websocket_expected_reset(&error) && !response_in_flight =>
-                    {
-                        let _closed_entry = entry.take();
-                        refresh_target_before_connect = true;
-                        continue;
-                    }
-                    Err(ResponsesWebSocketReadError::Transport(error)) => {
-                        let error = ProxyError::bad_gateway(error.to_string());
-                        if response_in_flight {
-                            let error_body = websocket_stream_error_body(
-                                error.client_message(),
-                                "upstream_stream_transport_error",
+                        if let Some(observation) = &semantic_observation {
+                            if let Some(timing) = active_attempt.request_memory().and_then(RequestMemoryBudget::timing) {
+                                if !timing.is_grok() {
+                                    timing.observe(observation);
+                                }
+                            }
+                            crate::metrics::record_proxy_semantic_guard(
+                                "websocket",
+                                observation.metric_kind(),
                             );
-                            return terminate_responses_websocket_with_error(
-                                &mut downstream,
-                                &mut output_patcher,
-                                mode,
-                                state,
-                                &execution,
-                                &mut pending_lifecycle_messages,
-                                error,
-                                Some("transport_error"),
-                                error_body,
-                                Some(ProviderOutcome::NetworkFailure),
-                                &mut active_usage_turn,
-                            )
-                            .await;
+                            if let Some(turn) = active_usage_turn.as_mut() {
+                                turn.observe_message(&message, observation.counts_as_business_output());
+                            }
                         }
-                        return Err(error);
-                    }
-                };
-                match &message {
-                    TungsteniteMessage::Text(text) => codex::record_quota_websocket_payload(state, &execution, text.as_bytes()),
-                    TungsteniteMessage::Binary(bytes) => codex::record_quota_websocket_payload(state, &execution, bytes),
-                    _ => {}
-                }
-                let upstream_closed = matches!(message, TungsteniteMessage::Close(_));
-                if upstream_closed {
-                    let fallback_source = websocket_close_fallback_source(
-                        &message,
-                        entry_was_cached,
-                    );
-                    let _closed_entry = entry.take();
-                    if let Some(source) = fallback_source
-                        .filter(|_| {
-                            response_in_flight
+                        if matches!(
+                            semantic_observation,
+                            Some(SemanticObservation::Lifecycle | SemanticObservation::Metadata | SemanticObservation::ErrorFrame(_))
+                        ) && !emitted_business_event
+                        {
+                            let buffered_bytes = pending_lifecycle_messages
+                                .iter()
+                                .map(websocket_message_payload_len)
+                                .sum::<usize>()
+                                .saturating_add(websocket_message_payload_len(&message));
+                            if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                                if let Err(error) = reservation.resize(buffered_bytes) {
+                                    let _failed_entry = entry.take();
+                                    let error = error.into_proxy_error();
+                                    let error_body = websocket_stream_error_body(
+                                        error.client_message(),
+                                        error.error_code(),
+                                    );
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        Some("memory_capacity"),
+                                        error_body,
+                                        None,
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                            }
+                            if pending_lifecycle_messages.len()
+                                >= MAX_RESPONSES_SEMANTIC_PRELUDE_MESSAGES
+                                || buffered_bytes > MAX_RESPONSES_SEMANTIC_PRELUDE_BYTES
+                            {
+                                let error = ProxyError::bad_gateway(
+                                    "Responses websocket lifecycle prelude exceeded its bound",
+                                );
+                                let error_body = websocket_stream_error_body(
+                                    error.client_message(),
+                                    "upstream_protocol_error",
+                                );
+                                return terminate_responses_websocket_with_error(
+                                    &mut downstream,
+                                    &mut output_patcher,
+                                    mode,
+                                    state,
+                                    &execution,
+                                    &mut pending_lifecycle_messages,
+                                    error,
+                                    Some("protocol_error"),
+                                    error_body,
+                                    Some(ProviderOutcome::Failure { status_code: 502 }),
+                                    &mut active_usage_turn,
+                                )
+                                .await;
+                            }
+                            pending_lifecycle_messages.push(message);
+                            continue;
+                        }
+                        if let Some(failure) = semantic_observation
+                            .as_ref()
+                            .and_then(provider_stream_failure)
+                        {
+                            if !grok_reasoning_rejection_from_websocket_message(&message)
                                 && responses_websocket_http_replay_allowed(
                                     mode,
                                     emitted_business_event,
                                     response_create_committed,
                                 )
-                        })
-                    {
-                        let body = active_response_body.as_ref().ok_or_else(|| {
-                            ProxyError::bad_request(
-                                "response.create body is unavailable for HTTP fallback",
-                            )
-                        })?;
-                        pending_lifecycle_messages.clear();
-                        if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
-                            let _ = reservation.resize(0);
-                        }
-                        let outcome = run_codex_websocket_http_fallback(
-                            &mut downstream,
-                            state,
-                            &mut execution,
-                            body,
-                            grok_session_id.as_deref(),
-                            grok_turn_index,
-                            first_byte_timeout,
-                            stream_idle_timeout,
-                            source,
-                            &mut active_attempt,
-                            &mut output_patcher,
-                            active_response_intent.as_ref().expect("active response intent"),
-                            &mut active_usage_turn,
-                        )
-                        .await?;
-                        if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
-                            return Ok(());
-                        }
-                        response_in_flight = false;
-                        response_create_committed = false;
-                        account_in_flight_guard.take();
-                        active_response_body = None;
-                        active_response_intent = None;
-                        release_responses_websocket_turn_memory(
-                            entry.as_ref(),
-                            &mut active_attempt,
-                            &mut active_normalized_memory,
-                            &mut active_semantic_prelude_memory,
-                            &mut active_tool_argument_memory,
-                            &mut active_grok_reasoning_replay,
-                            &mut active_grok_reasoning_retry_message,
-                            &mut active_grok_reasoning_retry_memory,
-                        );
-                        refresh_target_before_connect = true;
-                        continue;
-                    }
-                    if !response_in_flight {
-                        refresh_target_before_connect = true;
-                        continue;
-                    }
-                    return terminate_responses_websocket_without_terminal(
-                        &mut downstream,
-                        &mut output_patcher,
-                        mode,
-                        state,
-                        &execution,
-                        &mut pending_lifecycle_messages,
-                        Some(&message),
-                        &mut active_usage_turn,
-                    )
-                    .await;
-                }
-                let semantic_observation = if response_in_flight {
-                    match classify_responses_websocket_message_with_timing(
-                        &message,
-                        response_repeat_tracker.as_mut(),
-                        active_attempt.request_memory().and_then(RequestMemoryBudget::timing).as_ref(),
-                    ) {
-                        Ok(observation) => observation,
-                        Err(error) => {
-                            crate::metrics::record_proxy_semantic_guard(
-                                "websocket",
-                                "protocol_error",
-                            );
-                            if responses_websocket_http_replay_allowed(
-                                mode,
-                                emitted_business_event,
-                                response_create_committed,
-                            ) {
+                            {
                                 let failed = execution.runtime_stored_view();
-                                record_provider_outcome(
-                                    state,
-                                    &failed,
-                                    ProviderOutcome::Failure { status_code: 502 },
-                                )
-                                .await;
+                                if !semantic_provider_outcome_recorded {
+                                    record_provider_outcome(
+                                        state,
+                                        &failed,
+                                        if is_openai_capacity_shed_failure(failure) {
+                                            capacity_shed_provider_outcome()
+                                        } else {
+                                            ProviderOutcome::Failure { status_code: 502 }
+                                        },
+                                    )
+                                    .await;
+                                    semantic_provider_outcome_recorded = true;
+                                }
                                 let _failed_entry = entry.take();
                                 {
                                     pending_lifecycle_messages.clear();
-                                    if let Some(reservation) =
-                                        active_semantic_prelude_memory.as_ref()
-                                    {
+                                    if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
                                         let _ = reservation.resize(0);
                                     }
                                     output_patcher.clear_output_items();
@@ -14838,7 +15335,7 @@ async fn bridge_responses_websocket_inner(
                                         grok_turn_index,
                                         first_byte_timeout,
                                         stream_idle_timeout,
-                                        "semantic_protocol_error",
+                                        "semantic_failure",
                                         &mut active_attempt,
                                         &mut output_patcher,
                                         active_response_intent.as_ref().expect("active response intent"),
@@ -14868,76 +15365,204 @@ async fn bridge_responses_websocket_inner(
                                     continue;
                                 }
                             }
-                            let error_body = websocket_stream_error_body(
-                                error.client_message(),
-                                "upstream_protocol_error",
-                            );
-                            return terminate_responses_websocket_with_error(
+                        }
+
+                        for pending in std::mem::take(&mut pending_lifecycle_messages) {
+                            let sent_close = match send_responses_websocket_message(
                                 &mut downstream,
                                 &mut output_patcher,
                                 mode,
-                                state,
-                                &execution,
-                                &mut pending_lifecycle_messages,
-                                error,
-                                None,
-                                error_body,
-                                Some(ProviderOutcome::Failure { status_code: 502 }),
-                                &mut active_usage_turn,
+                                pending,
+                                active_attempt.request_memory(),
+                                active_tool_argument_memory.as_ref(),
                             )
-                            .await;
-                        }
-                    }
-                } else {
-                    // These exact, shape-checked frames belong to the account,
-                    // not the next response lease. Unknown idle frames retain
-                    // their existing delivery contract. Quota observation above
-                    // is separate from downstream visibility and token usage.
-                    let idle_observation = matches!(mode, ResponsesWebsocketMode::Codex)
-                        .then(|| websocket_message_payload(&message)
-                            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
-                            .map(|value| response_semantics::classify_value(&value))).flatten();
-                    match idle_observation {
-                        Some(SemanticObservation::Metadata) => continue,
-                        Some(SemanticObservation::Control) => Some(SemanticObservation::Control),
-                        _ => None,
-                    }
-                };
-                if matches!(mode, ResponsesWebsocketMode::Codex) {
-                    if semantic_observation == Some(SemanticObservation::Control) {
-                        let value = serde_json::from_slice::<Value>(websocket_message_payload(&message).expect("control payload"))
-                            .expect("classified control JSON");
-                        if !entry.as_ref().is_some_and(|entry| codex_interrupt.observe_ack(entry.created_at, &value)) {
-                            crate::metrics::record_proxy_semantic_guard("websocket", "unmatched_control");
-                            continue;
-                        }
-                    } else if response_in_flight {
-                        if let Some(id) = codex_websocket_response_id(&message) {
-                            if codex_interrupt.observe_response_id(entry.as_ref().expect("active connection").created_at, &id).is_err() {
-                                let _failed_entry = entry.take();
-                                let error = ProxyError::bad_gateway("upstream response identity changed during a turn");
-                                let body = websocket_stream_error_body(error.client_message(), "upstream_protocol_error");
-                                return terminate_responses_websocket_with_error(
-                                    &mut downstream,
-                                    &mut output_patcher,
-                                    mode,
-                                    state,
-                                    &execution,
-                                    &mut pending_lifecycle_messages,
-                                    error,
-                                    None,
-                                    body,
-                                    Some(ProviderOutcome::Failure { status_code: 502 }),
-                                    &mut active_usage_turn,
-                                ).await;
+                            .await
+                            {
+                                Ok(sent_close) => sent_close,
+                                Err(error) if error.is_request_memory_exhausted() => {
+                                    let _failed_entry = entry.take();
+                                    let error_body = websocket_stream_error_body(
+                                        error.client_message(),
+                                        error.error_code(),
+                                    );
+                                    return terminate_responses_websocket_with_error(
+                                        &mut downstream,
+                                        &mut output_patcher,
+                                        mode,
+                                        state,
+                                        &execution,
+                                        &mut pending_lifecycle_messages,
+                                        error,
+                                        Some("memory_capacity"),
+                                        error_body,
+                                        None,
+                                        &mut active_usage_turn,
+                                    )
+                                    .await;
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            if sent_close {
+                                return Ok(());
                             }
                         }
-                    }
-                }
-                if response_in_flight {
-                    if let Some(bytes) = websocket_message_payload(&message) {
-                        if let Some(replay) = active_grok_reasoning_replay.as_mut() {
-                            if let Err(error) = replay.inspect(bytes) {
+                        if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
+                            let _ = reservation.resize(0);
+                        }
+                        let semantic_terminal = match &semantic_observation {
+                            Some(SemanticObservation::SuccessTerminal) => Some(SemanticTerminal::Success),
+                            Some(SemanticObservation::IncompleteTerminal) => {
+                                Some(SemanticTerminal::Incomplete)
+                            }
+                            Some(SemanticObservation::Failure(failure)) => {
+                                Some(SemanticTerminal::Failure(failure.clone()))
+                            }
+                            Some(
+                                SemanticObservation::Lifecycle
+                                | SemanticObservation::Metadata
+                                | SemanticObservation::Control
+                                | SemanticObservation::Business
+                                | SemanticObservation::ErrorFrame(_),
+                            )
+                            | None => None,
+                        };
+                        let terminal = semantic_terminal.is_some()
+                            || (semantic_observation.is_none()
+                                && responses_websocket_response_is_terminal(&message));
+                        if matches!(mode, ResponsesWebsocketMode::Codex) && response_in_flight && terminal {
+                                if let (Some(entry), Some(id)) =
+                                    (entry.as_ref(), codex_interrupt.response_id())
+                                {
+                                    terminal_response_ids.remember(entry.created_at, id);
+                                }
+                                codex_interrupt.finish_generation();
+                        }
+                        if semantic_observation.is_none() {
+                            let usage_business = response_in_flight
+                                && !terminal
+                                && matches!(
+                                    message,
+                                    TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_)
+                                );
+                            if let Some(turn) = active_usage_turn.as_mut() {
+                                turn.observe_message(&message, usage_business);
+                            }
+                        }
+                        if terminal {
+                            let usage_terminal = semantic_terminal
+                                .clone()
+                                .unwrap_or(SemanticTerminal::Success);
+                            let completed_success =
+                                matches!(semantic_terminal, Some(SemanticTerminal::Success))
+                                    || (semantic_observation.is_none()
+                                        && grok_websocket_completed_success(&message));
+                            if completed_success {
+                                if let Some(observation) = active_grok_quality_observer
+                                    .as_mut()
+                                    .and_then(|observer| observer.finish())
+                                {
+                                    crate::metrics::record_grok_quality_observation(
+                                        "websocket",
+                                        observation.outcome,
+                                        observation.has_terminal,
+                                        observation.has_tool,
+                                        observation.has_visible_text,
+                                        observation.visible_length_bucket,
+                                    );
+                                }
+                                if let Some(replay) = active_grok_reasoning_replay.take() {
+                                    if let Err(error) = replay.commit(state).await {
+                                        let _failed_entry = entry.take();
+                                        let error_body = websocket_stream_error_body(
+                                            error.client_message(),
+                                            error.error_code(),
+                                        );
+                                        return terminate_responses_websocket_with_error(
+                                            &mut downstream,
+                                            &mut output_patcher,
+                                            mode,
+                                            state,
+                                            &execution,
+                                            &mut pending_lifecycle_messages,
+                                            error,
+                                            Some("memory_capacity"),
+                                            error_body,
+                                            None,
+                                            &mut active_usage_turn,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            } else {
+                                active_grok_reasoning_replay = None;
+                            }
+                            finish_active_websocket_terminal(&mut active_usage_turn, &usage_terminal).await;
+                            active_grok_quality_observer = None;
+                            active_grok_reasoning_retry_message = None;
+                            active_grok_reasoning_retry_memory = None;
+                            active_response_started_at = None;
+                            response_in_flight = false;
+                            response_create_committed = false;
+                            account_in_flight_guard.take();
+                            active_response_body = None;
+                            active_response_intent = None;
+                            upstream_read_deadline = None;
+                            match semantic_terminal {
+                                Some(SemanticTerminal::Failure(failure))
+                                    if failure.origin == FailureOrigin::Provider =>
+                                {
+                                    if !semantic_provider_outcome_recorded {
+                                        record_provider_outcome(
+                                            state,
+                                            &execution.runtime_stored_view(),
+                                            if is_openai_capacity_shed_failure(&failure) {
+                                                capacity_shed_provider_outcome()
+                                            } else {
+                                                ProviderOutcome::Failure { status_code: 502 }
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Some(SemanticTerminal::Failure(_)) => {}
+                                Some(SemanticTerminal::Success | SemanticTerminal::Incomplete) => {
+                                    record_provider_outcome(
+                                        state,
+                                        &execution.runtime_stored_view(),
+                                        ProviderOutcome::Success { status_code: 200 },
+                                    )
+                                    .await;
+                                }
+                                None => {}
+                            }
+                        } else if semantic_observation
+                            .as_ref()
+                            .is_some_and(SemanticObservation::counts_as_business_output)
+                            || (semantic_observation.is_none()
+                                && response_in_flight
+                                && matches!(
+                                    message,
+                                    TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_)
+                                ))
+                        {
+                            emitted_business_event = true;
+                            active_attempt.mark_downstream_committed();
+                            upstream_read_deadline = stream_idle_timeout
+                                .map(|timeout| tokio::time::Instant::now() + timeout);
+                        }
+                        let delivers_control = semantic_observation == Some(SemanticObservation::Control);
+                        let closes = match send_responses_websocket_message(
+                            &mut downstream,
+                            &mut output_patcher,
+                            mode,
+                            message,
+                            active_attempt.request_memory(),
+                            active_tool_argument_memory.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(closes) => closes,
+                            Err(error) if error.is_request_memory_exhausted() => {
                                 let _failed_entry = entry.take();
                                 let error_body = websocket_stream_error_body(
                                     error.client_message(),
@@ -14958,326 +15583,17 @@ async fn bridge_responses_websocket_inner(
                                 )
                                 .await;
                             }
+                            Err(error) => return Err(error),
+                        };
+                        if delivers_control {
+                            // A successful ACK write commits transport bytes, without
+                            // setting business/TTFT/idle progress or allowing replay.
+                            active_attempt.mark_downstream_committed();
                         }
-                    }
-                }
-                if matches!(mode, ResponsesWebsocketMode::Grok)
-                    && !emitted_business_event
-                    && !active_grok_reasoning_recovery_attempted
-                    && active_response_started_at.is_some_and(|started| {
-                        started.elapsed().as_millis() < MAX_FORWARD_RETRY_ELAPSED_MS
-                    })
-                    && active_grok_reasoning_replay
-                        .as_ref()
-                        .is_some_and(grok_provider::ReplayStreamWrite::replay_applied)
-                    && grok_reasoning_rejection_from_websocket_message(&message)
-                    && active_attempt.reserve_in_place(
-                        &execution,
-                        "body",
-                        "grok_reasoning_rejected",
-                        RecoveryStage::Reasoning,
-                        DelaySource::Immediate,
-                    )
-                {
-                    let Some(retry_message) = active_grok_reasoning_retry_message.take() else {
-                        return Err(ProxyError::bad_gateway(
-                            "Grok reasoning recovery request was not retained",
-                        ));
-                    };
-                    let grok_reasoning_retry_memory =
-                        active_grok_reasoning_retry_memory.take();
-                    let retry_timing = active_attempt.request_memory().and_then(RequestMemoryBudget::timing);
-                    if let Some(previous) = &retry_timing {
-                        previous.finish_attempt(TimingResult::Retried);
-                    }
-                    let retry_wait = retry_timing.as_ref().map(|timing| timing.wait(WaitKind::Retry));
-                    let retry_body = responses_websocket_http_body(&retry_message)?;
-                    if let Some(replay) = active_grok_reasoning_replay.as_mut() {
-                        if let Err(error) = replay.clear_rejected_and_reset(state).await {
-                            let _failed_entry = entry.take();
-                            let error_body = websocket_stream_error_body(
-                                error.client_message(),
-                                error.error_code(),
-                            );
-                            return terminate_responses_websocket_with_error(
-                                &mut downstream,
-                                &mut output_patcher,
-                                mode,
-                                state,
-                                &execution,
-                                &mut pending_lifecycle_messages,
-                                error,
-                                Some("memory_capacity"),
-                                error_body,
-                                None,
-                                &mut active_usage_turn,
-                            )
-                            .await;
-                        }
-                    }
-                    pending_lifecycle_messages.clear();
-                    if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
-                        let _ = reservation.resize(0);
-                    }
-                    output_patcher.begin_response(
-                        None,
-                        Some(transforms::responses_tool_context(&retry_body))
-                            .filter(transforms::ResponsesToolContext::requires_grok_emulation),
-                    );
-                    active_response_body = Some(retry_body);
-                    response_repeat_tracker = Some(ResponsesRepeatTracker::default());
-                    active_grok_quality_observer =
-                        Some(Box::new(super::grok::GrokQualityObserver::new(true)));
-                    active_grok_reasoning_recovery_attempted = true;
-                    record_forward_retry(
-                        ProxyRoute::CodexResponses,
-                        "body",
-                        "grok_reasoning_rejected",
-                    );
-                    if let Some(turn) = active_usage_turn.as_mut() {
-                        turn.record_retry("body", "grok_reasoning_rejected");
-                    }
-                    let _account_read_guard =
-                        lock_responses_websocket_turn_accounts(state, &execution, mode).await?;
-                    drop(retry_wait);
-                    if let (Some(previous), Some(budget)) = (&retry_timing, active_attempt.request_memory()) {
-                        let next = previous.request().attempt(Instant::now());
-                        next.mark(Milestone::Admission);
-                        active_attempt.timing.adopt_websocket_attempt(next.clone());
-                        budget.set_timing(next);
-                    }
-                    if let (Some(turn), Some(body)) = (active_usage_turn.as_mut(), active_response_body.as_ref()) {
-                        turn.admit_generation(body, websocket_message_payload_len(&retry_message)).await?;
-                    }
-                    let retry_send = send_responses_upstream_while_serving_downstream(
-                        &entry
-                            .as_ref()
-                            .expect("upstream websocket is connected")
-                            .socket,
-                        &mut downstream,
-                        retry_message,
-                        active_attempt.request_memory(),
-                        false,
-                        None,
-                        interrupt_ack_timeout,
-                    )
-                    .await;
-                    drop(grok_reasoning_retry_memory);
-                    let error = match retry_send {
-                        Ok(ResponsesWebsocketSendOutcome::Sent) => None,
-                        Ok(ResponsesWebsocketSendOutcome::DownstreamClosed) => {
-                            finish_active_websocket_usage(
-                                &mut active_usage_turn,
-                                499,
-                                "client_cancelled",
-                                Some(
-                                    "downstream websocket closed during upstream retry write"
-                                        .to_string(),
-                                ),
-                            )
-                            .await;
-                            let _cancelled_entry = entry.take();
-                            break;
-                        }
-                        Err(ResponsesWebsocketSendFailure::Downstream(error)) => return Err(error),
-                        Err(ResponsesWebsocketSendFailure::InterruptAckTimeout) => {
-                            return Err(ProxyError::bad_gateway("unexpected interrupt wait on Grok retry"));
-                        }
-                        Err(ResponsesWebsocketSendFailure::Memory(error)) => {
-                            let _failed_entry = entry.take();
-                            let error_body = websocket_stream_error_body(
-                                error.client_message(),
-                                error.error_code(),
-                            );
-                            return terminate_responses_websocket_with_error(
-                                &mut downstream,
-                                &mut output_patcher,
-                                mode,
-                                state,
-                                &execution,
-                                &mut pending_lifecycle_messages,
-                                error,
-                                Some("memory_capacity"),
-                                error_body,
-                                None,
-                                &mut active_usage_turn,
-                            )
-                            .await;
-                        }
-                        Err(ResponsesWebsocketSendFailure::Upstream(error)) => Some(error),
-                    };
-                    if let Some(error) = error {
-                        let error = ProxyError::bad_gateway(error.to_string());
-                        let error_body = websocket_stream_error_body(
-                            error.client_message(),
-                            "upstream_stream_transport_error",
-                        );
-                        return terminate_responses_websocket_with_error(
-                            &mut downstream,
-                            &mut output_patcher,
-                            mode,
-                            state,
-                            &execution,
-                            &mut pending_lifecycle_messages,
-                            error,
-                            Some("transport_error"),
-                            error_body,
-                            Some(ProviderOutcome::NetworkFailure),
-                            &mut active_usage_turn,
-                        )
-                        .await;
-                    }
-                    response_create_committed = true;
-                    upstream_read_deadline = first_byte_timeout
-                        .map(|timeout| tokio::time::Instant::now() + timeout);
-                    continue;
-                }
-                if matches!(mode, ResponsesWebsocketMode::Grok) && response_in_flight {
-                    if let (Some(observer), Some(bytes)) = (
-                        active_grok_quality_observer.as_mut(),
-                        websocket_message_payload(&message),
-                    ) {
-                        observer.observe_json_bytes(bytes);
-                    }
-                }
-                if let Some(observation) = &semantic_observation {
-                    if let Some(timing) = active_attempt.request_memory().and_then(RequestMemoryBudget::timing) {
-                        if !timing.is_grok() {
-                            timing.observe(observation);
-                        }
-                    }
-                    crate::metrics::record_proxy_semantic_guard(
-                        "websocket",
-                        observation.metric_kind(),
-                    );
-                    if let Some(turn) = active_usage_turn.as_mut() {
-                        turn.observe_message(&message, observation.counts_as_business_output());
-                    }
-                }
-                if matches!(
-                    semantic_observation,
-                    Some(SemanticObservation::Lifecycle | SemanticObservation::Metadata | SemanticObservation::ErrorFrame(_))
-                ) && !emitted_business_event
-                {
-                    let buffered_bytes = pending_lifecycle_messages
-                        .iter()
-                        .map(websocket_message_payload_len)
-                        .sum::<usize>()
-                        .saturating_add(websocket_message_payload_len(&message));
-                    if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
-                        if let Err(error) = reservation.resize(buffered_bytes) {
-                            let _failed_entry = entry.take();
-                            let error = error.into_proxy_error();
-                            let error_body = websocket_stream_error_body(
-                                error.client_message(),
-                                error.error_code(),
-                            );
-                            return terminate_responses_websocket_with_error(
-                                &mut downstream,
-                                &mut output_patcher,
-                                mode,
-                                state,
-                                &execution,
-                                &mut pending_lifecycle_messages,
-                                error,
-                                Some("memory_capacity"),
-                                error_body,
-                                None,
-                                &mut active_usage_turn,
-                            )
-                            .await;
-                        }
-                    }
-                    if pending_lifecycle_messages.len()
-                        >= MAX_RESPONSES_SEMANTIC_PRELUDE_MESSAGES
-                        || buffered_bytes > MAX_RESPONSES_SEMANTIC_PRELUDE_BYTES
-                    {
-                        let error = ProxyError::bad_gateway(
-                            "Responses websocket lifecycle prelude exceeded its bound",
-                        );
-                        let error_body = websocket_stream_error_body(
-                            error.client_message(),
-                            "upstream_protocol_error",
-                        );
-                        return terminate_responses_websocket_with_error(
-                            &mut downstream,
-                            &mut output_patcher,
-                            mode,
-                            state,
-                            &execution,
-                            &mut pending_lifecycle_messages,
-                            error,
-                            Some("protocol_error"),
-                            error_body,
-                            Some(ProviderOutcome::Failure { status_code: 502 }),
-                            &mut active_usage_turn,
-                        )
-                        .await;
-                    }
-                    pending_lifecycle_messages.push(message);
-                    continue;
-                }
-                if let Some(failure) = semantic_observation
-                    .as_ref()
-                    .and_then(provider_stream_failure)
-                {
-                    if !grok_reasoning_rejection_from_websocket_message(&message)
-                        && responses_websocket_http_replay_allowed(
-                            mode,
-                            emitted_business_event,
-                            response_create_committed,
-                        )
-                    {
-                        let failed = execution.runtime_stored_view();
-                        if !semantic_provider_outcome_recorded {
-                            record_provider_outcome(
-                                state,
-                                &failed,
-                                if is_openai_capacity_shed_failure(failure) {
-                                    capacity_shed_provider_outcome()
-                                } else {
-                                    ProviderOutcome::Failure { status_code: 502 }
-                                },
-                            )
-                            .await;
-                            semantic_provider_outcome_recorded = true;
-                        }
-                        let _failed_entry = entry.take();
-                        {
-                            pending_lifecycle_messages.clear();
-                            if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
-                                let _ = reservation.resize(0);
+                        if terminal {
+                            if let Some(timing) = active_attempt.request_memory().and_then(RequestMemoryBudget::timing) {
+                                timing.finish_delivery(true);
                             }
-                            output_patcher.clear_output_items();
-                            let body = active_response_body.as_ref().ok_or_else(|| {
-                                ProxyError::bad_request(
-                                    "response.create body is unavailable for HTTP fallback",
-                                )
-                            })?;
-                            let outcome = run_codex_websocket_http_fallback(
-                                &mut downstream,
-                                state,
-                                &mut execution,
-                                body,
-                                grok_session_id.as_deref(),
-                                grok_turn_index,
-                                first_byte_timeout,
-                                stream_idle_timeout,
-                                "semantic_failure",
-                                &mut active_attempt,
-                                &mut output_patcher,
-                                active_response_intent.as_ref().expect("active response intent"),
-                                &mut active_usage_turn,
-                            )
-                            .await?;
-                            if outcome == CodexHttpFallbackOutcome::DownstreamClosed {
-                                return Ok(());
-                            }
-                            response_in_flight = false;
-                            response_create_committed = false;
-                            account_in_flight_guard.take();
-                            active_response_body = None;
-                            active_response_intent = None;
                             release_responses_websocket_turn_memory(
                                 entry.as_ref(),
                                 &mut active_attempt,
@@ -15288,256 +15604,12 @@ async fn bridge_responses_websocket_inner(
                                 &mut active_grok_reasoning_retry_message,
                                 &mut active_grok_reasoning_retry_memory,
                             );
-                            upstream_read_deadline = None;
-                            refresh_target_before_connect = true;
-                            continue;
+                        }
+                        if closes || upstream_closed {
+                            return Ok(());
                         }
                     }
                 }
-
-                for pending in std::mem::take(&mut pending_lifecycle_messages) {
-                    let sent_close = match send_responses_websocket_message(
-                        &mut downstream,
-                        &mut output_patcher,
-                        mode,
-                        pending,
-                        active_attempt.request_memory(),
-                        active_tool_argument_memory.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(sent_close) => sent_close,
-                        Err(error) if error.is_request_memory_exhausted() => {
-                            let _failed_entry = entry.take();
-                            let error_body = websocket_stream_error_body(
-                                error.client_message(),
-                                error.error_code(),
-                            );
-                            return terminate_responses_websocket_with_error(
-                                &mut downstream,
-                                &mut output_patcher,
-                                mode,
-                                state,
-                                &execution,
-                                &mut pending_lifecycle_messages,
-                                error,
-                                Some("memory_capacity"),
-                                error_body,
-                                None,
-                                &mut active_usage_turn,
-                            )
-                            .await;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    if sent_close {
-                        return Ok(());
-                    }
-                }
-                if let Some(reservation) = active_semantic_prelude_memory.as_ref() {
-                    let _ = reservation.resize(0);
-                }
-                let semantic_terminal = match &semantic_observation {
-                    Some(SemanticObservation::SuccessTerminal) => Some(SemanticTerminal::Success),
-                    Some(SemanticObservation::IncompleteTerminal) => {
-                        Some(SemanticTerminal::Incomplete)
-                    }
-                    Some(SemanticObservation::Failure(failure)) => {
-                        Some(SemanticTerminal::Failure(failure.clone()))
-                    }
-                    Some(
-                        SemanticObservation::Lifecycle
-                        | SemanticObservation::Metadata
-                        | SemanticObservation::Control
-                        | SemanticObservation::Business
-                        | SemanticObservation::ErrorFrame(_),
-                    )
-                    | None => None,
-                };
-                let terminal = semantic_terminal.is_some()
-                    || (semantic_observation.is_none()
-                        && responses_websocket_response_is_terminal(&message));
-                if matches!(mode, ResponsesWebsocketMode::Codex) && response_in_flight && terminal {
-                        if let (Some(entry), Some(id)) =
-                            (entry.as_ref(), codex_interrupt.response_id())
-                        {
-                            terminal_response_ids.remember(entry.created_at, id);
-                        }
-                        codex_interrupt.finish_generation();
-                }
-                if semantic_observation.is_none() {
-                    let usage_business = response_in_flight
-                        && !terminal
-                        && matches!(
-                            message,
-                            TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_)
-                        );
-                    if let Some(turn) = active_usage_turn.as_mut() {
-                        turn.observe_message(&message, usage_business);
-                    }
-                }
-                if terminal {
-                    let usage_terminal = semantic_terminal
-                        .clone()
-                        .unwrap_or(SemanticTerminal::Success);
-                    let completed_success =
-                        matches!(semantic_terminal, Some(SemanticTerminal::Success))
-                            || (semantic_observation.is_none()
-                                && grok_websocket_completed_success(&message));
-                    if completed_success {
-                        if let Some(observation) = active_grok_quality_observer
-                            .as_mut()
-                            .and_then(|observer| observer.finish())
-                        {
-                            crate::metrics::record_grok_quality_observation(
-                                "websocket",
-                                observation.outcome,
-                                observation.has_terminal,
-                                observation.has_tool,
-                                observation.has_visible_text,
-                                observation.visible_length_bucket,
-                            );
-                        }
-                        if let Some(replay) = active_grok_reasoning_replay.take() {
-                            if let Err(error) = replay.commit(state).await {
-                                let _failed_entry = entry.take();
-                                let error_body = websocket_stream_error_body(
-                                    error.client_message(),
-                                    error.error_code(),
-                                );
-                                return terminate_responses_websocket_with_error(
-                                    &mut downstream,
-                                    &mut output_patcher,
-                                    mode,
-                                    state,
-                                    &execution,
-                                    &mut pending_lifecycle_messages,
-                                    error,
-                                    Some("memory_capacity"),
-                                    error_body,
-                                    None,
-                                    &mut active_usage_turn,
-                                )
-                                .await;
-                            }
-                        }
-                    } else {
-                        active_grok_reasoning_replay = None;
-                    }
-                    finish_active_websocket_terminal(&mut active_usage_turn, &usage_terminal).await;
-                    active_grok_quality_observer = None;
-                    active_grok_reasoning_retry_message = None;
-                    active_grok_reasoning_retry_memory = None;
-                    active_response_started_at = None;
-                    response_in_flight = false;
-                    response_create_committed = false;
-                    account_in_flight_guard.take();
-                    active_response_body = None;
-                    active_response_intent = None;
-                    upstream_read_deadline = None;
-                    match semantic_terminal {
-                        Some(SemanticTerminal::Failure(failure))
-                            if failure.origin == FailureOrigin::Provider =>
-                        {
-                            if !semantic_provider_outcome_recorded {
-                                record_provider_outcome(
-                                    state,
-                                    &execution.runtime_stored_view(),
-                                    if is_openai_capacity_shed_failure(&failure) {
-                                        capacity_shed_provider_outcome()
-                                    } else {
-                                        ProviderOutcome::Failure { status_code: 502 }
-                                    },
-                                )
-                                .await;
-                            }
-                        }
-                        Some(SemanticTerminal::Failure(_)) => {}
-                        Some(SemanticTerminal::Success | SemanticTerminal::Incomplete) => {
-                            record_provider_outcome(
-                                state,
-                                &execution.runtime_stored_view(),
-                                ProviderOutcome::Success { status_code: 200 },
-                            )
-                            .await;
-                        }
-                        None => {}
-                    }
-                } else if semantic_observation
-                    .as_ref()
-                    .is_some_and(SemanticObservation::counts_as_business_output)
-                    || (semantic_observation.is_none()
-                        && response_in_flight
-                        && matches!(
-                            message,
-                            TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_)
-                        ))
-                {
-                    emitted_business_event = true;
-                    active_attempt.mark_downstream_committed();
-                    upstream_read_deadline = stream_idle_timeout
-                        .map(|timeout| tokio::time::Instant::now() + timeout);
-                }
-                let delivers_control = semantic_observation == Some(SemanticObservation::Control);
-                let closes = match send_responses_websocket_message(
-                    &mut downstream,
-                    &mut output_patcher,
-                    mode,
-                    message,
-                    active_attempt.request_memory(),
-                    active_tool_argument_memory.as_ref(),
-                )
-                .await
-                {
-                    Ok(closes) => closes,
-                    Err(error) if error.is_request_memory_exhausted() => {
-                        let _failed_entry = entry.take();
-                        let error_body = websocket_stream_error_body(
-                            error.client_message(),
-                            error.error_code(),
-                        );
-                        return terminate_responses_websocket_with_error(
-                            &mut downstream,
-                            &mut output_patcher,
-                            mode,
-                            state,
-                            &execution,
-                            &mut pending_lifecycle_messages,
-                            error,
-                            Some("memory_capacity"),
-                            error_body,
-                            None,
-                            &mut active_usage_turn,
-                        )
-                        .await;
-                    }
-                    Err(error) => return Err(error),
-                };
-                if delivers_control {
-                    // A successful ACK write commits transport bytes, without
-                    // setting business/TTFT/idle progress or allowing replay.
-                    active_attempt.mark_downstream_committed();
-                }
-                if terminal {
-                    if let Some(timing) = active_attempt.request_memory().and_then(RequestMemoryBudget::timing) {
-                        timing.finish_delivery(true);
-                    }
-                    release_responses_websocket_turn_memory(
-                        entry.as_ref(),
-                        &mut active_attempt,
-                        &mut active_normalized_memory,
-                        &mut active_semantic_prelude_memory,
-                        &mut active_tool_argument_memory,
-                        &mut active_grok_reasoning_replay,
-                        &mut active_grok_reasoning_retry_message,
-                        &mut active_grok_reasoning_retry_memory,
-                    );
-                }
-                if closes || upstream_closed {
-                    return Ok(());
-                }
-            }
-        }
     }
 
     if !response_in_flight && !codex_interrupt.awaiting_ack() {
@@ -20658,10 +20730,18 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                     execution.plan.driver_id.as_str(),
                     execution.plan.coding_plan.is_some(),
                 ),
-                Some(crate::domain::usage::value_pricing::resource_request_plan(
-                    &prepared.payload,
-                    request_context.operation,
-                )),
+                Some({
+                    let mut plan = crate::domain::usage::value_pricing::resource_request_plan(
+                        &prepared.payload,
+                        request_context.operation,
+                    );
+                    plan.binding_fingerprint = Some(
+                        crate::domain::sharing::capability_intent::binding_fingerprint(
+                            &execution.plan,
+                        ),
+                    );
+                    plan
+                }),
             )
             .await
             .map_err(value_quota_proxy_error)?;
@@ -25184,11 +25264,21 @@ async fn forward_claude_deepseek_metered(
         .or_else(|| request_context.request_id.clone())
         .unwrap_or_else(deepseek::request_scoped_session_id);
     let mut resource_plan = serde_json::from_slice::<Value>(&body).ok().map(|body| {
-        crate::domain::usage::value_pricing::resource_request_plan(&body, request_context.operation)
+        let mut plan = crate::domain::usage::value_pricing::resource_request_plan(
+            &body,
+            request_context.operation,
+        );
+        plan.binding_fingerprint =
+            Some(crate::domain::sharing::capability_intent::binding_fingerprint(&execution.plan));
+        plan
     });
     if prepared.search_enabled {
         if let Some(plan) = &mut resource_plan {
             plan.requires_v2 = true;
+            plan.operations
+                .push(crate::domain::sharing::capabilities::ShareOperation::WebSearch);
+            plan.operations.sort();
+            plan.operations.dedup();
             plan.quantities.entry("tool.web_search".into()).or_insert(8);
         }
     }
@@ -26907,6 +26997,14 @@ pub(super) fn value_quota_proxy_error(error: anyhow::Error) -> ProxyError {
     use crate::domain::usage::value_pricing::{
         ValueError, ValueQuotaRejection, ValueQuotaRejectionKind,
     };
+    if let Some(rejection) =
+        crate::domain::sharing::capabilities::CapabilityRejection::from_message(&error.to_string())
+    {
+        return ProxyError {
+            status: StatusCode::from_u16(rejection.status).unwrap(),
+            message: rejection.code.into(),
+        };
+    }
     if let Some(price) = error.downcast_ref::<crate::domain::usage::value_pricing::PriceRejection>()
     {
         return ProxyError {
@@ -27563,6 +27661,9 @@ async fn ensure_grok_media_policy(
         .iter()
         .find(|share| share.id == share_id)
         .ok_or_else(|| ProxyError::bad_request("Grok media Share is unavailable"))?;
+    if share.capability_policy.is_some() {
+        return Ok(());
+    }
     let policy = share.grok_media_policy;
     let share_enabled = match capability {
         GrokAccountCapability::ImageGeneration => policy.image_generation_enabled,
@@ -33561,6 +33662,7 @@ mod tests {
             model.clone(),
             request_context.clone(),
             connection_id,
+            None,
         )
         .await
         .unwrap();
@@ -33575,6 +33677,7 @@ mod tests {
             model.clone(),
             request_context.clone(),
             connection_id,
+            None,
         )
         .await
         .unwrap();
@@ -33593,6 +33696,7 @@ mod tests {
             model,
             request_context,
             connection_id,
+            None,
         )
         .await
         .unwrap();
@@ -52923,6 +53027,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             None,
             UsageLogContext {
                 share_id: Some(share_id.to_string()),
+                is_health_check: true,
                 ..UsageLogContext::default()
             },
             Some(account_guard),

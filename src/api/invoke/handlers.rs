@@ -1031,6 +1031,13 @@ fn ensure_router_domain_matches(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SaveProviderBundleShareCommand {
     #[serde(default)]
+    capability_policy: Option<crate::domain::sharing::capabilities::ShareCapabilityPolicy>,
+    #[serde(default)]
+    capability_consent: Option<crate::domain::sharing::capabilities::CapabilityConsent>,
+    #[serde(skip)]
+    validated_capability_policy:
+        Option<crate::domain::sharing::capabilities::ShareCapabilityPolicy>,
+    #[serde(default)]
     expected_account_cycle: Option<crate::domain::sharing::quota_cycle::AccountQuotaCycle>,
     bundle_id: String,
     #[serde(default)]
@@ -1248,6 +1255,9 @@ fn stage_provider_bundle_share(
                 capacity_pool_id.to_string(),
                 subdomain,
                 ShareSettingsPatch {
+                    capability_policy: command.capability_policy.clone(),
+                    capability_consent: command.capability_consent.clone(),
+                    validated_capability_policy: command.validated_capability_policy.clone(),
                     expected_account_cycle: command.expected_account_cycle.clone(),
                     description: Some(description),
                     free_access,
@@ -1384,7 +1394,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
 ) -> Result<Option<Share>, ApiError> {
     let value = web_payload(args, &["params", "input"]);
     reject_retired_share_input_fields(value)?;
-    let command = serde_json::from_value::<SaveProviderBundleShareCommand>(value.clone())
+    let mut command = serde_json::from_value::<SaveProviderBundleShareCommand>(value.clone())
         .map_err(ApiError::bad_request)?;
     if command.user_quota_conversions.is_some() && !state.quota_conversion_router_negotiated().await
     {
@@ -1392,7 +1402,8 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
             "QUOTA_CONVERSION_ROUTER_UPGRADE_REQUIRED"
         )));
     }
-    let initialization_operation = if command.user_value_usage_initializations.is_some()
+    let initialization_operation = if command.capability_policy.is_some()
+        || command.user_value_usage_initializations.is_some()
         || command.user_quota_conversions.is_some()
     {
         let edits = command
@@ -1415,7 +1426,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
                     "USD usage initialization requires an operation ID",
                 )
             })?;
-        if (edits.is_empty() && conversions.is_empty())
+        if (edits.is_empty() && conversions.is_empty() && command.capability_policy.is_none())
             || edits.len() > 500
             || conversions.len() > 500
             || command.share_id.is_none()
@@ -1547,6 +1558,40 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
         }
     }
 
+    if command.capability_policy.is_some() {
+        let id = command.share_id.as_deref().ok_or_else(|| {
+            ApiError::bad_request(
+                "Create the Share with extensions disabled before enabling operations",
+            )
+        })?;
+        let patch = state
+            .prepare_capability_patch(
+                id,
+                ShareSettingsPatch {
+                    capability_policy: command.capability_policy.clone(),
+                    capability_consent: command.capability_consent.clone(),
+                    user_grants: command.user_grants.clone(),
+                    user_grant_edits: command.user_grant_edits.clone(),
+                    token_limit: Some(command.token_limit),
+                    edit_context: Some(
+                        crate::domain::sharing::router_contract::ShareSettingsEditContext {
+                            operation_id: command
+                                .value_usage_operation_id
+                                .clone()
+                                .unwrap_or_else(|| "native-capability-preview".into()),
+                            expected_config_revision: command.expected_config_revision.ok_or_else(
+                                || ApiError::bad_request("expectedConfigRevision is required"),
+                            )?,
+                            actor: operator.clone(),
+                        },
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(ApiError::value_quota)?;
+        command.validated_capability_policy = patch.validated_capability_policy;
+    }
     let surfaces = providers
         .providers
         .iter()

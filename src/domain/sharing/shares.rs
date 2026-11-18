@@ -691,6 +691,8 @@ pub struct SharePolicy {
     pub previous_response_cache_enabled: bool,
     #[serde(default)]
     pub grok_media_policy: GrokMediaPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_policy: Option<super::capabilities::ShareCapabilityPolicy>,
 }
 
 impl Default for SharePolicy {
@@ -705,6 +707,7 @@ impl Default for SharePolicy {
             banked_reset_expiry_lead_minutes: DEFAULT_BANKED_RESET_EXPIRY_LEAD_MINUTES,
             previous_response_cache_enabled: true,
             grok_media_policy: GrokMediaPolicy::default(),
+            capability_policy: None,
         }
     }
 }
@@ -1283,6 +1286,9 @@ impl ShareStore {
                 )
             });
 
+        let is_new = existing_id
+            .as_deref()
+            .is_none_or(|id| self.get(id).is_none());
         let share_id = existing_id.unwrap_or_else(generate_share_id);
         let (
             tokens_used,
@@ -1369,6 +1375,9 @@ impl ShareStore {
                 grok_media_policy: input
                     .grok_media_policy
                     .unwrap_or(existing_policy.grok_media_policy),
+                capability_policy: existing_policy
+                    .capability_policy
+                    .or_else(|| is_new.then(super::capabilities::ShareCapabilityPolicy::default)),
             },
             tokens_used,
             requests_count,
@@ -2694,6 +2703,18 @@ impl ShareStore {
         if let Some(enabled) = patch.previous_response_cache_enabled {
             share.previous_response_cache_enabled = enabled;
         }
+        if patch.capability_policy.is_none() && patch.capability_consent.is_some() {
+            return Err(SharePatchError::Invalid("CAPABILITY_STATE_CHANGED".into()));
+        }
+        if patch.capability_policy.is_some() && patch.validated_capability_policy.is_none() {
+            return Err(SharePatchError::Invalid(
+                "CAPABILITY_PREVIEW_EXPIRED".into(),
+            ));
+        }
+        if let Some(policy) = patch.validated_capability_policy {
+            policy.validate().map_err(SharePatchError::Invalid)?;
+            share.capability_policy = Some(policy);
+        }
         if let Some(policy) = patch.grok_media_policy {
             share.grok_media_policy = policy;
         }
@@ -2810,6 +2831,20 @@ impl ShareStore {
             .flatten();
         crate::domain::sharing::invariants::validate_share_import(&share)?;
         mark_share_config_pending(&mut share);
+        for grant in share.user_grants.values().filter(|g| g.active) {
+            if let Some(ops) = &grant.policy.allowed_operations {
+                super::capabilities::validate_operations(ops).map_err(SharePatchError::Invalid)?;
+                if let Some(policy) = &share.capability_policy {
+                    if !ops.iter().all(|op| policy.allowed_operations.contains(op)) {
+                        return Err(SharePatchError::Invalid("SHARE_CAPABILITY_DISABLED".into()));
+                    }
+                } else {
+                    return Err(SharePatchError::Invalid(
+                        "CAPABILITY_UPGRADE_REQUIRED".into(),
+                    ));
+                }
+            }
+        }
         self.shares[index] = share.clone();
         if let Some(operation) = managed_grant {
             // Router serializes managed operations per Share. Seeing a newer
@@ -3379,6 +3414,10 @@ impl ShareStore {
         let mut candidate = self.clone();
         let mut imported = 0;
         for mut share in shares {
+            share.capability_policy = match candidate.get(&share.id) {
+                Some(old) => old.capability_policy.clone(),
+                None => Some(super::capabilities::ShareCapabilityPolicy::default()),
+            };
             crate::domain::sharing::invariants::validate_share_import(&share)?;
             if let Some(existing) = candidate.shares.iter().find(|item| item.id == share.id) {
                 if existing.app != share.app
@@ -4299,6 +4338,7 @@ fn default_user_policy(share: &Share) -> ShareUserPolicy {
         token_period_anchor_at_ms: None,
         expires_at: canonical_user_policy_expiry(share.expires_at),
         allowed_apps: Vec::new(),
+        allowed_operations: None,
     }
 }
 
@@ -4920,6 +4960,7 @@ mod tests {
             action,
             email: email.to_string(),
             policy: (action == ShareManagedGrantAction::Upsert).then_some(ShareUserPolicy {
+                allowed_operations: None,
                 value_quota: None,
                 parallel_limit: Some(2),
                 token_limit: Some(10_000),
@@ -5525,6 +5566,7 @@ mod tests {
         use crate::domain::usage::value_pricing::ValueQuota;
         let usd = || {
             Some(ValueQuota {
+                unpriced_usage: Default::default(),
                 limit_usd_micros: "10000000".into(),
                 tariff_policy_id: "api-equivalent-v1".into(),
             })
@@ -5670,6 +5712,7 @@ mod tests {
         let policy = op.policy.as_mut().unwrap();
         policy.token_limit = None;
         policy.value_quota = Some(crate::domain::usage::value_pricing::ValueQuota {
+            unpriced_usage: Default::default(),
             limit_usd_micros: "10000000".into(),
             tariff_policy_id: "api-equivalent-v1".into(),
         });
@@ -7278,6 +7321,7 @@ mod tests {
                 role: "shareto".to_string(),
                 active: true,
                 policy: ShareUserPolicy {
+                    allowed_operations: None,
                     value_quota: None,
                     parallel_limit: input.parallel_limit,
                     token_limit: input.token_limit,
@@ -7404,6 +7448,7 @@ mod tests {
         input.parallel_limit = Some(7);
         input.expires_at = Some(expires_at);
         let expected = ShareUserPolicy {
+            allowed_operations: None,
             value_quota: None,
             parallel_limit: Some(7),
             token_limit: Some(50_000),

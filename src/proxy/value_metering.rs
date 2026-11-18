@@ -34,6 +34,7 @@ impl ValueAttemptSeries {
         context: &UsageLogContext,
         model: &str,
         payload: &[u8],
+        runtime_fingerprint: &str,
     ) -> Result<(), ProxyError> {
         if let Some(previous) = self.attempt.take() {
             previous.settle_now().await;
@@ -44,7 +45,25 @@ impl ValueAttemptSeries {
             .ok_or_else(|| ProxyError::bad_gateway("monetary attempt identity exhausted"))?;
         let mut context = context.clone();
         context.attempt_count = Some(self.number);
-        self.attempt = admit_prepared(state, &context, model, payload, true).await?;
+        let mut plan = serde_json::from_slice(payload).ok().map(|body| {
+            crate::domain::usage::value_pricing::resource_request_plan(&body, context.operation)
+        });
+        let runtime = {
+            let providers = state.providers.read().await;
+            providers
+                .providers
+                .iter()
+                .filter(|p| context.quota_app.is_none_or(|app| p.app == app))
+                .filter_map(|p| providers.runtime_plan(p.app, &p.provider.id))
+                .find(|p| p.runtime_fingerprint == runtime_fingerprint)
+        };
+        if let Some(plan) = &mut plan {
+            plan.binding_fingerprint = runtime
+                .filter(|r| r.runtime_fingerprint == runtime_fingerprint)
+                .map(|r| crate::domain::sharing::capability_intent::binding_fingerprint(&r));
+        }
+        self.attempt =
+            admit_prepared_with_plan(state, &context, model, payload, true, plan).await?;
         Ok(())
     }
     pub(crate) fn sent(&self) {
@@ -88,7 +107,14 @@ pub(crate) async fn admit(
     model: &str,
     payload: &[u8],
 ) -> Result<Option<ValueAttemptGuard>, ProxyError> {
-    admit_prepared(
+    let mut plan = serde_json::from_slice(payload).ok().map(|body| {
+        crate::domain::usage::value_pricing::resource_request_plan(&body, context.operation)
+    });
+    if let Some(plan) = &mut plan {
+        plan.binding_fingerprint =
+            Some(crate::domain::sharing::capability_intent::binding_fingerprint(&execution.plan));
+    }
+    admit_prepared_with_plan(
         state,
         context,
         model,
@@ -98,18 +124,9 @@ pub(crate) async fn admit(
             execution.plan.driver_id.as_str(),
             execution.plan.coding_plan.is_some(),
         ),
+        plan,
     )
     .await
-}
-
-pub(crate) async fn admit_prepared(
-    state: &ServerState,
-    context: &UsageLogContext,
-    model: &str,
-    payload: &[u8],
-    verified_runtime: bool,
-) -> Result<Option<ValueAttemptGuard>, ProxyError> {
-    admit_prepared_with_plan(state, context, model, payload, verified_runtime, None).await
 }
 
 pub(crate) async fn admit_prepared_with_plan(
@@ -120,10 +137,7 @@ pub(crate) async fn admit_prepared_with_plan(
     verified_runtime: bool,
     resource_plan: Option<crate::domain::usage::value_pricing::ResourcePlan>,
 ) -> Result<Option<ValueAttemptGuard>, ProxyError> {
-    if context.is_health_check {
-        return Ok(None);
-    }
-    let (Some(_), Some(_)) = (context.share_id.as_deref(), context.user_email.as_deref()) else {
+    let Some(_) = context.share_id.as_deref() else {
         return Ok(None);
     };
     let facts = value_request_facts(payload);

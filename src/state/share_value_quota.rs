@@ -2048,19 +2048,117 @@ impl ServerStateInner {
         effective_tier: Option<&'static str>,
         estimate: RiskEstimate,
         verified_surface: bool,
-        resource_plan: Option<crate::domain::usage::value_pricing::ResourcePlan>,
+        mut resource_plan: Option<crate::domain::usage::value_pricing::ResourcePlan>,
     ) -> anyhow::Result<Option<ValueAttemptGuard>> {
-        if context.is_health_check {
-            return Ok(None);
-        }
-        let (Some(share_id), Some(email)) = (&context.share_id, &context.user_email) else {
+        let Some(share_id) = &context.share_id else {
             return Ok(None);
         };
+        if context.is_health_check && share_id.starts_with("test-share:") {
+            return Ok(None);
+        }
         let config = self.config_snapshot().await;
+        let providers = self.providers.read().await;
         // Serializes policy reads + durable admission with policy commits. The
         // gate is released before any upstream I/O or response body lifetime.
         let usage = self.usage.read().await;
         let _admission = self.shares_persistence.gate.lock().await;
+        {
+            let shares = self.shares.read().await;
+            let share = shares.get(share_id).context("VALUE_QUOTA_SHARE_REVOKED")?;
+            if let Some(plan) = &mut resource_plan {
+                plan.policy_revision = share
+                    .capability_policy
+                    .as_ref()
+                    .map(|_| share.config_revision);
+                if !matches!(
+                    context.operation,
+                    crate::domain::usage::store::InferenceOperation::ImageEdit
+                ) {
+                    for op in
+                        crate::domain::sharing::capability_intent::model_operations_for_request(
+                            effective_model,
+                            Some(plan),
+                        )
+                    {
+                        if !plan.operations.contains(&op) {
+                            plan.operations.push(op);
+                        }
+                        plan.quantities.entry(op.resource().into()).or_insert(1);
+                        plan.requires_v2 = true;
+                    }
+                }
+            }
+            if share.capability_policy.is_some() {
+                if let Some(plan) = &mut resource_plan {
+                    if plan.continuation {
+                        let scope = crate::repository::server_sqlite::capability_context::scope(
+                            &config, context,
+                        )?;
+                        let inherited =
+                            crate::repository::server_sqlite::capability_context::previous(
+                                &self.config_dir,
+                                &scope,
+                                plan.binding_fingerprint
+                                    .as_deref()
+                                    .context("CAPABILITY_STATE_CHANGED")?,
+                                plan.previous_response_id
+                                    .as_deref()
+                                    .context("CAPABILITY_CONTEXT_REQUIRED")?,
+                                now_ms_i64(),
+                            )?;
+                        // Only executable controls survive continuation. Prior
+                        // understanding inputs are not a new audio/image debit.
+                        let inherited_resources = inherited
+                            .operations
+                            .iter()
+                            .map(|op| op.resource())
+                            .collect::<std::collections::BTreeSet<_>>();
+                        plan.operations.extend(inherited.operations);
+                        plan.operations.sort();
+                        plan.operations.dedup();
+                        for (key, value) in inherited.quantities.into_iter().filter(|(key, _)| {
+                            inherited_resources.contains(key.split('/').next().unwrap_or(key))
+                        }) {
+                            let count = plan.quantities.entry(key).or_default();
+                            *count = (*count).max(value);
+                        }
+                        plan.requires_v2 |= !inherited_resources.is_empty();
+                        plan.continuation = false;
+                    }
+                }
+            }
+            self.check_share_capabilities(
+                share,
+                context,
+                effective_model,
+                resource_plan.as_ref(),
+                &providers,
+                &config,
+            )?;
+            if share.capability_policy.is_some() && !context.is_health_check {
+                let plan = resource_plan
+                    .as_ref()
+                    .context("CAPABILITY_REQUEST_INVALID")?;
+                crate::repository::server_sqlite::capability_context::admit(
+                    &self.config_dir,
+                    &crate::repository::server_sqlite::capability_context::scope(&config, context)?,
+                    context
+                        .request_id
+                        .as_deref()
+                        .context("CAPABILITY_STATE_CHANGED")?,
+                    context.attempt_count.unwrap_or(1),
+                    plan,
+                    now_ms_i64(),
+                )?;
+            }
+        }
+        drop(providers);
+        if context.is_health_check {
+            return Ok(None);
+        }
+        let Some(email) = &context.user_email else {
+            return Ok(None);
+        };
         let (free_access, grant, trial) = {
             let shares = self.shares.read().await;
             let share = shares.get(share_id).context("VALUE_QUOTA_SHARE_REVOKED")?;
@@ -2232,6 +2330,7 @@ impl ServerStateInner {
         }
         let quota = grant.policy.value_quota.clone().unwrap_or_else(|| {
             crate::domain::usage::value_pricing::ValueQuota {
+                unpriced_usage: Default::default(),
                 limit_usd_micros: "1".into(),
                 tariff_policy_id: if resource_plan.as_ref().is_some_and(|p| p.requires_v2) {
                     crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
@@ -2591,6 +2690,7 @@ mod tests {
     fn usd_policy(period: ShareTokenPeriod) -> ShareUserPolicy {
         ShareUserPolicy {
             value_quota: Some(ValueQuota {
+                unpriced_usage: Default::default(),
                 limit_usd_micros: "1000000".into(),
                 tariff_policy_id: "api-equivalent-v1".into(),
             }),
