@@ -243,7 +243,7 @@ describe("Server Provider profile drafts", () => {
       "passthrough",
     ]);
     expect(profile!.modelPolicy).toBe("passthrough");
-    expect(profile!.defaultUpstreamModel).toBe("gpt-5.4");
+    expect(profile!.defaultUpstreamModel).toBe("gpt-6.2-sol");
 
     const draft = createDraftForProfile(profile!);
     expect(readModelPolicy(draft.settingsConfig, profile!)).toBe("passthrough");

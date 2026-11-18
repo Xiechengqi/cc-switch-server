@@ -654,7 +654,7 @@ describe("Provider Bundle drafts", () => {
       {
         app: "claude",
         modelPolicy: "single",
-        upstreamModel: "gpt-5.6-sol",
+        upstreamModel: "gpt-6.2-sol",
       },
       { app: "codex", modelPolicy: "passthrough" },
     ]);
@@ -669,7 +669,7 @@ describe("Provider Bundle drafts", () => {
         {
           app: "claude",
           modelPolicy: "single",
-          upstreamModel: "gpt-5.6-sol",
+          upstreamModel: "gpt-6.2-sol",
         },
         {
           app: "codex",

@@ -57,14 +57,14 @@ export const serverProviderPresets: Readonly<
     "settingsConfig": {
       "env": {
         "ANTHROPIC_BASE_URL": "https://chatgpt.com/backend-api/codex",
-        "ANTHROPIC_MODEL": "gpt-5.6-sol",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.4",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6-sol",
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.6-sol"
+        "ANTHROPIC_MODEL": "gpt-6.2-sol",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-6.2-sol",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-6.2-sol",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-6.2-sol"
       },
       "modelMapping": {
         "mode": "single",
-        "upstreamModel": "gpt-5.6-sol"
+        "upstreamModel": "gpt-6.2-sol"
       }
     },
     "category": "official",
@@ -564,7 +564,7 @@ export const serverProviderPresets: Readonly<
     "notes": "",
     "settingsConfig": {
       "auth": {},
-      "config": "model = \"gpt-5.6-sol\"",
+      "config": "model = \"gpt-6.2-sol\"",
       "modelMapping": {
         "mode": "passthrough"
       },
@@ -580,7 +580,7 @@ export const serverProviderPresets: Readonly<
     "notes": "",
     "settingsConfig": {
       "auth": {},
-      "config": "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true",
+      "config": "model = \"gpt-6.2-sol\"\nmodel_reasoning_effort = \"high\"\ndisable_response_storage = true",
       "modelMapping": {
         "mode": "passthrough"
       },
