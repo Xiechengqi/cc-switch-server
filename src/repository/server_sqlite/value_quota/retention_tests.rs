@@ -395,7 +395,7 @@ fn value_quota_natural_boundary_normalizes_live_and_shadow_without_reassigning_a
         },
     )
     .unwrap();
-    activate_authority(&dir).unwrap();
+    let marker = activate_authority(&dir).unwrap();
     install_snapshot(&dir, &scope, &revision, &snapshot, 0).unwrap();
     activate_snapshot(&dir, &scope, &revision).unwrap();
     cover_from(&dir, &scope, 0).unwrap();
@@ -482,6 +482,11 @@ fn value_quota_natural_boundary_normalizes_live_and_shadow_without_reassigning_a
         "account attribution must never move into another source window"
     );
     drop(db);
+    // Even this empty fixture creates a readonly migration backup. Restore
+    // owner access to its directory so non-root runners can remove the fixture.
+    let backup = dir.join(marker.legacy_backup_dir.unwrap());
+    assert!(std::fs::metadata(&backup).unwrap().permissions().readonly());
+    set_private_directory_permissions(&backup).unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 
