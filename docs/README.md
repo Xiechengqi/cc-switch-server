@@ -76,6 +76,7 @@
 | [quota-unit-conversions.md](share/quota-unit-conversions.md) | 权威 | 普通授权 Token / USD 即时切换、历史证据、签名预览、校准、原子回执与恢复 |
 | [extended-capabilities.md](share/extended-capabilities.md) | 权威 | v13 独立扩展能力、单位覆盖确认、Driver 准入、原子保存、续接隔离及迁移/回退边界 |
 | [value-quotas.md](share/value-quotas.md) | 权威 | v10 双口径额度、有界预占与结果分类结算、作用域阻断与对账、生效规则、错误码、规范签名与 knownRevision、就绪诊断和 live_pending 门槛 |
+| [quota-hardening.md](share/quota-hardening.md) | 权威 | 额度错误证据、存储维护、同步容量、并发编辑与历史会话续做 review |
 | [universal-value-metering.md](share/universal-value-metering.md) | 权威 | 全供应商美元等值额度、统一准入与终结、传输及资源计量覆盖和验收边界 |
 
 ## 验收 `docs/acceptance/`

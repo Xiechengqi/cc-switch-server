@@ -90,11 +90,12 @@ pub(super) fn preview_in_tx(
         [scope.key()?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
     let source_adjustment = latest_adjustment(tx, scope, w)?;
     // A final log for retry N alone cannot prove what earlier attempts cost.
-    let holes:i64=tx.query_row("SELECT count(*) FROM quota_metering_facts f WHERE f.scope=?1 AND f.started_at_ms>=?2
-        AND (?3 IS NULL OR f.started_at_ms<?3) AND CAST(f.attempt_id AS INTEGER)>
+    let clock = evidence::fact_clock(w);
+    let holes:i64=tx.query_row(&format!("SELECT count(*) FROM quota_metering_facts f WHERE f.scope=?1 AND {clock}>=?2
+        AND (?3 IS NULL OR {clock}<?3) AND (?4 IS NULL OR f.account_key=?4) AND CAST(f.attempt_id AS INTEGER)>
         (SELECT count(*) FROM (SELECT a.attempt_id FROM value_quota_attempts a WHERE a.request_id=f.request_id
-        UNION SELECT b.attempt_id FROM quota_metering_facts b WHERE b.request_id=f.request_id))",
-        params![scope.key()?,w.metered_start_ms(),w.ends_at_ms],|r|r.get(0))?;
+        UNION SELECT b.attempt_id FROM quota_metering_facts b WHERE b.request_id=f.request_id))"),
+        params![scope.key()?,w.metered_start_ms(),w.ends_at_ms,w.account_key()?],|r|r.get(0))?;
     let (pending, pending_value_complete) = evidence::pending_value_in(tx, scope, w)?;
     let (pending_tokens, pending_token_complete) = evidence::pending_tokens_in(tx, scope, w, None)?;
     status.pending_risk_picos = pending.to_string();
@@ -175,8 +176,10 @@ pub(crate) struct Conversion {
 /// frozen model price. No network request is held behind this short gate.
 fn reserve_live(tx: &Transaction<'_>, c: &Conversion) -> anyhow::Result<()> {
     let rows = {
-        let mut q=tx.prepare("SELECT request_id,attempt_id,started_at_ms,usage_picos,pending_risk_picos,pricing_revision,watermark FROM value_quota_attempts
-            WHERE scope=?1 AND started_at_ms>=?2 AND (?3 IS NULL OR started_at_ms<?3) AND metering_status='pending' AND (?4 IS NULL OR EXISTS(SELECT 1 FROM quota_metering_facts f WHERE f.request_id=value_quota_attempts.request_id AND f.attempt_id=value_quota_attempts.attempt_id AND f.account_key=?4))")?;
+        let clock = evidence::attempt_clock(&c.window);
+        let mut q=tx.prepare(&format!("SELECT a.request_id,a.attempt_id,a.started_at_ms,a.usage_picos,a.pending_risk_picos,a.pricing_revision,a.watermark FROM value_quota_attempts a
+            LEFT JOIN quota_metering_facts f USING(request_id,attempt_id)
+            WHERE a.scope=?1 AND {clock}>=?2 AND (?3 IS NULL OR {clock}<?3) AND a.metering_status='pending' AND (?4 IS NULL OR f.account_key=?4)"))?;
         let mapped = q.query_map(
             params![
                 c.scope.key()?,

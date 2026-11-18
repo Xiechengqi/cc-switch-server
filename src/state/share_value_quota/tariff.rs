@@ -151,6 +151,7 @@ impl ServerStateInner {
         match result {
             Ok(Ok(0)) => {}
             Ok(Ok(repriced)) => {
+                self.value_watermark_dirty.notify_one();
                 tracing::info!(
                     repriced,
                     "unpriced USD-equivalent usage re-priced after a tariff activation"

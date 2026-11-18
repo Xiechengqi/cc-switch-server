@@ -72,6 +72,9 @@ pub enum ValueUsageEditAction {
     Clear,
 }
 
+mod upstream_errors;
+pub use upstream_errors::classify_upstream_error;
+
 /// Text metering follows the authoritative runtime binding, independently of
 /// credentials or subscription type. The shared ledger accepts authoritative
 /// usage and explicitly marked conservative estimates from every Driver.
@@ -169,18 +172,15 @@ pub fn value_execution_model_hint(profile: &str, model: &str) -> Option<String> 
     .then_some(model)
 }
 
-/// Object keys that positively identify separately billed media, audio
-/// output, cached server context, or a provider-executed (paid) tool. A key
-/// whose value is `null`/`false` is a harmless replayed placeholder.
+/// Object keys that positively identify separately billed audio/video,
+/// cached server context, or a provider-executed tool with its own fee. A
+/// key whose value is `null`/`false` is a harmless replayed placeholder.
+/// Images, documents and files (`image_url`, `input_image`, `input_file`,
+/// Gemini `inlineData`/`fileData`) are counted by every upstream as input
+/// tokens and are text; inline audio is detected by the resource plan.
+/// URL context, computer use and MCP connectors are token-only as well.
 const DENIED_KEYS: &[&str] = &[
-    "inlineData",
-    "inline_data",
-    "fileData",
-    "file_data",
-    "image_url",
-    "input_image",
     "input_audio",
-    "input_file",
     "audio",
     "video",
     "audioConfig",
@@ -204,12 +204,7 @@ const DENIED_KEYS: &[&str] = &[
     "file_search",
     "codeExecution",
     "code_execution",
-    "urlContext",
-    "url_context",
-    "computerUse",
-    "computer_use",
     "web_search_options",
-    "mcp_servers",
     "container",
 ];
 /// Subtrees that carry caller-defined data (JSON schemas, tool arguments,
@@ -237,40 +232,29 @@ const OPAQUE_KEYS: &[&str] = &[
     "thoughtSignature",
     "thought_signature",
 ];
-/// Typed content/tool entries that are billed separately from text tokens:
-/// media parts and provider-executed (server-side/built-in) tools, including
-/// their history items (`web_search_call`, `code_interpreter_call`, ...).
-fn denied_type(kind: &str) -> bool {
+/// Typed content billed separately from text tokens: audio and video parts.
+/// Images, documents and files are input tokens upstream.
+fn denied_content_type(kind: &str) -> bool {
     matches!(
         kind,
-        "image"
-            | "image_url"
-            | "input_image"
-            | "output_image"
-            | "image_file"
-            | "input_audio"
-            | "output_audio"
-            | "audio"
-            | "input_file"
-            | "file"
-            | "document"
-            | "video"
-            | "input_video"
-    ) || [
+        "input_audio" | "output_audio" | "audio" | "video" | "input_video"
+    )
+}
+/// Declared provider-executed tools with a fee beyond tokens (search calls,
+/// code-execution containers, file search, image generation). Client tools
+/// executed by the caller (`bash_*`, `text_editor_*`, `computer_*`) and
+/// token-only server tools (`web_fetch`, MCP connectors) are text. History
+/// items of earlier tool calls (`web_search_call`, `server_tool_use`, tool
+/// results) are input tokens; only a declaration in `tools`/`tool_choice`
+/// can incur a new fee.
+fn paid_tool_type(kind: &str) -> bool {
+    [
         "web_search",
-        "web_fetch",
         "file_search",
         "code_interpreter",
         "code_execution",
-        "computer",
         "image_generation",
-        "mcp",
-        "bash_",
-        "text_editor_",
         "google_search",
-        "url_context",
-        "server_tool_use",
-        "container_upload",
     ]
     .iter()
     .any(|prefix| kind.starts_with(prefix))
@@ -280,7 +264,10 @@ fn metered_text_value(value: &serde_json::Value, parent_key: Option<&str>) -> bo
     match value {
         Value::Object(map) => {
             let kind = map.get("type").and_then(Value::as_str);
-            if kind.is_some_and(denied_type) {
+            let declared_tool = matches!(parent_key, Some("tools" | "tool_choice"));
+            if kind.is_some_and(|kind| {
+                denied_content_type(kind) || (declared_tool && paid_tool_type(kind))
+            }) {
                 return false;
             }
             for key in ["responseModalities", "response_modalities", "modalities"] {
@@ -316,10 +303,12 @@ fn metered_text_value(value: &serde_json::Value, parent_key: Option<&str>) -> bo
     }
 }
 /// Protocol-aware text classifier for Messages, Chat Completions, Responses
-/// and Gemini bodies. Everything is text token usage except positively
-/// identified media/audio/file content and provider-executed paid tools.
-/// Client tools (function/custom), thinking/reasoning blocks, cache control,
-/// tool_choice and structured-output formats are ordinary text.
+/// and Gemini bodies. Everything is text token usage (including images,
+/// documents and files, which upstreams count as input tokens) except
+/// positively identified audio/video content, non-text output modalities and
+/// declared provider-executed tools with their own fee. Client tools,
+/// thinking/reasoning blocks, cache control, tool history and
+/// structured-output formats are ordinary text.
 pub fn is_metered_text_value(body: &serde_json::Value) -> bool {
     body.is_object() && metered_text_value(body, None)
 }
@@ -330,9 +319,70 @@ pub fn is_metered_text_payload(bytes: &[u8]) -> bool {
 
 pub const DEFAULT_OUTPUT_CEILING: u64 = 32_000;
 pub const MAX_OUTPUT_CEILING: u64 = 128_000;
+/// Conservative reservation heuristic per embedded image. Actual image tokens
+/// depend on model, resolution and detail; this is not an upstream hard bound.
+pub const IMAGE_INPUT_ESTIMATE: u64 = 6_000;
+/// Inline base64 strings shorter than this are counted as ordinary text.
+const EMBEDDED_MEDIA_MIN_BYTES: usize = 1_024;
+
+/// Base64 media embedded in a request body: `(payload bytes, token bound)`.
+/// Images are bounded per image; other media (PDFs, files) by their decoded
+/// size (`base64 / 4`, i.e. decoded bytes / 3).
+fn embedded_media(value: &serde_json::Value, found: &mut (u64, u64)) {
+    use serde_json::Value;
+    fn count(found: &mut (u64, u64), payload: &str, mime: Option<&str>) {
+        let bytes = payload.len() as u64;
+        found.0 = found.0.saturating_add(bytes);
+        found.1 = found.1.saturating_add(
+            if mime.is_some_and(|mime| mime.trim().to_ascii_lowercase().starts_with("image/")) {
+                IMAGE_INPUT_ESTIMATE
+            } else {
+                bytes.div_ceil(4)
+            },
+        );
+    }
+    match value {
+        Value::Object(map) => {
+            let mime = ["media_type", "mimeType", "mime_type"]
+                .iter()
+                .find_map(|key| map.get(*key).and_then(Value::as_str));
+            let base64_source =
+                map.get("type").and_then(Value::as_str) == Some("base64") || mime.is_some();
+            let kind = map.get("type").and_then(Value::as_str);
+            for (key, child) in map {
+                if OPAQUE_KEYS.contains(&key.as_str())
+                    || (key == "input" && matches!(kind, Some("tool_use" | "custom_tool_call")))
+                {
+                    continue;
+                }
+                match child {
+                    Value::String(text) if text.len() >= EMBEDDED_MEDIA_MIN_BYTES => {
+                        if let Some(rest) = text.strip_prefix("data:").filter(|_| {
+                            key == "url" || matches!(key.as_str(), "image_url" | "file_data")
+                        }) {
+                            if let Some((header, _)) = rest.split_once(',') {
+                                if header.ends_with(";base64") {
+                                    count(found, text, header.split(';').next());
+                                }
+                            }
+                        } else if key == "data" && base64_source {
+                            count(found, text, mime);
+                        }
+                    }
+                    _ => embedded_media(child, found),
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| embedded_media(item, found)),
+        _ => {}
+    }
+}
+
 /// Bounded per-request reservation inputs. Input is a byte heuristic
-/// (`ceil(bytes / 3)` fresh-input tokens); output is the request's declared
-/// maximum, clamped to `[1, 128000]`, or 32000 when the client sent none.
+/// (`ceil(bytes / 3)` fresh-input tokens) over the body without embedded
+/// base64 media, plus a per-image estimate and the decoded size of other media;
+/// output is the request's declared maximum, clamped to `[1, 128000]`, or
+/// 32000 when the client sent none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RiskEstimate {
@@ -352,8 +402,15 @@ impl RiskEstimate {
                         .and_then(Value::as_u64)
                 })
         });
+        let mut media = (0u64, 0u64);
+        if let Some(body) = body {
+            embedded_media(body, &mut media);
+        }
+        let text_bytes = u64::try_from(body_len)
+            .unwrap_or(u64::MAX)
+            .saturating_sub(media.0);
         Self {
-            input_tokens: u64::try_from(body_len).unwrap_or(u64::MAX).div_ceil(3),
+            input_tokens: text_bytes.div_ceil(3).saturating_add(media.1),
             output_tokens: requested
                 .map(|n| n.clamp(1, MAX_OUTPUT_CEILING))
                 .unwrap_or(DEFAULT_OUTPUT_CEILING),
@@ -1335,7 +1392,6 @@ mod tests {
         for request in [
             br#"{"tools":[{"googleSearch":{}}]}"#.as_slice(),
             br#"{"tools":[{"type":"web_search"}]}"#,
-            br#"{"messages":[{"content":[{"type":"image_url","image_url":"url"}]}]}"#,
             br#"{"generationConfig":{"responseModalities":["IMAGE"]}}"#,
             br#"{"cachedContent":"unverified-context"}"#,
         ] {
@@ -1428,34 +1484,47 @@ mod tests {
         }
     }
     #[test]
-    fn media_documents_and_server_tools_are_not_metered_text() {
+    fn images_documents_client_tools_and_tool_history_are_metered_text() {
+        // Upstreams count these as (input) tokens; none carries its own fee.
         for body in [
+            serde_json::json!({"messages": [{"content": [{"type": "image_url", "image_url": "url"}]}]}),
             serde_json::json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "data": "x"}}]}]}),
             serde_json::json!({"messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "url", "url": "x"}}]}]}),
             serde_json::json!({"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": [{"type": "image", "source": {}}]}]}]}),
-            serde_json::json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}], "messages": []}),
-            serde_json::json!({"tools": [{"type": "code_execution_20250522", "name": "code_execution"}]}),
             serde_json::json!({"tools": [{"type": "computer_20250124", "name": "computer"}]}),
             serde_json::json!({"tools": [{"type": "bash_20250124", "name": "bash"}]}),
             serde_json::json!({"tools": [{"type": "text_editor_20250429", "name": "str_replace_based_edit_tool"}]}),
+            serde_json::json!({"tools": [{"type": "web_fetch_20250910", "name": "web_fetch"}]}),
             serde_json::json!({"mcp_servers": [{"type": "url", "url": "x"}]}),
+            serde_json::json!({"tools": [{"type": "mcp", "server_label": "x"}]}),
             serde_json::json!({"input": [{"type": "message", "role": "user", "content": [{"type": "input_image", "image_url": "x"}]}]}),
             serde_json::json!({"input": [{"type": "message", "role": "user", "content": [{"type": "input_file", "file_id": "f"}]}]}),
+            // History of an earlier paid call is input; only a declaration bills.
             serde_json::json!({"input": [{"type": "web_search_call", "id": "ws", "status": "completed"}]}),
+            serde_json::json!({"messages": [{"role": "assistant", "content": [{"type": "server_tool_use", "id": "s", "name": "web_search", "input": {}}, {"type": "web_search_tool_result", "tool_use_id": "s", "content": []}]}]}),
+            serde_json::json!({"contents": [{"parts": [{"inlineData": {"mimeType": "image/png", "data": "x"}}]}]}),
+            serde_json::json!({"contents": [{"parts": [{"fileData": {"fileUri": "x"}}]}]}),
+            serde_json::json!({"tools": [{"urlContext": {}}]}),
+        ] {
+            assert!(is_metered_text_value(&body), "{body}");
+        }
+    }
+    #[test]
+    fn audio_video_and_declared_paid_server_tools_are_not_metered_text() {
+        for body in [
+            serde_json::json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}], "messages": []}),
+            serde_json::json!({"tools": [{"type": "code_execution_20250522", "name": "code_execution"}]}),
             serde_json::json!({"tools": [{"type": "web_search_preview"}]}),
             serde_json::json!({"tools": [{"type": "file_search", "vector_store_ids": ["v"]}]}),
             serde_json::json!({"tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]}),
             serde_json::json!({"tools": [{"type": "image_generation"}]}),
-            serde_json::json!({"tools": [{"type": "mcp", "server_label": "x"}]}),
             serde_json::json!({"tool_choice": {"type": "web_search_preview"}}),
             serde_json::json!({"messages": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": "x"}}]}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": [{"type": "video", "source": {}}]}]}),
             serde_json::json!({"modalities": ["text", "audio"], "audio": {"voice": "alloy"}}),
             serde_json::json!({"web_search_options": {}}),
-            serde_json::json!({"contents": [{"parts": [{"inlineData": {"mimeType": "image/png", "data": "x"}}]}]}),
-            serde_json::json!({"contents": [{"parts": [{"fileData": {"fileUri": "x"}}]}]}),
             serde_json::json!({"tools": [{"googleSearch": {}}]}),
             serde_json::json!({"tools": [{"codeExecution": {}}]}),
-            serde_json::json!({"tools": [{"urlContext": {}}]}),
             serde_json::json!({"generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}),
             serde_json::json!({"generationConfig": {"speechConfig": {"voiceConfig": {}}}}),
             serde_json::json!({"cachedContent": "cachedContents/x"}),
@@ -1464,6 +1533,72 @@ mod tests {
         }
         assert!(!is_metered_text_payload(b"[1]"));
         assert!(!is_metered_text_payload(b"not json"));
+    }
+    #[test]
+    fn embedded_images_are_bounded_per_image_not_by_base64_size() {
+        let image = "A".repeat(400_000);
+        let pdf = "B".repeat(40_000);
+        let body = serde_json::json!({"max_tokens": 100, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image}},
+            {"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{image}")}},
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf}},
+        ]}]});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let media = 400_000 + (400_000 + "data:image/jpeg;base64,".len()) + 40_000;
+        let estimate = value_request_facts(&bytes).estimate;
+        assert_eq!(
+            estimate.input_tokens,
+            u64::try_from(bytes.len() - media).unwrap().div_ceil(3)
+                + 2 * IMAGE_INPUT_ESTIMATE
+                + 10_000
+        );
+        assert_eq!(estimate.output_tokens, 100);
+        // Short inline strings stay ordinary text.
+        let small = serde_json::to_vec(&serde_json::json!({"messages": [{"content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "xyz"}}]}]})).unwrap();
+        assert_eq!(
+            value_request_facts(&small).estimate.input_tokens,
+            u64::try_from(small.len()).unwrap().div_ceil(3)
+        );
+        for body in [
+            serde_json::json!({"messages":[{"content":[{"type":"text","text":format!("data:image/png;base64,{image}")}]}]}),
+            serde_json::json!({"tools":[{"type":"function","parameters":{"source":{"type":"base64","media_type":"image/png","data":image}}}]}),
+        ] {
+            let bytes = serde_json::to_vec(&body).unwrap();
+            assert_eq!(
+                value_request_facts(&bytes).estimate.input_tokens,
+                u64::try_from(bytes.len()).unwrap().div_ceil(3),
+                "ordinary text and schemas are not media"
+            );
+        }
+    }
+    /// Cross-repo pricing vectors: the identical digests are pinned in
+    /// cc-switch-router `src/share_value_pricing.rs`. A fixture change must land in both repos with both pins.
+    #[test]
+    fn shared_value_fixtures_match_the_cross_repo_pinned_digests() {
+        use sha2::{Digest, Sha256};
+        for (name, bytes, pinned) in [
+            (
+                "share-value-model-identity-v1.json",
+                include_bytes!("../../../tests/fixtures/share-value-model-identity-v1.json")
+                    .as_slice(),
+                "7c708feb01af3cc5c96a33e3e855f1643280b5843fbcaa17064ea087820d597f",
+            ),
+            (
+                "share-value-pricing-v1.json",
+                include_bytes!("../../../tests/fixtures/share-value-pricing-v1.json").as_slice(),
+                "a6ffe5e0f1c96b1dc038e12d862176261e7d5626ad606ef7e7e95fa39076716a",
+            ),
+            (
+                "share-value-signed-payload-v1.json",
+                include_bytes!("../../../tests/fixtures/share-value-signed-payload-v1.json")
+                    .as_slice(),
+                "3b770b55c552f9f61ff7f8f1ed011abdd0a00864734890ce5cb86139b8652715",
+            ),
+        ] {
+            assert_eq!(hex::encode(Sha256::digest(bytes)), pinned, "{name} drifted");
+        }
     }
     #[test]
     fn risk_estimate_uses_declared_output_ceiling_and_byte_heuristic() {

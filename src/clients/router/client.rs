@@ -1013,6 +1013,18 @@ impl RouterShareCapabilities {
                 .iter()
                 .any(|c| c == "quotaUnitConversionV1")
     }
+    /// One signed request carries the projections of many grants.
+    pub fn value_quota_watermark_batch(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == "valueQuotaWatermarkBatchV1")
+    }
+    /// The Router's `valueQuota` reader accepts `unpricedUsage`.
+    pub fn value_quota_unpriced_policy(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == "valueQuotaUnpricedPolicyV1")
+    }
     /// Router accepts the optional `unpricedRequests/Tokens/Models` fields of
     /// a strict `ValueQuotaStatus` (owner-managed $0 unpriced usage).
     pub fn value_quota_unpriced(&self) -> bool {

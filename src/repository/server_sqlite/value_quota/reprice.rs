@@ -120,16 +120,6 @@ pub(super) fn reprice_page_in_tx(
     // activating installation, the scope's open window and (account-reset)
     // its bucket, so ended windows and other installations are never read.
     let mut rows: Vec<(String, i64, String, String)> = Vec::new();
-    let mut q = tx.prepare(
-        "SELECT a.started_at_ms,a.request_id,a.attempt_id FROM value_quota_attempts a
-         WHERE a.scope=?1 AND a.unpriced_reason IS NOT NULL AND a.unpriced_reason!='usage_unobserved'
-         AND json_extract(a.scope,'$.routerUrl')=?2 AND json_extract(a.scope,'$.installationId')=?3
-         AND a.started_at_ms>=?4 AND (?5 IS NULL OR a.started_at_ms<?5)
-         AND (a.started_at_ms,a.request_id,a.attempt_id)>(?6,?7,?8)
-         AND (?9 IS NULL OR EXISTS(SELECT 1 FROM quota_metering_facts f
-           WHERE f.request_id=a.request_id AND f.attempt_id=a.attempt_id AND f.account_key=?9))
-         ORDER BY a.started_at_ms,a.request_id,a.attempt_id LIMIT ?10",
-    )?;
     let first = after.as_ref().map_or(String::new(), |a| a.0.clone());
     for (scope_key, w) in windows.range(first..) {
         let remaining = REPRICE_PAGE - rows.len();
@@ -149,6 +139,17 @@ pub(super) fn reprice_page_in_tx(
             Some(a) => (a.1, a.2.clone(), a.3.clone()),
             None => (i64::MIN, String::new(), String::new()),
         };
+        let clock = evidence::attempt_clock(w);
+        let mut q = tx.prepare(&format!(
+            "SELECT a.started_at_ms,a.request_id,a.attempt_id FROM value_quota_attempts a
+             LEFT JOIN quota_metering_facts f USING(request_id,attempt_id)
+             WHERE a.scope=?1 AND a.unpriced_reason IS NOT NULL AND a.unpriced_reason!='usage_unobserved'
+             AND json_extract(a.scope,'$.routerUrl')=?2 AND json_extract(a.scope,'$.installationId')=?3
+             AND {clock}>=?4 AND (?5 IS NULL OR {clock}<?5)
+             AND (a.started_at_ms,a.request_id,a.attempt_id)>(?6,?7,?8)
+             AND (?9 IS NULL OR f.account_key=?9)
+             ORDER BY a.started_at_ms,a.request_id,a.attempt_id LIMIT ?10"
+        ))?;
         let mapped = q.query_map(
             params![
                 scope_key,
@@ -173,7 +174,6 @@ pub(super) fn reprice_page_in_tx(
         )?;
         rows.extend(mapped.collect::<rusqlite::Result<Vec<_>>>()?);
     }
-    drop(q);
     let mut repriced = 0;
     for (_, _, request, attempt) in &rows {
         tx.execute_batch("SAVEPOINT value_reprice")?;
@@ -261,7 +261,7 @@ pub(super) fn reprice_row_in_tx(
     let pending = old.8 == "pending";
     let frozen = serde_json::to_string(model)?;
     meta.frozen_tariff_sha256 = Some(sha256_hex(frozen.as_bytes()));
-    meta.exact_aliases = snapshot.exact_aliases.clone();
+    meta.exact_aliases = attempt_aliases(&snapshot.exact_aliases, &old.1);
     meta.admission_revision
         .get_or_insert_with(|| old.11.clone());
     // Settled rows are re-priced from observed evidence alone: a zero

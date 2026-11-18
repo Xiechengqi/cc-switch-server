@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "5c58b3c676f32f9a3f5875c7b629f8b41ca22c8141c38e286659d26fa5d4dab5"
+      "sha256": "6cb1e840169dd424b7cbc1c5d99b95d2ae7f7b88a1ef56da3a1e30bd28590b45"
     },
     {
       "path": "src/state/provider_bundle.rs",

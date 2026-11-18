@@ -1264,6 +1264,8 @@
     "unlimited": "無上限",
     "userLimit": {
       "valueQuota": {
+        "parallelCap": "美元額度每位使用者最多並行 4 個請求；請輸入 1–4，留空按 4 生效。未修改的歷史高值仍按 4 生效。",
+        "rejectUnpriced": "拒絕缺價請求（文字與資源均適用）",
         "readiness": {
           "blocked": "美元等值額度尚未就緒",
           "retry": "重新檢查",

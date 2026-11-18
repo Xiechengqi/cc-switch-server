@@ -13,6 +13,32 @@ use crate::{
     state::{ServerState, ValueAttemptGuard},
 };
 
+/// Invoke only after the complete upstream error body has been read and
+/// decoded, before delivering any business output or settling a retry.
+pub(crate) fn buffered_error(
+    attempt: Option<&ValueAttemptGuard>,
+    execution: &ProviderExecution,
+    endpoint: &str,
+    status: u16,
+    body: &[u8],
+    context: &mut UsageLogContext,
+) {
+    if context.failure_kind.as_deref() == Some("upstream_outcome_unknown") {
+        return;
+    }
+    if let Some(reason) = crate::domain::usage::value_pricing::classify_upstream_error(
+        execution.plan.profile_id.as_str(),
+        endpoint,
+        status,
+        body,
+    ) {
+        if let Some(attempt) = attempt {
+            attempt.mark_response_failure(reason);
+        }
+        context.failure_kind = Some(reason.into());
+    }
+}
+
 /// A series is shared only by the supervisor and response-lifetime guard;
 /// Driver generation operations remain sequential.
 #[derive(Default)]

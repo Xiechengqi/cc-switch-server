@@ -619,3 +619,40 @@ async fn value_quota_deepseek_cached_recovery_admits_each_real_generation() {
     );
     server.abort();
 }
+
+#[test]
+fn value_quota_deterministic_policy_errors_are_client_errors_with_stable_nonretryable_codes() {
+    let resource = value_quota_proxy_error(anyhow::anyhow!("RESOURCE_POLICY_REQUIRED"));
+    assert_eq!(resource.status, StatusCode::BAD_REQUEST);
+    assert_eq!(resource.error_code(), "resource_policy_required");
+    assert_eq!(resource.error_type(), "quota_error");
+    assert!(!resource.retryable());
+    for reason in [
+        "model_unpriced",
+        "resource_unpriced",
+        "tier_unpriced",
+        "tariff_not_effective",
+    ] {
+        let price = value_quota_proxy_error(
+            crate::domain::usage::value_pricing::PriceRejection {
+                reason_code: reason,
+                model: "model".into(),
+                tier: "standard".into(),
+                active_pricing_revision: None,
+                pending_pricing_revision: None,
+                effective_from_ms: None,
+            }
+            .into(),
+        );
+        assert_eq!(
+            price.status,
+            if reason == "tariff_not_effective" {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        );
+        assert_eq!(price.error_code(), "price_unavailable");
+        assert!(!price.retryable());
+    }
+}

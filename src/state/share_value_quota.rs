@@ -352,9 +352,46 @@ fn metered_grant(grant: &ShareUserGrant) -> bool {
         && (grant.policy.value_quota.is_some() || grant.pending_value_quota.is_some())
 }
 
+const WATERMARK_BATCH: usize = 64;
+const LEGACY_WATERMARK_SENDS: usize = 16;
+type WatermarkProjection = (
+    String,
+    String,
+    ledger::Scope,
+    crate::domain::usage::value_pricing::ValueQuotaStatus,
+);
+/// Bound serialized JSON as well as item count: model diagnostics can make
+/// a 64-item body exceed the Router's 256 KiB control ingress limit.
+pub(super) fn watermark_chunks(
+    pending: &[WatermarkProjection],
+) -> anyhow::Result<Vec<&[WatermarkProjection]>> {
+    const PAYLOAD_BUDGET: usize = 192 * 1024;
+    let mut chunks = Vec::new();
+    let (mut start, mut bytes) = (0, 32);
+    for (index, (id, _, _, status)) in pending.iter().enumerate() {
+        let size =
+            serde_json::to_vec(&serde_json::json!({"shareId":id,"status":status}))?.len() + 1;
+        anyhow::ensure!(
+            size + 32 <= PAYLOAD_BUDGET,
+            "value watermark projection too large"
+        );
+        if index > start && (index - start >= WATERMARK_BATCH || bytes + size > PAYLOAD_BUDGET) {
+            chunks.push(&pending[start..index]);
+            start = index;
+            bytes = 32;
+        }
+        bytes += size;
+    }
+    if start < pending.len() {
+        chunks.push(&pending[start..]);
+    }
+    Ok(chunks)
+}
+
 const PHASE_NOT_SENT: u8 = 0;
 const PHASE_SENT: u8 = 1;
 const PHASE_UPSTREAM_ERROR: u8 = 2;
+const PHASE_NO_OUTPUT: u8 = 3;
 
 /// State-owned generation admission for Drivers whose control-plane setup
 /// and generation retries are orchestrated inside ServerStateInner.
@@ -395,9 +432,11 @@ impl ValueGenerationAdmission<'_> {
 /// Terminal guard for one admitted USD attempt. Unless the attempt is settled
 /// by its usage log first, dropping the guard (normal return, early `?`, or
 /// a dropped request future) schedules an outcome settlement: never sent =>
-/// $0, explicit authentication rejection => $0 unless usage is logged; an
-/// error status, protocol failure, or missing output leaves the outcome
-/// unknown => reserved risk. Before a retry the forwarder calls
+/// $0, explicit authentication rejection or a declared first-party
+/// rejection (400/403/404/413/422/429/529) => $0 unless usage is logged; a
+/// first-party server failure => input estimate only; any other error
+/// status, protocol failure, or missing output leaves the outcome unknown =>
+/// reserved risk. Before a retry the forwarder calls
 /// [`ValueAttemptGuard::settle_now`] instead, so the retry's admission never
 /// races a still-pending row. Settlement is idempotent with usage-log
 /// settlement.
@@ -472,6 +511,9 @@ impl ValueAttemptGuard {
         .await
         .context("generation evidence task panicked")
         .and_then(|r| r);
+        if result.as_ref().is_ok_and(|changed| *changed) {
+            self.state.value_watermark_dirty.notify_one();
+        }
         if let Err(error) = result {
             if self.enforced {
                 return Err(error);
@@ -486,7 +528,10 @@ impl ValueAttemptGuard {
         Ok(())
     }
     pub(crate) fn proves_no_usage(&self) -> bool {
-        self.outcome() != ledger::AttemptOutcome::Unknown
+        matches!(
+            self.outcome(),
+            ledger::AttemptOutcome::NotSent | ledger::AttemptOutcome::UpstreamError
+        )
     }
     /// The request is about to be written upstream.
     pub(crate) fn mark_sent(&self) {
@@ -496,10 +541,20 @@ impl ValueAttemptGuard {
     pub(crate) fn mark_not_sent(&self) {
         self.phase.store(PHASE_NOT_SENT, AtomicOrdering::Release);
     }
-    /// Upstream response headers arrived.
+    /// Authentication rejection keeps the existing no-execution contract.
+    /// Other statuses require a fully read, validated first-party error body.
     pub(crate) fn mark_upstream_status(&self, status: u16) {
         if status == 401 {
             self.mark_upstream_error();
+        }
+    }
+    pub(crate) fn mark_response_failure(&self, reason: &str) {
+        match reason {
+            "upstream_declared_rejection" => self.mark_upstream_error(),
+            "upstream_error_no_output" => {
+                self.phase.store(PHASE_NO_OUTPUT, AtomicOrdering::Release)
+            }
+            _ => {}
         }
     }
     /// Explicit upstream rejection proving generation did not execute.
@@ -512,6 +567,7 @@ impl ValueAttemptGuard {
         match self.phase.load(AtomicOrdering::Acquire) {
             PHASE_NOT_SENT => ledger::AttemptOutcome::NotSent,
             PHASE_UPSTREAM_ERROR => ledger::AttemptOutcome::UpstreamError,
+            PHASE_NO_OUTPUT => ledger::AttemptOutcome::NoOutput,
             _ => ledger::AttemptOutcome::Unknown,
         }
     }
@@ -529,7 +585,10 @@ impl ValueAttemptGuard {
         state
             .settle_value_attempt_outcome(&request_id, &attempt_id, outcome)
             .await;
-        outcome != ledger::AttemptOutcome::Unknown
+        matches!(
+            outcome,
+            ledger::AttemptOutcome::NotSent | ledger::AttemptOutcome::UpstreamError
+        )
     }
 }
 impl Drop for ValueAttemptGuard {
@@ -712,7 +771,8 @@ impl ServerStateInner {
             .await
             .as_ref()
             .is_some_and(|(base, id, at, c)| {
-                c.3 && at.elapsed() < Duration::from_secs(300)
+                c.cache_creation_ttl
+                    && at.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
                         .registered_router_identity()
@@ -1153,7 +1213,7 @@ impl ServerStateInner {
             .await
             .as_ref()
             .is_some_and(|(base, id, at, supported)| {
-                supported.2
+                supported.value_quotas
                     && at.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
@@ -1169,7 +1229,39 @@ impl ServerStateInner {
             .await
             .as_ref()
             .is_some_and(|(base, id, at, supported)| {
-                supported.9
+                supported.unpriced_fields
+                    && at.elapsed() < Duration::from_secs(300)
+                    && config.router_api_base() == Some(base.as_str())
+                    && config
+                        .registered_router_identity()
+                        .is_some_and(|identity| identity.installation_id == *id)
+            })
+    }
+    /// The Router's strict `valueQuota` reader accepts `unpricedUsage`.
+    pub(crate) async fn value_unpriced_policy_router_negotiated(&self) -> bool {
+        let config = self.config_snapshot().await;
+        self.router_quota_capability
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(base, id, at, supported)| {
+                supported.unpriced_policy
+                    && at.elapsed() < Duration::from_secs(300)
+                    && config.router_api_base() == Some(base.as_str())
+                    && config
+                        .registered_router_identity()
+                        .is_some_and(|identity| identity.installation_id == *id)
+            })
+    }
+    /// The Router accepts batched watermark projections.
+    pub(crate) async fn value_watermark_batch_router_negotiated(&self) -> bool {
+        let config = self.config_snapshot().await;
+        self.router_quota_capability
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(base, id, at, supported)| {
+                supported.watermark_batch
                     && at.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
@@ -1184,7 +1276,7 @@ impl ServerStateInner {
             .await
             .as_ref()
             .is_some_and(|(base, id, at, supported)| {
-                supported.7
+                supported.resource_value_quotas
                     && at.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
@@ -1938,6 +2030,7 @@ impl ServerStateInner {
         match result {
             Ok(Ok(true)) => {
                 tracing::debug!(%request_id, ?outcome, "USD attempt settled without a usage log");
+                self.value_watermark_dirty.notify_one();
                 // A sent attempt with an unknown outcome is charged its
                 // reservation; a USD trial budget must see that charge.
                 if let Err(error) = self.sync_market_trial_value(Some(request_id), false).await {
@@ -1973,6 +2066,7 @@ impl ServerStateInner {
                     blocked_windows = report.blocked,
                     "settled stale USD-equivalent quota attempts"
                 );
+                self.value_watermark_dirty.notify_one();
             }
             Ok(Ok(_)) => {}
             Ok(Err(error)) => tracing::warn!(%error, "USD quota sweeper failed; will retry"),
@@ -2304,12 +2398,20 @@ impl ServerStateInner {
             }
             let w = window(&bound, now)?;
             let identity = grant_scope(&config, share_id, email, &grant)?;
-            let (pending, complete) = ledger::evidence::pending_tokens(
-                &self.config_dir,
-                &identity,
-                &w,
-                context.request_id.as_deref(),
-            )?;
+            // SQLite read on the blocking pool, never on the async runtime.
+            let (pending, complete) = {
+                let (dir, scope, window, request) = (
+                    self.config_dir.clone(),
+                    identity.clone(),
+                    w.clone(),
+                    context.request_id.clone(),
+                );
+                tokio::task::spawn_blocking(move || {
+                    ledger::evidence::pending_tokens(&dir, &scope, &window, request.as_deref())
+                })
+                .await
+                .context("Token evidence task panicked")??
+            };
             let view = crate::domain::sharing::shares::quota_view_from_history(
                 &usage, share_id, email, &grant, now,
             )
@@ -2552,15 +2654,28 @@ impl ServerStateInner {
     pub(crate) fn value_quota_diagnostics(&self, share_id: &str) -> anyhow::Result<Value> {
         ledger::diagnostics(&self.config_dir, share_id)
     }
+    /// Pushes changed USD window projections to the Router. With the batch
+    /// capability every changed grant goes out in signed batches of
+    /// [`WATERMARK_BATCH`]; an older Router gets at most 16 single requests
+    /// per run, rotating through the grants. All ledger reads and writes run
+    /// on the blocking pool. `maintenance` (heartbeat only) also compacts
+    /// terminal history and runs the daily retention pass.
     pub(super) async fn sync_share_value_watermarks(
         &self,
         config: &ServerConfig,
+        maintenance: bool,
     ) -> anyhow::Result<()> {
         if !self.router_supports_value_quotas().await {
             return Ok(());
         }
-        if let Err(error) = ledger::compact_terminal_history(&self.config_dir, now_ms_i64()) {
-            tracing::warn!(%error,"value quota maintenance failed; no history is discarded");
+        let Ok(_sync) = self.value_watermark_sync.try_lock() else {
+            if !maintenance {
+                self.value_watermark_dirty.notify_one();
+            }
+            return Ok(());
+        };
+        if maintenance {
+            self.maintain_value_history(config).await;
         }
         let identity = config
             .registered_router_identity()
@@ -2579,104 +2694,244 @@ impl ServerStateInner {
                     .map(|(email, g)| ((s.id.clone(), email.clone()), g.clone()))
             })
             .collect::<Vec<_>>();
-        let sync_started = std::time::Instant::now();
-        let sync_scope = scope(config, "sync", "sync@local.invalid")?;
-        let last: Option<(String, String)> =
-            serde_json::from_str(&ledger::value_sync_cursor(&self.config_dir, &sync_scope)?).ok();
-        grants.sort_by(|a, b| a.0.cmp(&b.0));
-        if let Some(position) = last.and_then(|last| grants.iter().position(|(key, _)| key > &last))
-        {
-            grants.rotate_left(position);
+        if grants.is_empty() {
+            return Ok(());
         }
+        let batch = self.value_watermark_batch_router_negotiated().await;
         let unpriced_fields = self.value_quota_unpriced_router_negotiated().await;
-        let mut sent = 0;
-        for ((id, email), grant) in grants {
-            if sent >= 16 || sync_started.elapsed() >= Duration::from_secs(5) {
-                return Ok(());
-            }
-            ledger::set_value_sync_cursor(
-                &self.config_dir,
-                &sync_scope,
-                &serde_json::to_string(&(&id, &email))?,
-            )?;
-            let status = match value_status(
-                &self.config_dir,
-                config,
-                &id,
-                &email,
-                &grant,
-                now_ms_i64(),
-                unpriced_fields,
-            ) {
-                Ok(status) => status,
-                Err(error) => {
-                    tracing::debug!(%error,"one value quota projection is unavailable; continuing other users");
-                    continue;
+        let sync_scope = scope(config, "sync", "sync@local.invalid")?;
+        let (dir, projection_config) = (self.config_dir.clone(), config.clone());
+        let cursor_scope = sync_scope.clone();
+        let pending = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            grants.sort_by(|a, b| a.0.cmp(&b.0));
+            {
+                let last: Option<(String, String)> =
+                    serde_json::from_str(&ledger::value_sync_cursor(&dir, &cursor_scope)?).ok();
+                if let Some(position) =
+                    last.and_then(|last| grants.iter().position(|(key, _)| key > &last))
+                {
+                    grants.rotate_left(position);
                 }
-            };
-            let identity_scope = grant_scope(config, &id, &status.email, &grant)?;
-            let needs_sync = match ledger::projection_needs_sync(
-                &self.config_dir,
-                &identity_scope,
-                &status,
-                now_ms_i64(),
-            ) {
-                Ok(needs) => needs,
-                Err(error) => {
-                    tracing::warn!(%error,"value quota projection retry state unavailable");
-                    continue;
-                }
-            };
-            if !needs_sync {
-                continue;
             }
-            let request = client::signed_canonical_request(
-                identity,
-                "share_value_quota_watermark",
-                serde_json::json!({"shareId":id,"status":status}),
-            )?;
-            sent += 1;
-            let response = self
-                .http_client()
-                .await
-                .post(format!(
-                    "{}/v1/shares/{id}/value-quota-watermarks",
-                    base.trim_end_matches('/')
-                ))
-                .timeout(Duration::from_secs(3))
-                .json(&request)
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => {
-                    let ack = response.json::<Value>().await;
-                    let mark = ack
-                        .as_ref()
-                        .ok()
-                        .and_then(|ack| ack.get("usageWatermark").and_then(Value::as_u64));
-                    let Some(mark) = mark else {
-                        tracing::warn!("invalid value watermark ACK; retaining retry");
+            let now = now_ms_i64();
+            let mut pending = Vec::new();
+            for ((id, email), grant) in grants {
+                if !batch && pending.len() >= LEGACY_WATERMARK_SENDS {
+                    break;
+                }
+                let status = match value_status(
+                    &dir,
+                    &projection_config,
+                    &id,
+                    &email,
+                    &grant,
+                    now,
+                    unpriced_fields,
+                ) {
+                    Ok(status) => status,
+                    Err(error) => {
+                        tracing::debug!(%error,"one value quota projection is unavailable; continuing other users");
                         continue;
-                    };
-                    if let Err(error) = ledger::ack_projection(
-                        &self.config_dir,
-                        &identity_scope,
-                        &status,
-                        mark,
-                        now_ms_i64(),
-                    ) {
-                        tracing::warn!(%error,"value watermark ACK could not be committed");
+                    }
+                };
+                let identity_scope = grant_scope(&projection_config, &id, &status.email, &grant)?;
+                match ledger::projection_needs_sync(&dir, &identity_scope, &status, now) {
+                    Ok(true) => pending.push((id, email, identity_scope, status)),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error,"value quota projection retry state unavailable")
                     }
                 }
-                Ok(response) => {
-                    tracing::debug!(status=%response.status(),"value watermark awaits descriptor synchronization")
+            }
+            Ok(pending)
+        })
+        .await
+        .context("value watermark projection task panicked")??;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let base = base.trim_end_matches('/');
+        let mut acks = Vec::new();
+        let mut cursor = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        if batch {
+            for chunk in watermark_chunks(&pending)? {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
                 }
-                Err(error) => {
-                    tracing::debug!(%error,"value watermark will retry without blocking heartbeat")
+                cursor = chunk
+                    .last()
+                    .map(|(id, email, _, _)| (id.clone(), email.clone()));
+                let items: Vec<Value> = chunk
+                    .iter()
+                    .map(|(id, _, _, status)| serde_json::json!({"shareId":id,"status":status}))
+                    .collect();
+                let request = client::signed_canonical_request(
+                    identity,
+                    "share_value_quota_watermarks",
+                    serde_json::json!({"items":items}),
+                )?;
+                let response = self
+                    .http_client()
+                    .await
+                    .post(format!("{base}/v1/shares/value-quota-watermarks"))
+                    .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                    .json(&request)
+                    .send()
+                    .await;
+                let results = match response {
+                    Ok(response) if response.status().is_success() => {
+                        response.json::<Value>().await.ok()
+                    }
+                    Ok(response) => {
+                        tracing::debug!(status=%response.status(),"value watermark batch awaits descriptor synchronization");
+                        None
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error,"value watermark batch will retry without blocking heartbeat");
+                        None
+                    }
+                };
+                let Some(results) = results else {
+                    break;
+                };
+                let results = results
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for (id, email, identity_scope, status) in chunk {
+                    let mut matching = results.iter().filter(|item| {
+                        item.get("shareId").and_then(Value::as_str) == Some(id.as_str())
+                            && item.get("email").and_then(Value::as_str)
+                                == Some(status.email.as_str())
+                    });
+                    let unique = matching.next().filter(|_| matching.next().is_none());
+                    let mark = unique
+                        .filter(|item| {
+                            item.get("shareId").and_then(Value::as_str) == Some(id.as_str())
+                                && item.get("email").and_then(Value::as_str)
+                                    == Some(status.email.as_str())
+                        })
+                        .and_then(|item| {
+                            if item.get("ok").and_then(Value::as_bool) == Some(true) {
+                                item.get("usageWatermark").and_then(Value::as_u64)
+                            } else {
+                                let reason =
+                                    item.get("error").and_then(Value::as_str).unwrap_or("");
+                                tracing::debug!(share_id = %id, %email, %reason,
+                                    "value watermark item awaits descriptor synchronization");
+                                None
+                            }
+                        });
+                    if let Some(mark) = mark {
+                        acks.push((identity_scope.clone(), status.clone(), mark));
+                    }
+                }
+            }
+        } else {
+            for (id, email, identity_scope, status) in &pending {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                cursor = Some((id.clone(), email.clone()));
+                let request = client::signed_canonical_request(
+                    identity,
+                    "share_value_quota_watermark",
+                    serde_json::json!({"shareId":id,"status":status}),
+                )?;
+                let response = self
+                    .http_client()
+                    .await
+                    .post(format!("{base}/v1/shares/{id}/value-quota-watermarks"))
+                    .timeout(
+                        Duration::from_secs(3)
+                            .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    )
+                    .json(&request)
+                    .send()
+                    .await;
+                match response {
+                    Ok(response) if response.status().is_success() => {
+                        let ack = response.json::<Value>().await;
+                        match ack
+                            .as_ref()
+                            .ok()
+                            .and_then(|ack| ack.get("usageWatermark").and_then(Value::as_u64))
+                        {
+                            Some(mark) => acks.push((identity_scope.clone(), status.clone(), mark)),
+                            None => tracing::warn!("invalid value watermark ACK; retaining retry"),
+                        }
+                    }
+                    Ok(response) => {
+                        tracing::debug!(status=%response.status(),"value watermark awaits descriptor synchronization")
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error,"value watermark will retry without blocking heartbeat")
+                    }
                 }
             }
         }
+        if let Some(cursor) = cursor {
+            let (dir, cursor) = (self.config_dir.clone(), serde_json::to_string(&cursor)?);
+            tokio::task::spawn_blocking(move || {
+                ledger::set_value_sync_cursor(&dir, &sync_scope, &cursor)
+            })
+            .await
+            .context("value watermark cursor task panicked")??;
+        }
+        let needs_retry = acks.len() < pending.len();
+        let dir = self.config_dir.clone();
+        let committed = tokio::task::spawn_blocking(move || {
+            let now = now_ms_i64();
+            let mut committed = 0;
+            for (identity_scope, status, mark) in acks {
+                match ledger::ack_projection(&dir, &identity_scope, &status, mark, now) {
+                    Ok(()) => committed += 1,
+                    Err(error) => {
+                        tracing::warn!(%error,"value watermark ACK could not be committed")
+                    }
+                }
+            }
+            committed
+        })
+        .await;
+        if batch
+            && (needs_retry
+                || committed.as_ref().is_ok_and(|n| *n < pending.len())
+                || committed.is_err())
+        {
+            self.value_watermark_dirty.notify_one();
+        }
+        committed.context("value watermark ACK task panicked")?;
         Ok(())
+    }
+    /// Terminal-history compaction plus the daily retention pass (archive of
+    /// closed history, unreferenced tariff snapshots, alias trimming), on the
+    /// blocking pool. Failures discard nothing and are retried next run.
+    async fn maintain_value_history(&self, _config: &ServerConfig) {
+        let now = now_ms_i64();
+        let dir = self.config_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            ledger::compact_terminal_history(&dir, now)?;
+            ledger::retention::maintain(&dir, now)
+        })
+        .await;
+        match result {
+            Ok(Ok(report)) if report != Default::default() => {
+                tracing::info!(
+                    archived_attempts = report.archived_attempts,
+                    deleted_snapshots = report.deleted_snapshots,
+                    trimmed_alias_rows = report.trimmed_alias_rows,
+                    "USD ledger retention pass"
+                )
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error,"value quota maintenance failed; no history is discarded")
+            }
+            Err(error) => tracing::warn!(%error, "value quota maintenance task panicked"),
+        }
     }
 }
 

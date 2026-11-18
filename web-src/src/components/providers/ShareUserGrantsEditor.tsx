@@ -42,7 +42,7 @@ import type {
 } from "@/lib/api/share";
 import { shareApi } from "@/lib/api/share";
 import { isValidShareEmail, stageGrantPolicy, sharePolicyKey } from "@/utils/shareFormUtils";
-import { applyShareUserPolicyBatch, patchedSharePolicy, type ShareUserPolicyBatchPatch } from "./share-user-policy-batch";
+import { USD_PARALLEL_LIMIT, validParallelLimit, batchUsesUsd, applyShareUserPolicyBatch, patchedSharePolicy, type ShareUserPolicyBatchPatch } from "./share-user-policy-batch";
 import { ShareValueUsageCorrection } from "./ShareValueUsageCorrection";
 import {
   ShareValueResourceToggle, ShareValueLimitField, ShareValuePreviewLine, ShareValueReadiness, ShareValueScheduledLine, ShareValueUnitToggle, ShareValueUsageCell,
@@ -284,13 +284,13 @@ function anchorInvalid(period: ShareTokenPeriod, anchorAtMs: number | undefined)
 }
 
 /** The policy a valid USD draft saves; preview and save share it so intents match exactly. */
-function usdPolicyFor(draft: Pick<PolicyDraft, "allowedOperations" | "rejectUnpriced" | "resourceMetering" | "parallelLimit" | "tokenLimit" | "tokenPeriod" | "tokenPeriodAnchor" | "expiresAt">): ShareUserPolicy | undefined {
+function usdPolicyFor(draft: Pick<PolicyDraft, "allowedOperations" | "rejectUnpriced" | "resourceMetering" | "parallelLimit" | "tokenLimit" | "tokenPeriod" | "tokenPeriodAnchor" | "expiresAt">, previousParallel?: number): ShareUserPolicy | undefined {
   const amount = parseValueLimitInput(draft.tokenLimit);
   if (!amount.ok) return undefined;
   const parallelLimit = draft.parallelLimit.trim() ? Number(draft.parallelLimit) : undefined;
   const expiresAt = draft.expiresAt ? new Date(draft.expiresAt).getTime() : undefined;
   const tokenPeriodAnchorAtMs = ANCHORED_PERIODS.has(draft.tokenPeriod) ? parseUtcDateTime(draft.tokenPeriodAnchor) : undefined;
-  if ((parallelLimit != null && (!Number.isInteger(parallelLimit) || parallelLimit < 1))
+  if (!validParallelLimit(parallelLimit, true, previousParallel)
     || (expiresAt != null && !Number.isFinite(expiresAt)) || anchorInvalid(draft.tokenPeriod, tokenPeriodAnchorAtMs)) return undefined;
   return {
     allowedOperations:draft.allowedOperations,
@@ -448,7 +448,7 @@ export function ShareUserGrantsEditor({
     if (!draft) return undefined;
     const email = draft.email.trim().toLowerCase();
     if (!isValidShareEmail(email)) return undefined;
-    const policy: ShareUserPolicy | undefined = draft.quotaUnit === "usdEquivalent" ? usdPolicyFor(draft) : {
+    const policy: ShareUserPolicy | undefined = draft.quotaUnit === "usdEquivalent" ? usdPolicyFor(draft, (savedGrants[email]?.pendingValueQuota?.policy ?? savedGrants[email]?.policy)?.parallelLimit) : {
       allowedOperations:draft.allowedOperations,
       parallelLimit: draft.parallelLimit.trim() ? Number(draft.parallelLimit) : undefined,
       tokenLimit: draft.tokenLimit.trim() ? Number(draft.tokenLimit) : undefined,
@@ -463,11 +463,12 @@ export function ShareUserGrantsEditor({
     const patch = batchPatchFor(batchDraft);
     const parallel = patch.parallelLimit?.value;
     if (!patch.tokenLimit || (batchDraft.quotaUnit === "usdEquivalent" && !patch.tokenLimit.valueQuota) || anchorInvalid(batchDraft.tokenPeriod, patch.tokenLimit.periodAnchorAtMs)
-      || (parallel != null && (!Number.isInteger(parallel) || parallel < 1))
+      || !([...selectedEditableEmails].every(email => validParallelLimit(parallel, batchUsesUsd(grants, selectedEditableEmails, patch), (savedGrants[email]?.pendingValueQuota?.policy ?? savedGrants[email]?.policy)?.parallelLimit)))
       || (patch.expiresAt?.value != null && !Number.isFinite(patch.expiresAt.value))) return undefined;
     // Preview the policy being asked for, not what staging keeps enforced.
     return Object.fromEntries([...selectedEditableEmails].sort().map((email) => [email, patchedSharePolicy(value[email], patch)]));
   })();
+  const batchUsdParallel = !!batchDraft && batchUsesUsd(grants, selectedEditableEmails, batchPatchFor(batchDraft));
   const dialogOpen = draft != null || batchDraft != null;
   const hasUsdGrant = grants.some((grant) => !grant.valueQuotaMalformed && (grant.policy.valueQuota || grant.pendingValueQuota));
   const usdSelected = draft?.quotaUnit === "usdEquivalent" || (!!batchDraft?.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent");
@@ -644,7 +645,7 @@ export function ShareUserGrantsEditor({
       (editingEmail == null && (Boolean(value[email]?.active) || protectedEmails?.has(email))) ||
       parallelLimit === 0 ||
       tokenLimit === 0 ||
-      (parallelLimit != null && (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
+      !validParallelLimit(parallelLimit, draft.quotaUnit === "usdEquivalent", (savedGrants[editingEmail ?? email]?.pendingValueQuota?.policy ?? savedGrants[editingEmail ?? email]?.policy)?.parallelLimit) ||
       (tokenLimit != null && (!Number.isInteger(tokenLimit) || tokenLimit < 1)) ||
       (expiresAt != null && !Number.isFinite(expiresAt)) ||
       (anchored && (
@@ -667,7 +668,7 @@ export function ShareUserGrantsEditor({
       }
       return;
     }
-    const usdPolicy = draft.quotaUnit === "usdEquivalent" ? usdPolicyFor(draft) : undefined;
+    const usdPolicy = draft.quotaUnit === "usdEquivalent" ? usdPolicyFor(draft, (savedGrants[email]?.pendingValueQuota?.policy ?? savedGrants[email]?.policy)?.parallelLimit) : undefined;
     if (draft.quotaUnit === "usdEquivalent" && !usdPolicy) {
       // `$` is selected: never save a Token policy instead.
       setDraftError(t("share.userLimit.invalidPolicy"));
@@ -843,7 +844,7 @@ export function ShareUserGrantsEditor({
         (!(batchDraft.applyTokenLimit ? batchDraft.tokenPeriod === "accountReset" : selectedGrants.every((grant) => grant.policy.tokenPeriod === "accountReset")) && consumedTokens < usageFloor));
     if (
       (batchDraft.applyParallelLimit && parallelLimit != null &&
-        (!Number.isInteger(parallelLimit) || parallelLimit < 1)) ||
+        !([...selectedEditableEmails].every(email => validParallelLimit(parallelLimit, batchUsesUsd(grants, selectedEditableEmails, batchPatchFor(batchDraft)), (savedGrants[email]?.pendingValueQuota?.policy ?? savedGrants[email]?.policy)?.parallelLimit)))) ||
       (batchDraft.applyTokenLimit && tokenLimit != null &&
         (!Number.isInteger(tokenLimit) || tokenLimit < 1)) ||
       (batchDraft.applyExpiresAt && expiresAt != null && !Number.isFinite(expiresAt)) || (batchDraft.applyTokenLimit && anchored && (
@@ -1227,7 +1228,8 @@ export function ShareUserGrantsEditor({
               </div>
               <div className="space-y-2">
                 <Label htmlFor="share-user-parallel">{t("share.parallelLimit")}</Label>
-                <Input id="share-user-parallel" type="number" min={1} placeholder={unlimited} value={draft.parallelLimit} onChange={(event) => setDraft({ ...draft, parallelLimit: event.target.value })} />
+                <Input id="share-user-parallel" type="number" min={1} max={draft.quotaUnit === "usdEquivalent" ? USD_PARALLEL_LIMIT : undefined} placeholder={unlimited} value={draft.parallelLimit} onChange={(event) => setDraft({ ...draft, parallelLimit: event.target.value })} />
+                {draft.quotaUnit === "usdEquivalent" ? <p className="text-xs text-muted-foreground">{t("share.userLimit.valueQuota.parallelCap")}</p> : null}
               </div>
               <div className="space-y-2">
                 <Label id="share-user-unit-label">{t("share.userLimit.valueQuota.unit")}</Label>
@@ -1249,7 +1251,7 @@ export function ShareUserGrantsEditor({
                   label={draft.quotaUnit === "usdEquivalent" ? t("share.userLimit.valueQuota.limit") : t("share.tokenLimit")}
                   error={limitError(draft.quotaUnit, draft.tokenLimit)} onChange={(tokenLimit) => setDraft({ ...draft, tokenLimit })} />
                 {!independentCapabilities && draft.quotaUnit === "usdEquivalent" ? <ShareValueResourceToggle value={draft.resourceMetering} onChange={resourceMetering=>setDraft({...draft,resourceMetering})} /> : null}
-                {draft.quotaUnit === "usdEquivalent"?<label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={draft.rejectUnpriced} onChange={e=>setDraft({...draft,rejectUnpriced:e.target.checked})}/>{i18n.language.startsWith("zh")?"拒绝缺价请求（对文本与资源均生效）":"Reject unpriced requests (text and resources)"}</label>:null}
+                {draft.quotaUnit === "usdEquivalent"?<label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={draft.rejectUnpriced} onChange={e=>setDraft({...draft,rejectUnpriced:e.target.checked})}/>{t("share.userLimit.valueQuota.rejectUnpriced")}</label>:null}
                 {singleUsdPolicies ? <ShareValuePreviewLine state={singlePreview} calibrations={{[editedEmail]:{amount: draft.quotaUnit === "usdEquivalent" ? draft.consumedValue : draft.consumedTokens, reason: draft.valueReason}}} /> : null}
               </div>
               <div className={draft.quotaUnit==="usdEquivalent"?"hidden":"space-y-2 sm:col-span-2"}>
@@ -1453,6 +1455,7 @@ export function ShareUserGrantsEditor({
                 <Input
                   type="number"
                   min={1}
+                  max={batchUsdParallel ? USD_PARALLEL_LIMIT : undefined}
                   aria-label={t("share.parallelLimit")}
                   disabled={!batchDraft.applyParallelLimit}
                   placeholder={unlimited}
@@ -1462,6 +1465,7 @@ export function ShareUserGrantsEditor({
                     parallelLimit: event.target.value,
                   })}
                 />
+                {batchUsdParallel ? <p className="text-xs text-muted-foreground">{t("share.userLimit.valueQuota.parallelCap")}</p> : null}
               </div>
               <div className="space-y-2">
                 <div className="flex items-center gap-2">
@@ -1490,7 +1494,7 @@ export function ShareUserGrantsEditor({
                   error={batchDraft.applyTokenLimit ? limitError(batchDraft.quotaUnit, batchDraft.tokenLimit) : undefined}
                   onChange={(tokenLimit) => setBatchDraft({ ...batchDraft, tokenLimit })} />
                 {!independentCapabilities && batchDraft.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" ? <ShareValueResourceToggle value={batchDraft.resourceMetering} onChange={resourceMetering=>setBatchDraft({...batchDraft,resourceMetering})} /> : null}
-                {batchDraft.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent"?<label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={batchDraft.rejectUnpriced} onChange={e=>setBatchDraft({...batchDraft,rejectUnpriced:e.target.checked})}/>{i18n.language.startsWith("zh")?"拒绝缺价请求（对文本与资源均生效）":"Reject unpriced requests (text and resources)"}</label>:null}
+                {batchDraft.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent"?<label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={batchDraft.rejectUnpriced} onChange={e=>setBatchDraft({...batchDraft,rejectUnpriced:e.target.checked})}/>{t("share.userLimit.valueQuota.rejectUnpriced")}</label>:null}
                 {batchUsdPolicies ? <ShareValuePreviewLine state={batchPreview} calibrations={batchDraft.calibrations} /> : null}
                 {batchPreview.preview?.rows.filter(row => row.calibrationRequired).map(row => <div key={row.email} className="grid gap-2">
                   <Label>{row.email} · {t("share.userLimit.valueQuota.conversionCalibrationRequired")}</Label>

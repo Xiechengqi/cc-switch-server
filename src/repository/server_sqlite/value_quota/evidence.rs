@@ -106,6 +106,15 @@ pub(crate) fn admit_shadow(
     assert_committed(dir)?;
     let mut conn = open_database(&database_path(dir), false)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let normalized = Admission {
+        started_at_ms: if a.window.account.is_none() {
+            a.started_at_ms.max(a.window.metered_start_ms())
+        } else {
+            a.started_at_ms
+        },
+        ..a.clone()
+    };
+    let a = &normalized;
     record_admission(&tx, a, verified)?;
     let mut priced = false;
     tx.execute_batch("SAVEPOINT optional_shadow_price;")?;
@@ -166,6 +175,7 @@ pub(super) fn outcome(
         if fact.outcome == ObservedOutcome::InProgress {
             fact.outcome = match outcome {
                 AttemptOutcome::NotSent | AttemptOutcome::UpstreamError => ObservedOutcome::Free,
+                AttemptOutcome::NoOutput => ObservedOutcome::NoOutput,
                 AttemptOutcome::Unknown => ObservedOutcome::Unknown,
             };
             write_fact(tx, request, attempt, &fact)?;
@@ -312,8 +322,14 @@ pub(crate) fn capture_log(
     fact.tokens = tokens;
     fact.observed_tier = tier.map(str::to_owned);
     fact.reported_model = log.reported_model.clone();
-    fact.resources =
-        resource_usage_for_log(log, meta.as_ref()).or_else(|| log.value_resources.clone());
+    fact.resources = if matches!(
+        fact.outcome,
+        ObservedOutcome::Free | ObservedOutcome::NoOutput
+    ) {
+        None
+    } else {
+        resource_usage_for_log(log, meta.as_ref()).or_else(|| log.value_resources.clone())
+    };
     let json = serde_json::to_string(&fact)?;
     // Accounted-at intentionally retains the existing Token aggregation clock.
     // USD amounts retain original admission/start attribution across late logs.
@@ -564,8 +580,9 @@ pub(super) fn prepare_page_in_tx(
 }
 
 pub(super) fn missing_in(conn: &Connection, scope: &Scope, w: &Window) -> anyhow::Result<u64> {
-    let missing:i64=conn.query_row("SELECT count(*) FROM quota_metering_facts f WHERE f.scope=?1 AND f.started_at_ms>=?2
-        AND (?3 IS NULL OR f.started_at_ms<?3) AND (?4 IS NULL OR f.account_key=?4) AND json_extract(f.fact_json,'$.outcome')!='free' AND NOT EXISTS(SELECT 1 FROM value_quota_attempts a WHERE a.request_id=f.request_id AND a.attempt_id=f.attempt_id)",
+    let clock = fact_clock(w);
+    let missing:i64=conn.query_row(&format!("SELECT count(*) FROM quota_metering_facts f WHERE f.scope=?1 AND {clock}>=?2
+        AND (?3 IS NULL OR {clock}<?3) AND (?4 IS NULL OR f.account_key=?4) AND json_extract(f.fact_json,'$.outcome')!='free' AND NOT EXISTS(SELECT 1 FROM value_quota_attempts a WHERE a.request_id=f.request_id AND a.attempt_id=f.attempt_id)"),
         params![scope.key()?,w.metered_start_ms(),w.ends_at_ms,w.account_key()?],|r|r.get(0))?;
     Ok(u64::try_from(missing)?)
 }
@@ -578,11 +595,30 @@ pub(super) fn totals_in(
     until: Option<i64>,
 ) -> anyhow::Result<(u64, u64)> {
     let totals: (i64, i64) = if w.account.is_some() {
-        conn.query_row("SELECT COALESCE(sum(quota_tokens),0),COALESCE(sum(request_count),0) FROM quota_metering_facts WHERE scope=?1 AND account_key=?2 AND started_at_ms>=?3 AND (?4 IS NULL OR started_at_ms<?4)",params![scope.key()?,w.account_key()?,from,until],|r|Ok((r.get(0)?,r.get(1)?)))?
+        conn.query_row("SELECT COALESCE(sum(quota_tokens),0),COALESCE(sum(request_count),0) FROM quota_metering_facts WHERE scope=?1 AND account_key=?2 AND account_started_at_ms>=?3 AND (?4 IS NULL OR account_started_at_ms<?4)",params![scope.key()?,w.account_key()?,from,until],|r|Ok((r.get(0)?,r.get(1)?)))?
     } else {
         conn.query_row("SELECT COALESCE(sum(quota_tokens),0),COALESCE(sum(request_count),0) FROM quota_metering_facts WHERE scope=?1 AND accounted_at_ms>=?2 AND (?3 IS NULL OR accounted_at_ms<?3)",params![scope.key()?,from,until],|r|Ok((r.get(0)?,r.get(1)?)))?
     };
     Ok((u64::try_from(totals.0)?, u64::try_from(totals.1)?))
+}
+
+/// All fragments are fixed SQL identifiers. Calendar money retains its
+/// admission clock; account money and Token proof retain the source clock.
+pub(super) fn fact_clock(window: &Window) -> &'static str {
+    if window.account.is_some() {
+        "f.account_started_at_ms"
+    } else {
+        "f.started_at_ms"
+    }
+}
+
+pub(super) fn attempt_clock(window: &Window) -> &'static str {
+    if window.account.is_some() {
+        // Missing facts remain uncertainty for an account cycle.
+        "COALESCE(f.account_started_at_ms,a.started_at_ms)"
+    } else {
+        "a.started_at_ms"
+    }
 }
 
 pub(super) fn attribution_key(
@@ -605,7 +641,7 @@ pub(super) fn account_aggregate(
     let mut aggregate = Checkpoint::empty();
     let mut q=conn.prepare("SELECT a.usage_picos,a.pending_risk_picos,a.metering_status,a.watermark,a.pricing_revision
         FROM quota_metering_facts f JOIN value_quota_attempts a USING(request_id,attempt_id)
-        WHERE f.scope=?1 AND f.account_key=?2 AND f.started_at_ms>=?3 AND (?4 IS NULL OR f.started_at_ms<?4)")?;
+        WHERE f.scope=?1 AND f.account_key=?2 AND f.account_started_at_ms>=?3 AND (?4 IS NULL OR f.account_started_at_ms<?4)")?;
     let rows = q.query_map(
         params![
             scope.key()?,
@@ -666,9 +702,10 @@ pub(super) fn pending_tokens_in(
     w: &Window,
     exclude: Option<&str>,
 ) -> anyhow::Result<(u64, bool)> {
-    let mut q=conn.prepare("SELECT request_id,fact_json,quota_tokens FROM quota_metering_facts WHERE scope=?1 AND started_at_ms>=?2
-        AND (?3 IS NULL OR started_at_ms<?3) AND (?4 IS NULL OR account_key=?4) AND (?5 IS NULL OR request_id!=?5)
-        AND (json_extract(fact_json,'$.outcome')='inProgress' OR (accounted_at_ms IS NULL AND json_extract(fact_json,'$.outcome') IN ('final','finalConservative')))")?;
+    let clock = fact_clock(w);
+    let mut q=conn.prepare(&format!("SELECT request_id,fact_json,quota_tokens FROM quota_metering_facts f WHERE scope=?1 AND {clock}>=?2
+        AND (?3 IS NULL OR {clock}<?3) AND (?4 IS NULL OR account_key=?4) AND (?5 IS NULL OR request_id!=?5)
+        AND (json_extract(fact_json,'$.outcome')='inProgress' OR (accounted_at_ms IS NULL AND json_extract(fact_json,'$.outcome') IN ('final','finalConservative')))"))?;
     let rows = q.query_map(
         params![
             scope.key()?,
@@ -746,9 +783,10 @@ pub(super) fn pending_value_in(
 ) -> anyhow::Result<(i128, bool)> {
     let mut risk = 0i128;
     let mut complete = true;
-    let mut q=conn.prepare("SELECT a.request_id,a.attempt_id,a.usage_picos FROM value_quota_attempts a
-        LEFT JOIN quota_metering_facts f USING(request_id,attempt_id) WHERE a.scope=?1 AND a.started_at_ms>=?2
-        AND (?3 IS NULL OR a.started_at_ms<?3) AND (?4 IS NULL OR f.account_key=?4) AND a.metering_status='pending'")?;
+    let clock = attempt_clock(w);
+    let mut q=conn.prepare(&format!("SELECT a.request_id,a.attempt_id,a.usage_picos FROM value_quota_attempts a
+        LEFT JOIN quota_metering_facts f USING(request_id,attempt_id) WHERE a.scope=?1 AND {clock}>=?2
+        AND (?3 IS NULL OR {clock}<?3) AND (?4 IS NULL OR f.account_key=?4) AND a.metering_status='pending'"))?;
     let rows = q.query_map(
         params![
             scope.key()?,
@@ -795,9 +833,10 @@ pub(super) fn non_token_basis(
     scope: &Scope,
     w: &Window,
 ) -> anyhow::Result<Option<String>> {
-    let mut q=conn.prepare("SELECT a.request_id,a.attempt_id,a.usage_picos,a.metering_status,f.fact_json FROM value_quota_attempts a
-        LEFT JOIN quota_metering_facts f USING(request_id,attempt_id) WHERE a.scope=?1 AND a.started_at_ms>=?2
-        AND (?3 IS NULL OR a.started_at_ms<?3) AND (?4 IS NULL OR f.account_key=?4) AND a.usage_picos!='0' ORDER BY a.request_id,a.attempt_id")?;
+    let clock = attempt_clock(w);
+    let mut q=conn.prepare(&format!("SELECT a.request_id,a.attempt_id,a.usage_picos,a.metering_status,f.fact_json FROM value_quota_attempts a
+        LEFT JOIN quota_metering_facts f USING(request_id,attempt_id) WHERE a.scope=?1 AND {clock}>=?2
+        AND (?3 IS NULL OR {clock}<?3) AND (?4 IS NULL OR f.account_key=?4) AND a.usage_picos!='0' ORDER BY a.request_id,a.attempt_id"))?;
     let rows = q.query_map(
         params![
             scope.key()?,
@@ -868,11 +907,13 @@ pub(super) fn observe_task_fact(
 }
 
 pub(super) fn unresolved_in(conn: &Connection, scope: &Scope, w: &Window) -> anyhow::Result<u64> {
-    let count:i64=conn.query_row("SELECT
+    let clock = attempt_clock(w);
+    let count:i64=conn.query_row(&format!("SELECT
         (SELECT count(*) FROM value_quota_gaps WHERE scope=?1 AND started_at_ms>=?2 AND (?3 IS NULL OR started_at_ms<?3))+
         (SELECT count(*) FROM value_quota_attempts a LEFT JOIN quota_metering_facts f USING(request_id,attempt_id)
-         WHERE a.scope=?1 AND a.started_at_ms>=?2 AND (?3 IS NULL OR a.started_at_ms<?3)
-         AND (a.metering_status='unavailable' OR (a.metering_status='pending' AND COALESCE(json_extract(f.fact_json,'$.outcome'),'unknown') NOT IN ('inProgress','free')) OR (?4 IS NOT NULL AND f.account_key IS NULL)))",
+         WHERE a.scope=?1 AND {clock}>=?2 AND (?3 IS NULL OR {clock}<?3)
+         AND (?4 IS NULL OR f.account_key=?4 OR f.account_key IS NULL)
+         AND (a.metering_status='unavailable' OR (a.metering_status='pending' AND COALESCE(json_extract(f.fact_json,'$.outcome'),'unknown') NOT IN ('inProgress','free')) OR (?4 IS NOT NULL AND f.account_key IS NULL)))"),
         params![scope.key()?,w.metered_start_ms(),w.ends_at_ms,w.account_key()?],|r|r.get(0))?;
     Ok(u64::try_from(count)?)
 }

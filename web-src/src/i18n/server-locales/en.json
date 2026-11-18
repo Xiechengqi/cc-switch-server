@@ -1264,6 +1264,8 @@
     "unlimited": "Unlimited",
     "userLimit": {
       "valueQuota": {
+        "parallelCap": "USD-equivalent quotas allow at most 4 concurrent requests per user. Enter 1–4 or leave empty for 4. Unchanged historical values above 4 still take effect as 4.",
+        "rejectUnpriced": "Reject unpriced requests (text and resources)",
         "readiness": {
           "blocked": "USD-equivalent quota is not ready",
           "retry": "Check again",

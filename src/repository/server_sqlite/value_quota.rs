@@ -17,6 +17,7 @@ pub(crate) mod conversion;
 pub(crate) mod evidence;
 mod reprice;
 mod resource_tasks;
+pub(crate) mod retention;
 mod tariff;
 pub(crate) use reprice::{reprice_due, reprice_page};
 pub(crate) use resource_tasks::attach_task;
@@ -404,6 +405,65 @@ fn estimate_picos(
     text.checked_add(resources)
         .context("value quota arithmetic overflow")
 }
+/// The exact aliases settlement needs for one attempt: the effective
+/// model's own entry and every alias of the same canonical model. A snapshot
+/// never chains aliases (targets are model keys, aliases are not), so
+/// comparing a reported model with the effective one through this subset
+/// gives exactly the full table's answer, at a few entries instead of the
+/// whole catalogue per attempt.
+pub(super) fn attempt_aliases(
+    aliases: &BTreeMap<String, String>,
+    model: &str,
+) -> BTreeMap<String, String> {
+    let canonical = aliases.get(model).map_or(model, String::as_str);
+    aliases
+        .iter()
+        .filter(|(alias, key)| key.as_str() == canonical || alias.as_str() == model)
+        .map(|(alias, key)| (alias.clone(), key.clone()))
+        .collect()
+}
+/// Price of the admission input estimate alone (no output, no resources):
+/// the charge of a first-party server failure that produced no output. An
+/// unpriced attempt (or a resource-only plan) has no input to charge.
+fn input_only_picos(frozen_tariff: &str, tier: &str, meta: Option<&AttemptMeta>) -> i128 {
+    let Some(meta) = meta.filter(|meta| {
+        meta.resource_plan
+            .as_ref()
+            .is_none_or(|plan| plan.text_tokens)
+    }) else {
+        return 0;
+    };
+    let Ok(model) = serde_json::from_str::<ExecutionModelPrice>(frozen_tariff) else {
+        return 0;
+    };
+    model
+        .price_or_highest_tier(
+            tier,
+            &ValueTokens {
+                fresh_input: meta.input_tokens,
+                ..Default::default()
+            },
+        )
+        .map(|price| price.usage_picos)
+        .unwrap_or(0)
+}
+fn no_output_picos(
+    frozen_tariff: &str,
+    tier: &str,
+    meta: Option<&AttemptMeta>,
+    floor: i128,
+) -> i128 {
+    let input = input_only_picos(frozen_tariff, tier, meta);
+    // Non-enforcing Token/shadow attempts reserve nothing but still retain
+    // the same input-only estimate for later unit conversion.
+    let reserved = meta.map(AttemptMeta::reserved).unwrap_or(0);
+    (if reserved > 0 {
+        input.min(reserved)
+    } else {
+        input
+    })
+    .max(floor)
+}
 /// An admission bound exists: an outcome-unknown attempt has something to
 /// charge once it is priced. Without one, zero usage is `usage_unobserved`.
 fn has_estimate(meta: Option<&AttemptMeta>) -> bool {
@@ -432,8 +492,7 @@ fn read_attempt_meta(
             |r| r.get(0),
         )
         .optional()?;
-    raw.map(|raw| serde_json::from_str(&raw).context("VALUE_QUOTA_ATTEMPT_METADATA_CORRUPT"))
-        .transpose()
+    raw.map(|raw| retention::decode_meta(&raw)).transpose()
 }
 
 /// SQLite busy/locked is a transient contention signal, not a quota fact.
@@ -1128,9 +1187,18 @@ fn status_with_coverage_in(
             * DAY_MS;
         let full_until = window.ends_at_ms.unwrap_or(i64::MAX).div_euclid(DAY_MS) * DAY_MS;
         let mut aggregate = Checkpoint::empty();
-        let mut buckets=connection.prepare("SELECT day_start_ms FROM value_quota_checkpoints WHERE scope=?1 AND day_start_ms>=?2 AND day_start_ms<?3")?;
-        for day in buckets.query_map(params![key, full_from, full_until], |r| r.get::<_, i64>(0))? {
-            aggregate.merge(&read_checkpoint(connection, &key, day?)?)?;
+        // One indexed range read (not one query per day); every payload is
+        // still verified against its digest before it is merged.
+        let mut buckets=connection.prepare("SELECT payload_json,payload_sha256 FROM value_quota_checkpoints WHERE scope=?1 AND day_start_ms>=?2 AND day_start_ms<?3")?;
+        for row in buckets.query_map(params![key, full_from, full_until], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (json, hash) = row?;
+            ensure!(
+                sha256_hex(json.as_bytes()) == hash,
+                "VALUE_QUOTA_CHECKPOINT_CORRUPT"
+            );
+            aggregate.merge(&serde_json::from_str(&json)?)?;
         }
         // Missing materialized evidence cannot masquerade as an empty window.
         let actual_count:i64=connection.query_row("SELECT
@@ -1244,9 +1312,12 @@ pub(super) fn unpriced_summary_in(
 ) -> anyhow::Result<UnpricedSummary> {
     let (key, from, account) = (scope.key()?, w.metered_start_ms(), w.account_key()?);
     let args = params![key, from, w.ends_at_ms, account];
-    let filter = "FROM value_quota_attempts a LEFT JOIN quota_metering_facts f USING(request_id,attempt_id)
+    let clock = evidence::attempt_clock(w);
+    let filter = format!(
+        "FROM value_quota_attempts a LEFT JOIN quota_metering_facts f USING(request_id,attempt_id)
         WHERE a.scope=?1 AND a.unpriced_reason IS NOT NULL AND a.unpriced_reason!='usage_unobserved'
-        AND a.started_at_ms>=?2 AND (?3 IS NULL OR a.started_at_ms<?3) AND (?4 IS NULL OR f.account_key=?4)";
+        AND {clock}>=?2 AND (?3 IS NULL OR {clock}<?3) AND (?4 IS NULL OR f.account_key=?4)"
+    );
     let (requests, tokens): (i64, i64) = conn.query_row(
         &format!("SELECT count(*),COALESCE(sum(f.quota_tokens),0) {filter}"),
         args,
@@ -1312,8 +1383,17 @@ pub(crate) fn admit_with_market_trial(
     // Resolve and freeze the revision in the same transaction as reservation.
     // An idempotent replay must keep its already frozen revision after a price edit.
     let revision = tariff::admission_revision(&tx, input, crate::infra::time::now_ms() as i64)?;
+    // The window is selected at admission time; a request (or retry) that
+    // began before the window's metered start, e.g. in flight across a UTC
+    // day boundary, is attributed to the window it is admitted into instead
+    // of failing with a window conflict.
     let frozen = Admission {
         pricing_revision: &revision,
+        started_at_ms: if input.window.account.is_none() {
+            input.started_at_ms.max(input.window.metered_start_ms())
+        } else {
+            input.started_at_ms
+        },
         ..input.clone()
     };
     evidence::record_admission(&tx, &frozen, true)?;
@@ -1536,12 +1616,22 @@ fn admit_with_trial_in_tx(
         if let Some(trial) = trial {
             available = available.min(trial_available_in_tx(tx, a.scope, trial)?);
         }
-        let in_flight: i64 = tx.query_row(
-            "SELECT count(*) FROM value_quota_attempts WHERE scope=?1 AND metering_status='pending'
-             AND started_at_ms>=?2 AND (?3 IS NULL OR started_at_ms<?3)",
-            params![key, a.window.metered_start_ms(), a.window.ends_at_ms],
-            |r| r.get(0),
-        )?;
+        let in_flight: i64 = if a.window.account.is_some() {
+            tx.query_row(
+                "SELECT count(*) FROM quota_metering_facts f JOIN value_quota_attempts a USING(request_id,attempt_id)
+                 WHERE f.scope=?1 AND f.account_key=?4 AND f.account_started_at_ms>=?2
+                 AND (?3 IS NULL OR f.account_started_at_ms<?3) AND a.metering_status='pending'",
+                params![key, a.window.metered_start_ms(), a.window.ends_at_ms, a.window.account_key()?],
+                |r| r.get(0),
+            )?
+        } else {
+            tx.query_row(
+                "SELECT count(*) FROM value_quota_attempts WHERE scope=?1 AND metering_status='pending'
+                 AND started_at_ms>=?2 AND (?3 IS NULL OR started_at_ms<?3)",
+                params![key, a.window.metered_start_ms(), a.window.ends_at_ms],
+                |r| r.get(0),
+            )?
+        };
         if u64::try_from(in_flight)? >= u64::from(a.parallel_limit.clamp(1, 4)) {
             return Err(ValueQuotaRejection::new(ValueQuotaRejectionKind::Busy).into());
         }
@@ -1611,7 +1701,7 @@ fn admit_with_trial_in_tx(
                     None => 0,
                 }.to_string(),
                 frozen_tariff_sha256: Some(sha256_hex(frozen.as_bytes())),
-                exact_aliases: snapshot.exact_aliases.clone(),
+                exact_aliases: attempt_aliases(&snapshot.exact_aliases, a.effective_model),
                 resource_plan: a.resource_plan.clone(),
                 admission_revision: None,
             })?
@@ -1695,8 +1785,10 @@ pub(crate) enum ObservedOutcome {
     /// Complete usage priced exactly but with weaker evidence (multi-attempt,
     /// tier upgrade, merged cache TTL): `conservative`.
     FinalConservative,
-    /// Not sent upstream, or upstream error status without usage: `$0`.
+    /// Explicit evidence of no execution, without billable usage: `$0`.
     Free,
+    /// Complete first-party server failure with no usage/output: input-only.
+    NoOutput,
     /// Interrupted/truncated stream: partial usage plus streamed-text output
     /// estimate, capped by the output ceiling; `conservative`.
     Interrupted,
@@ -2136,16 +2228,25 @@ fn classify_log(
         );
     }
     let streamed = log.value_streamed_text_bytes.unwrap_or(0);
-    if (log.status_code == 401
-        || matches!(
-            log.failure_kind.as_deref(),
-            Some("request_not_sent" | "upstream_auth_rejected")
-        ))
-        && !has_usage
+    let no_evidence = !has_usage
         && streamed == 0
-        && log.failure_kind.as_deref() != Some("upstream_outcome_unknown")
+        && log.failure_kind.as_deref() != Some("upstream_outcome_unknown");
+    // Authentication rejections (any runtime) and declared first-party
+    // rejections such as 429/529/400 execute nothing.
+    if no_evidence
+        && ((log.status_code == 401
+            || log.failure_kind.as_deref() == Some("upstream_declared_rejection"))
+            || matches!(
+                log.failure_kind.as_deref(),
+                Some("request_not_sent" | "upstream_auth_rejected")
+            ))
     {
         return (ObservedOutcome::Free, None, None);
+    }
+    // A first-party server failure without any output: charge the input
+    // estimate (interrupted before output), never the output ceiling.
+    if no_evidence && log.failure_kind.as_deref() == Some("upstream_error_no_output") {
+        return (ObservedOutcome::NoOutput, None, None);
     }
     if !evidence_ok
         || tier.is_none()
@@ -2244,7 +2345,11 @@ fn settle_log_in_tx(
     settle_in_tx(
         tx,
         &Observation {
-            resources: resource_usage_for_log(log, meta.as_ref()),
+            resources: if matches!(outcome, ObservedOutcome::Free | ObservedOutcome::NoOutput) {
+                None
+            } else {
+                resource_usage_for_log(log, meta.as_ref())
+            },
             request_id: &log.request_id,
             attempt_id: &attempt,
             scope: &scope,
@@ -2590,12 +2695,27 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
     let reported_matches = o
         .reported_model
         .is_none_or(|reported| canonical(reported) == canonical(o.effective_model));
-    let reserved = read_attempt_meta(tx, o.request_id, o.attempt_id)?
-        .map(|meta| meta.reserved())
-        .unwrap_or(0);
+    // `meta` was read (and parsed) once above for the whole settlement.
+    let reserved = meta.as_ref().map(AttemptMeta::reserved).unwrap_or(0);
     let old_amount = unsigned_decimal(&old.5)?;
-    let meta = read_attempt_meta(tx, o.request_id, o.attempt_id)?;
     let plan = meta.as_ref().and_then(|meta| meta.resource_plan.as_ref());
+    if o.outcome == ObservedOutcome::NoOutput {
+        let amount = no_output_picos(&old.3, &old.2, meta.as_ref(), old_amount);
+        write_settlement(
+            tx,
+            o.request_id,
+            o.attempt_id,
+            &old,
+            revision,
+            &digest,
+            &observation_json,
+            amount,
+            "conservative",
+            0,
+            None,
+        )?;
+        return Ok(true);
+    }
     let original = o;
     let priced_only;
     let mut resource_unpriced = false;
@@ -2783,8 +2903,12 @@ pub(crate) enum AttemptOutcome {
     /// Never written upstream (connect/DNS/TLS failure, early error, client
     /// gone before send): `$0`, observed.
     NotSent,
-    /// Explicit authentication rejection before any billable evidence.
+    /// Explicit authentication rejection (any runtime) or declared
+    /// first-party rejection before any billable evidence.
     UpstreamError,
+    /// First-party server failure before any output: the input estimate is
+    /// charged, never the output ceiling.
+    NoOutput,
     /// Sent but the outcome is unknown: the reserved risk is charged.
     Unknown,
 }
@@ -2814,22 +2938,27 @@ fn settle_outcome_in_tx(
     } else {
         outcome
     };
-    let reserved = read_attempt_meta(tx, request_id, attempt_id)?
-        .map(|meta| meta.reserved())
-        .unwrap_or(0);
+    let meta = read_attempt_meta(tx, request_id, attempt_id)?;
+    let reserved = meta.as_ref().map(AttemptMeta::reserved).unwrap_or(0);
+    let floor = unsigned_decimal(&old.5)?;
     let (amount, state) = match outcome {
         AttemptOutcome::NotSent | AttemptOutcome::UpstreamError => (0, "observed"),
-        AttemptOutcome::Unknown => (reserved.max(unsigned_decimal(&old.5)?), "conservative"),
+        AttemptOutcome::NoOutput => (
+            no_output_picos(&old.3, &old.2, meta.as_ref(), floor),
+            "conservative",
+        ),
+        AttemptOutcome::Unknown => (reserved.max(floor), "conservative"),
     };
-    let meta = read_attempt_meta(tx, request_id, attempt_id)?;
     let observed = old.4 != 0 || has_estimate(meta.as_ref());
     let unpriced = match (outcome, unpriced_marker(&old.3)) {
         (AttemptOutcome::NotSent | AttemptOutcome::UpstreamError, _) => None,
-        (AttemptOutcome::Unknown, Some(reason)) if observed => Some(reason),
-        (AttemptOutcome::Unknown, _) if amount == 0 && !observed => {
+        (AttemptOutcome::Unknown | AttemptOutcome::NoOutput, Some(reason)) if observed => {
+            Some(reason)
+        }
+        (AttemptOutcome::Unknown | AttemptOutcome::NoOutput, _) if amount == 0 && !observed => {
             Some(crate::domain::usage::value_pricing::USAGE_UNOBSERVED.to_owned())
         }
-        (AttemptOutcome::Unknown, _) => None,
+        (AttemptOutcome::Unknown | AttemptOutcome::NoOutput, _) => None,
     };
     let observation_json = serde_json::json!({"requestId":request_id,"attemptId":attempt_id,
         "usageRevision":old.4,"outcome":outcome,"amountPicos":amount.to_string()})
@@ -3035,17 +3164,21 @@ fn resolve_window_pending_in_tx(
     started_before: i64,
 ) -> anyhow::Result<usize> {
     let rows = {
-        let mut query = tx.prepare(
-            "SELECT request_id,attempt_id FROM value_quota_attempts WHERE scope=?1
-             AND metering_status IN ('pending','unavailable') AND started_at_ms>=?2
-             AND (?3 IS NULL OR started_at_ms<?3) AND started_at_ms<?4",
-        )?;
+        let clock = evidence::attempt_clock(window);
+        let mut query = tx.prepare(&format!(
+            "SELECT a.request_id,a.attempt_id FROM value_quota_attempts a
+             LEFT JOIN quota_metering_facts f USING(request_id,attempt_id) WHERE a.scope=?1
+             AND a.metering_status IN ('pending','unavailable') AND {clock}>=?2
+             AND (?3 IS NULL OR {clock}<?3) AND a.started_at_ms<?4
+             AND (?5 IS NULL OR f.account_key=?5 OR f.account_key IS NULL)"
+        ))?;
         let rows = query.query_map(
             params![
                 key,
                 window.metered_start_ms(),
                 window.ends_at_ms,
-                started_before
+                started_before,
+                window.account_key()?
             ],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )?;
@@ -3479,6 +3612,7 @@ mod tests {
     }
     include!("value_quota/conversion_tests.rs");
     include!("value_quota/unpriced_tests.rs");
+    include!("value_quota/retention_tests.rs");
     use crate::domain::usage::value_pricing::*;
     #[test]
     fn value_quota_durable_admission_is_atomic_across_connections_and_survives_reopen() {
@@ -4851,6 +4985,30 @@ mod tests {
             classify_log(&error, "model", "standard", Some(&meta), false).0,
             ObservedOutcome::Unknown
         );
+        // A first-party API answers 429/529/400... before executing anything.
+        error.profile_id = Some("claude.anthropic_api_key".into());
+        error.failure_kind = Some("upstream_declared_rejection".into());
+        assert_eq!(
+            classify_log(&error, "model", "standard", Some(&meta), false).0,
+            ObservedOutcome::Free
+        );
+        // A first-party server failure without output charges the input
+        // estimate only, never the output ceiling.
+        error.status_code = 503;
+        error.failure_kind = Some("upstream_error_no_output".into());
+        let (outcome, tokens, _) = classify_log(&error, "model", "standard", Some(&meta), false);
+        assert_eq!(outcome, ObservedOutcome::NoOutput);
+        assert!(tokens.is_none());
+        // A relay cannot prove either: the outcome stays unknown.
+        error.profile_id = Some("claude.openrouter".into());
+        error.failure_kind = None;
+        for status in [503, 529] {
+            error.status_code = status;
+            assert_eq!(
+                classify_log(&error, "model", "standard", Some(&meta), false).0,
+                ObservedOutcome::Unknown
+            );
+        }
         let mut cut = log_for(&scope, "i");
         cut.is_streaming = true;
         cut.stream_status = Some("client_cancelled".into());

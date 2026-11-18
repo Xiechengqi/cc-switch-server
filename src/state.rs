@@ -991,23 +991,27 @@ impl DeviceFlowPrincipalStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NegotiatedShareCapabilities {
+    account_reset: bool,
+    market_trials: bool,
+    value_quotas: bool,
+    cache_creation_ttl: bool,
+    share_termination: bool,
+    provider_identity: bool,
+    buddy_quota_presentation: bool,
+    resource_value_quotas: bool,
+    quota_unit_conversion: bool,
+    unpriced_fields: bool,
+    share_capabilities: bool,
+    watermark_batch: bool,
+    unpriced_policy: bool,
+}
 type CachedRouterShareCapabilities = (
     String,
     String,
     std::time::Instant,
-    (
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-        bool,
-    ),
+    NegotiatedShareCapabilities,
 );
 
 #[derive(Clone, Copy)]
@@ -1171,6 +1175,11 @@ pub struct ServerStateInner {
     reported_public_ip: RwLock<Option<String>>,
     installation_heartbeat_wakeup: Notify,
     router_quota_capability: RwLock<Option<CachedRouterShareCapabilities>>,
+    /// Serializes USD watermark projection syncs (heartbeat and push).
+    value_watermark_sync: tokio::sync::Mutex<()>,
+    /// Signalled after a USD settlement changes a projection; the push loop
+    /// syncs the changed grants within seconds instead of the next heartbeat.
+    value_watermark_dirty: tokio::sync::Notify,
 }
 
 #[derive(Debug)]
@@ -7561,6 +7570,8 @@ impl ServerStateInner {
             reported_public_ip: RwLock::new(None),
             installation_heartbeat_wakeup: Notify::new(),
             router_quota_capability: RwLock::new(None),
+            value_watermark_sync: tokio::sync::Mutex::new(()),
+            value_watermark_dirty: tokio::sync::Notify::new(),
         }))
     }
 
@@ -13753,6 +13764,11 @@ impl ServerStateInner {
             }
             self.usage.write().await.apply_append(append);
             self.usage_persistence.mark_published();
+            if expected_log.share_id.is_some() {
+                // A Share request may have settled a USD attempt: push the
+                // changed projection instead of waiting for the heartbeat.
+                self.value_watermark_dirty.notify_one();
+            }
             if has_market_receipt
                 || expected_log.operation
                     == crate::domain::usage::store::InferenceOperation::VideoStatus
@@ -19737,36 +19753,34 @@ impl ServerStateInner {
                     base.to_string(),
                     identity.installation_id.clone(),
                     std::time::Instant::now(),
-                    (
-                        capability.account_reset(),
-                        capability.market_trials(),
-                        capability.value_quotas(),
-                        capability.cache_creation_ttl(),
-                        capability.share_termination(),
-                        capability.provider_identity(),
-                        capability.buddy_quota_presentation(),
-                        capability.resource_value_quotas(),
-                        capability.quota_unit_conversion(),
-                        capability.value_quota_unpriced(),
-                        capability.share_contract_version >= 13
+                    NegotiatedShareCapabilities {
+                        account_reset: capability.account_reset(),
+                        market_trials: capability.market_trials(),
+                        value_quotas: capability.value_quotas(),
+                        cache_creation_ttl: capability.cache_creation_ttl(),
+                        share_termination: capability.share_termination(),
+                        provider_identity: capability.provider_identity(),
+                        buddy_quota_presentation: capability.buddy_quota_presentation(),
+                        resource_value_quotas: capability.resource_value_quotas(),
+                        quota_unit_conversion: capability.quota_unit_conversion(),
+                        unpriced_fields: capability.value_quota_unpriced(),
+                        share_capabilities: capability.share_contract_version >= 13
                             && capability
                                 .capabilities
                                 .iter()
                                 .any(|c| c == "shareCapabilityPolicyV1"),
-                    ),
+                        watermark_batch: capability.value_quota_watermark_batch(),
+                        unpriced_policy: capability.value_quota_unpriced_policy(),
+                    },
                 )
             });
         let identity_changed = {
             let mut previous = self.router_quota_capability.write().await;
-            let changed = previous
-                .as_ref()
-                .map(|(base, id, _, c)| (base, id, c.5, c.6, c.7, c.8, c.9))
-                != value
-                    .as_ref()
-                    .map(|(base, id, _, c)| (base, id, c.5, c.6, c.7, c.8, c.9))
-                || previous
-                    .as_ref()
-                    .is_some_and(|(_, _, at, c)| c.6 && at.elapsed() >= Duration::from_secs(300));
+            let changed = previous.as_ref().map(|(base, id, _, c)| (base, id, *c))
+                != value.as_ref().map(|(base, id, _, c)| (base, id, *c))
+                || previous.as_ref().is_some_and(|(_, _, at, c)| {
+                    c.buddy_quota_presentation && at.elapsed() >= Duration::from_secs(300)
+                });
             *previous = value;
             changed
         };
@@ -19783,7 +19797,7 @@ impl ServerStateInner {
         capability
             .as_ref()
             .is_some_and(|(base, installation, observed, supported)| {
-                supported.0
+                supported.account_reset
                     && observed.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
@@ -19799,7 +19813,8 @@ impl ServerStateInner {
             .await
             .as_ref()
             .is_some_and(|(base, id, at, c)| {
-                c.4 && at.elapsed() < Duration::from_secs(300)
+                c.share_termination
+                    && at.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
                         .registered_router_identity()
@@ -19814,7 +19829,8 @@ impl ServerStateInner {
             .await
             .as_ref()
             .is_some_and(|(base, id, at, c)| {
-                c.5 && at.elapsed() < Duration::from_secs(300)
+                c.provider_identity
+                    && at.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
                         .registered_router_identity()
@@ -19841,7 +19857,8 @@ impl ServerStateInner {
             .await
             .as_ref()
             .is_some_and(|(base, id, at, c)| {
-                c.6 && at.elapsed() < Duration::from_secs(300)
+                c.buddy_quota_presentation
+                    && at.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
                         .registered_router_identity()
@@ -19856,7 +19873,7 @@ impl ServerStateInner {
             .await
             .as_ref()
             .is_some_and(|(base, installation, observed, supported)| {
-                supported.1
+                supported.market_trials
                     && observed.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
@@ -22069,6 +22086,7 @@ pub(crate) async fn authoritative_share_descriptor(
             &mut descriptor,
             state.router_supports_value_quotas().await,
             state.resource_value_router_negotiated().await,
+            state.value_unpriced_policy_router_negotiated().await,
         )?;
         state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
         let share_id = share_id.to_string();
@@ -22135,7 +22153,30 @@ fn apply_value_descriptor_projection(
     descriptor: &mut ShareDescriptor,
     supported: bool,
     resources_supported: bool,
+    unpriced_policy_supported: bool,
 ) -> anyhow::Result<()> {
+    // Never publish a weaker policy to an old strict reader: a later edit
+    // could otherwise turn an enforced Reject into the default Zero.
+    anyhow::ensure!(
+        unpriced_policy_supported
+            || !descriptor.user_grants.values().any(|grant| {
+                grant
+                    .policy
+                    .value_quota
+                    .iter()
+                    .chain(
+                        grant
+                            .pending_value_quota
+                            .iter()
+                            .filter_map(|pending| pending.policy.value_quota.as_ref()),
+                    )
+                    .any(|quota| {
+                        quota.unpriced_usage
+                            == crate::domain::usage::value_pricing::UnpricedUsage::Reject
+                    })
+            }),
+        "VALUE_QUOTA_UNPRICED_POLICY_UNSUPPORTED"
+    );
     let has_resources = descriptor.user_grants.values().any(|g| {
         g.active
             && g.policy
@@ -23328,6 +23369,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         let market_trial_supported = state.router_supports_market_trials().await;
         let value_supported = state.router_supports_value_quotas().await;
         let resources_supported = state.resource_value_router_negotiated().await;
+        let unpriced_policy_supported = state.value_unpriced_policy_router_negotiated().await;
         let conversions_supported = state.quota_conversion_router_negotiated().await;
         let provider_identity_supported = state.router_supports_provider_identity().await;
         let buddy_quota_supported = state.router_supports_buddy_quota_presentation().await;
@@ -23439,6 +23481,7 @@ fn build_router_share_upsert_ops_with_policy<'a>(
                     &mut descriptor,
                     value_supported,
                     resources_supported,
+                    unpriced_policy_supported,
                 )?;
                 state.apply_ollama_cloud_share_projections(&mut descriptor, share, &providers);
                 Ok((share.id.clone(), descriptor, fingerprint))
@@ -24420,6 +24463,7 @@ mod tests {
     include!("state/buddy_catalog_tests.rs");
     include!("state/copilot_inference_tests.rs");
     include!("state/share_value_quota/tariff_state_tests.rs");
+    include!("state/share_value_quota/watermark_tests.rs");
     include!("state/share_value_quota/initialization_tests.rs");
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};

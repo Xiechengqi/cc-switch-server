@@ -794,7 +794,7 @@ pub(super) async fn run_installation_heartbeat_once(
                     tracing::debug!(%error,"Share value pricing activation report pending");
                 }
             }
-            if let Err(error) = state.sync_share_value_watermarks(&config).await {
+            if let Err(error) = state.sync_share_value_watermarks(&config, true).await {
                 tracing::debug!(%error,"Share value quota watermark synchronization pending");
             }
             state.retry_pending_setup_completion_notification().await;
@@ -998,6 +998,27 @@ pub fn spawn_periodic_share_sync_retry(state: ServerState) {
 /// the longest provider request timeout plus five minutes.
 pub fn spawn_value_quota_sweeper(state: ServerState) {
     ServerStateInner::spawn_value_tariff_activation(state.clone());
+    // Push loop: a settlement that changed a USD projection is synced within
+    // seconds (batched) instead of on the next heartbeat. One push covers all
+    // settlements of the debounce interval; the heartbeat remains the
+    // keepalive and the path for Routers without batch support.
+    let push = state.clone();
+    tokio::spawn(async move {
+        loop {
+            push.value_watermark_dirty.notified().await;
+            if push.is_shutting_down() {
+                return;
+            }
+            sleep(Duration::from_secs(5)).await;
+            if !push.value_watermark_batch_router_negotiated().await {
+                continue;
+            }
+            let config = push.config_snapshot().await;
+            if let Err(error) = push.sync_share_value_watermarks(&config, false).await {
+                tracing::debug!(%error, "Share value quota watermark push pending");
+            }
+        }
+    });
     tokio::spawn(async move {
         loop {
             if state.is_shutting_down() {

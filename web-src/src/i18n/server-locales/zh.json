@@ -1264,6 +1264,8 @@
     "unlimited": "无上限",
     "userLimit": {
       "valueQuota": {
+        "parallelCap": "美元额度每位用户最多并发 4 个请求；请输入 1–4，留空按 4 生效。未修改的历史高值仍按 4 生效。",
+        "rejectUnpriced": "拒绝缺价请求（对文本与资源均生效）",
         "readiness": {
           "blocked": "美元等值额度尚未就绪",
           "retry": "重新检查",

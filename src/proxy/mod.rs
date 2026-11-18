@@ -527,6 +527,7 @@ impl ProxyError {
             "value_quota_exhausted",
             "value_quota_busy",
             "price_unavailable",
+            "resource_policy_required",
             "quota_unavailable",
         ] {
             if message
@@ -633,6 +634,7 @@ impl ProxyError {
             "value_quota_exhausted"
                 | "value_quota_busy"
                 | "price_unavailable"
+                | "resource_policy_required"
                 | "quota_unavailable"
         ) {
             return "quota_error";
@@ -687,7 +689,9 @@ impl ProxyError {
             "value_quota_busy" => return true,
             // Only transient storage contention (with Retry-After) retries.
             "quota_unavailable" => return self.retry_after_seconds().is_some(),
-            "value_quota_exhausted" | "price_unavailable" => return false,
+            "value_quota_exhausted" | "price_unavailable" | "resource_policy_required" => {
+                return false
+            }
             _ => {}
         }
         if message.starts_with(Self::CURSOR_CONTINUATION_IN_PROGRESS_PREFIX) {

@@ -181,7 +181,8 @@ impl ServerStateInner {
             .await
             .as_ref()
             .is_some_and(|(base, id, at, c)| {
-                c.10 && at.elapsed() < std::time::Duration::from_secs(300)
+                c.share_capabilities
+                    && at.elapsed() < std::time::Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config
                         .registered_router_identity()

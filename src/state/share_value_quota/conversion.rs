@@ -194,7 +194,7 @@ impl ServerStateInner {
             .await
             .as_ref()
             .is_some_and(|(base, id, at, supported)| {
-                supported.8
+                supported.quota_unit_conversion
                     && at.elapsed() < Duration::from_secs(300)
                     && config.router_api_base() == Some(base.as_str())
                     && config

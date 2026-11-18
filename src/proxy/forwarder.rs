@@ -2031,6 +2031,14 @@ pub async fn forward_codex_alpha_search(
             response_body,
             CODEX_ALPHA_SEARCH_RESPONSE_BODY_LIMIT_BYTES,
         )?;
+        super::value_metering::buffered_error(
+            value_attempt.as_ref(),
+            &execution,
+            &context.url,
+            status.as_u16(),
+            &decoded.body,
+            &mut request_context,
+        );
         maybe_mark_upstream_rate_limited(
             &state,
             &context.execution,
@@ -2412,6 +2420,26 @@ async fn summarize_codex_overflow(
                 )
             }
         };
+    super::value_metering::buffered_error(
+        value_attempt.as_ref(),
+        execution,
+        url,
+        status,
+        &body,
+        &mut summary_context,
+    );
+    if let Some(reason) = summary_context.failure_kind.as_deref() {
+        if let Err(error) = state
+            .update_usage_log(&summary_id, |log| {
+                log.failure_kind = Some(reason.into());
+                log.reset_router_sync_state();
+            })
+            .await
+        {
+            state.mark_quota_usage_degraded();
+            tracing::warn!(%error, "failed to persist summary error billing evidence");
+        }
+    }
     let mut usage = StreamUsageAccumulator::new(adapters::usage_input_semantics_for(
         &stored,
         ProxyRoute::CodexResponses,
@@ -3903,6 +3931,14 @@ async fn forward_with_attempt_inner(
                 CODEX_OVERFLOW_SUMMARY_BODY_LIMIT_BYTES,
                 attempt_context.request_memory(),
             )?;
+            super::value_metering::buffered_error(
+                value_attempt_guard.as_ref(),
+                &execution,
+                &url,
+                status.as_u16(),
+                &original_decoded.body,
+                &mut request_context,
+            );
             if codex_image_tool_rejection_body(&original_decoded.body) {
                 if let Some(retry_body) =
                     codex_image_tool_stripped_body_bytes(&adapter_request.body)?
@@ -4098,6 +4134,14 @@ async fn forward_with_attempt_inner(
                     )?
                 }
             };
+            super::value_metering::buffered_error(
+                value_attempt_guard.as_ref(),
+                &execution,
+                &url,
+                status.as_u16(),
+                &decoded.body,
+                &mut request_context,
+            );
             let capacity_failure = openai_capacity_shed_failure_from_bytes(&decoded.body)
                 .or_else(|| {
                     (status.as_u16() == 529).then(|| SemanticFailure {
@@ -4156,6 +4200,14 @@ async fn forward_with_attempt_inner(
                     )?
                 }
             };
+            super::value_metering::buffered_error(
+                value_attempt_guard.as_ref(),
+                &execution,
+                &url,
+                status.as_u16(),
+                &decoded.body,
+                &mut request_context,
+            );
             if super::overflow_compact::is_context_length_exceeded_body(&decoded.body) {
                 if let Some(next_attempt) = next_codex_overflow_attempt(
                     &state,
@@ -4235,6 +4287,14 @@ async fn forward_with_attempt_inner(
                     )?
                 }
             };
+            super::value_metering::buffered_error(
+                value_attempt_guard.as_ref(),
+                &execution,
+                &url,
+                status.as_u16(),
+                &decoded.body,
+                &mut request_context,
+            );
             let antigravity_limit = antigravity::limit_info(&execution, status, &decoded.body);
             if let Some(limit) = antigravity_limit.as_ref() {
                 antigravity::install_retry_after(&mut response_headers, limit);
@@ -6795,6 +6855,14 @@ async fn forward_with_attempt_inner(
                 }
             }
         };
+        super::value_metering::buffered_error(
+            value_attempt_guard.as_ref(),
+            &execution,
+            &url,
+            status.as_u16(),
+            &decoded.body,
+            &mut request_context,
+        );
         let mut preserve_content_encoding = decoded.preserve_content_encoding;
         let mut bytes = decoded.body;
         if let Some(context) = &antigravity_service_access {
@@ -10362,6 +10430,9 @@ async fn forward_codex_images_request(
     };
     let status = upstream.status();
     let status_code = status.as_u16();
+    if let Some(guard) = value_attempt.as_ref() {
+        guard.mark_upstream_status(status_code);
+    }
     if status == StatusCode::UNAUTHORIZED && audit_attempt.auth_refresh_attempted() {
         mark_managed_account_auth_cooldown(
             &state,
@@ -10477,6 +10548,14 @@ async fn forward_codex_images_request(
                 return Err(error);
             }
         };
+        super::value_metering::buffered_error(
+            value_attempt.as_ref(),
+            &execution,
+            upstream.url().as_str(),
+            status.as_u16(),
+            &decoded.body,
+            &mut request_context,
+        );
         if status == StatusCode::TOO_MANY_REQUESTS {
             maybe_mark_upstream_rate_limited(
                 &state,
@@ -27166,7 +27245,11 @@ pub(super) fn value_quota_proxy_error(error: anyhow::Error) -> ProxyError {
     if let Some(price) = error.downcast_ref::<crate::domain::usage::value_pricing::PriceRejection>()
     {
         return ProxyError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
+            status: if price.reason_code == "tariff_not_effective" {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            },
             message: format!(
                 "price_unavailable: {}\n{}",
                 serde_json::to_string(price).unwrap_or_default(),
@@ -27204,8 +27287,8 @@ pub(super) fn value_quota_proxy_error(error: anyhow::Error) -> ProxyError {
         };
     }
     if error.to_string().contains("RESOURCE_POLICY_REQUIRED") {
-        return ProxyError { status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "quota_unavailable: this operation requires the resource-metering USD policy (api-equivalent-v2); enable it explicitly and configure resource prices in Router settings".into() };
+        return ProxyError { status: StatusCode::BAD_REQUEST,
+            message: "resource_policy_required: this Share's quota does not cover this request type; remove the requested feature or ask the Share owner to configure it".into() };
     }
     if error.downcast_ref::<ValueError>() == Some(&ValueError::PriceUnavailable) {
         return ProxyError {

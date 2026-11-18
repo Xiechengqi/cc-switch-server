@@ -86,3 +86,6 @@ WebSocket 每次生成重新读取当前策略并记录独立事实，Token 模�
 
 
 2026-11-17：核心 schema8 / v13 将执行权限与额度单位分离。部分缺价按维度结算，response ID 不代表资源零量，严格缺价不可豁免，异常执行隔离与永久设置回执见 [独立扩展能力](extended-capabilities.md)。
+
+
+2026-11-18 账本与同步补强：第一方错误必须由实际 HTTPS 域名与完整标准错误体证明，不能只按 Profile／状态码免计量；图片／文档输入估算、部分缺价、自然窗口边界、schema9 无损归档与批量水位见 [额度加固](quota-hardening.md)。旧 capabilityPolicy、转换回执与金融证据永久保留。

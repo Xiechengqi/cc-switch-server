@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { ShareUserGrantMap } from "@/lib/api/share";
 
-import { applyShareUserPolicyBatch } from "./share-user-policy-batch";
+import { applyShareUserPolicyBatch, validParallelLimit, batchUsesUsd } from "./share-user-policy-batch";
 
 function grants(): ShareUserGrantMap {
   return {
@@ -82,5 +82,28 @@ describe("applyShareUserPolicyBatch", () => {
     expect(updated["bob@example.com"].policy).toEqual(
       grants()["bob@example.com"].policy,
     );
+  });
+});
+
+
+describe("USD concurrency editing", () => {
+  it("rejects new high USD values, retains historical values, and leaves Token limits available", () => {
+    expect(validParallelLimit(8, false)).toBe(true);
+    expect(validParallelLimit(5, true)).toBe(false);
+    expect(validParallelLimit(4, true)).toBe(true);
+    expect(validParallelLimit(undefined, true)).toBe(true);
+    expect(validParallelLimit(8, true, 8)).toBe(true);
+    expect(validParallelLimit(9, true, 8)).toBe(false);
+    for (const n of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(validParallelLimit(n, true, n)).toBe(false);
+    }
+  });
+  it("caps mixed batches while an active USD policy is being converted to Token", () => {
+    const source = Object.values(grants());
+    source[0].policy.valueQuota = {limitUsdMicros: "1000000", tariffPolicyId: "api-equivalent-v1"};
+    const tokenPatch = {tokenLimit:{value:100, period:"day" as const}};
+    expect(batchUsesUsd(source, new Set([source[0].email, source[1].email]), tokenPatch)).toBe(true);
+    expect(batchUsesUsd(source, new Set([source[1].email]), tokenPatch)).toBe(false);
+    expect(batchUsesUsd(source, new Set([source[1].email]), {tokenLimit:{period:"day", valueQuota:source[0].policy.valueQuota}})).toBe(true);
   });
 });
