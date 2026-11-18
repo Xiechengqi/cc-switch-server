@@ -317,6 +317,28 @@ pub(in crate::api) async fn web_fetch_buddy_account_models(
     }))
 }
 
+pub(in crate::api) async fn web_fetch_opencode_zen_models(
+    state: &ServerState,
+    args: &Value,
+) -> Result<Value, ApiError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Request {
+        #[serde(default)]
+        force_refresh: bool,
+    }
+    let input: Request = serde_json::from_value(args.clone()).map_err(ApiError::bad_request)?;
+    let client = state.http_client().await;
+    let catalog = crate::proxy::opencode_zen::refresh_model_catalog(
+        &client,
+        &state.config_dir,
+        input.force_refresh,
+    )
+    .await
+    .map_err(ApiError::bad_gateway)?;
+    serde_json::to_value(catalog).map_err(ApiError::internal)
+}
+
 pub(in crate::api) async fn web_fetch_models_for_config(
     state: &ServerState,
     args: &Value,

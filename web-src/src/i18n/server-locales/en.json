@@ -1,4 +1,27 @@
 {
+  "zenModels": {
+    "choose": "Choose upstream model",
+    "search": "Search model name or ID",
+    "refresh": "Refresh model catalog",
+    "noMatch": "No matching models. You can enter a model ID manually.",
+    "showAll": "Show all models, including unavailable options",
+    "free": "Free",
+    "context": "Context: {{count}} tokens",
+    "legacy": "Identified from a legacy model ID; a full upstream free declaration is pending.",
+    "hint": "Choose a model or enter a custom model ID. This provider forwards supported free models only. Catalog declarations do not confirm live availability.",
+    "loading": "Loading the OpenCode Zen model catalog…",
+    "failed": "Unable to update the catalog. Your input is preserved; refresh later or enter a model manually.",
+    "stale": "Cached catalog; last successful update: {{time}}",
+    "updated": "Catalog updated: {{time}}",
+    "empty": "No selectable free models in the current catalog. Keep a custom value or refresh later.",
+    "missing": "This model is absent from the current catalog. Your input is preserved; inference still requires free-model validation.",
+    "reason": {
+      "unsupported_model_type": "This model type is not supported by this proxy.",
+      "paid_model": "Paid model; unavailable through this keyless provider.",
+      "pricing_unknown": "The upstream has not declared this model free; unavailable for selection.",
+      "unsupported_protocol": "The declared protocol or endpoint is not supported by this proxy."
+    }
+  },
   "accountAuth": {
     "accountCount": "{{count}} accounts",
     "notAuthenticated": "Not authenticated",

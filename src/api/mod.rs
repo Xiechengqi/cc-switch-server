@@ -6017,6 +6017,7 @@ mod grok_catalog_provider_tests {
         server.abort();
     }
     include!("buddy_catalog_tests.rs");
+    include!("zen_catalog_tests.rs");
 }
 
 async fn web_runtime_context(

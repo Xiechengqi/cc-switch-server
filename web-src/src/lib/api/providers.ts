@@ -10,6 +10,25 @@ export interface ProviderSortUpdate {
 
 export type BuddyProviderType = "codebuddy_oauth" | "workbuddy_oauth";
 
+export interface ZenModelCatalog {
+  source: "opencode_zen_live_model_catalog";
+  fetchedAtMs: number;
+  stale: boolean;
+  models: Array<{
+    id: string;
+    upstreamModel: string;
+    displayName: string;
+    modelType: string;
+    pricing: "free" | "paid" | "unknown";
+    pricingSource: "upstream_declared" | "legacy_id" | "unspecified";
+    selectable: boolean;
+    unavailableReason: "unsupported_model_type" | "paid_model" | "pricing_unknown" | "unsupported_protocol" | null;
+    protocol: "chat" | "responses" | "messages" | null;
+    contextWindow: number | null;
+    maxOutputTokens: number | null;
+  }>;
+}
+
 export interface BuddyAccountModels {
   providerType: BuddyProviderType;
   accountId: string;
@@ -450,6 +469,9 @@ export type ProviderCredentialPatch =
 export type ProviderCredentialPatches = Record<string, ProviderCredentialPatch>;
 
 export const providersApi = {
+  async fetchZenModels(forceRefresh = false, signal?: AbortSignal): Promise<ZenModelCatalog> {
+    return invokeCommand<ZenModelCatalog>("fetch_opencode_zen_models", { forceRefresh }, { cache: "no-store", signal });
+  },
   async fetchBuddyAccountModels(
     identity: { providerType: BuddyProviderType; accountId: string; authIdentityGeneration: number },
     forceRefresh = false,

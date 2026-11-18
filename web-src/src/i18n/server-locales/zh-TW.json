@@ -1,4 +1,27 @@
 {
+  "zenModels": {
+    "choose": "選擇上游模型",
+    "search": "搜尋模型名稱或 ID",
+    "refresh": "重新整理模型目錄",
+    "noMatch": "沒有符合的模型，可手動輸入模型 ID。",
+    "showAll": "顯示全部模型（包含目前不可選項）",
+    "free": "Free · 免費",
+    "context": "上下文：{{count}} tokens",
+    "legacy": "舊格式目錄依模型 ID 識別，免費狀態待上游完整聲明。",
+    "hint": "選擇清單中的模型，或直接輸入自訂模型 ID。目前供應商僅轉發支援的免費模型；目錄聲明不代表即時可用性。",
+    "loading": "正在取得 OpenCode Zen 模型目錄…",
+    "failed": "無法更新模型目錄。已保留填寫內容，可稍後重新整理或手動輸入。",
+    "stale": "快取目錄，最近成功更新：{{time}}",
+    "updated": "目錄已更新：{{time}}",
+    "empty": "目前目錄沒有可選的免費模型，可保留自訂值並稍後重新整理。",
+    "missing": "目前目錄未收錄此模型。填寫內容已保留，實際呼叫仍須通過免費模型驗證。",
+    "reason": {
+      "unsupported_model_type": "目前反代不支援此模型類型。",
+      "paid_model": "付費模型，目前免 Key 供應商不可用。",
+      "pricing_unknown": "上游未明確聲明免費，目前不可選。",
+      "unsupported_protocol": "目前反代尚不支援此模型聲明的協定或端點。"
+    }
+  },
   "accountAuth": {
     "accountCount": "{{count}} 個帳號",
     "notAuthenticated": "未認證",

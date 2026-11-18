@@ -1,12 +1,12 @@
 # OpenCode Zen 免 Key 反代
 
-状态：单条公开免费车道；协议离线/本地 loopback 验证与真实供应商验收分开记录。真实目录、推理及 Router 链路仍为 `live_pending`。
+状态：单条公开免费车道；协议离线/本地 loopback 验证与真实供应商验收分开记录。目录已做只读在线格式核对；真实推理及 Router 链路仍为 `live_pending`。
 
 不使用 OpenCode Go、付费 Zen API Key、账号池或出口轮换；不注册第四个 App。Claude/Codex 的 Profile 使用 `special.opencode_zen`，无用户凭据，固定 `https://opencode.ai`，配置不可覆盖端点。Gemini Surface 不开放。
 
 ## 线格式与协议转换
 
-- Chat：`/inference/v1/chat/completions`；Muse Spark：`/inference/v1/responses`；`union-alpha`：`/inference/v1/messages`。
+- 现代目录的已知协议仅映射到固定路径：Chat `/inference/openai/v1/chat/completions`、Responses `/inference/openai/v1/responses`、Messages `/inference/anthropic/v1/messages`。旧目录继续使用 `/inference/v1/*` 与既有 Muse Spark/union-alpha 协议映射。未知协议、不同 origin 或未受审路径不可选；绝不直接跟随目录 URL。
 - `Bearer public`；UA `opencode/latest/2.1.3/cli`；官方 CLI/session/affinity 头，不发 `x-opencode-request`。
 - Session 是可解码时间戳前缀加随机尾部，6 天重铸。缓存键包含 Provider、Share、用户和下游会话；缺少会话时每次请求独立，不把全部用户折叠到 Provider ID。4096 条、哈希键、单条最旧铸造记录淘汰，不接受下游直接指定上游 session。
 - 官方 `read`、`shell` 原文指纹；冲突工具改名并恢复，Chat 名称增量支持别名分片。缓存提示不注入上游，工具 schema 中的同名属性不删除。
@@ -36,9 +36,9 @@ Chat 必须有合法 finish_reason 与 `[DONE]`；Responses/Messages 使用公�
 
 429、403、401 不自动重放，分别保留对应 HTTP 状态；其他供应商错误映射为网关错误。客户端和日志不拼接上游原始正文/HTML，只保留固定类别、原状态、受限请求 ID 及合法数字 Retry-After 提示。重铸 session 不会创造新额度。
 
-公开目录、管理发现与生成准入共用缓存：8 分钟 fresh，失败后旧成功目录最多保留 24 小时；冷启动无可用目录则拒绝生成，不使用写死清单。单次刷新最多 15 秒、响应 1 MiB、512 个模型、每 ID 256 字节；并发 single-flight，失败退避 30 秒。决策模型 `jev*` 不作为 Chat 模型开放。
+公开目录、管理发现与生成准入共用缓存：8 分钟 fresh，失败后旧成功目录最多保留 24 小时；冷启动无可用目录则拒绝生成，不使用写死清单。单次刷新最多 15 秒、响应 1 MiB、512 个模型、每 ID 256 字节；并发 single-flight，失败退避 30 秒。模型类型、免费分类和协议共同决定准入；decision/image/未知类型及决策模型 `jev*` 不作为 Chat 模型开放。手动刷新可绕过 fresh，但受 30 秒最短间隔、并发合并和失败退避限制。
 
-成功目录原子写入数据目录 `opencode-zen-catalog.json`；重启时仅恢复有效时间窗内、大小受限的免费模型快照，未来时间或过期数据无效。缓存保存失败不撤销上游成功结果。目录保留合法 context_window/max_output_tokens 声明；公开接口可投影这些声明，管理端明确列为 upstreamDeclared，不冒称实测能力。降级返回旧目录时管理发现标记 stale。
+成功目录原子写入数据目录 `opencode-zen-catalog.json`；重启时仅恢复有效时间窗内、大小受限的版本化完整模型快照，兼容旧版免费 ID 快照，未来时间或过期数据无效。缓存保存失败不撤销上游成功结果。目录规范化 name/type、旧式 cost.input/output 与现代 cost.text.*、limit.context/output 及旧式容量声明。显式零价、收费、未知分开；正价（含阶梯、缓存和模式）优先于 free 名称，缺价不补零。Legacy ID 来源单独标注。成功空名单撤销旧候选，失败不清空；管理发现与生成只从同一快照派生可用子集。目录保留合法 context_window/max_output_tokens 声明；公开接口可投影这些声明，管理端明确列为 upstreamDeclared，不冒称实测能力。降级返回旧目录时管理发现标记 stale。
 
 ## 证据与验证
 
@@ -59,3 +59,11 @@ Claude/Codex 均支持透传与固定上游模型，默认保持透传；允许�
 保存遇到服务端异常或传输中断时，保留输入并回读，但不自动重放。提示展示脱敏的保存/回读状态及受限错误码，不回显响应正文、凭据或任意异常 URL；回读 404 不再被直接解释为断网。
 
 OpenCode 图标取自官方 `https://opencode.ai/favicon.svg` 的图形，内联 SVG 只保留静态几何，并使用 currentColor 适配主题。旧 Zen 预设持久化的 `custom` 占位在 Web 和服务端身份投影中解析为 OpenCode；其他明确自定义图标保持不变，其他供应商不受影响。
+
+## 动态固定模型选择
+
+切换到固定上游模型后，Web 自动调用受认证的 `fetch_opencode_zen_models`，新建与编辑均无需先保存 Provider。首次加载和编辑期间每 8 分钟刷新、手动刷新共用后端缓存；可搜索名称或精确 ID，也可直接输入自定义模型。默认仅列出可选免费模型；“显示全部模型”可查看付费、未知价格或未支持类型/协议，相关项禁用并说明原因。免费条目显示 Free 标记；声明不等于真实可用性或已验证能力。
+
+全局与 Claude/Codex 按应用固定策略使用同一目录。读取、刷新、失败、下架和晚到结果不改写用户输入，不自动选择第一项，不自动保存。目录失败可保留手动模型并保存；实际调用仍必须通过后端准入。`requiresExplicitUpstreamModel` 表示该 Profile 没有静态默认模型，固定策略需显式填入模型；旧 chat-free 配置保留原值并提示，不自动替换。
+
+2026-11-18 动态模型选择实施与整体 review 已完成。发布隔离树的 Rust 源码和重新构建的 Web 资产与已通过全量验证的冻结树一致：Zen 专项 35/35、库 4521 通过 / 0 失败 / 3 忽略、API 契约 139/139、两个独立集成目标各 1/1；完整静态检查、check/build 与本地 HTTP smoke 通过。本次另行复测 Web 类型检查、414/414 测试和生产构建，均通过。具体摘要、命令及真实验收边界见根 PROTOCOL_EVIDENCE.md 的动态模型选择条目。

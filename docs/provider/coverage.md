@@ -102,7 +102,7 @@ The Server-owned requirements and Rust Provider Registry are authoritative. Lega
 
 ## Server implementation notes
 
-- OpenCode Zen uses the single public free lane on Claude/Codex only. The model-selected upstream wire is bridged independently to Messages/Chat/Responses, with bounded incremental SSE, strict terminal+EOF, scoped minted sessions, isolated continuation evidence, and bounded fresh/stale persisted catalog. Upstream capacity declarations are not measured capabilities. Offline and loopback fixtures do not promote live_pending; see docs/provider/opencode-zen.md and PROTOCOL_EVIDENCE.md.
+- OpenCode Zen uses the single public free lane on Claude/Codex only. The model-selected upstream wire is bridged independently to Messages/Chat/Responses, with bounded incremental SSE, strict terminal+EOF, scoped minted sessions, isolated continuation evidence, and bounded fresh/stale persisted catalog. The complete live catalog and eligible free text models share one bounded versioned cache, with explicit free/paid/unknown pricing, fixed reviewed API routes, and authoritative empty-roster withdrawal. Authenticated unsaved Bundle forms offer editable search, Free labels and unavailable reasons without rewriting drafts; dynamic Profiles require explicit fixed-model selection. Upstream capacity declarations are not measured capabilities. Offline and loopback fixtures do not promote live_pending; see docs/provider/opencode-zen.md and PROTOCOL_EVIDENCE.md.
 
 ### Claude/Codex/Gemini model routing contract
 

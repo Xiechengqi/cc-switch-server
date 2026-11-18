@@ -9,7 +9,7 @@
     },
     {
       "path": "src/api/invoke/dispatch.rs",
-      "sha256": "64c18bdcf6f319cbc98c84ea06267bb180a71a763f19b51a1443d56bc24aa2ce"
+      "sha256": "c37de34dbbe432d68100f98b6c99b63e432ddf5b20757731020a8a231a995f6c"
     },
     {
       "path": "src/api/providers.rs",

@@ -76,11 +76,6 @@ async fn forward_opencode_zen_at(
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| ProxyError::bad_request("model must be a nonempty string"))?
         .to_string();
-    if !zen::is_free_model(&model) {
-        return Err(ProxyError::bad_request(
-            "OpenCode Zen only supports reviewed free-lane models",
-        ));
-    }
     // Reject unsupported Responses resource semantics rather than silently
     // dropping history or promising persistence that this driver cannot provide.
     if requested
@@ -92,12 +87,19 @@ async fn forward_opencode_zen_at(
             "OpenCode Zen requires explicit history and store=false",
         ));
     }
-    let prepared = zen::prepare_for_route(&requested, route)?;
+    zen::validate_source_request(&requested)?;
+    if zen::tool_choice_rejected(&requested) {
+        return Err(ProxyError {
+            status: http::StatusCode::FORBIDDEN,
+            message: "OpenCode Zen rejects tool_choice none".into(),
+        });
+    }
     let client = state.http_client().await;
     zen::refresh_catalog(&client, &state.config_dir)
         .await
         .map_err(ProxyError::bad_gateway)?;
-    zen::generation_allowed(&model).map_err(ProxyError::bad_request)?;
+    let endpoint = zen::generation_endpoint(&model).map_err(ProxyError::bad_request)?;
+    let prepared = zen::prepare_for_route(&requested, route, endpoint)?;
     ensure_share_model_available(
         &state,
         &execution,
@@ -105,7 +107,7 @@ async fn forward_opencode_zen_at(
         Some(&model),
     )
     .await?;
-    let wire = zen::wire_for(&model);
+    let wire = prepared.wire;
     let tool_context = super::transforms::responses_tool_context(&requested);
     let metadata = routed_model_metadata(
         routed.requested_model.as_deref().unwrap_or(&model),
@@ -245,9 +247,14 @@ async fn forward_opencode_zen_at(
             && !guard.usage.snapshot().response_model.conflict
         {
             if let Some(kind) = zen::continuation_kind(&payload) {
-                if let Some((next, continuation)) =
-                    zen_continuation_request(&requested, route, kind, &payload, total_deadline)?
-                {
+                if let Some((next, continuation)) = zen_continuation_request(
+                    &requested,
+                    route,
+                    endpoint,
+                    kind,
+                    &payload,
+                    total_deadline,
+                )? {
                     let continuation_result = async {
                         series
                             .lock()
@@ -667,6 +674,7 @@ fn zen_validate_json(
 fn zen_continuation_request(
     requested: &Value,
     route: ProxyRoute,
+    endpoint: super::opencode_zen::CatalogEndpoint,
     kind: super::opencode_zen::ContinuationKind,
     payload: &Value,
     deadline: tokio::time::Instant,
@@ -710,7 +718,7 @@ fn zen_continuation_request(
     if let Some(tools) = canonical.get("tools") {
         next["tools"] = tools.clone();
     }
-    let prepared = zen::prepare_for_route(&next, ProxyRoute::CodexChatCompletions)?;
+    let prepared = zen::prepare_for_route(&next, ProxyRoute::CodexChatCompletions, endpoint)?;
     Ok(Some((next, prepared)))
 }
 

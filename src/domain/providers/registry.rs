@@ -231,6 +231,9 @@ pub struct ProfileSpec {
     pub allowed_model_policies: Vec<ModelPolicyKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_upstream_model: Option<String>,
+    /// Dynamic catalogs require an explicit selection instead of a static default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_explicit_upstream_model: bool,
     pub visibility: ProfileVisibility,
     pub creation_policy: CreationPolicy,
     pub maturity: ProfileMaturity,
@@ -1360,9 +1363,20 @@ fn validate_profile_contract(
         );
     }
     let allows_single = allowed_model_policies.contains(&ModelPolicyKind::Single);
+    if profile.requires_explicit_upstream_model
+        && (!allows_single
+            || default_upstream_model.is_some()
+            || profile.form_composition == FormComposition::Legacy)
+    {
+        bail!(
+            "profile {} has an invalid explicit upstream model contract",
+            profile.profile_id
+        );
+    }
     if allows_single {
         if default_upstream_model.is_none()
             && profile.creation_policy == CreationPolicy::CreateAllowed
+            && !profile.requires_explicit_upstream_model
         {
             bail!(
                 "profile {} that allows single-model policy has no default upstream model",
@@ -1984,10 +1998,13 @@ mod tests {
                             "hidden passthrough Profile unexpectedly permits single: {}",
                             profile.profile_id
                         );
-                        assert!(profile
-                            .default_upstream_model
-                            .as_deref()
-                            .is_some_and(|model| !model.trim().is_empty()));
+                        assert!(
+                            profile.requires_explicit_upstream_model
+                                || profile
+                                    .default_upstream_model
+                                    .as_deref()
+                                    .is_some_and(|model| !model.trim().is_empty())
+                        );
                     } else {
                         assert!(profile.default_upstream_model.is_none());
                     }
@@ -2021,6 +2038,23 @@ mod tests {
                 "codex.perplexity_web_session",
             ]
         );
+    }
+
+    #[test]
+    fn opencode_zen_dynamic_profiles_require_explicit_models_without_static_defaults() {
+        for id in ["claude.opencode_zen", "codex.opencode_zen"] {
+            let profile = profile_by_id(id).unwrap();
+            assert!(profile.requires_explicit_upstream_model);
+            assert!(profile.default_upstream_model.is_none());
+            let mut registry = provider_registry().clone();
+            registry
+                .profiles
+                .iter_mut()
+                .find(|p| p.profile_id.as_str() == id)
+                .unwrap()
+                .default_upstream_model = Some("chat-free".into());
+            assert!(validate_registry(&registry).is_err());
+        }
     }
 
     #[test]

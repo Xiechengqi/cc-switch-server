@@ -180,9 +180,18 @@ async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() 
 
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let count = calls.clone();
-    let router = axum::Router::new().fallback(axum::routing::post(move |body: Bytes| {
+    let router = axum::Router::new().fallback(axum::routing::post(move |uri: axum::http::Uri, body: Bytes| {
         let n = count.fetch_add(1, Ordering::SeqCst);
         async move {
+            assert_eq!(uri.path(), "/inference/v1/chat/completions");
+            if n == 0 {
+                // A concurrent refresh changes the catalog's route; continuation
+                // must retain the admitted protocol of the original generation.
+                super::super::opencode_zen::store_catalog_payload(&json!({"data":[{
+                    "id":"chat-free","type":"chat","cost":{"input":0,"output":0},
+                    "api":{"messages":{"base_url":"https://opencode.ai/inference/anthropic/v1"}}
+                }]}));
+            }
             let sent: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(sent["model"], "chat-free");
             if n == 1 { assert!(sent["messages"].to_string().contains("partial")); }
@@ -308,6 +317,7 @@ fn opencode_zen_continuation_uses_remaining_budget_and_rejects_tools() {
     let prepared = zen_continuation_request(
         &request,
         ProxyRoute::CodexChatCompletions,
+        super::super::opencode_zen::CatalogEndpoint::LegacyChat,
         super::super::opencode_zen::ContinuationKind::MaxTokens,
         &first,
         tokio::time::Instant::now() + Duration::from_secs(10),
@@ -382,7 +392,14 @@ async fn opencode_zen_role_only_stream_cannot_extend_first_semantic_deadline() {
 async fn opencode_zen_fixed_models_choose_upstream_wire_before_conversion() {
     use super::super::opencode_zen as zen;
     let _lock = zen::CATALOG_TEST_LOCK.lock().await;
-    for model in ["chat-free", "muse-spark-free", "union-alpha"] {
+    for (model, api) in [
+        ("chat-free", None),
+        ("muse-spark-free", None),
+        ("union-alpha", None),
+        ("big-pickle", Some("chat-completions")),
+        ("new-messages", Some("messages")),
+        ("new-responses", Some("responses")),
+    ] {
         for route in [
             ProxyRoute::ClaudeMessages,
             ProxyRoute::CodexChatCompletions,
@@ -419,7 +436,19 @@ async fn opencode_zen_fixed_models_choose_upstream_wire_before_conversion() {
                 crate::domain::providers::runtime::RuntimeModelPolicy::Single {
                     upstream_model: model.into(),
                 };
-            zen::store_catalog(vec![model.to_string()], current_time_ms() as i64);
+            if let Some(api) = api {
+                let base = if api == "messages" {
+                    "https://opencode.ai/inference/anthropic/v1"
+                } else {
+                    "https://opencode.ai/inference/openai/v1"
+                };
+                zen::store_catalog_payload(
+                    &json!({"data":[{"id":model,"cost":{"input":0,"output":0},
+                    "api":{api:{"base_url":base}}}]}),
+                );
+            } else {
+                zen::store_catalog(vec![model.to_string()], current_time_ms() as i64);
+            }
             let response = forward_opencode_zen_at(options, &origin).await.unwrap();
             let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
                 .await

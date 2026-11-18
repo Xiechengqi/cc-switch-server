@@ -83,6 +83,7 @@ export interface ProviderRegistryProfile {
   modelPolicy: ProviderModelPolicy;
   allowedModelPolicies?: ProviderModelPolicy[];
   defaultUpstreamModel?: string;
+  requiresExplicitUpstreamModel?: boolean;
   visibility: "visible" | "hidden";
   creationPolicy: "create_allowed" | "existing_only";
   maturity: "stable" | "experimental";

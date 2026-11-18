@@ -3346,3 +3346,23 @@ DeepSeek Harness 完整会话仍为 `live_pending`，未部署、未发起真实
 - 本轮仅改变本地权限、计量覆盖、持久化与管理交互，不新增或宣称已真实验证任何上游媒体/工具接口。实际实现由编译 Registry runtime 和 Driver 合同派生；未知账号、模型和传输保持 live_pending。
 - 只读研究 sub2api、TokenRouter、new-api、LiteLLM 的设计证据已登记在 Router `docs/share-capability-policy-implementation-plan.md §13`，这些外部仓库不作为构建、测试或同步输入。借鉴操作/计量分离、原生资源单位、幂等结算；不采用缺价泛化默认价、未知用量按免费或事后删媒体等做法。
 - 本地协议控制夹具、SQLite/state 原子/重放测试、组件和浏览器证明本地边界，不将其提升为真实供应商执行、计费精度或灰度通过。权威实现说明见 `docs/share/extended-capabilities.md`。
+
+
+## 2026-11-18 OpenCode Zen dynamic model selection
+本轮协议研究仅读取 zen-gate `58fa1b7bd98662696ff92777c3c7e4957058b111`（首选）以及 OpenCode `49b94635ff` 的目录服务与免 Key 过滤。外仓不参与构建、测试、发布或运行。逐文件 SHA-256：
+- `internal/lane/catalog.go`：`aa5be88f49b0f6da5cc82ee857959e235496a9b87155583a69a89a8f1bd1f24e`。
+- `internal/openref/modelsdev.go`：`5bb8fa389f6564fd47a9676e01c53f67900495f3a9cee73b74c77e9419ce5f8e`。
+- `packages/core/src/models-dev.ts`：`f3debccd16471205cb2b357eef5e1af4e53a3160c59c0adc23e8d1fd320480f1`。
+- `packages/core/src/plugin/provider/opencode.ts`：`eaa39c9b07a7bea909a6d3a44ebbe3133d740514351cc20e1dde0f83f119f75d`。
+
+2026-11-18 01:57 UTC 只读 GET `https://opencode.ai/zen/v1/models` 返回 HTTP 200、88 个 chat 模型，12 个声明文本输入/输出零价；`big-pickle` 没有 free 后缀。当前字段包括 name/type/limit/cost.text/api；`chat-free` 与旧默认 deepseek-v4-flash-free 未在该名单中。OpenCode 源使用 `https://models.opencode.ai/experimental/v2.0/api.json?type=chat,decision,image,video`，opencode 段当次 150 项（142 chat、4 decision、4 image）；models.dev 旧 v1 段 142 项。目录差异不能当作实时推理接受性或账号授权证明，本轮不调用真实推理。
+
+实现使用固定 Zen 在线名单作为权威；完整目录与免费文本转发候选从同一版本化、限量、持久化快照派生。新旧价格格式显式零价/正价/未知分开，阶梯、缓存与模式的正价优先，Legacy ID 兼容明确标记来源。现代协议仅允许固定 opencode.ai 的受审路径，不接受目录任意 URL；准入与协议选择固定到同一模型快照。成功空名单撤销旧候选，失败保留有效旧快照并标 stale。
+
+受认证的 fetch_opencode_zen_models 为未保存表单提供同一目录，不创建 Provider 或账号、不写模型策略。通用可编辑输入框复用本仓 Buddy 交互；Zen 独立声明 Free 标记、不可选原因及手动输入提示，不引入 Buddy auto 或账号要求。动态 Profile requiresExplicitUpstreamModel 替代静态 chat-free 默认，旧值保留且不自动换模；保存不依赖目录网络。
+
+整体 review 已覆盖价格与协议规范化、目录准入、版本化缓存恢复、并发刷新及失败退避、未保存表单的认证与只读边界、全局/按应用模型策略和 Buddy 兼容。收口时将首次准入的协议端点贯穿到续写，避免中途目录刷新导致协议漂移；回环测试在首段返回时更改目录协议，核对续写仍沿用原路径。现代目录缺少 cost 时保持未知价格，不回退到 free 名称猜测；成功空名单撤销旧候选。键盘导航跳过禁用项，目录加载、刷新和失败均不修改草稿。本轮 Zen 增强没有发现未解决的阻断问题。
+
+2026-11-18 发布隔离核对：以已发布的 `92083f6` 为父提交，单独整理 Zen 变更并重新生成契约证据与 Web 产物。完整 Rust 源码（src/tests）摘要为 `5b16caa94f84875df96dde01f4ac40c77709cd23e9a4b9d8b117d0efb022dce4`，Web 产物摘要为 `e58af935702131a6a9d9851813bb83b99616ba0572504768fb5a1c74780fadd2`，二者均与实施阶段全量验证通过的冻结树逐字节一致，复用该冻结树回执：Rust 库 4521 passed / 0 failed / 3 ignored、API 契约 139/139、两个独立集成目标各 1/1，Zen 专项 35/35。该树的 cargo fmt、全部 include 源文件 rustfmt、严格 all-targets Clippy、cargo check/build、10 步本地 HTTP smoke 及完整 static-checks 均通过；后端审计 2205/2205、smoke 脚本测试 13/13。资源参数为 CARGO_PROFILE_TEST_DEBUG=0、CARGO_PROFILE_DEV_DEBUG=0、CARGO_INCREMENTAL=0、RUST_MIN_STACK=67108864、单编译任务、4 测试线程。
+
+本次在隔离发布树重新执行 Node 20.20.2 Web 类型检查、59 文件 / 414 测试和生产构建，均通过；Provider writer 证据、覆盖/UI 矩阵及文档索引再校验通过。发布树另保留既有 Codex 配置项查询的等价 Clippy 修正：双向迭代器 `.last()` 改为 `.next_back()`。离线 readiness 无检查失败，因真实 Router/账号/部署输入不齐而保持 blocked_inputs；本轮未部署、未发起真实推理。并行额度工作保留在主工作区，按其独立源码与回执验收。

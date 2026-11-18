@@ -991,6 +991,13 @@
       "notes": "Persisted in ui-settings.json commonConfigSnippets."
     },
     {
+      "name": "fetch_opencode_zen_models",
+      "support": "native",
+      "implemented": true,
+      "feature": "providers",
+      "notes": "Authenticated fixed-origin OpenCode Zen model catalog for saved and unsaved Bundle forms; explicit free/paid/unknown classification and supported protocol projection share the bounded persisted inference catalog. No Provider or configuration writes."
+    },
+    {
       "name": "fetch_buddy_account_models",
       "support": "native",
       "implemented": true,

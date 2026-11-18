@@ -33,11 +33,12 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import {
-  UpstreamModelInput,
   BuddyReasoningNotice,
   useBuddyModelCatalog,
   type BuddyModelCatalogControl,
 } from "./BuddyModelSelector";
+import { UpstreamModelInput } from "./UpstreamModelInput";
+import { useZenModelCatalog, type ZenModelCatalogControl } from "./ZenModelSelector";
 import { resolveBundleIcon } from "./bundleIcon";
 
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -394,11 +395,13 @@ function CardGapStatus({ gap }: { gap: BundleGap | null }) {
  */
 function SurfaceModelRow({
   catalog,
+  zenCatalog,
   surface,
   validation,
   onChange,
 }: {
   catalog?: BuddyModelCatalogControl;
+  zenCatalog?: ZenModelCatalogControl;
   surface: BundleSurfaceEditorDraft;
   validation: BundleValidationIssue | null;
   onChange: (surface: BundleSurfaceEditorDraft) => void;
@@ -461,6 +464,7 @@ function SurfaceModelRow({
           {surface.modelPolicy === "single" ? (
             <UpstreamModelInput
               catalog={catalog}
+              zenCatalog={zenCatalog}
               id={bundleValidationFieldId({
                 code: "surfaceUpstreamModelRequired",
                 field: "upstreamModel",
@@ -1604,6 +1608,11 @@ export function ProviderBundleEditor({
       : undefined;
   const buddyCatalog = useBuddyModelCatalog(
     managedProviderType, draft.accountId, draft.accountGeneration,
+    draft.modelPolicyScope === "global" ? draft.modelPolicy === "single"
+      : draft.surfaces.some((surface) => surface.modelPolicy === "single"),
+  );
+  const zenCatalog = useZenModelCatalog(
+    family.familyId,
     draft.modelPolicyScope === "global" ? draft.modelPolicy === "single"
       : draft.surfaces.some((surface) => surface.modelPolicy === "single"),
   );
@@ -2825,6 +2834,7 @@ export function ProviderBundleEditor({
                       {draft.modelPolicy === "single" ? (
                         <UpstreamModelInput
                           catalog={buddyCatalog}
+                          zenCatalog={zenCatalog}
                           id={bundleValidationFieldId({
                             code: "upstreamModelRequired",
                             field: "upstreamModel",
@@ -2864,6 +2874,7 @@ export function ProviderBundleEditor({
                         {fixedModelSurfaces.map((surface) => (
                           <SurfaceModelRow
                             catalog={buddyCatalog}
+                            zenCatalog={zenCatalog}
                             key={surface.app}
                             surface={surface}
                             validation={validation}
@@ -2880,6 +2891,7 @@ export function ProviderBundleEditor({
                     {draft.surfaces.map((surface) => (
                       <SurfaceModelRow
                         catalog={buddyCatalog}
+                        zenCatalog={zenCatalog}
                         key={surface.app}
                         surface={surface}
                         validation={validation}

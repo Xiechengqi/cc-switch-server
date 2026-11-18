@@ -486,17 +486,23 @@ mod tests {
             ("union-alpha", ZenWire::Messages),
         ] {
             let body = json!({"model":model,"stream":true,"system":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"x"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ok"}]}],"tools":[{"name":"read","description":"client read","input_schema":{"type":"object","properties":{"cache_control":{"type":"string"}}}}]});
-            let prepared = prepare_for_route(&body, ProxyRoute::ClaudeMessages).unwrap();
+            let prepared = prepare_for_route(
+                &body,
+                ProxyRoute::ClaudeMessages,
+                CatalogEndpoint::legacy(model),
+            )
+            .unwrap();
             let raw = String::from_utf8(prepared.body).unwrap();
             assert!(raw.contains("call_1"));
             assert!(raw.contains("read_client"));
             assert!(raw.contains("cache_control")); // schema property survives
             assert!(!raw.contains("ephemeral"));
-            assert_eq!(wire_for(model), wire);
+            assert_eq!(prepared.wire, wire);
         }
         assert!(prepare_for_route(
             &json!({"model":"chat-free","messages":[],"tool_choice":"none"}),
-            ProxyRoute::CodexChatCompletions
+            ProxyRoute::CodexChatCompletions,
+            CatalogEndpoint::LegacyChat
         )
         .is_err());
     }

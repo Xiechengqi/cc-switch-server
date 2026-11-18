@@ -233,7 +233,7 @@ fn last_configuration_effort(body: &Value) -> Option<String> {
         .flatten()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("configuration_update"))
         .filter_map(reasoning_effort)
-        .last()
+        .next_back()
 }
 
 fn normalized_string(value: Option<&Value>) -> Option<String> {

@@ -1,10 +1,11 @@
+import { UpstreamModelInput } from "./UpstreamModelInput";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { BuddyAccountModels } from "@/lib/api/providers";
 import i18n from "@/i18n";
-import { UpstreamModelInput, useBuddyModelCatalog } from "./BuddyModelSelector";
+import { useBuddyModelCatalog } from "./BuddyModelSelector";
 
 const mocks = vi.hoisted(() => ({ fetch: vi.fn() }));
 vi.mock("@/lib/api/providers", () => ({ providersApi: { fetchBuddyAccountModels: mocks.fetch } }));
