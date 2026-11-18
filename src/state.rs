@@ -6011,6 +6011,15 @@ fn prepare_account_binding_migration_preview(
 }
 
 impl ServerStateInner {
+    /// Refresh bound-account capability evidence without changing credential
+    /// selection. Network failure is a soft fallback to the built-in snapshot.
+    pub(crate) async fn ensure_codex_model_capabilities(
+        self: &Arc<Self>,
+        execution: &crate::proxy::provider_ops::ProviderExecution,
+    ) {
+        crate::proxy::refresh_codex_model_capabilities(self, execution).await;
+    }
+
     /// Freeze durable core-store writers in the declared lock order, refresh
     /// the SQLite shadow from those exact durable snapshots, then create one
     /// backup manifest containing both representations.

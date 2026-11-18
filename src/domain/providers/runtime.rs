@@ -1195,6 +1195,10 @@ fn runtime_driver_options(
             meta.codex_fast_mode.map(|value| json!(value)),
         ),
         (
+            "codexServiceTier",
+            meta.codex_service_tier.map(|value| json!(value)),
+        ),
+        (
             "codexImageGenerationEnabled",
             meta.codex_image_generation_enabled
                 .map(|value| json!(value)),

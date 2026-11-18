@@ -259,13 +259,37 @@ function main() {
   const compatibility = readContract("provider-legacy-compatibility.json");
   const compatibilityWindow = readContract("provider-compatibility-window.json");
   const registry = readContract("provider-registry.json");
+  const refreshSource = process.argv.includes("--refresh-source-evidence");
+  const checked = structuredClone(requirements);
+  if (refreshSource) {
+    const sourcePath = checked.providerTypeSource.path;
+    const source = fs.readFileSync(path.join(repoRoot, sourcePath), "utf8");
+    const actual = extractServerProviderTypesSource(sourcePath, source);
+    const expected = checked.providerTypes.map(({ variant, id }) => ({ variant, id }));
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new Error("ProviderType inventory changed; review product requirements before refreshing source evidence");
+    }
+    checked.providerTypeSource.sha256 = sha256(source);
+  }
   validateServerProviderContracts(
-    requirements,
+    checked,
     compatibility,
     compatibilityWindow,
     registry,
   );
   assertCodeBuddyEvidenceFreeze(registry);
+  if (refreshSource) {
+    const requirementsPath = path.join(repoRoot, "assets/contract/server-provider-requirements.json");
+    const original = fs.readFileSync(requirementsPath, "utf8");
+    const refreshed = original.replace(
+      JSON.stringify(requirements.providerTypeSource.sha256),
+      JSON.stringify(checked.providerTypeSource.sha256),
+    );
+    if (JSON.stringify(JSON.parse(refreshed)) !== JSON.stringify(checked)) {
+      throw new Error("Cannot refresh ProviderType source evidence without changing other requirements");
+    }
+    fs.writeFileSync(requirementsPath, refreshed);
+  }
   console.log(
     `Server Provider contracts ok: ${requirements.providerTypes.length} types, ${Object.values(compatibility.counts).join("/")} legacy fixtures`,
   );

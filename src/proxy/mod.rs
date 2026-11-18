@@ -91,6 +91,7 @@ pub use forwarder::forward_codex_responses_ws;
 pub use forwarder::forward_grok_media;
 pub(crate) use forwarder::forward_grok_media_provider_test;
 pub(crate) use forwarder::forward_provider_test;
+pub(crate) use forwarder::refresh_codex_model_capabilities;
 
 pub(crate) fn grok_fixed_api_base_url() -> &'static str {
     grok::default_base_url()
@@ -936,7 +937,7 @@ mod tests {
                 ("authorization", "Bearer token".to_string()),
                 ("chatgpt-account-id", "acct_123".to_string()),
                 ("originator", "codex_cli_rs".to_string()),
-                ("version", "0.144.1".to_string()),
+                ("version", crate::codex_identity::configured_version()),
             ]
         );
     }

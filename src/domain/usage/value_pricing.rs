@@ -402,6 +402,8 @@ pub fn canonical_service_tier(raw: Option<&str>) -> Option<&'static str> {
         Some("standard")
     } else if raw.eq_ignore_ascii_case("priority") {
         Some("priority")
+    } else if raw.eq_ignore_ascii_case("ultrafast") {
+        Some("ultrafast")
     } else if raw.eq_ignore_ascii_case("flex") {
         Some("flex")
     } else {
@@ -774,7 +776,7 @@ impl ExecutionModelPrice {
         validate_resource_rates(&self.resources)?;
         if self.long_context_threshold == Some(0)
             || (self.rates.is_empty() && self.resources.is_empty())
-            || self.rates.len() > 6
+            || self.rates.len() > 8
         {
             return Err(ValueError::InvalidSnapshot);
         }
@@ -787,6 +789,8 @@ impl ExecutionModelPrice {
                     | "priority/long"
                     | "flex/base"
                     | "flex/long"
+                    | "ultrafast/base"
+                    | "ultrafast/long"
             ) {
                 return Err(ValueError::InvalidSnapshot);
             }
@@ -795,7 +799,7 @@ impl ExecutionModelPrice {
             }
             rates.validate()?;
         }
-        for tier in ["standard", "priority", "flex"] {
+        for tier in ["standard", "priority", "flex", "ultrafast"] {
             if self
                 .rates
                 .keys()
@@ -812,7 +816,10 @@ impl ExecutionModelPrice {
         effective_tier: &str,
         tokens: &ValueTokens,
     ) -> Result<PricedValue, ValueError> {
-        if !matches!(effective_tier, "standard" | "priority" | "flex") {
+        if !matches!(
+            effective_tier,
+            "standard" | "priority" | "flex" | "ultrafast"
+        ) {
             return Err(ValueError::PriceUnavailable);
         }
         let context_input = match self.context_input_basis {
@@ -834,7 +841,7 @@ impl ExecutionModelPrice {
     }
     /// Tiers this model can price text at, in a fixed order.
     pub fn supported_tiers(&self) -> impl Iterator<Item = &'static str> + '_ {
-        ["standard", "priority", "flex"]
+        ["standard", "priority", "flex", "ultrafast"]
             .into_iter()
             .filter(|tier| self.supports_tier(tier))
     }
@@ -845,7 +852,7 @@ impl ExecutionModelPrice {
         tier: &str,
         tokens: &ValueTokens,
     ) -> Result<PricedValue, ValueError> {
-        if self.supports_tier(tier) {
+        if self.supports_tier(tier) || tier == "ultrafast" {
             return self.price(tier, tokens);
         }
         self.supported_tiers()
@@ -1524,6 +1531,50 @@ mod tests {
             cache_write_policy: CacheWritePolicy::Both,
         }
     }
+    #[test]
+    fn ultrafast_is_independently_priced_and_never_borrows_legacy_rates() {
+        let mut price = ExecutionModelPrice {
+            resources: Default::default(),
+            context_input_basis: ContextInputBasis::RawInput,
+            long_context_threshold: None,
+            long_context_inclusive: false,
+            rates: BTreeMap::from([
+                ("standard/base".into(), rates()),
+                ("priority/base".into(), rates()),
+            ]),
+        };
+        let tokens = ValueTokens {
+            fresh_input: 10,
+            output: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            price.price("ultrafast", &tokens),
+            Err(ValueError::PriceUnavailable)
+        );
+        assert_eq!(
+            price.price_or_highest_tier("ultrafast", &tokens),
+            Err(ValueError::PriceUnavailable)
+        );
+        assert_eq!(canonical_service_tier(Some("ULTRAFAST")), Some("ultrafast"));
+        let mut ultrafast = rates();
+        ultrafast.input = Some("12000000".into());
+        ultrafast.output = Some("60000000".into());
+        price.rates.insert("ultrafast/base".into(), ultrafast);
+        price.validate().unwrap();
+        assert_eq!(
+            price.price("ultrafast", &tokens).unwrap().usage_picos,
+            240_000_000
+        );
+        let encoded = serde_json::to_string(&price).unwrap();
+        let decoded: ExecutionModelPrice = serde_json::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(
+            decoded.price("ultrafast", &tokens),
+            price.price("ultrafast", &tokens)
+        );
+    }
+
     #[test]
     fn exact_picos_keep_sub_micro_requests_and_real_zero_separate_from_missing() {
         let r = rates();

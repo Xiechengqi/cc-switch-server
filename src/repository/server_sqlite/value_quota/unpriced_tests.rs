@@ -758,3 +758,55 @@ fn a_model_without_any_text_tier_is_tier_unpriced_and_zero_dimensions_are_stripp
         BTreeMap::from([("image.output".to_string(), 1)])
     );
 }
+
+#[test]
+fn ultrafast_without_a_dedicated_tariff_stays_unpriced_and_market_refuses() {
+    let (mut conn, scope, window, quota, revision) = setup();
+    let tx = conn.transaction().unwrap();
+    let admission = Admission {
+        enforce: true,
+        effective_tier: "ultrafast",
+        ..unpriced_admission(
+            &scope,
+            &window,
+            &quota,
+            &revision,
+            "ultrafast-unpriced",
+            "model",
+        )
+    };
+    evidence::record_admission(&tx, &admission, true).unwrap();
+    admit_with_trial_in_tx(&tx, &admission, None).unwrap();
+    assert_eq!(
+        attempt_state(&tx, "ultrafast-unpriced").2.as_deref(),
+        Some("tier_unpriced")
+    );
+    let mut log = unpriced_log(&scope, "ultrafast-unpriced", "model", Some((100, 50)));
+    log.effective_service_tier = Some("ultrafast".into());
+    evidence::capture_log(&tx, &log, None).unwrap();
+    settle_log_in_tx(&tx, &log, false).unwrap();
+    let state = attempt_state(&tx, "ultrafast-unpriced");
+    assert_eq!(state.0, "0");
+    assert_eq!(state.2.as_deref(), Some("tier_unpriced"));
+    let market = Scope {
+        entitlement_id: Some("contract".into()),
+        ..scope.clone()
+    };
+    let error = admit_with_trial_in_tx(
+        &tx,
+        &Admission {
+            scope: &market,
+            request_id: "market-ultrafast",
+            ..admission
+        },
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<crate::domain::usage::value_pricing::PriceRejection>()
+            .unwrap()
+            .reason_code,
+        "tier_unpriced"
+    );
+}

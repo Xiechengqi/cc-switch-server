@@ -99,6 +99,7 @@ import {
 import {
   CodexFeatureOptions,
   type CodexFeatureOptionKey,
+  type CodexFeatureOptionValues,
 } from "@/server/providers/CodexFeatureOptions";
 import {
   GrokFeatureOptions,
@@ -1909,7 +1910,7 @@ export function ProviderBundleEditor({
       }),
     );
 
-  const setDriverOption = (key: CodexFeatureOptionKey, checked: boolean) =>
+  const setDriverOption = <K extends CodexFeatureOptionKey>(key: K, checked: CodexFeatureOptionValues[K]) =>
     setDraft((current) => ({
       ...current,
       surfaces: current.surfaces.map((surface) => {
@@ -2135,9 +2136,13 @@ export function ProviderBundleEditor({
   ].filter((key) =>
     draft.surfaces.some(
       (surface) =>
-        surface.driverOptions[
-          key as keyof BundleSurfaceEditorDraft["driverOptions"]
-        ] === true,
+        key === "codexFastMode"
+          ? surface.driverOptions.codexServiceTier
+            ? surface.driverOptions.codexServiceTier !== "standard"
+            : surface.driverOptions.codexFastMode === true
+          : surface.driverOptions[
+              key as keyof BundleSurfaceEditorDraft["driverOptions"]
+            ] === true,
     ),
   ).length;
   const featuresSummary = enabledFeatureCount
@@ -3114,9 +3119,11 @@ export function ProviderBundleEditor({
                   {codexDriverOptions ? (
                     <CodexFeatureOptions
                       values={{
-                        codexFastMode: draft.surfaces.some(
-                          (surface) =>
-                            surface.driverOptions.codexFastMode === true,
+                        codexServiceTier: draft.surfaces.find(
+                          (surface) => surface.driverOptions.codexServiceTier,
+                        )?.driverOptions.codexServiceTier ?? (
+                          draft.surfaces.some((surface) => surface.driverOptions.codexFastMode === true)
+                            ? "priority" : "standard"
                         ),
                         codexImageGenerationEnabled: draft.surfaces.some(
                           (surface) =>

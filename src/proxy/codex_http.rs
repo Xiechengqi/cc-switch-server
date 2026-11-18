@@ -31,13 +31,14 @@ pub(crate) fn routing_hint(body: &[u8]) -> Option<String> {
     {
         return None;
     }
-    let mut hint = model.to_string();
-    if value
+    let mut hint = format!("model={model}");
+    if let Some(tier) = value
         .get("service_tier")
         .and_then(Value::as_str)
-        .is_some_and(|tier| tier.eq_ignore_ascii_case("priority"))
+        .filter(|tier| matches!(*tier, "priority" | "ultrafast"))
     {
-        hint.push_str(";tier=priority");
+        hint.push_str(";tier=");
+        hint.push_str(tier);
     }
     Some(hint)
 }
@@ -107,14 +108,18 @@ mod tests {
     }
 
     #[test]
-    fn routing_hint_uses_final_model_and_only_verified_priority_tier() {
+    fn routing_hint_uses_final_model_and_supported_service_tiers() {
         assert_eq!(
             routing_hint(br#"{"model":"gpt-5.5","service_tier":"priority"}"#).as_deref(),
-            Some("gpt-5.5;tier=priority")
+            Some("model=gpt-5.5;tier=priority")
         );
         assert_eq!(
             routing_hint(br#"{"model":"gpt-5.5","service_tier":"flex"}"#).as_deref(),
-            Some("gpt-5.5")
+            Some("model=gpt-5.5")
+        );
+        assert_eq!(
+            routing_hint(br#"{"model":"gpt-6.2-sol","service_tier":"ultrafast"}"#).as_deref(),
+            Some("model=gpt-6.2-sol;tier=ultrafast")
         );
         assert!(routing_hint(br#"{"model":"bad;model"}"#).is_none());
     }
@@ -134,7 +139,7 @@ mod tests {
             true,
         );
         assert!(headers.iter().any(|(name, value)| {
-            name == ROUTING_HINT_HEADER && value == "gpt-5.5;tier=priority"
+            name == ROUTING_HINT_HEADER && value == "model=gpt-5.5;tier=priority"
         }));
     }
 

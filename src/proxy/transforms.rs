@@ -3828,14 +3828,32 @@ fn openai_chat_content_part_to_response_part(
                 .pointer("/image_url/url")
                 .or_else(|| part.get("image_url"))
                 .and_then(Value::as_str)?;
-            (!url.is_empty()).then(|| json!({"type": "input_image", "image_url": url}))
+            (!url.is_empty()).then(|| {
+                let mut output = json!({"type": "input_image", "image_url": url});
+                if let Some(detail) = part
+                    .pointer("/image_url/detail")
+                    .or_else(|| part.get("detail"))
+                {
+                    output["detail"] = detail.clone();
+                }
+                output
+            })
         }
         Some("input_image") if role != "assistant" => {
             let url = part
                 .get("image_url")
                 .or_else(|| part.get("url"))
                 .and_then(Value::as_str)?;
-            (!url.is_empty()).then(|| json!({"type": "input_image", "image_url": url}))
+            (!url.is_empty()).then(|| {
+                let mut output = json!({"type": "input_image", "image_url": url});
+                if let Some(detail) = part
+                    .pointer("/image_url/detail")
+                    .or_else(|| part.get("detail"))
+                {
+                    output["detail"] = detail.clone();
+                }
+                output
+            })
         }
         Some("file") if role != "assistant" => {
             let file = part.get("file")?;
@@ -5997,7 +6015,7 @@ fn anthropic_message_to_openai_response_items(message: &Value) -> Vec<Value> {
             }
             _ => {
                 flush_responses_tool_media(&mut items, &mut pending_media);
-                content.push(anthropic_block_to_openai_response_content(
+                content.extend(anthropic_block_to_openai_response_contents(
                     response_role,
                     block,
                 ));
@@ -6647,14 +6665,41 @@ fn anthropic_block_to_openai_chat_content(block: &Value) -> Value {
     }
 }
 
-fn anthropic_block_to_openai_response_content(role: &str, block: &Value) -> Value {
-    match block.get("type").and_then(Value::as_str) {
-        Some("image") => anthropic_image_to_openai_response(block),
-        _ => json!({
-            "type": responses_text_part_type(role),
-            "text": anthropic_text_from_block(block).unwrap_or_default()
-        }),
+// Reuse the same typed media parser as tool results. Never traverse arbitrary
+// user JSON here: only Anthropic-owned document/source positions are expanded.
+fn anthropic_block_to_openai_response_contents(role: &str, block: &Value) -> Vec<Value> {
+    if let Some(part) =
+        super::tool_media::media_part(block).and_then(|media| media.to_responses_part())
+    {
+        return vec![part];
     }
+    if block.get("type").and_then(Value::as_str) == Some("document") {
+        match block.pointer("/source/type").and_then(Value::as_str) {
+            Some("text") => {
+                return vec![json!({"type": responses_text_part_type(role),
+                    "text": block.pointer("/source/data").and_then(Value::as_str).unwrap_or_default()})];
+            }
+            Some("content") => {
+                return block
+                    .pointer("/source/content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|part| anthropic_block_to_openai_response_contents(role, part))
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    vec![json!({"type": responses_text_part_type(role),
+        "text": anthropic_text_from_block(block).unwrap_or_default()})]
+}
+
+fn anthropic_block_to_openai_response_content(role: &str, block: &Value) -> Value {
+    anthropic_block_to_openai_response_contents(role, block)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| json!({"type": responses_text_part_type(role), "text": ""}))
 }
 
 fn anthropic_block_to_gemini_part(block: &Value) -> Value {
@@ -6758,30 +6803,9 @@ fn anthropic_tool_use_to_openai_response_with_tool_context(
 }
 
 fn anthropic_image_to_openai_chat(block: &Value) -> Value {
-    if block.pointer("/source/type").and_then(Value::as_str) == Some("url") {
-        return json!({"type": "image_url", "image_url": {"url": block.pointer("/source/url").cloned().unwrap_or(Value::Null)}});
-    }
-    let media_type = block
-        .pointer("/source/media_type")
-        .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream");
-    let data = block
-        .pointer("/source/data")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    json!({"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{data}")}})
-}
-
-fn anthropic_image_to_openai_response(block: &Value) -> Value {
-    let media_type = block
-        .pointer("/source/media_type")
-        .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream");
-    let data = block
-        .pointer("/source/data")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    json!({"type": "input_image", "image_url": format!("data:{media_type};base64,{data}")})
+    super::tool_media::media_part(block)
+        .and_then(|media| media.to_chat_part())
+        .unwrap_or_else(|| json!({"type": "text", "text": ""}))
 }
 
 fn openai_tools_to_anthropic(tools: Option<&Value>) -> Option<Value> {
@@ -11716,6 +11740,48 @@ mod tests {
                 .and_then(Value::as_str),
             Some("ping")
         );
+    }
+
+    #[test]
+    fn ordinary_anthropic_media_preserves_sources_order_and_image_detail() {
+        let input = json!({"model": "gpt-6.2-sol", "max_tokens": 64, "messages": [{
+            "role": "user", "content": [
+                {"type": "text", "text": "before"},
+                {"type": "image", "source": {"type": "url", "url": "https://example.test/image.png"}, "detail": "original"},
+                {"type": "document", "title": "report.pdf", "source": {"type": "base64", "media_type": "application/pdf", "data": "cGRm"}},
+                {"type": "document", "source": {"type": "url", "url": "https://example.test/report.pdf"}},
+                {"type": "document", "source": {"type": "text", "data": "document text"}},
+                {"type": "document", "source": {"type": "content", "content": [
+                    {"type": "text", "text": "embedded text"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aW1n"}}
+                ]}},
+                {"type": "input_audio", "input_audio": {"data": "YXVkaW8=", "format": "wav"}},
+                {"type": "text", "text": "after"}
+            ]
+        }]});
+        let output = anthropic_to_openai_responses_with_instructions(&input).unwrap();
+        let content = &output["input"][0]["content"];
+        assert_eq!(content.as_array().unwrap().len(), 9);
+        assert_eq!(content[0]["text"], "before");
+        assert_eq!(
+            content[1],
+            json!({"type": "input_image", "image_url": "https://example.test/image.png", "detail": "original"})
+        );
+        assert_eq!(content[2]["file_data"], "data:application/pdf;base64,cGRm");
+        assert_eq!(content[2]["filename"], "report.pdf");
+        assert_eq!(content[3]["file_url"], "https://example.test/report.pdf");
+        assert_eq!(content[4]["text"], "document text");
+        assert_eq!(content[5]["text"], "embedded text");
+        assert_eq!(content[6]["image_url"], "data:image/png;base64,aW1n");
+        assert_eq!(
+            content[7],
+            json!({"type": "input_audio", "input_audio": {"data": "YXVkaW8=", "format": "wav"}})
+        );
+        assert_eq!(content[8]["text"], "after");
+        let part = openai_chat_content_part_to_response_part("user", "input_text", &json!({
+            "type": "image_url", "image_url": {"url": "https://example.test/img", "detail": "original"}
+        })).unwrap();
+        assert_eq!(part["detail"], "original");
     }
 
     #[test]

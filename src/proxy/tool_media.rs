@@ -421,7 +421,7 @@ fn strip_media(
     }
 }
 
-fn media_part(value: &Value) -> Option<ToolMediaPart> {
+pub(crate) fn media_part(value: &Value) -> Option<ToolMediaPart> {
     let object = value.as_object()?;
     if let Some(inline) = object
         .get("inlineData")

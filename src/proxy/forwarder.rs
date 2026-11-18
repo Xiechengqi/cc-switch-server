@@ -1558,12 +1558,95 @@ async fn force_refresh_codex_auth_context(
     ensure_managed_credential_persistence_available(state, execution)
 }
 
-fn codex_models_client_version(client_version: Option<&str>) -> String {
-    client_version
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(crate::codex_identity::configured_version)
+fn codex_models_client_version(_client_version: Option<&str>) -> String {
+    crate::codex_identity::configured_version()
+}
+
+/// State owns credential orchestration; this helper never selects an account
+/// and uses only the execution's generation-fenced binding.
+pub(crate) async fn refresh_codex_model_capabilities(
+    state: &ServerState,
+    execution: &ProviderExecution,
+) {
+    if !execution.driver_is("oauth.openai_codex") {
+        return;
+    }
+    #[cfg(test)]
+    if !execution
+        .plan
+        .driver_options
+        .contains_key("testCodexModelsUrl")
+    {
+        return;
+    }
+    let stored = execution.runtime_stored_view();
+    let Some(guard) = super::codex_models::manifest_refresh_guard(&stored).await else {
+        return;
+    };
+    if !guard.should_refresh() {
+        return;
+    }
+    let version = guard.client_version().to_string();
+    let memory = RequestMemoryBudget::new(CODEX_MODELS_MANIFEST_BODY_LIMIT_BYTES.saturating_mul(4));
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let endpoint = codex_models_manifest_url(execution);
+        for attempt in 0..2 {
+            let context = materialize_codex_auth_context(
+                state,
+                execution,
+                &HeaderMap::new(),
+                endpoint.clone(),
+            )
+            .await?;
+            let mut response = build_codex_models_request(
+                &context.http_client,
+                &context.url,
+                &context.headers,
+                &HeaderMap::new(),
+                &version,
+            )?
+            .send()
+            .await
+            .map_err(ProxyError::bad_gateway)?;
+            if response.status() == StatusCode::UNAUTHORIZED && attempt == 0 {
+                drop(response);
+                force_refresh_codex_auth_context(state, execution).await?;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Ok::<(), ProxyError>(());
+            }
+            let headers = response.headers().clone();
+            let (body, transport_memory) = read_response_body_limited_with_memory(
+                &mut response,
+                CODEX_MODELS_MANIFEST_BODY_LIMIT_BYTES,
+                Some(&memory),
+            )
+            .await
+            .map_err(RequestMemoryResponseReadError::into_proxy_error)?;
+            let decoded = decode_response_body_with_memory(
+                &headers,
+                body,
+                transport_memory,
+                CODEX_MODELS_MANIFEST_BODY_LIMIT_BYTES,
+                Some(&memory),
+            )?;
+            // Revalidate after I/O so a reauthorized account cannot publish an
+            // old credential's manifest into the current binding.
+            let accounts = accounts_snapshot_for_execution_auth(state, execution).await?;
+            execution.materialize_auth(&accounts)?;
+            if !decoded.preserve_content_encoding {
+                super::codex_models::update_manifest_models_for_version(
+                    &stored,
+                    &version,
+                    &decoded.body,
+                );
+            }
+            break;
+        }
+        Ok(())
+    })
+    .await;
 }
 
 fn build_codex_models_request(
@@ -1575,10 +1658,25 @@ fn build_codex_models_request(
 ) -> Result<reqwest::RequestBuilder, ProxyError> {
     let mut url = url::Url::parse(endpoint)
         .map_err(|error| ProxyError::bad_gateway(format!("invalid Codex models URL: {error}")))?;
-    url.query_pairs_mut().append_pair("client_version", version);
+    let pairs = url
+        .query_pairs()
+        .filter(|(key, _)| key != "client_version")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    url.query_pairs_mut()
+        .extend_pairs(pairs)
+        .append_pair("client_version", version);
 
+    let mut identity_headers = target_headers.to_vec();
+    replace_or_push_owned_header(
+        &mut identity_headers,
+        "version".to_string(),
+        version.to_string(),
+    );
+    crate::codex_identity::finalize_owned_headers(&mut identity_headers);
     let mut headers = HeaderMap::new();
-    super::outbound_request::insert_target_headers(&mut headers, target_headers)?;
+    super::outbound_request::insert_target_headers(&mut headers, &identity_headers)?;
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert("accept-encoding", HeaderValue::from_static("identity"));
     headers.insert(
@@ -1704,8 +1802,11 @@ pub async fn forward_codex_models_manifest(
             )?
         };
         if status.is_success() && !decoded.preserve_content_encoding {
-            super::codex_models::update_manifest_models(
+            let accounts = accounts_snapshot_for_execution_auth(&state, &execution).await?;
+            execution.materialize_auth(&accounts)?;
+            super::codex_models::update_manifest_models_for_version(
                 &execution.runtime_stored_view(),
+                &version,
                 &decoded.body,
             );
         }
@@ -2037,7 +2138,7 @@ fn apply_codex_alpha_search_policy(
         body,
         &execution.runtime_stored_view(),
         final_model.as_deref(),
-        codex_fast_mode_enabled(execution),
+        codex_service_tier(execution),
         &intent,
     )
     .map(|(body, _)| body)
@@ -2175,7 +2276,7 @@ async fn summarize_codex_overflow(
         &summary_body,
         &stored,
         model.as_deref(),
-        codex_fast_mode_enabled(execution),
+        codex_service_tier(execution),
         &intent,
     ) {
         Ok(prepared) => prepared,
@@ -2652,6 +2753,7 @@ async fn forward_with_attempt_inner(
             &headers,
             request_context.share_id.is_some(),
         )?;
+        state.ensure_codex_model_capabilities(&execution).await;
         let started = Instant::now();
         if execution.driver_is("special.cursor") && cursor::agentservice_driver_requested(&stored) {
             let mut prepared = cursor::prepare_agentservice_request(
@@ -3996,18 +4098,29 @@ async fn forward_with_attempt_inner(
                     )?
                 }
             };
-            let capacity_failure =
-                openai_capacity_shed_failure_from_bytes(&decoded.body).or_else(|| {
+            let capacity_failure = openai_capacity_shed_failure_from_bytes(&decoded.body)
+                .or_else(|| {
                     (status.as_u16() == 529).then(|| SemanticFailure {
+                        retry_after_ms: None,
                         origin: FailureOrigin::Provider,
                         code: "server_is_overloaded".to_string(),
                         message: "OpenAI Codex upstream returned HTTP 529".to_string(),
                     })
+                })
+                .map(|mut failure| {
+                    failure.retry_after_ms =
+                        super::response_semantics::retry_after_ms_from_headers(&response_headers)
+                            .or(failure.retry_after_ms);
+                    failure
                 });
             if let Some(failure) = capacity_failure.as_ref() {
-                if let Some(next_attempt) =
-                    next_codex_capacity_retry_attempt(route, &attempt_context, &execution, failure)
-                {
+                if let Some(next_attempt) = next_codex_capacity_retry_attempt(
+                    route,
+                    &attempt_context,
+                    &execution,
+                    failure,
+                    &response_headers,
+                ) {
                     attempt_context = next_attempt;
                     drop(account_in_flight_guard);
                     drop(share_invocation_guard);
@@ -4015,7 +4128,7 @@ async fn forward_with_attempt_inner(
                     continue 'attempt;
                 }
                 record_provider_outcome(&state, &stored, capacity_shed_provider_outcome()).await;
-                return Err(codex::capacity_shed_proxy_error(failure));
+                return Err(codex_capacity_error(failure, &response_headers));
             }
             buffered_upstream_body = Some(decoded);
         }
@@ -4366,6 +4479,7 @@ async fn forward_with_attempt_inner(
                                 &attempt_context,
                                 &execution,
                                 shed,
+                                &response_headers,
                             ) {
                                 attempt_context = next_attempt;
                                 drop(account_in_flight_guard);
@@ -4385,7 +4499,7 @@ async fn forward_with_attempt_inner(
                                     &failure,
                                 )
                                 .await;
-                                return Err(codex::capacity_shed_proxy_error(shed));
+                                return Err(codex_capacity_error(shed, &response_headers));
                             }
                         }
                     }
@@ -5345,6 +5459,7 @@ async fn forward_with_attempt_inner(
                                                 &attempt_context,
                                                 &execution,
                                                 failure,
+                                                &response_headers,
                                             )
                                         {
                                             settle_value_attempt_before_retry(
@@ -5369,7 +5484,10 @@ async fn forward_with_attempt_inner(
                                             drop(inner);
                                             drop(account_in_flight_guard);
                                             drop(share_invocation_guard);
-                                            return Err(codex::capacity_shed_proxy_error(failure));
+                                            return Err(codex_capacity_error(
+                                                failure,
+                                                &response_headers,
+                                            ));
                                         }
                                     }
                                     record_provider_outcome(
@@ -6994,6 +7112,7 @@ async fn forward_with_attempt_inner(
                             &attempt_context,
                             &execution,
                             failure,
+                            &response_headers,
                         ) {
                             attempt_context = next_attempt;
                             drop(account_in_flight_guard);
@@ -7003,7 +7122,7 @@ async fn forward_with_attempt_inner(
                         }
                         record_provider_outcome(&state, &stored, capacity_shed_provider_outcome())
                             .await;
-                        return Err(codex::capacity_shed_proxy_error(failure));
+                        return Err(codex_capacity_error(failure, &response_headers));
                     }
                     record_provider_outcome(
                         &state,
@@ -7363,6 +7482,7 @@ pub async fn forward_codex_responses_ws(
     ensure_codex_websocket_enabled(&stored)?;
     validate_codex_allowed_client(&stored, route, &headers, request_context.share_id.is_some())?;
     refresh_execution_managed_account_if_needed(&state, &execution).await?;
+    state.ensure_codex_model_capabilities(&execution).await;
     let mut session_id = codex_oauth_session_id_from_request(&headers, b"").or_else(|| {
         execution
             .driver_is("oauth.grok_responses")
@@ -7465,14 +7585,12 @@ fn ensure_codex_websocket_enabled(stored: &StoredProvider) -> Result<(), ProxyEr
     })
 }
 
-fn codex_fast_mode_enabled(execution: &ProviderExecution) -> bool {
-    execution.driver_is("oauth.openai_codex")
-        && execution
-            .plan
-            .driver_options
-            .get("codexFastMode")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+fn codex_service_tier(
+    execution: &ProviderExecution,
+) -> crate::domain::providers::model::CodexServiceTier {
+    crate::domain::providers::model::CodexServiceTier::from_driver_options(
+        &execution.plan.driver_options,
+    )
 }
 
 fn codex_model_from_body(body: &[u8]) -> Option<String> {
@@ -10064,7 +10182,7 @@ async fn forward_codex_images_request(
         &adapter_request.body,
         &stored,
         final_model.as_deref(),
-        codex_fast_mode_enabled(&execution),
+        codex_service_tier(&execution),
         &prepared.intent,
     )?;
     adapter_request.body = body.clone();
@@ -13257,6 +13375,7 @@ async fn ensure_responses_websocket_turn_allowed(
     mode: ResponsesWebsocketMode,
     outbound_authorization: Option<&str>,
 ) -> Result<(), ProxyError> {
+    state.ensure_codex_model_capabilities(execution).await;
     let accounts = accounts_snapshot_for_execution_auth(state, execution).await?;
     ensure_responses_websocket_turn_allowed_with_accounts(execution, mode, &accounts)?;
     if matches!(mode, ResponsesWebsocketMode::Codex) {
@@ -13828,7 +13947,7 @@ async fn bridge_responses_websocket_inner(
                             prepare_codex_responses_websocket_request(
                                 message,
                                 &execution.runtime_stored_view(),
-                                codex_fast_mode_enabled(&execution),
+                                codex_service_tier(&execution),
                                 codex_session_model.as_deref(),
                                 &intent,
                                 metadata_scope.as_ref(),
@@ -16770,13 +16889,22 @@ fn run_codex_websocket_http_fallback<'a>(
                         .await;
                     }
                 };
-                let capacity_failure =
-                    openai_capacity_shed_failure_from_bytes(&body).or_else(|| {
+                let capacity_failure = openai_capacity_shed_failure_from_bytes(&body)
+                    .or_else(|| {
                         (status.as_u16() == 529).then(|| SemanticFailure {
+                            retry_after_ms: None,
                             origin: FailureOrigin::Provider,
                             code: "server_is_overloaded".to_string(),
                             message: "OpenAI Codex upstream returned HTTP 529".to_string(),
                         })
+                    })
+                    .map(|mut failure| {
+                        failure.retry_after_ms =
+                            super::response_semantics::retry_after_ms_from_headers(
+                                &response_headers,
+                            )
+                            .or(failure.retry_after_ms);
+                        failure
                     });
                 if execution.driver_is("oauth.openai_codex") {
                     if let Some(failure) = capacity_failure.as_ref() {
@@ -16785,6 +16913,10 @@ fn run_codex_websocket_http_fallback<'a>(
                             attempt_context,
                             execution,
                             capacity_source,
+                            super::response_semantics::retry_after_ms_from_headers(
+                                &response_headers,
+                            )
+                            .or(failure.retry_after_ms),
                         ) {
                             record_forward_retry(
                                 ProxyRoute::CodexResponses,
@@ -16857,7 +16989,7 @@ fn run_codex_websocket_http_fallback<'a>(
                             output_patcher,
                             source,
                             Vec::new(),
-                            codex::capacity_shed_proxy_error(failure),
+                            codex_capacity_error(failure, &response_headers),
                             "cc_switch_upstream_capacity_shed",
                             Some("provider_failure"),
                             active_usage_turn,
@@ -16997,9 +17129,12 @@ fn run_codex_websocket_http_fallback<'a>(
                     return Ok(CodexHttpFallbackOutcome::DownstreamClosed);
                 }
                 Ok(CodexHttpRelayOutcome::ProviderFailureBeforeCommit {
-                    failure,
+                    mut failure,
                     replay_payloads,
                 }) => {
+                    failure.retry_after_ms =
+                        super::response_semantics::retry_after_ms_from_headers(&response_headers)
+                            .or(failure.retry_after_ms);
                     if is_openai_rate_limit_failure(&failure)
                         && execution.driver_is("oauth.openai_codex")
                     {
@@ -17063,6 +17198,10 @@ fn run_codex_websocket_http_fallback<'a>(
                             attempt_context,
                             execution,
                             capacity_source,
+                            super::response_semantics::retry_after_ms_from_headers(
+                                &response_headers,
+                            )
+                            .or(failure.retry_after_ms),
                         ) {
                             let _ = replay_payloads;
                             if let Some(reservation) = fallback_semantic_memory.as_ref() {
@@ -17151,7 +17290,10 @@ fn run_codex_websocket_http_fallback<'a>(
                         })
                     });
                     for payload in replay_payloads {
-                        let payload = sanitize_openai_capacity_shed_json_text(&payload).0;
+                        let payload = super::openai_capacity_shed::sanitize_openai_capacity_shed_json_text_with_retry_after(
+                            &payload,
+                            failure.retry_after_ms,
+                        ).0;
                         relay_codex_http_fallback_event(
                             downstream,
                             output_patcher,
@@ -17185,9 +17327,14 @@ fn run_codex_websocket_http_fallback<'a>(
                     replay_payloads,
                     last_error,
                 }) => {
-                    if let Some(failure) =
+                    if let Some(mut failure) =
                         last_error.or_else(|| last_responses_error_from_payloads(&replay_payloads))
                     {
+                        failure.retry_after_ms =
+                            super::response_semantics::retry_after_ms_from_headers(
+                                &response_headers,
+                            )
+                            .or(failure.retry_after_ms);
                         let rate_limited = is_openai_rate_limit_failure(&failure)
                             && execution.driver_is("oauth.openai_codex");
                         if rate_limited {
@@ -17223,7 +17370,10 @@ fn run_codex_websocket_http_fallback<'a>(
                             })
                         });
                         for payload in replay_payloads {
-                            let payload = sanitize_openai_capacity_shed_json_text(&payload).0;
+                            let payload = super::openai_capacity_shed::sanitize_openai_capacity_shed_json_text_with_retry_after(
+                                &payload,
+                                failure.retry_after_ms,
+                            ).0;
                             relay_codex_http_fallback_event(
                                 downstream,
                                 output_patcher,
@@ -17480,7 +17630,7 @@ async fn prepare_codex_http_fallback_target(
             &adapter_request.body,
             &stored,
             final_model.as_deref(),
-            codex_fast_mode_enabled(execution),
+            codex_service_tier(execution),
             intent,
         )?;
         let mut body_value = serde_json::from_slice::<Value>(&body).map_err(|error| {
@@ -17921,7 +18071,7 @@ fn inject_previous_response_context_into_websocket_message_with_memory(
 async fn prepare_codex_responses_websocket_request(
     message: TungsteniteMessage,
     stored: &StoredProvider,
-    fast_mode_enabled: bool,
+    service_tier: impl Into<crate::domain::providers::model::CodexServiceTier>,
     inherited_model: Option<&str>,
     intent: &super::codex_request_policy::CodexRequestIntent,
     metadata_scope: Option<&super::codex_metadata::CodexMetadataScope>,
@@ -18019,7 +18169,7 @@ async fn prepare_codex_responses_websocket_request(
         target,
         stored,
         final_model.as_deref(),
-        fast_mode_enabled,
+        service_tier,
         intent,
     )?;
     super::codex_models::normalize_structured_output_for_transport(
@@ -19795,15 +19945,14 @@ fn websocket_stream_error_body(message: &str, code: &str) -> String {
 }
 
 fn websocket_proxy_error_body(error: &ProxyError) -> String {
-    json!({
+    let mut value = json!({
         "type": "error",
-        "error": {
-            "message": error.client_message(),
-            "type": error.error_type(),
-            "code": error.error_code(),
-        }
-    })
-    .to_string()
+        "error": {"message": error.client_message(), "type": error.error_type(), "code": error.error_code()}
+    });
+    if let Some(seconds) = error.retry_after_seconds() {
+        value["headers"] = json!({"Retry-After": seconds.to_string()});
+    }
+    value.to_string()
 }
 
 async fn maybe_mark_upstream_rate_limited(
@@ -19852,6 +20001,7 @@ fn take_codex_http_fallback_capacity_retry(
     attempt_context: &mut ForwardAttemptContext,
     execution: &ProviderExecution,
     source: &'static str,
+    retry_after_ms: Option<u64>,
 ) -> Option<Duration> {
     let attempted = attempt_context.codex_capacity_retry_attempted();
     let remaining_ms = MAX_FORWARD_RETRY_ELAPSED_MS.saturating_sub(
@@ -19860,7 +20010,7 @@ fn take_codex_http_fallback_capacity_retry(
     if !codex::capacity_retry_allowed(attempted, attempt_context.retry_allowed(), remaining_ms) {
         return None;
     }
-    let delay = codex::capacity_retry_delay(remaining_ms, attempted);
+    let delay = codex::capacity_retry_delay_with_hint(remaining_ms, attempted, retry_after_ms)?;
     let next_attempt = attempt_context.next_for(
         execution,
         attempt_context.body_retry_stage,
@@ -19896,11 +20046,20 @@ fn semantic_failure_json(failure: &SemanticFailure) -> Vec<u8> {
     .unwrap_or_default()
 }
 
+fn codex_capacity_error(failure: &SemanticFailure, response_headers: &HeaderMap) -> ProxyError {
+    let mut failure = failure.clone();
+    failure.retry_after_ms =
+        super::response_semantics::retry_after_ms_from_headers(response_headers)
+            .or(failure.retry_after_ms);
+    codex::capacity_shed_proxy_error(&failure)
+}
+
 fn next_codex_capacity_retry_attempt(
     route: ProxyRoute,
     attempt_context: &ForwardAttemptContext,
     execution: &ProviderExecution,
     failure: &SemanticFailure,
+    response_headers: &HeaderMap,
 ) -> Option<ForwardAttemptContext> {
     if !execution.driver_is("oauth.openai_codex") || !is_openai_capacity_shed_failure(failure) {
         return None;
@@ -19915,16 +20074,15 @@ fn next_codex_capacity_retry_attempt(
     ) {
         return None;
     }
+    let delay = codex::capacity_retry_delay_with_hint(
+        remaining_ms,
+        attempt_context.codex_capacity_retry_attempted(),
+        super::response_semantics::retry_after_ms_from_headers(response_headers)
+            .or(failure.retry_after_ms),
+    )?;
     let source = capacity_shed_retry_source(failure);
     record_forward_retry(route, "capacity", source);
-    attempt_context.after_codex_capacity_retry(
-        execution,
-        source,
-        codex::capacity_retry_delay(
-            remaining_ms,
-            attempt_context.codex_capacity_retry_attempted(),
-        ),
-    )
+    attempt_context.after_codex_capacity_retry(execution, source, delay)
 }
 
 fn next_antigravity_limit_attempt(
@@ -29566,7 +29724,6 @@ fn merge_owned_headers(target: &mut Vec<(String, String)>, headers: Vec<(String,
 const CODEX_OAUTH_UNSUPPORTED_RESPONSES_FIELDS: &[&str] = &[
     "max_tokens",
     "max_completion_tokens",
-    "max_output_tokens",
     "reasoning_effort",
     "temperature",
     "top_p",
@@ -29599,6 +29756,7 @@ pub(super) fn normalize_codex_oauth_responses_body_bytes(
         message: format!("invalid codex oauth responses body: {error}"),
     })?;
     value = normalize_codex_oauth_responses_body(value, prompt_cache_key, image_tool_strip_policy);
+    super::codex_request_policy::validate_output_budget(&value)?;
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .map_err(|error| ProxyError {
@@ -29703,6 +29861,7 @@ pub(super) fn normalize_codex_oauth_compact_body_bytes(body: &Bytes) -> Result<B
         object.remove("prompt_cache_key");
     }
     sanitize_codex_oauth_request_body(&mut value);
+    super::codex_request_policy::validate_output_budget(&value)?;
     super::tool_schema::normalize_codex_tool_schemas(&mut value);
     strip_codex_oauth_unsupported_responses_fields(&mut value);
     super::codex_compaction::normalize_compaction_trigger(
@@ -29836,6 +29995,7 @@ pub(super) fn normalize_codex_parallel_tool_calls_for_tools(
 }
 
 fn sanitize_codex_oauth_request_body(body: &mut Value) {
+    super::codex_request_policy::normalize_output_budget(body);
     normalize_codex_oauth_reasoning_effort(body);
 
     if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
@@ -33127,6 +33287,7 @@ mod tests {
     include!("forwarder/codex_message_content_tests.rs");
     include!("forwarder/codex_tool_result_error_tests.rs");
     include!("forwarder/codex_r4_tests.rs");
+    include!("forwarder/codex62_tests.rs");
     include!("forwarder/claude_timing_tests.rs");
     include!("forwarder/r5_timing_tests.rs");
     include!("forwarder/claude_r5_tests.rs");
@@ -33762,10 +33923,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_models_client_version_prefers_non_empty_request_value() {
+    fn codex_models_client_version_uses_server_identity() {
         assert_eq!(
             codex_models_client_version(Some("  codex-cli/9.9.9  ")),
-            "codex-cli/9.9.9"
+            crate::codex_identity::configured_version()
         );
         assert_eq!(
             codex_models_client_version(Some("   ")),
@@ -33830,7 +33991,7 @@ mod tests {
             &format!("http://{address}/models?existing=1"),
             &target_headers,
             &HeaderMap::new(),
-            "codex-cli/9.9.9",
+            "9.9.9",
         )
         .unwrap()
         .send()
@@ -33839,7 +34000,7 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
 
         let (versions, query, authorization) = captured.lock().unwrap().take().unwrap();
-        assert_eq!(versions, ["codex-cli/9.9.9"]);
+        assert_eq!(versions, ["9.9.9"]);
         assert_eq!(authorization, "Bearer models-token");
         let query = url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
@@ -33851,7 +34012,7 @@ mod tests {
                 .filter(|(name, _)| name == "client_version")
                 .cloned()
                 .collect::<Vec<_>>(),
-            vec![("client_version".to_string(), "codex-cli/9.9.9".to_string())]
+            vec![("client_version".to_string(), "9.9.9".to_string())]
         );
 
         server.abort();
@@ -49502,7 +49663,6 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         for field in [
             "max_tokens",
             "max_completion_tokens",
-            "max_output_tokens",
             "reasoning_effort",
             "temperature",
             "prompt_cache_retention",
@@ -49512,6 +49672,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         ] {
             assert!(normalized.get(field).is_none(), "field {field} survived");
         }
+        assert_eq!(normalized["max_output_tokens"], 128);
         assert_eq!(
             normalized.pointer("/reasoning/effort"),
             Some(&json!("high"))
@@ -50481,7 +50642,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert!(value.get("prompt_cache_key").is_none());
         assert!(value.get("instructions").is_none());
         assert!(value.get("temperature").is_none());
-        assert!(value.get("max_output_tokens").is_none());
+        assert_eq!(value["max_output_tokens"], 128);
         assert_eq!(
             value.pointer("/input/1/type"),
             Some(&json!("compaction_trigger"))
@@ -51496,6 +51657,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             &mut attempt_context,
             &execution,
             "capacity_shed",
+            None,
         )
         .is_none());
         assert_eq!(attempt_context.codex_capacity_retry_attempted(), 0);
@@ -51505,6 +51667,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             &mut attempt_context,
             &execution,
             "capacity_shed",
+            None,
         )
         .expect("fresh fallback has retry budget");
         assert_eq!(attempt_context.codex_capacity_retry_attempted(), 1);
@@ -51538,15 +51701,21 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             RecoveryStage::Auth,
             DelaySource::Immediate,
         ));
-        assert!(
-            take_codex_http_fallback_capacity_retry(&mut attempt, &execution, "capacity_shed",)
-                .is_some()
-        );
+        assert!(take_codex_http_fallback_capacity_retry(
+            &mut attempt,
+            &execution,
+            "capacity_shed",
+            None
+        )
+        .is_some());
         assert_eq!(attempt.attempt(), MAX_FORWARD_RETRY_ATTEMPTS);
-        assert!(
-            take_codex_http_fallback_capacity_retry(&mut attempt, &execution, "capacity_shed",)
-                .is_none()
-        );
+        assert!(take_codex_http_fallback_capacity_retry(
+            &mut attempt,
+            &execution,
+            "capacity_shed",
+            None
+        )
+        .is_none());
 
         attempt.mark_downstream_committed();
         assert!(!attempt.reserve_in_place(
@@ -53485,6 +53654,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
     #[test]
     fn semantic_prelude_prioritizes_provider_failure_in_same_batch() {
         let failure = SemanticFailure {
+            retry_after_ms: None,
             origin: FailureOrigin::Provider,
             code: "server_error".to_string(),
             message: "busy".to_string(),
@@ -53499,6 +53669,7 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             Some(SemanticObservation::Failure(failure.clone()))
         );
         let shed = SemanticFailure {
+            retry_after_ms: None,
             origin: FailureOrigin::Provider,
             code: "server_is_overloaded".to_string(),
             message: "overloaded".to_string(),

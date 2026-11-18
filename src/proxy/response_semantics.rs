@@ -221,6 +221,7 @@ pub(super) struct SemanticFailure {
     pub(super) origin: FailureOrigin,
     pub(super) code: String,
     pub(super) message: String,
+    pub(super) retry_after_ms: Option<u64>,
 }
 
 impl SemanticFailure {
@@ -715,7 +716,99 @@ fn failure_from_value(value: &Value, response: &Value, status: Option<&str>) -> 
         origin,
         code,
         message,
+        retry_after_ms: retry_after_ms_from_value(value)
+            .or_else(|| retry_after_ms_from_value(response)),
     }
+}
+
+// Inspect only protocol envelope/header positions. Outer headers take priority;
+// values are bounded to one week and never turn a large hint into a short wait.
+fn parse_retry_delay(value: &str, milliseconds: bool) -> Option<u64> {
+    if value.len() > 64 {
+        return None;
+    }
+    let value = value.trim();
+    if let Ok(number) = value.parse::<f64>() {
+        if !number.is_finite() || number < 0.0 {
+            return None;
+        }
+        return Some(
+            (number * if milliseconds { 1.0 } else { 1000.0 })
+                .ceil()
+                .min(604_800_000.0) as u64,
+        );
+    }
+    if milliseconds {
+        return None;
+    }
+    httpdate::parse_http_date(value).ok().map(|at| {
+        at.duration_since(std::time::SystemTime::now())
+            .unwrap_or_default()
+            .as_millis()
+            .min(604_800_000) as u64
+    })
+}
+
+fn retry_delay_from_json(value: &Value, milliseconds: bool) -> Option<u64> {
+    match value {
+        Value::String(value) => parse_retry_delay(value, milliseconds),
+        Value::Number(value) => parse_retry_delay(&value.to_string(), milliseconds),
+        Value::Array(values) => values
+            .first()
+            .and_then(|value| retry_delay_from_json(value, milliseconds)),
+        _ => None,
+    }
+}
+
+pub(super) fn retry_after_ms_from_headers(headers: &axum::http::HeaderMap) -> Option<u64> {
+    headers
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| parse_retry_delay(v, true))
+        .or_else(|| {
+            headers
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| parse_retry_delay(v, false))
+        })
+}
+
+pub(super) fn retry_after_ms_from_value(value: &Value) -> Option<u64> {
+    for path in [
+        "/headers",
+        "/body/headers",
+        "/error/headers",
+        "/body/error/headers",
+        "/response/error/headers",
+        "/response/headers",
+    ] {
+        let Some(headers) = value.pointer(path).and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, milliseconds) in [("retry-after-ms", true), ("retry-after", false)] {
+            if let Some(delay) = headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .and_then(|(_, value)| retry_delay_from_json(value, milliseconds))
+            {
+                return Some(delay);
+            }
+        }
+    }
+    for path in ["", "/body", "/error", "/body/error", "/response/error"] {
+        let Some(envelope) = value.pointer(path) else {
+            continue;
+        };
+        for (name, milliseconds) in [("retry_after_ms", true), ("retry_after", false)] {
+            if let Some(delay) = envelope
+                .get(name)
+                .and_then(|v| retry_delay_from_json(v, milliseconds))
+            {
+                return Some(delay);
+            }
+        }
+    }
+    None
 }
 
 fn nested_non_null_error(value: &Value) -> Option<&Value> {
@@ -1671,6 +1764,62 @@ mod tests {
             }
         }));
         assert!(non_retryable_error_frame.commits_downstream());
+    }
+
+    #[test]
+    fn retry_after_headers_are_case_insensitive_bounded_and_keep_outer_precedence() {
+        for path in [
+            "/headers",
+            "/body/headers",
+            "/error/headers",
+            "/body/error/headers",
+            "/response/error/headers",
+        ] {
+            let mut value = serde_json::json!({});
+            let mut target = &mut value;
+            for key in path.trim_start_matches('/').split('/') {
+                target[key] = serde_json::json!({});
+                target = &mut target[key];
+            }
+            *target = serde_json::json!({"ReTrY-AfTeR": "326"});
+            assert_eq!(retry_after_ms_from_value(&value), Some(326_000), "{path}");
+        }
+        assert_eq!(
+            retry_after_ms_from_value(&serde_json::json!({
+                "headers": {"Retry-After-Ms": "303001"}, "body": {"headers": {"retry-after": "1"}}
+            })),
+            Some(303_001)
+        );
+        assert_eq!(
+            retry_after_ms_from_value(&serde_json::json!({"headers": {"retry-after": "0.25"}})),
+            Some(250)
+        );
+        assert_eq!(
+            retry_after_ms_from_value(
+                &serde_json::json!({"headers": {"retry-after": "999999999999"}})
+            ),
+            Some(604_800_000)
+        );
+        for invalid in ["-1", "NaN", "inf", "bad"] {
+            assert_eq!(
+                retry_after_ms_from_value(
+                    &serde_json::json!({"headers": {"retry-after": invalid}})
+                ),
+                None
+            );
+        }
+        let observation = classify_value(
+            &serde_json::json!({"type": "response.failed", "response": {
+                "error": {"code": "server_is_overloaded", "message": "wait", "headers": {"Retry-After": "326"}}
+            }}),
+        );
+        assert!(matches!(
+            observation,
+            SemanticObservation::Failure(SemanticFailure {
+                retry_after_ms: Some(326_000),
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -45,6 +45,7 @@ export interface ProviderMeta {
   authBinding?: AuthBinding;
   apiKeyField?: ClaudeApiKeyField;
   codexFastMode?: boolean;
+    codexServiceTier?: "standard" | "priority" | "ultrafast";
   codexImageGenerationEnabled?: boolean;
   grokImageGenerationEnabled?: boolean;
   grokImageEditEnabled?: boolean;

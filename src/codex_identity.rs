@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub(crate) const DEFAULT_CODEX_ORIGINATOR: &str = "codex_cli_rs";
-pub(crate) const DEFAULT_CODEX_VERSION: &str = "0.144.1";
+pub(crate) const DEFAULT_CODEX_VERSION: &str = "0.169.0";
 
 const CODEX_VERSION_ENV: &str = "CC_SWITCH_CODEX_CLIENT_VERSION";
 const CODEX_USER_AGENT_ENV: &str = "CC_SWITCH_CODEX_USER_AGENT";
@@ -446,18 +446,18 @@ mod tests {
     #[test]
     fn stable_release_versions_are_strict_and_never_downgrade_builtin() {
         assert_eq!(
-            extract_stable_release_version("rust-v0.145.2"),
-            Some("0.145.2".to_string())
+            extract_stable_release_version("rust-v0.170.2"),
+            Some("0.170.2".to_string())
         );
-        assert!(extract_stable_release_version("0.145.2-alpha.1").is_none());
-        assert!(extract_stable_release_version("0.145.2+build.1").is_none());
+        assert!(extract_stable_release_version("0.170.2-alpha.1").is_none());
+        assert!(extract_stable_release_version("0.170.2+build.1").is_none());
         assert!(extract_stable_release_version("0.145").is_none());
         assert_eq!(
             parse_latest_release_version(
-                br#"{"name":"0.145.3-alpha.1","tag_name":"rust-v0.145.2"}"#,
+                br#"{"name":"0.145.3-alpha.1","tag_name":"rust-v0.170.2"}"#,
             )
             .unwrap(),
-            "0.145.2"
+            "0.170.2"
         );
         assert_eq!(
             resolve_configured_version(None, Some("0.100.0")),
@@ -468,13 +468,13 @@ mod tests {
     #[test]
     fn explicit_version_precedes_synced_cache() {
         assert_eq!(
-            resolve_configured_version(Some("0.146.0"), Some("0.147.0")),
-            "0.146.0"
+            resolve_configured_version(Some("0.171.0"), Some("0.172.0")),
+            "0.171.0"
         );
-        assert_eq!(resolve_configured_version(None, Some("0.147.0")), "0.147.0");
+        assert_eq!(resolve_configured_version(None, Some("0.172.0")), "0.172.0");
         assert_eq!(
-            resolve_configured_version(Some("0.144.0"), Some("0.147.0")),
-            "0.147.0"
+            resolve_configured_version(Some("0.144.0"), Some("0.172.0")),
+            "0.172.0"
         );
     }
 
@@ -493,7 +493,7 @@ mod tests {
             &path,
             &CodexVersionCache {
                 schema_version: CODEX_VERSION_CACHE_SCHEMA,
-                version: "0.145.0".to_string(),
+                version: "0.170.0".to_string(),
                 synced_at_ms: 1,
                 source: "github_latest_release".to_string(),
             },
@@ -501,7 +501,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             read_version_cache(&path).unwrap().unwrap().version,
-            "0.145.0"
+            "0.170.0"
         );
 
         crate::infra::storage::write_json_pretty(
@@ -572,7 +572,8 @@ mod tests {
         replace_or_push(&mut headers, "user-agent", "PostmanRuntime/7".to_string());
         finalize_headers(&mut headers);
         assert_eq!(header_value(&headers, "originator"), Some("codex_cli_rs"));
-        assert!(header_value(&headers, "user-agent")
-            .is_some_and(|value| value.starts_with("codex_cli_rs/0.144.1")));
+        assert!(header_value(&headers, "user-agent").is_some_and(
+            |value| value.starts_with(&format!("codex_cli_rs/{DEFAULT_CODEX_VERSION}"))
+        ));
     }
 }

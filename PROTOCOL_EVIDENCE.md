@@ -1,5 +1,23 @@
 # Protocol evidence policy
 
+## 2026-11-18 OpenAI GPT-6.2 compatibility
+
+Read-only protocol review pins CLIProxyAPI `a5e8f69e56309e1ef6d6872e667da81fdfbce2ce` and codex2api `4514623dda4a`. CLIProxyAPI's `internal/registry/models/codex_client_models.json` declares `gpt-6.2-sol` (500000 context, text/image/audio, priority/ultrafast) and `gpt-6.2-astra` (272000 context, text/image, priority), with Lite, reasoning updates, code mode and v2 collaboration. Both declare maximum context 872000 and minimum client 0.166.0; the fetch tool uses 0.169.0. These snapshots are compatibility evidence, never account entitlement or verified price evidence. The generic registry differs on Ultra/audio, so client Ultra mode must not be inferred from an effort scalar or synthesized by the proxy.
+
+Reviewed behavior: native reasoning-update timelines (`internal/thinking/configuration_update.go`), output-budget minimum 16 (`internal/runtime/executor/codex_executor_request.go`), typed document/URL-image conversion (`internal/translator/codex/claude/codex_claude_request.go`), nested Retry-After (`codex_overload_retry_after_issue7600_test.go`), and `model=<slug>;tier=<tier>` routing hints in both references. Existing account pinning, strict terminal/usage semantics and no replay after business output remain mandatory. New model structured-output string-length exceptions and cross-model plaintext collaboration have no applicable evidence and are not enabled. External repositories remain read-only research inputs; production uses only repository-owned snapshots and the bound account's official manifest. Offline regressions do not promote any GPT-6.2 live operation beyond `live_pending`.
+
+本轮实现：内置两款 6.2 模型的兼容能力，默认客户端版本提升至 0.169.0；绑定账号目录按账号、身份代次与客户端版本隔离，5 分钟 TTL、4 个缓存 scope、最多 16 个 singleflight 槽位、失败退避 30 秒，单次预热总时限 5 秒并计入既有内存预算。目录获取失败只回到静态兼容能力，不增加账号模型授权。管理员档位支持 Standard/Priority/Ultrafast；缺少显式配置时继续读取旧 codexFastMode，客户端正文和 configuration_update 均不能覆盖档位。
+
+原生 configuration_update 保留时序与其他字段，最终 effort 仅作实际策略记录；保留客户端工具 namespace、自定义工具、加密 agent_message 与 Ultra 指令。输出预算保留并规范化到至少 16；普通图片、PDF、文本/嵌套文档和音频复用类型化媒体转换。HTTP/SSE/WS 与 HTTP 回退解析嵌套 Retry-After（含 HTTP-date），超过既有重试时限则直接向调用方返回等待提示。整体 review 补齐配置更新档位约束、HTTP 外层等待提示透传，以及 Ultrafast 缺价在结算后的原因保留。
+
+Server/Router 执行价目均增加独立 ultrafast 行，不从 standard、priority 或 owner 通用文本价格推导；未定价时 owner 用量保留明确原因，market 美元额度在发送前拒绝。未编造 6.2 或 Ultrafast 价格，未改动真实价格目录。启用新档位价目前先升级 Server 解析器，再发布 Router 价目；旧 Server 会拒绝含 ultrafast 键的执行快照。真实上游、账号权限、配额消耗与计价接受性仍为 `live_pending`。
+
+验证基线为 Server `91520a244e99` 加本轮变更；共享目录另有并行 OpenCode 开发，Rust 完整验证在独立工作树执行，未覆盖其改动。最终 Rust src/tests 摘要为 `97130694b905de4e43cd7750d2a0708c52c2a826b2a550a426ebdc5bc4490a40`（排序路径、NUL、内容、NUL 后 SHA-256）。`RUST_MIN_STACK=67108864 cargo test -j 1 --all-targets --no-fail-fast -- --test-threads=8`：库 4515 passed / 0 failed / 3 ignored，API 集成 139/139、独立 fixture 2/2；Router 完整 Rust 2012/2012。Server Node 后端审计 2205/2205、前端 58 文件 / 408 测试、两仓前端类型检查、Server 前端构建、Router 价格脚本与目录审计通过。Node 26 的前端测试使用 `NODE_OPTIONS=--no-experimental-webstorage`，避免 Node 内置 Web Storage 覆盖 jsdom；未为环境差异修改产品存储实现。全 src 独立 rustfmt、cargo fmt、Provider Phase 0、coverage/UI matrix、文档索引及 diff 检查通过。
+
+离线 readiness 使用 `RUN_TESTS=0 RUN_REAL=0 RUN_DEPLOYMENT_TESTS=0`，结果为 failures=0 / warnings=2 / blockers=9 / internalBlockers=1、`blocked_inputs`；local-contracts-unverified 来自脚本显式跳过本地套件，独立本地验证结果以上述记录为准。缺少真实厂商、Router/Share 与部署验收输入，真实接受性继续 `live_pending`。
+
+最终 `cargo check --quiet`、`cargo build -j 1` 与本地 smoke 的 10 个 HTTP 步骤通过。smoke 首次因共享 Cargo 编译锁超过原脚本 30 秒启动窗口而未启动服务；随后复制当前构建二进制，以临时 Cargo 启动包装器执行未修改的 `scripts/smoke/smoke-local.sh`，全部步骤通过并正常清理。该次二进制 SHA-256 为 `e24d8d2d3ef279f442cbb7bc07776754ed0e59b0d13ff70368b53ec0ac68048b`；验证前后 Rust 摘要一致。整体 review 未留下本轮新增的未解决阻断项。
+
 ## OpenCode Zen free lane
 
 只读对照 `/data/projects/proxy/OpenCode/zen-gate/internal/lane/upstream.go` 的单账号免费车道：`Bearer public`、可解码 session 前缀、`/inference/v1` 三条路径、官方 `read`/`shell` 工具原文、无 HTML 转义的 CLI 字段顺序。不引用 OpenCode Go API Key，不引用 9router / OmniRoute 的旧 `/zen/v1` 指纹。zen-gate 不是构建、测试或运行时输入。实现与 fixture 见 `src/proxy/opencode_zen.rs` 与 `docs/provider/opencode-zen.md`。真实目录拉取和真实推理保持 `live_pending`。

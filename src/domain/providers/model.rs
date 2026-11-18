@@ -21,6 +21,50 @@ impl AppKind {
     }
 }
 
+/// Administrator-owned Codex service tier. An absent value keeps the legacy
+/// codexFastMode behavior; clients cannot override this selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexServiceTier {
+    Standard,
+    Priority,
+    Ultrafast,
+}
+
+impl CodexServiceTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Priority => "priority",
+            Self::Ultrafast => "ultrafast",
+        }
+    }
+
+    pub fn from_driver_options(options: &BTreeMap<String, Value>) -> Self {
+        options
+            .get("codexServiceTier")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_else(|| {
+                Self::from(
+                    options
+                        .get("codexFastMode")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+            })
+    }
+}
+
+impl From<bool> for CodexServiceTier {
+    fn from(fast: bool) -> Self {
+        if fast {
+            Self::Priority
+        } else {
+            Self::Standard
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderType {
     #[serde(rename = "claude")]
@@ -213,6 +257,8 @@ pub struct ProviderMeta {
     pub prompt_cache_key: Option<String>,
     #[serde(default)]
     pub codex_fast_mode: Option<bool>,
+    #[serde(default)]
+    pub codex_service_tier: Option<CodexServiceTier>,
     #[serde(default)]
     pub codex_image_generation_enabled: Option<bool>,
     #[serde(default)]

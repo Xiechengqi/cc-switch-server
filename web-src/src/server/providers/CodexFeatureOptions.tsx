@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import { FeatureToggleList, FeatureToggleRow } from "./FeatureToggleRow";
 
 export interface CodexFeatureOptionValues {
-  codexFastMode: boolean;
+  codexServiceTier: "standard" | "priority" | "ultrafast";
   codexImageGenerationEnabled: boolean;
   codexWebsocketEnabled: boolean;
 }
@@ -13,15 +13,10 @@ export type CodexFeatureOptionKey = keyof CodexFeatureOptionValues;
 
 interface CodexFeatureOptionsProps {
   values: CodexFeatureOptionValues;
-  onChange: (key: CodexFeatureOptionKey, enabled: boolean) => void;
+  onChange: <K extends CodexFeatureOptionKey>(key: K, value: CodexFeatureOptionValues[K]) => void;
 }
 
 const OPTIONS = [
-  {
-    key: "codexFastMode",
-    labelKey: "codexOauth.fastMode",
-    descriptionKey: "codexOauth.fastModeDescription",
-  },
   {
     key: "codexImageGenerationEnabled",
     labelKey: "codexOauth.imageGeneration",
@@ -47,6 +42,25 @@ export function CodexFeatureOptions({
 
   return (
     <FeatureToggleList>
+      <div className="flex items-center gap-2 px-3 py-2">
+        <label htmlFor={`${idPrefix}-tier`} className="min-w-0 flex-1 text-sm">
+          {t("codexOauth.serviceTier")}
+        </label>
+        <select
+          id={`${idPrefix}-tier`}
+          className="rounded-md border border-input bg-background px-2 py-1 text-sm"
+          aria-describedby={`${idPrefix}-tier-description`}
+          value={values.codexServiceTier}
+          onChange={(event) => onChange("codexServiceTier", event.target.value as CodexFeatureOptionValues["codexServiceTier"])}
+        >
+          <option value="standard">{t("codexOauth.serviceTierStandard")}</option>
+          <option value="priority">{t("codexOauth.serviceTierPriority")}</option>
+          <option value="ultrafast">{t("codexOauth.serviceTierUltrafast")}</option>
+        </select>
+      </div>
+      <p id={`${idPrefix}-tier-description`} className="px-3 py-2 text-xs text-muted-foreground">
+        {t("codexOauth.serviceTierDescription")}
+      </p>
       {OPTIONS.map((option) => (
         <FeatureToggleRow
           key={option.key}

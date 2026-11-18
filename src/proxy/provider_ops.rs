@@ -831,17 +831,14 @@ impl ProviderExecution {
         let final_model = request_model(&request.body)
             .or_else(|| request.actual_model.clone())
             .or_else(|| request.model.clone());
-        let fast_mode_enabled = self
-            .plan
-            .driver_options
-            .get("codexFastMode")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let service_tier = crate::domain::providers::model::CodexServiceTier::from_driver_options(
+            &self.plan.driver_options,
+        );
         let (body, metadata) = super::codex_request_policy::apply_to_bytes(
             &request.body,
             &self.runtime_stored_view(),
             final_model.as_deref(),
-            fast_mode_enabled,
+            service_tier,
             intent,
         )?;
         let mut body_value = serde_json::from_slice::<Value>(&body).map_err(|error| {

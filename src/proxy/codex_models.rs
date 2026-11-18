@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -9,6 +10,8 @@ use crate::infra::resident_memory::{
 };
 
 const MANIFEST_CACHE_SCOPE_LIMIT: usize = 4;
+const MANIFEST_TTL: Duration = Duration::from_secs(5 * 60);
+const MANIFEST_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CodexModelCapability {
@@ -17,6 +20,8 @@ pub(crate) struct CodexModelCapability {
     pub input_modalities: &'static [&'static str],
     pub service_tiers: &'static [&'static str],
     pub use_responses_lite: bool,
+    pub context_window: Option<u64>,
+    pub supports_reasoning_effort_updates: Option<bool>,
 }
 
 const GPT_56_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -29,6 +34,24 @@ const PRIORITY: &[&str] = &["priority"];
 const NO_SERVICE_TIERS: &[&str] = &[];
 
 pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
+    CodexModelCapability {
+        id: "gpt-6.2-sol",
+        reasoning_efforts: GPT_6_ASTRA_EFFORTS,
+        input_modalities: &["text", "image", "audio"],
+        service_tiers: &["priority", "ultrafast"],
+        use_responses_lite: true,
+        context_window: Some(500_000),
+        supports_reasoning_effort_updates: Some(true),
+    },
+    CodexModelCapability {
+        id: "gpt-6.2-astra",
+        reasoning_efforts: GPT_6_ASTRA_EFFORTS,
+        input_modalities: TEXT_IMAGE,
+        service_tiers: PRIORITY,
+        use_responses_lite: true,
+        context_window: Some(272_000),
+        supports_reasoning_effort_updates: Some(true),
+    },
     // Keep a cold-start capability for Astra. The bound account manifest still
     // wins field-by-field and remains the entitlement authority.
     CodexModelCapability {
@@ -37,6 +60,8 @@ pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
         input_modalities: TEXT_IMAGE,
         service_tiers: PRIORITY,
         use_responses_lite: true,
+        context_window: None,
+        supports_reasoning_effort_updates: None,
     },
     CodexModelCapability {
         id: "gpt-5.6-sol",
@@ -44,6 +69,8 @@ pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
         input_modalities: TEXT_IMAGE,
         service_tiers: PRIORITY,
         use_responses_lite: true,
+        context_window: None,
+        supports_reasoning_effort_updates: None,
     },
     CodexModelCapability {
         id: "gpt-5.6-terra",
@@ -51,6 +78,8 @@ pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
         input_modalities: TEXT_IMAGE,
         service_tiers: PRIORITY,
         use_responses_lite: true,
+        context_window: None,
+        supports_reasoning_effort_updates: None,
     },
     CodexModelCapability {
         id: "gpt-5.6-luna",
@@ -58,6 +87,8 @@ pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
         input_modalities: TEXT_IMAGE,
         service_tiers: PRIORITY,
         use_responses_lite: true,
+        context_window: None,
+        supports_reasoning_effort_updates: None,
     },
     CodexModelCapability {
         id: "gpt-5.5",
@@ -65,6 +96,8 @@ pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
         input_modalities: TEXT_IMAGE,
         service_tiers: PRIORITY,
         use_responses_lite: false,
+        context_window: None,
+        supports_reasoning_effort_updates: None,
     },
     CodexModelCapability {
         id: "gpt-5.4",
@@ -72,6 +105,8 @@ pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
         input_modalities: TEXT_IMAGE,
         service_tiers: PRIORITY,
         use_responses_lite: false,
+        context_window: None,
+        supports_reasoning_effort_updates: None,
     },
     CodexModelCapability {
         id: "gpt-5.4-mini",
@@ -79,6 +114,8 @@ pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
         input_modalities: TEXT_IMAGE,
         service_tiers: NO_SERVICE_TIERS,
         use_responses_lite: false,
+        context_window: None,
+        supports_reasoning_effort_updates: None,
     },
     CodexModelCapability {
         id: "gpt-5.3-codex-spark",
@@ -86,6 +123,8 @@ pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
         input_modalities: TEXT_ONLY,
         service_tiers: NO_SERVICE_TIERS,
         use_responses_lite: false,
+        context_window: None,
+        supports_reasoning_effort_updates: None,
     },
     CodexModelCapability {
         id: "gpt-5.2",
@@ -93,6 +132,8 @@ pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
         input_modalities: TEXT_IMAGE,
         service_tiers: NO_SERVICE_TIERS,
         use_responses_lite: false,
+        context_window: None,
+        supports_reasoning_effort_updates: None,
     },
     CodexModelCapability {
         id: "codex-auto-review",
@@ -100,6 +141,8 @@ pub(crate) const BUILTIN_CODEX_MODELS: &[CodexModelCapability] = &[
         input_modalities: TEXT_IMAGE,
         service_tiers: NO_SERVICE_TIERS,
         use_responses_lite: true,
+        context_window: None,
+        supports_reasoning_effort_updates: None,
     },
 ];
 
@@ -118,6 +161,7 @@ pub(crate) struct ResolvedCodexModelCapability {
     pub use_responses_lite: Option<bool>,
     pub context_window: Option<u64>,
     pub supports_search_tool: Option<bool>,
+    pub supports_reasoning_effort_updates: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,18 +173,21 @@ struct ManifestModelCapability {
     use_responses_lite: Option<bool>,
     context_window: Option<u64>,
     supports_search_tool: Option<bool>,
+    supports_reasoning_effort_updates: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ManifestModelScope {
     account_id: String,
     auth_identity_generation: u64,
+    client_version: String,
 }
 
 #[derive(Debug)]
 struct ManifestModelCacheEntry {
     scope: ManifestModelScope,
     models: Vec<ManifestModelCapability>,
+    expires_at: Instant,
     _memory: ResidentMemoryReservation,
 }
 
@@ -166,6 +213,7 @@ impl ManifestModelCache {
         }
     }
 
+    #[cfg(test)]
     fn update_from_body(&mut self, scope: Option<ManifestModelScope>, body: &[u8]) -> usize {
         let Some(models) = parse_manifest_models(body) else {
             return self.model_ids(scope.as_ref()).len();
@@ -182,11 +230,15 @@ impl ManifestModelCache {
             return 0;
         };
         let bytes = models.iter().fold(
-            scope.account_id.capacity().saturating_add(
-                models
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<ManifestModelCapability>()),
-            ),
+            scope
+                .account_id
+                .capacity()
+                .saturating_add(scope.client_version.capacity())
+                .saturating_add(
+                    models
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<ManifestModelCapability>()),
+                ),
             |bytes, model| {
                 [
                     &model.reasoning_efforts,
@@ -232,6 +284,7 @@ impl ManifestModelCache {
         self.entries.push(ManifestModelCacheEntry {
             scope,
             models,
+            expires_at: Instant::now() + MANIFEST_TTL,
             _memory: memory,
         });
         model_count
@@ -244,7 +297,7 @@ impl ManifestModelCache {
         self.entries
             .iter()
             .rev()
-            .find(|entry| &entry.scope == scope)
+            .find(|entry| &entry.scope == scope && entry.expires_at > Instant::now())
             .map(|entry| entry.models.iter().map(|model| model.id.clone()).collect())
             .unwrap_or_default()
     }
@@ -259,7 +312,7 @@ impl ManifestModelCache {
         self.entries
             .iter()
             .rev()
-            .find(|entry| &entry.scope == scope)?
+            .find(|entry| &entry.scope == scope && entry.expires_at > Instant::now())?
             .models
             .iter()
             .find(|capability| normalize_model_id(&capability.id) == model)
@@ -281,14 +334,125 @@ fn manifest_model_scope(provider: &StoredProvider) -> Option<ManifestModelScope>
     Some(ManifestModelScope {
         account_id: account_id.to_string(),
         auth_identity_generation: binding.auth_identity_generation?,
+        client_version: crate::codex_identity::configured_version(),
     })
 }
 
+#[cfg(test)]
 pub(crate) fn update_manifest_models(provider: &StoredProvider, body: &[u8]) -> usize {
+    update_manifest_models_for_version(provider, &crate::codex_identity::configured_version(), body)
+}
+
+pub(crate) fn update_manifest_models_for_version(
+    provider: &StoredProvider,
+    version: &str,
+    body: &[u8],
+) -> usize {
+    let scope = manifest_model_scope(provider).map(|mut scope| {
+        scope.client_version = version.to_string();
+        scope
+    });
+    let previous_count = || {
+        manifest_model_cache()
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .model_ids(scope.as_ref())
+            .len()
+    };
+    let Some(_working_memory) =
+        process_resident_memory().reserve(super::request_memory::json_parse_working_bytes(body))
+    else {
+        return previous_count();
+    };
+    let Some(models) = parse_manifest_models(body) else {
+        return previous_count();
+    };
+    // Parsing is outside the global cache lock; only bounded snapshot install
+    // and eviction need exclusive access.
     manifest_model_cache()
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .update_from_body(manifest_model_scope(provider), body)
+        .unwrap_or_else(|p| p.into_inner())
+        .replace(scope, models)
+}
+
+/// One bounded singleflight slot per identity/version, independent of inference leases.
+struct ManifestRefreshFlight {
+    scope: ManifestModelScope,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    last_attempt: std::sync::Mutex<Option<Instant>>,
+    _memory: ResidentMemoryReservation,
+}
+
+pub(crate) struct ManifestRefreshGuard {
+    flight: Arc<ManifestRefreshFlight>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl ManifestRefreshGuard {
+    pub(crate) fn client_version(&self) -> &str {
+        &self.flight.scope.client_version
+    }
+
+    pub(crate) fn should_refresh(&self) -> bool {
+        let cache = manifest_model_cache()
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        if cache
+            .entries
+            .iter()
+            .any(|entry| entry.scope == self.flight.scope && entry.expires_at > Instant::now())
+        {
+            return false;
+        }
+        let mut attempted = self
+            .flight
+            .last_attempt
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if attempted.is_some_and(|at| at.elapsed() < MANIFEST_RETRY_DELAY) {
+            return false;
+        }
+        *attempted = Some(Instant::now());
+        true
+    }
+}
+
+pub(crate) async fn manifest_refresh_guard(
+    provider: &StoredProvider,
+) -> Option<ManifestRefreshGuard> {
+    static FLIGHTS: OnceLock<std::sync::Mutex<Vec<Arc<ManifestRefreshFlight>>>> = OnceLock::new();
+    let scope = manifest_model_scope(provider)?;
+    let flight = {
+        let mut flights = FLIGHTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(flight) = flights.iter().find(|flight| flight.scope == scope) {
+            Arc::clone(flight)
+        } else {
+            if flights.len() >= 16 {
+                let index = flights
+                    .iter()
+                    .position(|flight| Arc::strong_count(flight) == 1)?;
+                flights.remove(index);
+            }
+            let memory = process_resident_memory()
+                .reserve(2048 + scope.account_id.len() + scope.client_version.len())?;
+            let flight = Arc::new(ManifestRefreshFlight {
+                scope,
+                gate: Arc::new(tokio::sync::Mutex::new(())),
+                last_attempt: std::sync::Mutex::new(None),
+                _memory: memory,
+            });
+            flights.push(Arc::clone(&flight));
+            flight
+        }
+    };
+    let guard = Arc::clone(&flight.gate).lock_owned().await;
+    Some(ManifestRefreshGuard {
+        flight,
+        _guard: guard,
+    })
 }
 
 fn parse_manifest_models(body: &[u8]) -> Option<Vec<ManifestModelCapability>> {
@@ -296,6 +460,9 @@ fn parse_manifest_models(body: &[u8]) -> Option<Vec<ManifestModelCapability>> {
         return None;
     };
     let models = value.get("models")?.as_array()?;
+    if models.len() > 512 {
+        return None;
+    }
     let mut parsed = BTreeMap::new();
     for model in models {
         let Some(id) = model
@@ -306,6 +473,9 @@ fn parse_manifest_models(body: &[u8]) -> Option<Vec<ManifestModelCapability>> {
         else {
             continue;
         };
+        if parsed.contains_key(id) {
+            return None;
+        }
         parsed.insert(
             id.to_string(),
             ManifestModelCapability {
@@ -320,6 +490,9 @@ fn parse_manifest_models(body: &[u8]) -> Option<Vec<ManifestModelCapability>> {
                 use_responses_lite: model.get("use_responses_lite").and_then(Value::as_bool),
                 context_window: model.get("context_window").and_then(Value::as_u64),
                 supports_search_tool: model.get("supports_search_tool").and_then(Value::as_bool),
+                supports_reasoning_effort_updates: model
+                    .get("supports_reasoning_effort_updates")
+                    .and_then(Value::as_bool),
             },
         );
     }
@@ -328,6 +501,9 @@ fn parse_manifest_models(body: &[u8]) -> Option<Vec<ManifestModelCapability>> {
 
 fn parse_capability_values(model: &Value, array_key: &str, value_key: &str) -> Option<Vec<String>> {
     let values = model.get(array_key)?.as_array()?;
+    if values.len() > 64 {
+        return None;
+    }
     Some(normalize_capability_values(values.iter().filter_map(
         |value| value.get(value_key).and_then(Value::as_str),
     )))
@@ -335,6 +511,9 @@ fn parse_capability_values(model: &Value, array_key: &str, value_key: &str) -> O
 
 fn parse_string_capability_values(model: &Value, array_key: &str) -> Option<Vec<String>> {
     let values = model.get(array_key)?.as_array()?;
+    if values.len() > 64 {
+        return None;
+    }
     Some(normalize_capability_values(
         values.iter().filter_map(Value::as_str),
     ))
@@ -405,7 +584,14 @@ pub(crate) fn resolved_capability_for_model(
             .or_else(|| builtin.map(|capability| capability.use_responses_lite)),
         context_window: manifest
             .as_ref()
-            .and_then(|capability| capability.context_window),
+            .and_then(|capability| capability.context_window)
+            .or_else(|| builtin.and_then(|capability| capability.context_window)),
+        supports_reasoning_effort_updates: manifest
+            .as_ref()
+            .and_then(|capability| capability.supports_reasoning_effort_updates)
+            .or_else(|| {
+                builtin.and_then(|capability| capability.supports_reasoning_effort_updates)
+            }),
         supports_search_tool: manifest
             .as_ref()
             .and_then(|capability| capability.supports_search_tool),
@@ -550,10 +736,74 @@ mod tests {
         assert_eq!(normalize_reasoning_effort("gpt-5.6-luna", "ultra"), "max");
         assert_eq!(normalize_reasoning_effort("gpt-5.5", "max"), "max");
         assert_eq!(normalize_reasoning_effort("vendor/model", "max"), "max");
-        assert_eq!(BUILTIN_CODEX_MODELS[0].input_modalities, ["text", "image"]);
-        assert_eq!(BUILTIN_CODEX_MODELS[0].id, "gpt-6-astra");
+        assert_eq!(
+            BUILTIN_CODEX_MODELS[0].input_modalities,
+            ["text", "image", "audio"]
+        );
+        assert_eq!(BUILTIN_CODEX_MODELS[0].id, "gpt-6.2-sol");
         assert!(BUILTIN_CODEX_MODELS[0].reasoning_efforts.contains(&"max"));
         assert!(BUILTIN_CODEX_MODELS[0].use_responses_lite);
+    }
+
+    #[test]
+    fn manifest_cache_expires_and_isolates_client_versions() {
+        let provider = manifest_provider("cache-version-test", 1);
+        let scope = manifest_model_scope(&provider).unwrap();
+        let mut cache = ManifestModelCache::default();
+        cache.replace(Some(scope.clone()), vec![manifest_model("model-a")]);
+        assert!(cache.capability(Some(&scope), "model-a").is_some());
+        let mut newer = scope.clone();
+        newer.client_version = "99.0.0".into();
+        assert!(cache.model_ids(Some(&newer)).is_empty());
+        assert!(cache.capability(Some(&newer), "model-a").is_none());
+        cache.entries[0].expires_at = Instant::now() - Duration::from_secs(1);
+        assert!(cache.model_ids(Some(&scope)).is_empty());
+        assert!(cache.capability(Some(&scope), "model-a").is_none());
+        cache.replace(Some(scope.clone()), vec![manifest_model("model-b")]);
+        assert_eq!(cache.model_ids(Some(&scope)), ["model-b"]);
+    }
+
+    #[tokio::test]
+    async fn manifest_refresh_singleflight_serializes_and_backs_off_failures() {
+        use futures_util::FutureExt;
+        let provider = manifest_provider("refresh-singleflight-test", 1);
+        let guard = manifest_refresh_guard(&provider).await.unwrap();
+        assert_eq!(
+            guard.client_version(),
+            crate::codex_identity::configured_version()
+        );
+        assert!(guard.should_refresh());
+        let mut waiter = Box::pin(manifest_refresh_guard(&provider));
+        assert!(waiter.as_mut().now_or_never().is_none());
+        drop(guard);
+        let guard = waiter.await.unwrap();
+        assert!(
+            !guard.should_refresh(),
+            "failed refreshes must not stampede"
+        );
+        *guard.flight.last_attempt.lock().unwrap() = Some(Instant::now() - MANIFEST_RETRY_DELAY);
+        assert!(
+            guard.should_refresh(),
+            "backoff is bounded even without a cache entry"
+        );
+    }
+
+    #[test]
+    fn manifest_parser_rejects_duplicates_and_bounds_model_count() {
+        assert!(parse_manifest_models(
+            br#"{"models":[{"slug":"duplicate"},{"slug":"duplicate"}]}"#
+        )
+        .is_none());
+        let models = (0..513)
+            .map(|i| json!({"slug": format!("model-{i}")}))
+            .collect::<Vec<_>>();
+        assert!(
+            parse_manifest_models(&serde_json::to_vec(&json!({"models": models})).unwrap())
+                .is_none()
+        );
+        let parsed = parse_manifest_models(br#"{"models":[{"slug":"gpt-6.2-sol","supports_reasoning_effort_updates":true,"context_window":500000}]}"#).unwrap();
+        assert_eq!(parsed[0].supports_reasoning_effort_updates, Some(true));
+        assert_eq!(parsed[0].context_window, Some(500_000));
     }
 
     #[test]
@@ -615,9 +865,9 @@ mod tests {
     }
 
     #[test]
-    fn manifest_models_are_validated_sorted_and_deduplicated() {
+    fn manifest_models_are_validated_sorted_and_ignore_invalid_ids() {
         let models = parse_manifest_models(
-            br#"{"models":[{"slug":"gpt-5.6-sol"},{"slug":" gpt-5.5 "},{"slug":"gpt-5.6-sol"},{"slug":"bad/model"},{"slug":""},{"id":"ignored"}]}"#,
+            br#"{"models":[{"slug":"gpt-5.6-sol"},{"slug":" gpt-5.5 "},{"slug":"bad/model"},{"slug":""},{"id":"ignored"}]}"#,
         )
         .unwrap();
         assert_eq!(
@@ -835,6 +1085,7 @@ mod tests {
             use_responses_lite: None,
             context_window: None,
             supports_search_tool: None,
+            supports_reasoning_effort_updates: None,
         }
     }
 }

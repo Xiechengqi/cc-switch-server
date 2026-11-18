@@ -354,6 +354,7 @@ export interface ProviderBundleSurfaceWriteDraft {
     apiKeyField?: string;
     customUserAgent?: string;
     codexFastMode?: boolean;
+    codexServiceTier?: "standard" | "priority" | "ultrafast";
     codexImageGenerationEnabled?: boolean;
     grokImageGenerationEnabled?: boolean;
     grokImageEditEnabled?: boolean;

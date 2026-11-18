@@ -7,7 +7,7 @@ use serde_json::{json, Map, Value};
 use crate::domain::codebuddy::CodeBuddySite;
 
 use super::credentials::{CredentialPatch, ProviderView};
-use super::model::{AppKind, Provider, ProviderMeta};
+use super::model::{AppKind, CodexServiceTier, Provider, ProviderMeta};
 use super::model_routing::normalize_and_validate_provider_model_routing;
 use super::probe::{automatic_probe_app, profile_id_supports_probe};
 use super::registry::{
@@ -237,6 +237,8 @@ pub struct ProviderDriverOptionsWriteDraft {
     #[serde(default)]
     pub codex_fast_mode: Option<bool>,
     #[serde(default)]
+    pub codex_service_tier: Option<CodexServiceTier>,
+    #[serde(default)]
     pub codex_image_generation_enabled: Option<bool>,
     #[serde(default)]
     pub grok_image_generation_enabled: Option<bool>,
@@ -461,6 +463,7 @@ impl ProviderBundleWriteDraft {
                 surface.driver_options.custom_user_agent.as_deref(),
             ),
             codex_fast_mode: surface.driver_options.codex_fast_mode,
+            codex_service_tier: surface.driver_options.codex_service_tier,
             codex_image_generation_enabled: surface.driver_options.codex_image_generation_enabled,
             grok_image_generation_enabled: surface.driver_options.grok_image_generation_enabled,
             grok_image_edit_enabled: surface.driver_options.grok_image_edit_enabled,
@@ -847,6 +850,9 @@ impl ProviderDriverOptionsWriteDraft {
         }
         if self.custom_user_agent.is_some() {
             fields.insert("customUserAgent");
+        }
+        if self.codex_service_tier.is_some() {
+            fields.insert("codexServiceTier");
         }
         if self.codex_fast_mode.is_some() {
             fields.insert("codexFastMode");
@@ -1565,6 +1571,7 @@ mod tests {
     fn openai_oauth_bundle_materializes_keepalive_and_routing_driver_options() {
         let mut draft = openai_oauth_bundle();
         for surface in &mut draft.surfaces {
+            surface.driver_options.codex_service_tier = Some(CodexServiceTier::Ultrafast);
             surface.driver_options.codex_responses_keepalive_interval_ms = Some(22_000);
             surface.driver_options.codex_routing_hint_enabled = Some(false);
         }
@@ -1573,6 +1580,7 @@ mod tests {
         for surface in &draft.surfaces {
             let provider = draft.provider_for_surface(surface).unwrap();
             let meta = provider.meta.unwrap();
+            assert_eq!(meta.codex_service_tier, Some(CodexServiceTier::Ultrafast));
             assert_eq!(meta.codex_responses_keepalive_interval_ms, Some(22_000));
             assert_eq!(meta.codex_routing_hint_enabled, Some(false));
         }

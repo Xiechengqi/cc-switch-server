@@ -260,6 +260,7 @@ function buildFieldConsumption(inventory) {
     persistedField("provider.meta.isFullUrl", "runtime"),
     persistedField("provider.meta.promptCacheKey", "runtime"),
     persistedField("provider.meta.codexFastMode", "runtime"),
+    persistedField("provider.meta.codexServiceTier", "runtime"),
     persistedField("provider.meta.codexImageGenerationEnabled", "runtime"),
     persistedField("provider.meta.codexImageToolStripPolicy", "runtime"),
     persistedField("provider.meta.codexWebsocketEnabled", "runtime"),

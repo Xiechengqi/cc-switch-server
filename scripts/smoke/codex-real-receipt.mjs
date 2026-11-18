@@ -576,7 +576,7 @@ async function validateWebsocketModel() {
   const manifest = await requestJson(
     shareUrl,
     `/v1/models?${new URLSearchParams({
-      client_version: "0.144.1",
+      client_version: "0.169.0",
       expectedShareId: shareId,
       expectedProviderId: providerId,
     })}`,

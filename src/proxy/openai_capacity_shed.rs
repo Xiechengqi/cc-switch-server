@@ -309,10 +309,34 @@ pub(super) fn openai_stream_bytes_start_client_output(bytes: &[u8]) -> bool {
 }
 
 pub(super) fn sanitize_openai_capacity_shed_json_bytes(payload: &[u8]) -> (Vec<u8>, bool) {
+    sanitize_capacity_shed_json_with_retry_after(payload, None)
+}
+
+fn sanitize_capacity_shed_json_with_retry_after(
+    payload: &[u8],
+    retry_after_ms: Option<u64>,
+) -> (Vec<u8>, bool) {
     let Ok(mut value) = serde_json::from_slice::<Value>(payload) else {
         return (payload.to_vec(), false);
     };
-    if !sanitize_openai_capacity_shed_value(&mut value) {
+    let capacity_failure = is_openai_capacity_shed_value(&value);
+    let mut changed = sanitize_openai_capacity_shed_value(&mut value);
+    if let Some(milliseconds) = retry_after_ms.filter(|_| capacity_failure) {
+        if !value.get("headers").is_some_and(Value::is_object) {
+            value["headers"] = json!({});
+        }
+        let headers = value["headers"].as_object_mut().expect("headers object");
+        headers.retain(|name, _| {
+            !name.eq_ignore_ascii_case("retry-after")
+                && !name.eq_ignore_ascii_case("retry-after-ms")
+        });
+        headers.insert(
+            "Retry-After".to_string(),
+            json!((milliseconds.saturating_add(999) / 1000).max(1).to_string()),
+        );
+        changed = true;
+    }
+    if !changed {
         return (payload.to_vec(), false);
     }
     match serde_json::to_vec(&value) {
@@ -322,7 +346,15 @@ pub(super) fn sanitize_openai_capacity_shed_json_bytes(payload: &[u8]) -> (Vec<u
 }
 
 pub(super) fn sanitize_openai_capacity_shed_json_text(payload: &str) -> (String, bool) {
-    let (bytes, changed) = sanitize_openai_capacity_shed_json_bytes(payload.as_bytes());
+    sanitize_openai_capacity_shed_json_text_with_retry_after(payload, None)
+}
+
+pub(super) fn sanitize_openai_capacity_shed_json_text_with_retry_after(
+    payload: &str,
+    retry_after_ms: Option<u64>,
+) -> (String, bool) {
+    let (bytes, changed) =
+        sanitize_capacity_shed_json_with_retry_after(payload.as_bytes(), retry_after_ms);
     (
         String::from_utf8(bytes).unwrap_or_else(|_| payload.to_string()),
         changed,
@@ -330,32 +362,9 @@ pub(super) fn sanitize_openai_capacity_shed_json_text(payload: &str) -> (String,
 }
 
 pub(super) fn synthesize_openai_capacity_shed_failed_sse(failure: &SemanticFailure) -> Bytes {
-    let code = if is_openai_capacity_shed_failure(failure) {
-        OPENAI_CAPACITY_SHED_RETRYABLE_CLIENT_CODE
-    } else if failure.code.trim().is_empty() {
-        "server_error"
-    } else {
-        failure.code.trim()
-    };
-    let message = if failure.message.trim().is_empty() {
-        "Upstream response failed"
-    } else {
-        failure.message.trim()
-    };
     Bytes::from(format!(
         "event: response.failed\ndata: {}\n\n",
-        json!({
-            "type": "response.failed",
-            "response": {
-                "object": "response",
-                "status": "failed",
-                "error": {
-                    "type": "upstream_error",
-                    "code": code,
-                    "message": message,
-                }
-            }
-        })
+        synthesize_openai_capacity_shed_failed_json(failure)
     ))
 }
 
@@ -372,7 +381,7 @@ pub(super) fn synthesize_openai_capacity_shed_failed_json(failure: &SemanticFail
     } else {
         failure.message.trim()
     };
-    json!({
+    let mut value = json!({
         "type": "response.failed",
         "response": {
             "object": "response",
@@ -383,8 +392,12 @@ pub(super) fn synthesize_openai_capacity_shed_failed_json(failure: &SemanticFail
                 "message": message,
             }
         }
-    })
-    .to_string()
+    });
+    if let Some(milliseconds) = failure.retry_after_ms {
+        value["headers"] =
+            json!({"Retry-After": (milliseconds.saturating_add(999) / 1000).max(1).to_string()});
+    }
+    value.to_string()
 }
 
 pub(super) fn omit_openai_responses_done_events(input: &[u8]) -> Bytes {
@@ -735,6 +748,7 @@ data: {"type":"error","error":{"code":"server_is_overloaded","message":"overload
     #[test]
     fn synthesizes_response_failed_with_retryable_code() {
         let failure = SemanticFailure {
+            retry_after_ms: None,
             origin: crate::proxy::response_semantics::FailureOrigin::Provider,
             code: "server_is_overloaded".to_string(),
             message: "Our servers are currently overloaded. Please try again later.".to_string(),
@@ -766,6 +780,7 @@ data: {"type":"error","error":{"code":"server_is_overloaded","message":"overload
     #[test]
     fn synthesizes_response_failed_without_rewriting_rate_limit() {
         let failure = SemanticFailure {
+            retry_after_ms: None,
             origin: crate::proxy::response_semantics::FailureOrigin::Provider,
             code: "rate_limit_exceeded".to_string(),
             message: "try again in 3s".to_string(),

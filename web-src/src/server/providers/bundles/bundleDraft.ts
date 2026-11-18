@@ -103,6 +103,7 @@ export interface BundleSurfaceEditorDraft {
     apiKeyField?: string;
     customUserAgent?: string;
     codexFastMode?: boolean;
+    codexServiceTier?: "standard" | "priority" | "ultrafast";
     codexImageGenerationEnabled?: boolean;
     grokImageGenerationEnabled?: boolean;
     grokImageEditEnabled?: boolean;
@@ -550,6 +551,9 @@ function surfaceFromResource(
       customUserAgent:
         stringOption(runtimeOptions.customUserAgent) ??
         configuredMeta.customUserAgent,
+      codexServiceTier: (["standard", "priority", "ultrafast"] as const).find(
+        (tier) => tier === (runtimeOptions.codexServiceTier ?? configuredMeta.codexServiceTier),
+      ),
       codexFastMode:
         booleanOption(runtimeOptions.codexFastMode) ??
         configuredMeta.codexFastMode,
@@ -984,6 +988,9 @@ function typedDriverOptions(surface: BundleSurfaceEditorDraft) {
       customUserAgent
         ? customUserAgent
         : undefined,
+    codexServiceTier: fields.has("codexServiceTier")
+      ? surface.driverOptions.codexServiceTier
+      : undefined,
     codexFastMode: fields.has("codexFastMode")
       ? surface.driverOptions.codexFastMode
       : undefined,

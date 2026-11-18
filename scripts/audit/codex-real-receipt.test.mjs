@@ -24,7 +24,9 @@ const routerSecret = "codex-router-secret-for-harness";
 
 test("Codex receipt manifest query tracks the server default client version", () => {
   const source = fs.readFileSync(path.join(repoRoot, "src/codex_identity.rs"), "utf8");
-  assert.match(source, /DEFAULT_CODEX_VERSION: &str = "0\.144\.1"/);
+  assert.match(source, /DEFAULT_CODEX_VERSION: &str = "0\.169\.0"/);
+  const version = source.match(/DEFAULT_CODEX_VERSION: &str = "([^"]+)"/)[1];
+  assert.ok(fs.readFileSync(script, "utf8").includes(`client_version: "${version}"`));
 });
 
 const specs = Object.freeze({
@@ -418,7 +420,7 @@ async function startMockServer(
     }
     if (request.method === "GET" && url.pathname === "/v1/models") {
       if (url.searchParams.has("client_version")) {
-        assert.equal(url.searchParams.get("client_version"), "0.144.1");
+        assert.equal(url.searchParams.get("client_version"), "0.169.0");
         manifestQueries.push(url.searchParams);
         manifestReads += 1;
         const fault = manifestReads > 1 ? finalModelFault : "";

@@ -137,8 +137,22 @@ pub(crate) fn semantic_rate_limit_error(
     ProxyError::rate_limited(message, retry_after_seconds.max(1))
 }
 
-pub(crate) fn capacity_shed_proxy_error(_failure: &SemanticFailure) -> ProxyError {
-    ProxyError::upstream_capacity_shed(1)
+pub(crate) fn capacity_shed_proxy_error(failure: &SemanticFailure) -> ProxyError {
+    ProxyError::upstream_capacity_shed(
+        (failure.retry_after_ms.unwrap_or(1000).saturating_add(999) / 1000).max(1),
+    )
+}
+
+pub(crate) fn capacity_retry_delay_with_hint(
+    remaining_ms: u128,
+    attempted: u32,
+    hint_ms: Option<u64>,
+) -> Option<Duration> {
+    let hint_ms = hint_ms.unwrap_or(0);
+    if u128::from(hint_ms) >= remaining_ms {
+        return None;
+    }
+    Some(capacity_retry_delay(remaining_ms, attempted).max(Duration::from_millis(hint_ms)))
 }
 
 pub(crate) fn capacity_retry_allowed(

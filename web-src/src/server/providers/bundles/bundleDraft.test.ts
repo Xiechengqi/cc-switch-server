@@ -170,6 +170,25 @@ function openAiOAuthBundle(
 }
 
 describe("Provider Bundle drafts", () => {
+  it("round-trips explicit Codex service tiers and preserves absent legacy overrides", () => {
+    const legacy = openAiOAuthBundle();
+    for (const surface of Object.values(legacy.surfaces)) {
+      if (surface) surface.provider.meta = { ...surface.provider.meta, codexFastMode: true };
+    }
+    const oldDraft = editProviderBundleDraft(legacy);
+    expect(oldDraft.surfaces.every(surface => surface.driverOptions.codexServiceTier === undefined)).toBe(true);
+    expect(toProviderBundleWriteDraft(oldDraft).surfaces.every(surface => surface.driverOptions?.codexFastMode === true)).toBe(true);
+    for (const tier of ["standard", "priority", "ultrafast"] as const) {
+      const bundle = openAiOAuthBundle();
+      for (const surface of Object.values(bundle.surfaces)) {
+        if (surface) surface.provider.meta = { ...surface.provider.meta, codexServiceTier: tier, codexFastMode: true };
+      }
+      const draft = editProviderBundleDraft(bundle);
+      const written = toProviderBundleWriteDraft(draft);
+      expect(written.surfaces.every(surface => surface.driverOptions?.codexServiceTier === tier)).toBe(true);
+    }
+  });
+
   it("only exposes Codex controls for the persisted bound account", () => {
     const bundle = openAiOAuthBundle();
     for (const resource of Object.values(bundle.surfaces)) {

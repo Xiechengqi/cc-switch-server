@@ -1442,7 +1442,9 @@ fn admit_with_trial_in_tx(
         if unpriced_reason.is_none()
             && a.resource_plan.as_ref().is_none_or(|plan| plan.text_tokens)
             && !model.supports_tier(a.effective_tier)
-            && (a.scope.entitlement_id.is_some() || model.supported_tiers().next().is_none())
+            && (a.effective_tier == "ultrafast"
+                || a.scope.entitlement_id.is_some()
+                || model.supported_tiers().next().is_none())
         {
             unpriced_reason = Some(unpriced("tier_unpriced")?);
         }
@@ -2638,8 +2640,9 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
         }
         None => o,
     };
-    let text_unpriced =
-        plan.is_none_or(|plan| plan.text_tokens) && tariff.supported_tiers().next().is_none();
+    let text_unpriced = plan.is_none_or(|plan| plan.text_tokens)
+        && (tariff.supported_tiers().next().is_none()
+            || (o.effective_tier == "ultrafast" && !tariff.supports_tier("ultrafast")));
     let price_at = |tier: &str| {
         let text = if plan.is_some_and(|plan| !plan.text_tokens) || text_unpriced {
             Some(crate::domain::usage::value_pricing::PricedValue {
@@ -2671,11 +2674,15 @@ fn settle_in_tx(tx: &Transaction<'_>, o: &Observation<'_>) -> anyhow::Result<boo
                 || o.resources.as_ref().is_some_and(|usage| usage.estimated),
         })
     };
-    // Owner-managed: an unknown or unsupported tier is charged at the
-    // model's highest tier and can never be `observed`.
+    // Owner-managed legacy tiers retain the conservative highest-tier rule.
+    // Ultrafast always needs its own tariff and keeps an explicit unpriced reason.
     let text_tier = plan.is_none_or(|plan| plan.text_tokens);
-    let tier_fallback =
-        |tier: &str| text_tier && scope.entitlement_id.is_none() && !tariff.supports_tier(tier);
+    let tier_fallback = |tier: &str| {
+        text_tier
+            && tier != "ultrafast"
+            && scope.entitlement_id.is_none()
+            && !tariff.supports_tier(tier)
+    };
     let price = |tier: &str| {
         if text_unpriced || !tier_fallback(tier) {
             return price_at(tier);

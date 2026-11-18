@@ -123,6 +123,7 @@ export type ProviderDriverOptionField =
   | "apiKeyField"
   | "customUserAgent"
   | "codexFastMode"
+  | "codexServiceTier"
   | "codexImageGenerationEnabled"
   | "grokImageGenerationEnabled"
   | "grokImageEditEnabled"
