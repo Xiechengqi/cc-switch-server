@@ -119,6 +119,8 @@ describe("Provider Bundle share user grants", () => {
       return (
         <ShareUserGrantsEditor
           value={draft.userGrants}
+          independentCapabilities
+          shareOperations={["tool.web_search"]}
           ownerEmail="owner@example.com"
           defaultPolicy={{ tokenPeriod: "lifetime" }}
           usageEdits={draft.userUsageEdits}
@@ -140,6 +142,11 @@ describe("Provider Bundle share user grants", () => {
       typeInto(email!, "friend@example.com");
     });
     await act(async () => {
+      const select = document.querySelector<HTMLSelectElement>('select[aria-label="Extension permission"], select[aria-label="扩展能力权限"]')!;
+      select.value = "disabled";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await act(async () => {
       findButton(i18n.t("common.apply", { defaultValue: "应用" })).click();
     });
 
@@ -148,6 +155,7 @@ describe("Provider Bundle share user grants", () => {
       "owner@example.com",
     ]);
     expect(latest.userGrants["friend@example.com"].role).toBe("shareto");
+    expect(latest.userGrants["friend@example.com"].policy.allowedOperations).toEqual([]);
 
     await act(async () => {
       root.unmount();
@@ -253,5 +261,39 @@ describe("USD-equivalent rows", () => {
       await act(async () => { root.unmount(); });
       container.remove();
     }
+  });
+});
+
+
+describe("scheduled quota permission editing", () => {
+  it("stages a capability restriction without demanding an immediate unit conversion", async () => {
+    const container = document.createElement("div"); document.body.appendChild(container);
+    const root = createRoot(container);
+    const waiting: ShareUserGrantMap = {
+      "waiting@example.com": { email: "waiting@example.com", active: true, role: "shareto",
+        policy: { tokenPeriod: "day", tokenLimit: 1000 },
+        pendingValueQuota: { policy: { tokenPeriod: "day", valueQuota: { limitUsdMicros: "10000000", tariffPolicyId: "api-equivalent-v1" } }, effectiveFromMs: Date.UTC(2030, 0, 1), retainAccess: true },
+      },
+    };
+    let latest = waiting;
+    function Harness() {
+      const [value, setValue] = useState(waiting); latest = value;
+      return <ShareUserGrantsEditor value={value} savedGrants={waiting} shareId="saved-share" configRevision={1} independentCapabilities shareOperations={["tool.web_search"]}
+        ownerEmail="owner@example.com" defaultPolicy={{tokenPeriod:"day"}} onChange={setValue} />;
+    }
+    try {
+      await act(async () => root.render(<Harness />));
+      const row = Array.from(container.querySelectorAll("tbody tr")).find(row => row.textContent?.includes("waiting@example.com"))!;
+      await act(async () => row.querySelector<HTMLButtonElement>(`button[aria-label="${i18n.t("common.edit")}"]`)!.click());
+      await act(async () => {
+        const select = document.querySelector<HTMLSelectElement>('select[aria-label="Extension permission"], select[aria-label="扩展能力权限"]')!;
+        select.value = "disabled"; select.dispatchEvent(new Event("change", {bubbles:true}));
+      });
+      await act(async () => findButton(i18n.t("common.apply" )).click());
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+      expect(latest["waiting@example.com"].policy.allowedOperations).toEqual([]);
+      expect(latest["waiting@example.com"].pendingValueQuota).toEqual(waiting["waiting@example.com"].pendingValueQuota);
+      expect(latest["waiting@example.com"].quotaUnitConversion).toBeUndefined();
+    } finally { await act(async () => root.unmount()); container.remove(); }
   });
 });

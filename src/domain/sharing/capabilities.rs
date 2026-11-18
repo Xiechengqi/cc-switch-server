@@ -145,6 +145,62 @@ pub fn validate_operations(operations: &[ShareOperation]) -> Result<(), String> 
     }
     Ok(())
 }
+
+/// Financial terms are unchanged by an execution permission edit.
+pub fn same_quota_terms(
+    a: &super::router_contract::ShareUserPolicy,
+    b: &super::router_contract::ShareUserPolicy,
+) -> bool {
+    let mut a = a.clone();
+    let mut b = b.clone();
+    a.allowed_operations = None;
+    b.allowed_operations = None;
+    if b.value_quota.as_ref().is_some_and(|q| {
+        q.tariff_policy_id == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+    }) {
+        if let Some(q) = a.value_quota.as_mut() {
+            q.tariff_policy_id = crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY.into();
+        }
+    }
+    a == b
+}
+
+/// Recognize an independently reviewed capability edit to a legacy schedule.
+/// Neither arbitrary future terms nor a new activation date are accepted here.
+pub fn scheduled_capability_policy(
+    grant: &super::router_contract::ShareUserGrant,
+    requested: &super::router_contract::ShareUserPolicy,
+) -> Option<super::router_contract::ShareUserPolicy> {
+    let pending = grant.pending_value_quota.as_ref()?;
+    let mut scheduled = pending.policy.clone();
+    scheduled.allowed_operations = requested.allowed_operations.clone();
+    let mut current = grant.policy.clone();
+    current.allowed_operations = requested.allowed_operations.clone();
+    if requested.value_quota.as_ref().is_some_and(|q| {
+        q.tariff_policy_id == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+    }) {
+        for policy in [&mut scheduled, &mut current] {
+            if let Some(quota) = policy.value_quota.as_mut() {
+                quota.tariff_policy_id =
+                    crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY.into();
+            }
+        }
+    }
+    (requested == &scheduled || requested == &current).then_some(scheduled)
+}
+
+pub fn capability_only_change(
+    original: &super::router_contract::ShareUserPolicy,
+    requested: &super::router_contract::ShareUserPolicy,
+) -> bool {
+    same_quota_terms(original, requested)
+        && (original.allowed_operations != requested.allowed_operations
+            || (requested.value_quota.as_ref().is_some_and(|q| {
+                q.tariff_policy_id == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+            }) && original.value_quota.as_ref().is_some_and(|q| {
+                q.tariff_policy_id != crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+            })))
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityConsent {

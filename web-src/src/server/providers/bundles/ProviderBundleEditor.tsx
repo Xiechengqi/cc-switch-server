@@ -1,4 +1,4 @@
-import {capabilityQuotaContext} from "@/lib/share-capabilities";
+import { capabilityQuotaContext, capabilityNeedsReview, reconcileCapabilityGrants, type CapabilityReviewHandle } from "@/lib/share-capabilities";
 import {ShareCapabilitiesEditor} from "@/components/providers/ShareCapabilitiesEditor";
 import {
   Fragment,
@@ -1118,6 +1118,7 @@ function BundleShareEditor({
   ownerEmail,
   shareUrl,
   showGrokMedia,
+  capabilitiesRef,
   disabled = false,
 }: {
   draft: ProviderBundleShareDraft;
@@ -1131,6 +1132,7 @@ function BundleShareEditor({
   ownerEmail: string;
   shareUrl?: string | null;
   showGrokMedia: boolean;
+  capabilitiesRef: React.Ref<CapabilityReviewHandle>;
   disabled?: boolean;
 }) {
   const { t, i18n } = useTranslation();
@@ -1470,13 +1472,11 @@ function BundleShareEditor({
           <div className="border-t border-border-default/70 pt-4 md:col-span-2">
             <ShareCapabilitiesEditor shareId={draft.baseline?.shareId} revision={draft.baseline?.configRevision}
               policy={draft.capabilityPolicy} savedPolicy={draft.baseline?.capabilityPolicy} grants={draft.userGrants}
-              tokenLimit={Number(draft.tokenLimit)||-1} disabled={disabled}
-              onChange={(capabilityPolicy,capabilityConsent)=>onChange(current=>{
-                const userGrants=Object.fromEntries(Object.entries(current.userGrants).map(([email,g])=>[email,g.active&&g.manager!=="routerShareMarket"&&g.policy.valueQuota&&capabilityPolicy.allowedOperations.some(op=>g.policy.allowedOperations?.includes(op)??true)?{...g,policy:{...g.policy,valueQuota:{...g.policy.valueQuota,tariffPolicyId:"api-equivalent-v2" as const}}}:g]));
-                return {...current,capabilityPolicy,capabilityConsent,userGrants,capabilityConsentScope:capabilityConsent?capabilityQuotaContext(capabilityPolicy,userGrants,Number(current.tokenLimit)):undefined};
-              })}
-              onGrantOperationsChange={(email,allowedOperations)=>onChange(current=>({...current,capabilityConsent:undefined,userGrants:{...current.userGrants,[email]:{...current.userGrants[email],policy:{...current.userGrants[email].policy,allowedOperations}}}}))}/>
-            <ShareUserGrantsEditor independentCapabilities={!!draft.capabilityPolicy}
+              tokenLimit={Number(draft.tokenLimit) || -1} disabled={disabled} reviewRef={capabilitiesRef}
+              onChange={capabilityPolicy => onChange(current => ({ ...current, capabilityPolicy, capabilityConsent: undefined,
+                userGrants: reconcileCapabilityGrants(capabilityPolicy, current.userGrants),
+              }))} />
+            <ShareUserGrantsEditor independentCapabilities={!!draft.capabilityPolicy} shareOperations={draft.capabilityPolicy?.allowedOperations}
               shareId={draft.baseline?.shareId}
               configRevision={draft.baseline?.configRevision}
               disabled={disabled}
@@ -1490,7 +1490,7 @@ function BundleShareEditor({
               valueUsageInitializations={draft.userValueUsageInitializations}
               onValueUsageInitializationsChange={updateValueUsageInitializations}
               onUsageEditsChange={updateUserUsageEdits}
-              onChange={updateUserGrants}
+              onChange={userGrants => updateUserGrants(draft.capabilityPolicy ? reconcileCapabilityGrants(draft.capabilityPolicy, userGrants) : userGrants)}
             />
           </div>
         </div>
@@ -1535,6 +1535,8 @@ export function ProviderBundleEditor({
   );
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
+  const capabilitiesRef = useRef<CapabilityReviewHandle>(null);
+  const capabilityRuntimeReviewPending = useRef(false);
   const savedBundleRef = useRef<ProviderBundleView | undefined>(
     bundle && !duplicate ? bundle : undefined,
   );
@@ -1985,6 +1987,7 @@ export function ProviderBundleEditor({
     }
     savingRef.current = true;
     setSaving(true);
+    const providerChanged = stableStringify(draft) !== draftBaselineRef.current;
     let providerSaved = false;
     try {
       if (family.familyId === "family.custom_http") {
@@ -2011,17 +2014,28 @@ export function ProviderBundleEditor({
       setDraft(savedDraft);
       draftBaselineRef.current = stableStringify(savedDraft);
       setShareSavePending(true);
-      const savedShare = await saveBundleShare(
-        saved.id,
-        shareDraft,
-        existingShare,
-      );
+      let reviewedShareDraft = shareDraft;
+      capabilityRuntimeReviewPending.current ||= !!shareDraft.capabilityPolicy?.allowedOperations.length && providerChanged;
+      const reviewNeeded = shareDraft.enabled && !!shareDraft.baseline && (capabilityNeedsReview(
+        shareDraft.capabilityPolicy, shareDraft.userGrants, Number(shareDraft.tokenLimit),
+        shareDraft.baseline.capabilityPolicy, shareDraft.baseline.userGrants, Number(shareDraft.baseline.tokenLimit),
+      ) || capabilityRuntimeReviewPending.current);
+      if (reviewNeeded) {
+        if (!capabilitiesRef.current) throw new Error("Capability editor is unavailable");
+        const approval = await capabilitiesRef.current.review();
+        if (!approval) return;
+        reviewedShareDraft = { ...shareDraft, capabilityPolicy: approval.policy, capabilityConsent: approval.consent,
+          capabilityConsentScope: capabilityQuotaContext(approval.policy, shareDraft.userGrants, Number(shareDraft.tokenLimit)),
+        };
+      }
+      const savedShare = await saveBundleShare(saved.id, reviewedShareDraft, existingShare);
       const savedShareDraft = savedShare
         ? createBundleShareDraft(savedShare)
         : shareDraft;
       shareBaselineRef.current = stableStringify(savedShareDraft);
       setShareDraft(savedShareDraft);
       setShareSavePending(false);
+      capabilityRuntimeReviewPending.current = false;
       await Promise.allSettled([
         queryClient.invalidateQueries({ queryKey: ["provider-bundles"] }),
         queryClient.invalidateQueries({ queryKey: shareKeys.list() }),
@@ -3222,8 +3236,9 @@ export function ProviderBundleEditor({
           </div>
         ) : null}
 
-        {showShareStep ? (
+        {(showShareStep || !!shareDraft.baseline) ? (
           <div
+            hidden={!showShareStep}
             id="bundle-section-share"
             role="tabpanel"
             aria-labelledby="bundle-tab-share"
@@ -3259,6 +3274,7 @@ export function ProviderBundleEditor({
                 ownerEmail={ownerEmail}
                 shareUrl={shareUrl}
                 showGrokMedia={grokDriverOptions}
+                capabilitiesRef={capabilitiesRef}
                 disabled={saving}
               />
             </fieldset>

@@ -1,4 +1,5 @@
-import type {ShareOperation} from "@/lib/share-capabilities";
+import { capabilityPermissionSummary, preservesCapabilitySchedule, type ShareOperation } from "@/lib/share-capabilities";
+import { ShareCapabilityPermissionFields } from "./ShareCapabilityPermissionFields";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Pencil, Plus, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -80,6 +81,7 @@ type PolicyDraft = {
 type BatchPolicyDraft = Omit<PolicyDraft, "email" | "consumedValue" | "valueReason"> & {
   calibrations?: Record<string, {amount: string; reason: string}>;
   calibrationDrafts?: Partial<Record<"tokens" | "usdEquivalent", Record<string,{amount:string;reason:string}>>>;
+  applyCapabilities: boolean;
   applyParallelLimit: boolean;
   applyTokenLimit: boolean;
   applyConsumedTokens: boolean;
@@ -103,6 +105,7 @@ function fixedPeriodDurationMs(period: ShareTokenPeriod): number | undefined {
  */
 type ShareUserGrantsEditorProps = {
   independentCapabilities?: boolean;
+  shareOperations?: ShareOperation[];
   shareId?: string;
   configRevision?: number;
   value: ShareUserGrantMap;
@@ -259,6 +262,8 @@ function batchPolicyDraft(grant: ShareUserGrant): BatchPolicyDraft {
     expiresAt: draft.expiresAt,
     consumedTokens: "",
     usageAction: "set",
+    allowedOperations: undefined,
+    applyCapabilities: false,
     applyParallelLimit: false,
     applyTokenLimit: false,
     applyConsumedTokens: false,
@@ -310,6 +315,7 @@ function batchPatchFor(draft: BatchPolicyDraft): ShareUserPolicyBatchPatch {
   const expiresAt = draft.expiresAt ? new Date(draft.expiresAt).getTime() : undefined;
   const periodAnchorAtMs = ANCHORED_PERIODS.has(draft.tokenPeriod) ? parseUtcDateTime(draft.tokenPeriodAnchor) : undefined;
   return {
+    ...(draft.applyCapabilities ? { allowedOperations: { value: draft.allowedOperations } } : {}),
     ...(draft.applyParallelLimit ? { parallelLimit: { value: parallelLimit } } : {}),
     ...(draft.applyTokenLimit ? { tokenLimit: {
       value: tokenLimit,
@@ -323,6 +329,7 @@ function batchPatchFor(draft: BatchPolicyDraft): ShareUserPolicyBatchPatch {
 
 export function ShareUserGrantsEditor({
   independentCapabilities,
+  shareOperations = [],
   shareId,
   configRevision,
   value,
@@ -456,7 +463,7 @@ export function ShareUserGrantsEditor({
       tokenPeriodAnchorAtMs: ANCHORED_PERIODS.has(draft.tokenPeriod) ? parseUtcDateTime(draft.tokenPeriodAnchor) : undefined,
       expiresAt: draft.expiresAt ? new Date(draft.expiresAt).getTime() : undefined,
     };
-    return policy && (policy.valueQuota || quotaConversionNeeded(savedGrants[email], policy)) ? {[email]: policy} : undefined;
+    return policy && !(savedGrants[email] && preservesCapabilitySchedule(savedGrants[email], policy)) && (policy.valueQuota || quotaConversionNeeded(savedGrants[email], policy)) ? {[email]: policy} : undefined;
   })();
   const batchUsdPolicies = (() => {
     if (!batchDraft?.applyTokenLimit || !selectedEditableEmails.size) return undefined;
@@ -680,6 +687,7 @@ export function ShareUserGrantsEditor({
     }
     setDraftError("");
     const requested: ShareUserPolicy = usdPolicy ?? {
+      allowedOperations: draft.allowedOperations,
       parallelLimit,
       tokenLimit,
       tokenPeriod: draft.tokenPeriod,
@@ -702,7 +710,7 @@ export function ShareUserGrantsEditor({
     };
     const next = stageGrantPolicy(base, requested);
     let initialization: ShareUserValueUsageInitializationMap[string] | undefined;
-    if (requested.valueQuota || quotaConversionNeeded(savedGrants[email], requested)) {
+    if (!(savedGrants[email] && preservesCapabilitySchedule(savedGrants[email], requested)) && (requested.valueQuota || quotaConversionNeeded(savedGrants[email], requested))) {
       const preview = await resolveValuePreview(singlePreview);
       if (!preview) return;
       if (currentDraft.current !== draft) return;
@@ -826,7 +834,7 @@ export function ShareUserGrantsEditor({
       !batchDraft.applyParallelLimit &&
       !batchDraft.applyTokenLimit &&
       !batchDraft.applyConsumedTokens &&
-      !batchDraft.applyExpiresAt
+      !batchDraft.applyExpiresAt && !batchDraft.applyCapabilities
     ) {
       return;
     }
@@ -1127,7 +1135,7 @@ export function ShareUserGrantsEditor({
                 ) : null}
                 <TableCell className="px-3 py-2 align-top">
                   <div className="flex min-w-0 flex-wrap items-start gap-2">
-                    <span className="min-w-0 whitespace-normal break-all">{grant.email}</span>
+                    <span className="min-w-0 whitespace-normal break-all">{grant.email}</span>{independentCapabilities ? <span className="text-xs text-muted-foreground">{grant.manager === "routerShareMarket" ? i18n.language.startsWith("zh") ? "由购买套餐决定" : "Purchased plan" : capabilityPermissionSummary(grant.policy.allowedOperations, i18n.language.startsWith("zh") ? 0 : 1)}</span> : null}
                     {grant.role === "owner" ? <Badge variant="secondary">{t("share.userLimit.role.owner")}</Badge> : null}
                     {grant.manager === "routerShareMarket" && grant.active !== false ? (
                       <Badge variant="secondary">{t("share.userLimit.role.market")}</Badge>
@@ -1222,6 +1230,9 @@ export function ShareUserGrantsEditor({
           </DialogHeader>
           {draft ? (
             <div className="grid gap-4 overflow-y-auto px-6 py-5 sm:grid-cols-2">
+              {independentCapabilities ? <ShareCapabilityPermissionFields value={draft.allowedOperations} available={shareOperations}
+                onChange={allowedOperations => setDraft({ ...draft, allowedOperations })} /> : null}
+
               <div className="space-y-2 sm:col-span-2">
                 <Label htmlFor="share-user-email">{t("share.userLimit.email")}</Label>
                 <Input id="share-user-email" type="email" disabled={editingEmail != null} value={draft.email} onChange={(event) => setDraft({ ...draft, email: event.target.value })} />
@@ -1433,6 +1444,14 @@ export function ShareUserGrantsEditor({
           </DialogHeader>
           {batchDraft ? (
             <div className="grid gap-4 overflow-y-auto px-6 py-5 sm:grid-cols-2">
+              {independentCapabilities ? <div className="space-y-2 sm:col-span-2">
+                <label className="flex items-center gap-2 text-sm"><input type="checkbox" className="h-4 min-h-4 w-4 shrink-0 p-0 accent-primary" checked={batchDraft.applyCapabilities}
+                  onChange={event => setBatchDraft({ ...batchDraft, applyCapabilities: event.target.checked })} />
+                  {i18n.language.startsWith("zh") ? "修改扩展能力权限" : "Change extension permissions"}</label>
+                {batchDraft.applyCapabilities ? <ShareCapabilityPermissionFields value={batchDraft.allowedOperations} available={shareOperations}
+                  onChange={allowedOperations => setBatchDraft({ ...batchDraft, allowedOperations })} /> : null}
+              </div> : null}
+
               <p className="text-sm text-muted-foreground sm:col-span-2">
                 {t("share.userLimit.batchHint", {
                   count: selectedEditableEmails.size,
@@ -1658,7 +1677,7 @@ export function ShareUserGrantsEditor({
                 !batchDraft.applyParallelLimit &&
                 !batchDraft.applyTokenLimit &&
                 !batchDraft.applyConsumedTokens &&
-                !batchDraft.applyExpiresAt)}
+                !batchDraft.applyExpiresAt && !batchDraft.applyCapabilities)}
               onClick={saveBatchDraft}
             >
               {(batchDraft?.applyTokenLimit && batchDraft.quotaUnit === "usdEquivalent" && needsConfirmation(batchPreview)) || batchAccountConfirmPending

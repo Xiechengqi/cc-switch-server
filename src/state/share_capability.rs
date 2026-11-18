@@ -105,6 +105,33 @@ fn generic_resource_priced(
         .and_then(|m| snapshot.and_then(|s| s.model(m).ok()))
         .is_some_and(|m| m.resources.contains_key(op.resource()))
 }
+
+/// Display evidence only. Admission still prices the actual request dimensions.
+fn pricing_coverage(
+    snapshot: Option<&PricingSnapshot>,
+    model: Option<&str>,
+    op: ShareOperation,
+) -> &'static str {
+    let Some(snapshot) = snapshot else {
+        return "tariff_unavailable";
+    };
+    let Some(model) = model else {
+        return "request_dependent";
+    };
+    let Ok(model) = snapshot.model(model) else {
+        return "missing";
+    };
+    if model.resources.contains_key(op.resource()) {
+        "base_rate"
+    } else if model.resources.keys().any(|key| {
+        key.strip_prefix(op.resource())
+            .is_some_and(|tail| tail.starts_with('/'))
+    }) {
+        "parameter_rates"
+    } else {
+        "missing"
+    }
+}
 fn coverage_gap(quota_unit: &str, priced: bool) -> Option<&'static str> {
     match quota_unit {
         "tokens" => Some("resource_not_in_token_ledger"),
@@ -263,12 +290,44 @@ impl ServerStateInner {
         policy.validate().map_err(anyhow::Error::msg)?;
         policy.coverage_acknowledgements.clear();
         let policies = policies(&share, &input.policies, input.replace_policies);
+        // An independent capability edit must cover both currently enforced
+        // and already scheduled units without activating the future quota.
+        let mut coverage_policies = policies
+            .iter()
+            .map(|(email, policy)| (email.as_str(), policy.clone()))
+            .collect::<Vec<_>>();
+        for (email, requested) in &policies {
+            if let Some(grant) = share.user_grants.get(email) {
+                if let Some(scheduled) = scheduled_capability_policy(grant, requested) {
+                    let mut active = grant.policy.clone();
+                    active.allowed_operations = requested.allowed_operations.clone();
+                    if requested.value_quota.as_ref().is_some_and(|q| {
+                        q.tariff_policy_id
+                            == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+                    }) {
+                        if let Some(quota) = active.value_quota.as_mut() {
+                            quota.tariff_policy_id =
+                                crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY.into();
+                        }
+                    }
+                    for extra in [active, scheduled] {
+                        if !coverage_policies
+                            .iter()
+                            .any(|(scope, policy)| *scope == email.as_str() && policy == &extra)
+                        {
+                            coverage_policies.push((email.as_str(), extra));
+                        }
+                    }
+                }
+            }
+        }
         let snapshot = if committed {
             tariff(&self.config_dir, &config, &share)?
         } else {
             None
         };
         let mut rows = Vec::new();
+        let mut unavailable_bindings = Vec::new();
         let mut acknowledgements = Vec::new();
         let requested_bindings = policy.operation_bindings.clone();
         policy.operation_bindings = policy
@@ -278,12 +337,26 @@ impl ServerStateInner {
             .collect();
         for binding in &share.bindings {
             let Some(plan) = providers.runtime_plan(binding.app, &binding.provider_id) else {
+                unavailable_bindings.push(
+                    serde_json::json!({"app":app_name(binding.app),"reason":"runtime_unavailable"}),
+                );
                 continue;
             };
+            if plan.configuration_state
+                == crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
+            {
+                unavailable_bindings.push(
+                    serde_json::json!({"app":app_name(binding.app),"reason":"runtime_unavailable"}),
+                );
+            }
             let fingerprint = binding_fingerprint(&plan);
             let app = app_name(binding.app);
             for op in ShareOperation::ALL {
                 let supported = implemented(&plan, op);
+                let driver_implemented =
+                    crate::domain::providers::share_operations::driver_implements(&plan, op);
+                let provider_enabled =
+                    crate::domain::providers::share_operations::provider_enabled(&plan, op);
                 let observed = crate::domain::providers::share_operations::observed_account_state(
                     &plan,
                     &accounts,
@@ -299,7 +372,25 @@ impl ServerStateInner {
                     _=>"unknown",
                 }
                 };
-                let binding_selected = supported
+                let account_support = match observed {
+                    Some(crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Supported) => "supported",
+                    Some(crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported) => "unsupported",
+                    _ => "unknown",
+                };
+                let unavailable_reason = if !driver_implemented {
+                    Some("driver_not_implemented")
+                } else if !provider_enabled {
+                    Some("provider_disabled")
+                } else if plan.configuration_state
+                    == crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
+                {
+                    Some("runtime_unavailable")
+                } else if account_support == "unsupported" {
+                    Some("account_unsupported")
+                } else {
+                    None
+                };
+                let binding_selected = unavailable_reason.is_none()
                     && policy.allowed_operations.contains(&op)
                     && requested_bindings.get(&op).is_none_or(|bindings| {
                         bindings
@@ -325,7 +416,7 @@ impl ServerStateInner {
                 let priced = generic_resource_priced(snapshot.as_ref().map(|(_, s)| s), model, op);
                 let mut scopes = Vec::new();
                 for (scope, p) in std::iter::once(("$default", None))
-                    .chain(policies.iter().map(|(e, p)| (e.as_str(), Some(p))))
+                    .chain(coverage_policies.iter().map(|(e, p)| (*e, Some(p))))
                 {
                     if p.and_then(|p| p.allowed_operations.as_ref())
                         .is_some_and(|ops| !ops.contains(&op))
@@ -371,6 +462,10 @@ impl ServerStateInner {
                     }
                 }
                 rows.push(serde_json::json!({"app":app,"operation":op,"bindingFingerprint":fingerprint,"execution":execution,"controllable":supported,"selected":binding_selected,
+                    "implemented":driver_implemented,"providerEnabled":provider_enabled,"accountSupport":account_support,"unavailableReason":unavailable_reason,
+                    "requiredProviderOption":crate::domain::providers::share_operations::required_provider_option(&plan,op),
+                    "providerLabel":crate::domain::providers::registry::profile_by_id(plan.profile_id.as_str()).map(|p|p.label.as_str()),
+                    "modelScope":if model.is_some(){"fixed"}else{"request"},"pricingCoverage":pricing_coverage(snapshot.as_ref().map(|(_,s)|s),model,op),
                     "source":"driver_contract","liveValidation":if execution=="supported"{"observed_account_evidence"}else{"live_pending"},"model":model,"measurement":if supported{"estimated"}else{"unavailable"},"nativeUnit":op.resource(),"pricing":if !priced{"missing"}else if model.and_then(|model|snapshot.as_ref().and_then(|(_,s)|s.model(model).ok())).and_then(|m|m.resources.get(op.resource())).is_some_and(|rate|rate=="0"){"explicit_free"}else{"priced"},"admission":if supported{"estimated_reservation"}else{"unavailable"},"scopes":scopes}));
             }
         }
@@ -397,6 +492,8 @@ impl ServerStateInner {
             acknowledgements.len() <= 16_384,
             "CAPABILITY_POLICY_TOO_LARGE"
         );
+        acknowledgements.sort_by(|a, b| a.condition.cmp(&b.condition));
+        acknowledgements.dedup_by(|a, b| a.condition == b.condition);
         let ticket = PreviewTicket {
             domain: "share-capability-preview-v1".into(),
             share_id: share.id.clone(),
@@ -444,7 +541,7 @@ impl ServerStateInner {
             None
         };
         Ok(
-            serde_json::json!({"shareId":share_id,"configRevision":share.config_revision,"catalogVersion":CAPABILITY_CATALOG_VERSION,"ready":ready,
+            serde_json::json!({"shareId":share_id,"configRevision":share.config_revision,"catalogVersion":CAPABILITY_CATALOG_VERSION,"displayVersion":2,"unavailableBindings":unavailable_bindings,"ready":ready,
             "legacy":share.capability_policy.is_none(),"policy":policy,"rows":rows,"requiredAcknowledgements":acknowledgements,"blockers":blockers,"recentUsage":recent_usage,"incidents":incidents,
             "previewCredential":credential,"generatedAt":now,"expiresAt":ticket.expires_at_ms,"pricingRevision":snapshot.map(|(r,_)|r),
             "reason":if ready{None}else{Some("CAPABILITY_UPGRADE_REQUIRED")}}),
@@ -613,7 +710,7 @@ impl ServerStateInner {
                 s.user_grants
                     .iter()
                     .filter(|(_, g)| g.active)
-                    .map(|(e, g)| (e.clone(), g.policy.clone()))
+                    .map(|(e, g)| (e.clone(), (g.policy.clone(), g.pending_value_quota.clone())))
                     .collect::<BTreeMap<_, _>>()
             };
             let changed = before.is_none_or(|s| {
@@ -654,13 +751,19 @@ impl ServerStateInner {
                     }
                     let priced =
                         generic_resource_priced(snapshot.as_ref().map(|(_, s)| s), model, *op);
-                    for (scope, p) in std::iter::once(("$default", None)).chain(
-                        share
-                            .user_grants
-                            .iter()
-                            .filter(|(_, g)| g.active)
-                            .map(|(e, g)| (e.as_str(), Some(&g.policy))),
-                    ) {
+                    for (scope, p) in
+                        std::iter::once(("$default", None)).chain(
+                            share.user_grants.iter().filter(|(_, g)| g.active).flat_map(
+                                |(e, g)| {
+                                    std::iter::once((e.as_str(), Some(&g.policy))).chain(
+                                        g.pending_value_quota
+                                            .as_ref()
+                                            .map(|pending| (e.as_str(), Some(&pending.policy))),
+                                    )
+                                },
+                            ),
+                        )
+                    {
                         if p.and_then(|p| p.allowed_operations.as_ref())
                             .is_some_and(|ops| !ops.contains(op))
                         {
@@ -829,5 +932,51 @@ impl ServerStateInner {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn capability_pricing_display_distinguishes_base_parameter_and_request_scope() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/share-value-pricing-v1.json"
+        ))
+        .unwrap();
+        let mut snapshot: PricingSnapshot =
+            serde_json::from_value(fixture["snapshot"].clone()).unwrap();
+        let op = ShareOperation::ImageGenerate;
+        assert_eq!(
+            pricing_coverage(None, Some("free-text"), op),
+            "tariff_unavailable"
+        );
+        assert_eq!(
+            pricing_coverage(Some(&snapshot), None, op),
+            "request_dependent"
+        );
+        assert_eq!(
+            pricing_coverage(Some(&snapshot), Some("absent"), op),
+            "missing"
+        );
+        let model = snapshot.models.get_mut("free-text").unwrap();
+        model
+            .resources
+            .insert("image.output/size=1024x1024".into(), "100".into());
+        assert_eq!(
+            pricing_coverage(Some(&snapshot), Some("free-text"), op),
+            "parameter_rates"
+        );
+        snapshot
+            .models
+            .get_mut("free-text")
+            .unwrap()
+            .resources
+            .insert("image.output".into(), "0".into());
+        assert_eq!(
+            pricing_coverage(Some(&snapshot), Some("free-text"), op),
+            "base_rate"
+        );
     }
 }

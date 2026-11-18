@@ -4,32 +4,28 @@ use crate::domain::sharing::capabilities::ShareOperation;
 use serde_json::Value;
 /// Driver/transport implementation capabilities, not a Provider-name whitelist.
 /// This describes controllable request intent, not successful upstream live verification.
-pub fn implemented(plan: &ProviderRuntimePlan, op: ShareOperation) -> bool {
+pub fn driver_implements(plan: &ProviderRuntimePlan, op: ShareOperation) -> bool {
     use ShareOperation::*;
     let driver = plan.driver_id.as_str();
     if crate::domain::usage::value_pricing::value_metering_strategy(driver).is_none() {
         return false;
     }
-    let grok_media = driver == "oauth.grok_responses";
+    // These transports have a narrower contract than their wire protocol.
+    // In particular, Grok Responses does not implement OpenAI file/code tools.
+    if driver == "oauth.grok_responses" {
+        return matches!(op, ImageGenerate | ImageEdit | VideoGenerate | WebSearch);
+    }
+    // The v1internal adapter translates Google Search for both App surfaces,
+    // including its model fallback. Other Gemini tools are not implied by it.
+    if matches!(driver, "special.antigravity" | "special.agy") {
+        return op == WebSearch;
+    }
     match op {
-        ImageGenerate | ImageEdit | VideoGenerate if grok_media => {
-            let key = match op {
-                ImageGenerate => "grokImageGenerationEnabled",
-                ImageEdit => "grokImageEditEnabled",
-                _ => "grokVideoGenerationEnabled",
-            };
-            plan.driver_options.get(key).and_then(Value::as_bool) == Some(true)
-        }
         ImageGenerate | ImageEdit => {
             matches!(
                 plan.upstream_protocol,
                 UpstreamProtocol::OpenAiResponses | UpstreamProtocol::GeminiNative
-            ) && (driver != "oauth.openai_codex"
-                || plan
-                    .driver_options
-                    .get("codexImageGenerationEnabled")
-                    .and_then(Value::as_bool)
-                    == Some(true))
+            )
         }
         AudioGenerate => matches!(
             plan.upstream_protocol,
@@ -57,6 +53,31 @@ pub fn implemented(plan: &ProviderRuntimePlan, op: ShareOperation) -> bool {
         // No reliable hosted computer/remote MCP collector and control contract yet.
         Computer | RemoteMcp | VideoGenerate => false,
     }
+}
+
+/// Provider configuration is separate from implementation and account evidence.
+pub fn required_provider_option(
+    plan: &ProviderRuntimePlan,
+    op: ShareOperation,
+) -> Option<&'static str> {
+    use ShareOperation::*;
+    match (plan.driver_id.as_str(), op) {
+        ("oauth.grok_responses", ImageGenerate) => Some("grokImageGenerationEnabled"),
+        ("oauth.grok_responses", ImageEdit) => Some("grokImageEditEnabled"),
+        ("oauth.grok_responses", VideoGenerate) => Some("grokVideoGenerationEnabled"),
+        ("oauth.openai_codex", ImageGenerate | ImageEdit) => Some("codexImageGenerationEnabled"),
+        _ => None,
+    }
+}
+
+pub fn provider_enabled(plan: &ProviderRuntimePlan, op: ShareOperation) -> bool {
+    required_provider_option(plan, op)
+        .is_none_or(|key| plan.driver_options.get(key).and_then(Value::as_bool) == Some(true))
+}
+
+/// Used by both preview and admission. A catalogue entry alone grants nothing.
+pub fn implemented(plan: &ProviderRuntimePlan, op: ShareOperation) -> bool {
+    driver_implements(plan, op) && provider_enabled(plan, op)
 }
 
 /// Reuse generation-scoped evidence where a Driver already publishes it.

@@ -1,3 +1,4 @@
+import { preservesCapabilitySchedule } from "@/lib/share-capabilities";
 import type { ShareBindings } from "@/lib/api";
 import type { ShareUserGrant, ShareUserGrantMap, ShareUserPolicy } from "@/lib/api/share";
 
@@ -25,7 +26,7 @@ export function sharePolicyKey(policy: ShareUserPolicy): string {
  * is saved. `valueMetering` is left alone so recorded USD usage is kept.
  */
 export function stageGrantPolicy(grant: ShareUserGrant, policy: ShareUserPolicy): ShareUserGrant {
-  return { ...grant, policy, pendingValueQuota: undefined,
+  return { ...grant, policy, pendingValueQuota: preservesCapabilitySchedule(grant, policy) ? grant.pendingValueQuota : undefined,
     quotaUnitConversion: grant.quotaUnitConversionPolicy === sharePolicyKey(policy) ? grant.quotaUnitConversion : undefined,
   };
 }

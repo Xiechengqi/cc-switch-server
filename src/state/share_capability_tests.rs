@@ -595,3 +595,341 @@ async fn capability_token_usage_shows_native_counts_without_inventing_usd_or_reu
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn capability_display_separates_driver_configuration_account_and_price_evidence() {
+    use crate::domain::providers::{registry::DriverId, share_operations::*};
+    use crate::domain::sharing::capabilities::ShareOperation::*;
+    let state = capability_test_state().await;
+    let share = state.shares.read().await.get("cap-share").unwrap().clone();
+    let preview = state
+        .preview_share_capabilities(
+            "cap-share",
+            crate::state::share_capability::CapabilityPreviewInput {
+                expected_config_revision: share.config_revision,
+                share_token_limit: None,
+                policy: None,
+                policies: BTreeMap::new(),
+                replace_policies: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["displayVersion"], 2);
+    let row = |op: &str| {
+        preview["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["operation"] == op)
+            .unwrap()
+    };
+    assert_eq!(row("tool.web_search")["implemented"], true);
+    assert_eq!(row("tool.web_search")["accountSupport"], "unknown");
+    assert_eq!(row("tool.web_search")["unavailableReason"], Value::Null);
+    assert_eq!(row("tool.computer")["implemented"], false);
+    assert_eq!(row("tool.computer")["accountSupport"], "unknown");
+    assert_eq!(
+        row("tool.computer")["unavailableReason"],
+        "driver_not_implemented"
+    );
+    let mut plan = state
+        .providers
+        .read()
+        .await
+        .runtime_plan(AppKind::Codex, "cap-provider")
+        .unwrap()
+        .as_ref()
+        .clone();
+    plan.driver_id = DriverId::parse("oauth.openai_codex").unwrap();
+    assert!(driver_implements(&plan, ImageGenerate));
+    assert!(!provider_enabled(&plan, ImageGenerate));
+    assert!(!implemented(&plan, ImageGenerate));
+    plan.driver_options
+        .insert("codexImageGenerationEnabled".into(), json!(true));
+    assert!(implemented(&plan, ImageGenerate));
+    plan.driver_id = DriverId::parse("oauth.grok_responses").unwrap();
+    for op in [
+        FileSearch,
+        CodeExecution,
+        AudioGenerate,
+        Computer,
+        RemoteMcp,
+    ] {
+        assert!(!driver_implements(&plan, op), "{op:?}");
+    }
+    assert!(driver_implements(&plan, WebSearch));
+    assert!(!implemented(&plan, VideoGenerate));
+    for driver in ["special.antigravity", "special.agy"] {
+        plan.driver_id = DriverId::parse(driver).unwrap();
+        assert!(implemented(&plan, WebSearch));
+        assert!(!implemented(&plan, ImageGenerate));
+    }
+}
+
+#[tokio::test]
+async fn capability_only_edit_preserves_scheduled_financial_terms_usage_and_activation() {
+    use crate::domain::sharing::{capabilities::*, router_contract::*};
+    use crate::domain::usage::value_pricing::{PricingSnapshot, ValueMeteringBinding, ValueQuota};
+    use crate::repository::server_sqlite::value_quota as ledger;
+    let state = capability_test_state().await;
+    let config = state.config_snapshot().await;
+    let snapshot: PricingSnapshot = serde_json::from_value(json!({
+        "schemaVersion":2,"tariffPolicyId":"api-equivalent-v2","currency":"USD","exactAliases":{},
+        "models":{"model":{"contextInputBasis":"rawInput","longContextThreshold":null,"longContextInclusive":false,
+            "rates":{"standard/base":{"input":"1000000","output":"1000000","cacheRead":null,"cacheWrite5m":null,"cacheWrite1h":null,"cacheWritePolicy":"unavailable"}},
+            "resources":{"tool.web_search":"1000000000"}}}
+    })).unwrap();
+    let revision = snapshot.revision().unwrap();
+    let identity = ledger::Scope {
+        router_url: config.router_api_base().unwrap().into(),
+        installation_id: "capability-install".into(),
+        share_id: "cap-share".into(),
+        email: "owner@example.com".into(),
+        entitlement_id: None,
+    };
+    ledger::install_snapshot(
+        &state.config_dir,
+        &identity,
+        &revision,
+        &snapshot,
+        now_ms_i64(),
+    )
+    .unwrap();
+    ledger::activate_snapshot(&state.config_dir, &identity, &revision).unwrap();
+    let boundary = (now_ms_i64() / 86_400_000 + 1) * 86_400_000;
+    state
+        .mutate_shares_immediate(|store| {
+            let grant = store
+                .shares
+                .iter_mut()
+                .find(|s| s.id == "cap-share")
+                .unwrap()
+                .user_grants
+                .get_mut("owner@example.com")
+                .unwrap();
+            grant.policy.token_period = ShareTokenPeriod::Day;
+            grant.policy.token_limit = Some(100);
+        })
+        .await
+        .unwrap();
+    let mut recorded = UsageLog::new(
+        AppKind::Codex,
+        "cap-provider".into(),
+        "Capability provider".into(),
+        ProviderType::Codex,
+        200,
+        1,
+        UsageModelMetadata {
+            model: Some("model".into()),
+            ..Default::default()
+        },
+        TokenUsage {
+            input_tokens: Some(17),
+            output_tokens: Some(20),
+            total_tokens: Some(37),
+            ..Default::default()
+        },
+    );
+    recorded.apply_context(UsageLogContext {
+        request_id: Some("before-capability-edit".into()),
+        share_id: Some("cap-share".into()),
+        user_email: Some("owner@example.com".into()),
+        ..Default::default()
+    });
+    state.push_usage_log(recorded).await.unwrap();
+    state
+        .record_share_invocation_result("cap-share", Some("owner@example.com"), 37, now_ms_i64())
+        .await;
+    state
+        .mutate_shares_immediate(|store| {
+            let share = store
+                .shares
+                .iter_mut()
+                .find(|s| s.id == "cap-share")
+                .unwrap();
+            let grant = share.user_grants.get_mut("owner@example.com").unwrap();
+            grant.policy.token_period = ShareTokenPeriod::Day;
+            grant.policy.token_limit = Some(100);
+            let mut future = grant.policy.clone();
+            future.token_limit = None;
+            future.value_quota = Some(ValueQuota {
+                limit_usd_micros: "1000000".into(),
+                tariff_policy_id: "api-equivalent-v1".into(),
+                unpriced_usage: Default::default(),
+            });
+            grant.pending_value_quota = Some(PendingValueQuota {
+                policy: future,
+                effective_from_ms: boundary,
+                retain_access: true,
+            });
+            grant.value_metering = Some(ValueMeteringBinding {
+                quota_policy_epoch: "legacy".into(),
+                value_metered_from_ms: boundary,
+                effective_from_ms: boundary,
+                pricing_revision: revision.clone(),
+            });
+        })
+        .await
+        .unwrap();
+    let before = state.shares.read().await.get("cap-share").unwrap().clone();
+    let old_grant = &before.user_grants["owner@example.com"];
+    let mut requested = old_grant
+        .pending_value_quota
+        .as_ref()
+        .unwrap()
+        .policy
+        .clone();
+    requested.allowed_operations = Some(vec![ShareOperation::WebSearch]);
+    requested.value_quota.as_mut().unwrap().tariff_policy_id = "api-equivalent-v2".into();
+    let policies = BTreeMap::from([("owner@example.com".into(), requested.clone())]);
+    let preview = state
+        .preview_share_capabilities(
+            "cap-share",
+            crate::state::share_capability::CapabilityPreviewInput {
+                expected_config_revision: before.config_revision,
+                share_token_limit: None,
+                policy: Some(ShareCapabilityPolicy {
+                    allowed_operations: vec![ShareOperation::WebSearch],
+                    ..Default::default()
+                }),
+                policies,
+                replace_policies: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["blockers"], json!([]));
+    let units = preview["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["operation"] == "tool.web_search")
+        .unwrap()["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["scope"] == "owner@example.com")
+        .map(|s| s["quotaUnit"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        units.contains(&"tokens") && units.contains(&"usdEquivalent"),
+        "{units:?}"
+    );
+    let patch = ShareSettingsPatch {
+        capability_policy: Some(serde_json::from_value(preview["policy"].clone()).unwrap()),
+        capability_consent: Some(CapabilityConsent {
+            credential: preview["previewCredential"].as_str().unwrap().into(),
+            accept_uncovered: preview["requiredAcknowledgements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["condition"].as_str().unwrap().into())
+                .collect(),
+        }),
+        user_grant_edits: Some(BTreeMap::from([(
+            "owner@example.com".into(),
+            ShareUserGrantEdit {
+                expected_revision: old_grant.revision,
+                policy: Some(requested),
+            },
+        )])),
+        edit_context: Some(ShareSettingsEditContext {
+            operation_id: "scheduled-capability-edit".into(),
+            expected_config_revision: before.config_revision,
+            actor: Some("owner@example.com".into()),
+        }),
+        ..Default::default()
+    };
+    let mut rejected = patch.clone();
+    rejected
+        .capability_consent
+        .as_mut()
+        .unwrap()
+        .accept_uncovered
+        .clear();
+    assert!(state
+        .apply_share_settings_patch_immediate("cap-share", rejected)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("QUOTA_COVERAGE_REQUIRED"));
+    let financial = |grant: &ShareUserGrant| {
+        (
+            grant.policy.clone(),
+            grant.pending_value_quota.clone(),
+            grant.value_metering.clone(),
+            grant.usage.day.tokens_used,
+            grant.usage.lifetime.tokens_used,
+            grant.usage_rebase.clone(),
+            grant.revision,
+        )
+    };
+    let rejected_state = state.shares.read().await.get("cap-share").unwrap().clone();
+    assert_eq!(
+        financial(&rejected_state.user_grants["owner@example.com"]),
+        financial(old_grant)
+    );
+    assert_eq!(rejected_state.config_revision, before.config_revision);
+    assert_eq!(rejected_state.capability_policy, before.capability_policy);
+    let saved = state
+        .apply_share_settings_patch_immediate("cap-share", patch)
+        .await
+        .unwrap()
+        .unwrap();
+    let grant = &saved.user_grants["owner@example.com"];
+    assert_eq!(grant.policy.token_limit, Some(100));
+    assert!(grant.policy.value_quota.is_none());
+    assert_eq!(
+        grant.policy.allowed_operations,
+        Some(vec![ShareOperation::WebSearch])
+    );
+    let pending = grant.pending_value_quota.as_ref().unwrap();
+    assert_eq!(pending.effective_from_ms, boundary);
+    assert!(pending.retain_access);
+    assert_eq!(
+        pending
+            .policy
+            .value_quota
+            .as_ref()
+            .unwrap()
+            .limit_usd_micros,
+        "1000000"
+    );
+    assert_eq!(
+        pending
+            .policy
+            .value_quota
+            .as_ref()
+            .unwrap()
+            .tariff_policy_id,
+        "api-equivalent-v2"
+    );
+    assert_eq!(
+        pending.policy.allowed_operations,
+        grant.policy.allowed_operations
+    );
+    assert_eq!(grant.value_metering, old_grant.value_metering);
+    assert_eq!(grant.usage.day.tokens_used, 37);
+    assert_eq!(grant.usage.day.tokens_used, old_grant.usage.day.tokens_used);
+    assert_eq!(
+        grant.usage.lifetime.tokens_used,
+        old_grant.usage.lifetime.tokens_used
+    );
+    let persisted = crate::repository::server_sqlite::load_authoritative(&state.config_dir)
+        .unwrap()
+        .shares;
+    assert_eq!(
+        financial(&persisted.get("cap-share").unwrap().user_grants["owner@example.com"]),
+        financial(grant)
+    );
+    let before_store = state.shares.read().await.clone();
+    let mut activated = before_store.clone();
+    state
+        .prepare_value_bindings_at(&mut activated, &before_store, boundary)
+        .await
+        .unwrap();
+    let active = &activated.get("cap-share").unwrap().user_grants["owner@example.com"];
+    assert!(active.pending_value_quota.is_none());
+    assert_eq!(active.policy, pending.policy);
+}

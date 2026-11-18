@@ -1428,6 +1428,7 @@ impl ShareStore {
                 user_grants,
                 &preserved_user_grants,
                 share.owner_email.as_deref(),
+                &BTreeSet::new(),
             )?;
         }
         reconcile_user_grants(&mut share);
@@ -2711,6 +2712,21 @@ impl ShareStore {
                 "CAPABILITY_PREVIEW_EXPIRED".into(),
             ));
         }
+        let preserve_capability_schedules = if patch.validated_capability_policy.is_some() {
+            share
+                .user_grants
+                .keys()
+                .filter(|email| {
+                    !patch
+                        .user_quota_conversions
+                        .as_ref()
+                        .is_some_and(|edits| edits.contains_key(*email))
+                })
+                .cloned()
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
         if let Some(policy) = patch.validated_capability_policy {
             policy.validate().map_err(SharePatchError::Invalid)?;
             share.capability_policy = Some(policy);
@@ -2778,8 +2794,12 @@ impl ShareStore {
                     merged.remove(email);
                 }
             }
-            share.user_grants =
-                normalize_user_grants(&merged, &share.user_grants, share.owner_email.as_deref())?;
+            share.user_grants = normalize_user_grants(
+                &merged,
+                &share.user_grants,
+                share.owner_email.as_deref(),
+                &preserve_capability_schedules,
+            )?;
         }
         let explicit_user_grants = patch.user_grants;
         if let Some(user_grants) = explicit_user_grants.as_ref() {
@@ -2787,6 +2807,7 @@ impl ShareStore {
                 user_grants,
                 &share.user_grants,
                 share.owner_email.as_deref(),
+                &preserve_capability_schedules,
             )?;
         }
         if let Some(auto_start) = patch.auto_start {
@@ -4747,6 +4768,7 @@ fn normalize_user_grants(
     incoming: &BTreeMap<String, ShareUserGrant>,
     existing: &BTreeMap<String, ShareUserGrant>,
     owner_email: Option<&str>,
+    preserve_capability_schedules: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, ShareUserGrant>, SharePatchError> {
     let now = now_ms();
     let owner = owner_email.map(|value| value.trim().to_ascii_lowercase());
@@ -4824,6 +4846,42 @@ fn normalize_user_grants(
         grant.pending_value_quota = previous
             .and_then(|item| item.pending_value_quota.clone())
             .filter(|pending| pending.policy == incoming_grant.policy);
+        if preserve_capability_schedules.contains(&email) {
+            if let Some(previous) = previous {
+                if let Some(scheduled) = super::capabilities::scheduled_capability_policy(
+                    previous,
+                    &incoming_grant.policy,
+                )
+                .filter(|_| {
+                    std::iter::once(&previous.policy)
+                        .chain(previous.pending_value_quota.as_ref().map(|p| &p.policy))
+                        .any(|original| {
+                            super::capabilities::capability_only_change(
+                                original,
+                                &incoming_grant.policy,
+                            )
+                        })
+                }) {
+                    grant.policy = previous.policy.clone();
+                    grant.policy.allowed_operations =
+                        incoming_grant.policy.allowed_operations.clone();
+                    if incoming_grant.policy.value_quota.as_ref().is_some_and(|q| {
+                        q.tariff_policy_id
+                            == crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY
+                    }) {
+                        if let Some(q) = grant.policy.value_quota.as_mut() {
+                            q.tariff_policy_id =
+                                crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY.into();
+                        }
+                    }
+                    grant.pending_value_quota =
+                        previous.pending_value_quota.clone().map(|mut pending| {
+                            pending.policy = scheduled;
+                            pending
+                        });
+                }
+            }
+        }
         // Usage snapshots and rebases are Server-owned.  Never trust either
         // value from a browser/Router patch; preserve the current durable
         // rebase and rebuild the derived snapshot below.

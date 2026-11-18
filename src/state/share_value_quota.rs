@@ -1616,7 +1616,9 @@ impl ServerStateInner {
         let mut activating = None;
         // Keep the previous policy enforced until the scheduled activation.
         if let Some(pending) = grant.pending_value_quota.clone() {
-            let background = old.is_some_and(|g| g.policy == requested);
+            let background = old.is_some_and(|g| {
+                crate::domain::sharing::capabilities::same_quota_terms(&g.policy, &requested)
+            });
             if now >= pending.effective_from_ms && (background || requested == pending.policy) {
                 grant.policy = pending.policy.clone();
                 grant.pending_value_quota = None;

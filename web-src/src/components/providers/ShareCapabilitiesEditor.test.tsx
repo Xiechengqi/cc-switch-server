@@ -1,21 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, useState } from "react";
+import { act, createRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import i18n from "@/i18n";
 import {
   emptyCapabilityPolicy,
-  capabilityQuotaContext,
   SHARE_OPERATIONS,
+  type CapabilityApproval,
   type CapabilityPreview,
+  type CapabilityReviewHandle,
   type ShareCapabilityPolicy,
-  type CapabilityConsent,
 } from "@/lib/share-capabilities";
 import type { ShareUserGrantMap } from "@/lib/api/share";
 const api = vi.hoisted(() => ({ previewCapabilities: vi.fn() }));
 vi.mock("@/lib/api/share", () => ({ shareApi: api }));
 import { ShareCapabilitiesEditor } from "./ShareCapabilitiesEditor";
+import { ShareCapabilityPermissionFields } from "./ShareCapabilityPermissionFields";
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 const operation = "tool.web_search" as const;
+const fp = "a".repeat(64);
+let liveFingerprint = fp;
 function preview(
   input: {
     policy?: ShareCapabilityPolicy;
@@ -26,8 +29,24 @@ function preview(
   },
   shareId = "share",
 ): CapabilityPreview {
-  const policy = input.policy ?? emptyCapabilityPolicy();
-  const selected = policy.allowedOperations.includes(operation);
+  const requested = input.policy ?? emptyCapabilityPolicy();
+  const enabled = requested.allowedOperations.includes(operation);
+  const selected =
+    enabled &&
+    (!requested.operationBindings[operation] ||
+      requested.operationBindings[operation]?.some(
+        (b) => b.fingerprint === liveFingerprint,
+      ));
+  const policy = {
+    ...requested,
+    operationBindings: enabled
+      ? {
+          [operation]: selected
+            ? [{ app: "codex", fingerprint: liveFingerprint }]
+            : [],
+        }
+      : {},
+  };
   const scopes = Object.entries(input.policies)
     .filter(
       ([, p]) =>
@@ -36,15 +55,16 @@ function preview(
     .map(([scope, p]) => ({
       scope,
       quotaUnit: p.valueQuota ? "usdEquivalent" : "tokens",
-      coverage: p.valueQuota ? "unknown" : "partial",
+      coverage: "partial",
       reason: p.valueQuota
         ? "priced_requests_only"
         : "resource_not_in_token_ledger",
-      condition: p.valueQuota ? undefined : `gap:${scope}`,
+      condition: p.valueQuota ? undefined : `gap:${scope}:${liveFingerprint}`,
     }));
   return {
     shareId,
     configRevision: 1,
+    displayVersion: 2,
     ready: true,
     legacy: false,
     policy,
@@ -58,7 +78,7 @@ function preview(
             scope: s.scope,
             operation,
             quotaUnit: s.quotaUnit,
-            bindingFingerprint: "a".repeat(64),
+            bindingFingerprint: liveFingerprint,
             actor: "",
             acceptedAtMs: 0,
           }))
@@ -66,8 +86,14 @@ function preview(
     rows: SHARE_OPERATIONS.map((op) => ({
       app: "codex",
       operation: op,
-      bindingFingerprint: "a".repeat(64),
+      bindingFingerprint: liveFingerprint,
       controllable: op === operation,
+      implemented: op === operation,
+      providerEnabled: true,
+      accountSupport: "unknown",
+      unavailableReason: op === operation ? null : "driver_not_implemented",
+      modelScope: "request",
+      pricingCoverage: "request_dependent",
       selected: op === operation && selected,
       execution: "unknown",
       measurement: "estimated",
@@ -83,6 +109,7 @@ let container: HTMLDivElement;
 beforeEach(async () => {
   await i18n.changeLanguage("en");
   vi.useFakeTimers();
+  liveFingerprint = fp;
   api.previewCapabilities.mockReset();
   api.previewCapabilities.mockImplementation((shareId, input) =>
     Promise.resolve(preview(input, shareId)),
@@ -97,47 +124,36 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 const button = (label: string) =>
-  Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
+  Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
     (b) => b.textContent === label,
   )!;
-const input = (label: string) =>
-  Array.from(container.querySelectorAll<HTMLLabelElement>("label"))
-    .find((l) => l.textContent === label)!
+const checkbox = (label: string) =>
+  Array.from(document.querySelectorAll<HTMLLabelElement>("label"))
+    .find((l) => l.textContent?.startsWith(label))!
     .querySelector<HTMLInputElement>("input")!;
 async function flush() {
   await act(async () => {
     await vi.advanceTimersByTimeAsync(250);
   });
 }
-describe("Server-native capability configuration", () => {
-  it("requires scoped Token acceptance, invalidates it after changing unit and protects managed grants", async () => {
-    let latest: {
-      policy: ShareCapabilityPolicy;
-      consent?: CapabilityConsent;
-      valid: boolean;
-    };
+const grants: ShareUserGrantMap = Object.fromEntries(
+  ["a@example.com", "b@example.com"].map((email) => [
+    email,
+    {
+      email,
+      role: "shareto",
+      active: true,
+      policy: { tokenPeriod: "day", tokenLimit: 100000000 },
+    },
+  ]),
+);
+
+describe("Server extension configuration", () => {
+  it("filters unsupported operations and reviews grouped risks only when saving", async () => {
+    const ref = createRef<CapabilityReviewHandle>();
+    let latest: CapabilityApproval | null = null;
     function Harness() {
       const [policy, setPolicy] = useState(emptyCapabilityPolicy);
-      const [grants, setGrants] = useState<ShareUserGrantMap>({
-        "a@example.com": {
-          email: "a@example.com",
-          role: "shareto",
-          active: true,
-          policy: { tokenPeriod: "day", tokenLimit: 100000000 },
-        },
-        "market@example.com": {
-          email: "market@example.com",
-          role: "shareto",
-          active: true,
-          manager: "routerShareMarket",
-          policy: { tokenPeriod: "day", allowedOperations: [] },
-        },
-      });
-      const [consent, setConsent] = useState<CapabilityConsent>();
-      const [scope, setScope] = useState<string>();
-      const valid =
-        !!consent && scope === capabilityQuotaContext(policy, grants, -1);
-      latest = { policy, consent, valid };
       return (
         <>
           <ShareCapabilitiesEditor
@@ -147,73 +163,50 @@ describe("Server-native capability configuration", () => {
             savedPolicy={emptyCapabilityPolicy()}
             grants={grants}
             tokenLimit={-1}
-            onChange={(p, c) => {
-              setPolicy(p);
-              setConsent(c);
-              setScope(c ? capabilityQuotaContext(p, grants, -1) : undefined);
-            }}
-            onGrantOperationsChange={(email, allowedOperations) => {
-              setGrants((current) => ({
-                ...current,
-                [email]: {
-                  ...current[email],
-                  policy: { ...current[email].policy, allowedOperations },
-                },
-              }));
-              setConsent(undefined);
-            }}
+            reviewRef={ref}
+            onChange={setPolicy}
           />
           <button
-            onClick={() =>
-              setGrants((current) => ({
-                ...current,
-                "a@example.com": {
-                  ...current["a@example.com"],
-                  policy: {
-                    tokenPeriod: "day",
-                    valueQuota: {
-                      limitUsdMicros: "100000000",
-                      tariffPolicyId: "api-equivalent-v2",
-                      unpricedUsage: "reject",
-                    },
-                  },
-                },
-              }))
-            }
+            onClick={async () => {
+              latest = await ref.current!.review();
+            }}
           >
-            Switch unit
+            Save settings
           </button>
         </>
       );
     }
     await act(async () => root.render(<Harness />));
     await flush();
-    expect(latest!.policy.allowedOperations).toEqual([]);
-    await act(async () => input("Web search").click());
+    expect(container.querySelectorAll('input[type="checkbox"]')).toHaveLength(
+      1,
+    );
+    expect(container.textContent).not.toContain("Hosted computer");
+    await act(async () => checkbox("Web search").click());
     await flush();
-    expect(button("Confirm capabilities").disabled).toBe(true);
-    const accept = Array.from(
-      container.querySelectorAll<HTMLLabelElement>("label"),
-    )
-      .find((l) => l.textContent?.startsWith("a@example.com · Web search"))!
-      .querySelector<HTMLInputElement>("input")!;
-    await act(async () => accept.click());
-    await act(async () => button("Confirm capabilities").click());
-    expect(latest!.valid).toBe(true);
-    expect(latest!.consent?.acceptUncovered).toEqual(["gap:a@example.com"]);
-    await act(async () => button("Switch unit").click());
-    await flush();
-    expect(latest!.valid).toBe(false);
-    await act(async () => button("Confirm capabilities").click());
-    expect(latest!.consent?.acceptUncovered).toEqual([]);
-    expect(latest!.valid).toBe(true);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    const calls = api.previewCapabilities.mock.calls.length;
+    await act(async () => button("Save settings").click());
+    expect(api.previewCapabilities.mock.calls.length).toBe(calls + 1);
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(button("Confirm and save").disabled).toBe(true);
     expect(
-      container.querySelector(
-        'select[aria-label="market@example.com capabilities"]',
-      ),
-    ).toBeNull();
+      document.querySelectorAll('[role="dialog"] input[type="checkbox"]'),
+    ).toHaveLength(1);
+    await act(async () =>
+      checkbox("I understand and allow this uncovered usage").click(),
+    );
+    await act(async () => button("Confirm and save").click());
+    expect(latest!.consent.acceptUncovered).toEqual([
+      `gap:a@example.com:${fp}`,
+      `gap:b@example.com:${fp}`,
+    ]);
+    expect(latest!.policy.operationBindings[operation]).toEqual([
+      { app: "codex", fingerprint: fp },
+    ]);
   });
-  it("discards late previews from a previous Share even when the transport ignores abort", async () => {
+
+  it("discards late previews from a previous Share even when transport ignores abort", async () => {
     const waiting = new Map<string, (value: CapabilityPreview) => void>();
     api.previewCapabilities.mockImplementation(
       (id) => new Promise((resolve) => waiting.set(id, resolve)),
@@ -224,7 +217,6 @@ describe("Server-native capability configuration", () => {
       grants: {},
       tokenLimit: -1,
       onChange: vi.fn(),
-      onGrantOperationsChange: vi.fn(),
     };
     await act(async () =>
       root.render(<ShareCapabilitiesEditor {...props} shareId="old" />),
@@ -238,15 +230,139 @@ describe("Server-native capability configuration", () => {
       { policy: emptyCapabilityPolicy(), policies: {} },
       "new",
     );
-    next.rows[0].app = "current";
+    next.rows.find((r) => r.operation === operation)!.providerLabel = "current";
     await act(async () => waiting.get("new")!(next));
     const old = preview(
       { policy: emptyCapabilityPolicy(), policies: {} },
       "old",
     );
-    old.rows[0].app = "late-old";
+    old.rows.find((r) => r.operation === operation)!.providerLabel = "late-old";
     await act(async () => waiting.get("old")!(old));
     expect(container.textContent).toContain("current");
     expect(container.textContent).not.toContain("late-old");
+  });
+
+  it("requires deliberate reauthorization of changed bindings and keeps newly added Apps disabled", async () => {
+    liveFingerprint = "b".repeat(64);
+    const ref = createRef<CapabilityReviewHandle>();
+    const policy: ShareCapabilityPolicy = {
+      ...emptyCapabilityPolicy(),
+      allowedOperations: [operation],
+      operationBindings: { [operation]: [{ app: "codex", fingerprint: fp }] },
+    };
+    const request = api.previewCapabilities.getMockImplementation()!;
+    api.previewCapabilities.mockImplementation(async (id, input) => {
+      const result = await request(id, input);
+      result.rows.push({
+        ...result.rows.find(
+          (r: CapabilityPreview["rows"][number]) => r.operation === operation,
+        )!,
+        app: "claude",
+        selected: false,
+      });
+      return result;
+    });
+    await act(async () =>
+      root.render(
+        <ShareCapabilitiesEditor
+          shareId="share"
+          revision={1}
+          policy={policy}
+          savedPolicy={policy}
+          grants={{}}
+          tokenLimit={-1}
+          reviewRef={ref}
+          onChange={vi.fn()}
+        />,
+      ),
+    );
+    await flush();
+    let pending: Promise<CapabilityApproval | null>;
+    await act(async () => {
+      pending = ref.current!.review();
+    });
+    expect(document.body.textContent).toContain(
+      "The account or execution binding changed",
+    );
+    expect(button("Confirm and save").disabled).toBe(true);
+    await act(async () => checkbox("Authorize the current binding").click());
+    await act(async () => button("Confirm and save").click());
+    const approval = await pending!;
+    expect(approval!.policy.operationBindings[operation]).toEqual([
+      { app: "codex", fingerprint: liveFingerprint },
+    ]);
+  });
+
+  it("cancels a pending save on scope changes and reports rebinding transport failures", async () => {
+    const ref = createRef<CapabilityReviewHandle>();
+    const policy: ShareCapabilityPolicy = {
+      ...emptyCapabilityPolicy(),
+      allowedOperations: [operation],
+    };
+    const props = {
+      shareId: "share",
+      revision: 1,
+      policy,
+      savedPolicy: emptyCapabilityPolicy(),
+      grants,
+      tokenLimit: -1,
+      reviewRef: ref,
+      onChange: vi.fn(),
+    };
+    await act(async () => root.render(<ShareCapabilitiesEditor {...props} />));
+    await flush();
+    let pending: Promise<CapabilityApproval | null>;
+    await act(async () => {
+      pending = ref.current!.review();
+    });
+    await act(async () =>
+      root.render(<ShareCapabilitiesEditor {...props} tokenLimit={100} />),
+    );
+    expect(await pending!).toBeNull();
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    liveFingerprint = "b".repeat(64);
+    const oldBinding = {
+      ...policy,
+      operationBindings: { [operation]: [{ app: "codex", fingerprint: fp }] },
+    };
+    await act(async () =>
+      root.render(<ShareCapabilitiesEditor {...props} policy={oldBinding} />),
+    );
+    await flush();
+    api.previewCapabilities
+      .mockImplementationOnce((id, input) =>
+        Promise.resolve(preview(input, id)),
+      )
+      .mockRejectedValueOnce(new Error("rebind unavailable"));
+    await act(async () => {
+      await expect(ref.current!.review()).rejects.toThrow("rebind unavailable");
+    });
+    expect(container.textContent).toContain("rebind unavailable");
+  });
+
+  it("choosing a custom subset starts with the existing Share choices", async () => {
+    let value: string[] | undefined;
+    function Harness() {
+      const [operations, setOperations] = useState<(typeof operation)[]>();
+      value = operations;
+      return (
+        <ShareCapabilityPermissionFields
+          value={operations}
+          available={[operation]}
+          onChange={setOperations}
+        />
+      );
+    }
+    await act(async () => root.render(<Harness />));
+    const select = container.querySelector("select")!;
+    await act(async () => {
+      select.value = "custom";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(value).toEqual([operation]);
+    expect(checkbox("Web search").checked).toBe(true);
+    await act(async () => checkbox("Web search").click());
+    expect(value).toEqual([]);
+    expect(select.value).toBe("disabled");
   });
 });
