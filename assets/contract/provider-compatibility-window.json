@@ -13,11 +13,11 @@
   "currentSourceEvidence": [
     {
       "path": "src/api/mod.rs",
-      "sha256": "34e4e999c7cbf68109e611decc8032216a38cafb545808ef12d018744a665566"
+      "sha256": "4faca6fb3df94f7d47731094b4a7293c6fbd2c7e7789145e719d76fad15a3aee"
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "12b9ed7055cfb410ab0eee341814156dd6f088d4ac6313d5eb5ac263ae88f70f"
+      "sha256": "2b682924305439dbed83cfe1eda0fc5c15ba7c279406817cf614ecc0993ffc5f"
     },
     {
       "path": "src/domain/providers/credentials.rs",
@@ -33,7 +33,7 @@
     },
     {
       "path": "src/domain/providers/runtime.rs",
-      "sha256": "1ac3d66a2481f1351fa50bdd710c8a13aee5f0dbc4ca8494fd90fae8417f2263"
+      "sha256": "05ed8621b34d4bda460bfb4470b3a870d1d9e402be15e7de929a9b2f2c3ceead"
     },
     {
       "path": "src/domain/providers/store.rs",

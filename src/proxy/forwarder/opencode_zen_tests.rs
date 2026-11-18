@@ -297,6 +297,19 @@ async fn opencode_zen_loopback_quota_failure_is_not_replayed_or_leaked() {
     assert!(!error.message.contains("private-upstream-body"));
     assert!(error.message.contains("safe-123"));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(error.retry_after_seconds(), Some(3));
+    let mut second_request =
+        zen_test_options(&state, json!({"model":"chat-free","messages":[]})).await;
+    second_request.request_context.request_id = Some("zen-second-receipt".into());
+    second_request.request_context.user_email = Some("other@example.test".into());
+    assert_eq!(
+        forward_opencode_zen_at(second_request, &origin)
+            .await
+            .unwrap_err()
+            .status,
+        429
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_ne!(
         state
             .usage_snapshot()
@@ -317,7 +330,13 @@ fn opencode_zen_continuation_uses_remaining_budget_and_rejects_tools() {
     let prepared = zen_continuation_request(
         &request,
         ProxyRoute::CodexChatCompletions,
-        super::super::opencode_zen::CatalogEndpoint::LegacyChat,
+        &super::super::opencode_zen::ZenAdmission {
+            endpoint: super::super::opencode_zen::CatalogEndpoint::LegacyChat,
+            capabilities: Default::default(),
+            stale: false,
+            context_window: None,
+            max_output_tokens: None,
+        },
         super::super::opencode_zen::ContinuationKind::MaxTokens,
         &first,
         tokio::time::Instant::now() + Duration::from_secs(10),
@@ -465,4 +484,79 @@ async fn opencode_zen_fixed_models_choose_upstream_wire_before_conversion() {
             server.abort();
         }
     }
+}
+
+#[tokio::test]
+async fn opencode_zen_catalog_wait_obeys_total_deadline_and_records_preflight_failure_once() {
+    use super::super::opencode_zen as zen;
+    let _lock = zen::CATALOG_TEST_LOCK.lock().await;
+    let state = forwarder_test_state("zen-catalog-deadline");
+    let mut options = zen_test_options(&state, json!({"model":"chat-free","messages":[]})).await;
+    options.started =
+        Instant::now() - options.execution.request_timeout() + Duration::from_millis(40);
+    let catalog_flight = zen::lock_catalog_refresh_for_test().await;
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        forward_opencode_zen_at(options, "http://127.0.0.1:9"),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.status, 504);
+    assert!(error.message.contains("catalog deadline"));
+    drop(catalog_flight);
+    let usage = state.usage_snapshot().await;
+    let logs: Vec<_> = usage
+        .logs
+        .iter()
+        .filter(|log| log.request_id == "zen-receipt")
+        .collect();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(
+        logs[0].failure_kind.as_deref(),
+        Some("zen_preflight_rejected")
+    );
+    assert_eq!(logs[0].usage_state, UsageState::NotApplicable);
+}
+
+#[test]
+fn opencode_zen_retry_after_accepts_http_date_and_never_echoes_unsafe_identifiers() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "retry-after",
+        httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(30))
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        "x-request-id",
+        "unsafe-query?secret=private".parse().unwrap(),
+    );
+    let error = zen_status_error(StatusCode::TOO_MANY_REQUESTS, &headers);
+    assert!(matches!(error.retry_after_seconds(), Some(28..=30)));
+    assert!(!error.client_message().contains("private"));
+}
+
+#[test]
+fn opencode_zen_does_not_append_a_second_schema_document_to_a_truncated_answer() {
+    use super::super::opencode_zen as zen;
+    let request = json!({"model":"chat-free","messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}});
+    let first = json!({"choices":[{"message":{"content":"{\"partial\":"},"finish_reason":"length"}],"usage":{"completion_tokens":100}});
+    let admitted = zen::ZenAdmission {
+        endpoint: zen::CatalogEndpoint::Chat,
+        capabilities: Default::default(),
+        stale: false,
+        context_window: None,
+        max_output_tokens: None,
+    };
+    assert!(zen_continuation_request(
+        &request,
+        ProxyRoute::CodexChatCompletions,
+        &admitted,
+        zen::ContinuationKind::MaxTokens,
+        &first,
+        tokio::time::Instant::now() + Duration::from_secs(2)
+    )
+    .unwrap()
+    .is_none());
 }

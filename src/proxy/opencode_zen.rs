@@ -13,8 +13,8 @@ use serde_json::{Map, Value};
 pub const ORIGIN: &str = "https://opencode.ai";
 pub const CLIENT_UA: &str = "opencode/latest/2.1.3/cli";
 pub const PUBLIC_ACCOUNT_ID: &str = "opencode-zen-public";
-/// Local default when a request names no model. The id is a free-lane id;
-/// a paid id is never substituted.
+/// Historical fixture ID. Production requests always require an explicit model.
+#[cfg(test)]
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash-free";
 const SESSION_CAP: usize = 4096;
 const SESSION_REMINT_MS: i64 = 6 * 24 * 60 * 60 * 1000;
@@ -491,6 +491,17 @@ fn alias_history_tool_calls(body: &mut Map<String, Value>, rename: &BTreeMap<Str
         return;
     };
     for message in messages {
+        if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    if let Some(name) = part.get("name").and_then(Value::as_str) {
+                        if let Some(alias) = alias_for(rename, name) {
+                            part["name"] = Value::String(alias);
+                        }
+                    }
+                }
+            }
+        }
         let Some(calls) = message
             .as_object_mut()
             .and_then(|map| map.get_mut("tool_calls"))
@@ -658,12 +669,15 @@ pub fn chat_body(model: &str, messages: Value, stream: bool) -> (Value, BTreeMap
 
 /// One prepared upstream call: the path, the encoded body, and the tool-name
 /// map that a response must restore.
+#[derive(Debug)]
 pub struct PreparedUpstream {
     pub path: &'static str,
     pub body: Vec<u8>,
     pub rename: BTreeMap<String, String>,
     pub stream: bool,
     pub wire: ZenWire,
+    /// Client-declared names on the sent wire, excluding injected placeholders.
+    pub client_tool_names: std::collections::BTreeSet<String>,
 }
 
 /// Translate a Claude Messages or OpenAI Chat/Responses body onto the wire
@@ -689,7 +703,8 @@ fn prepare_upstream_at(
     let model = requested
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_MODEL);
+        .filter(|m| !m.trim().is_empty())
+        .ok_or_else(|| PrepareError::Encode("OpenCode Zen model is required".into()))?;
     if tool_choice_rejected(requested) {
         return Err(PrepareError::ToolChoiceNone);
     }
@@ -712,7 +727,24 @@ fn prepare_upstream_at(
             FingerprintStyle::Chat,
         ),
     };
+    let client_names: Vec<_> = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(tool_name)
+        .map(str::to_string)
+        .collect();
     let rename = apply_fingerprint_style(&mut body, style);
+    let client_tool_names = client_names
+        .into_iter()
+        .map(|name| {
+            rename
+                .iter()
+                .find_map(|(alias, original)| (original == &name).then(|| alias.clone()))
+                .unwrap_or(name)
+        })
+        .collect();
     let bytes = marshal_upstream(&body).map_err(PrepareError::Encode)?;
     Ok(PreparedUpstream {
         path: endpoint.path(),
@@ -720,15 +752,41 @@ fn prepare_upstream_at(
         rename,
         stream,
         wire,
+        client_tool_names,
     })
 }
 
 /// This reviewed lane publishes text/tools only. Reject unsupported payloads
 /// before generic converters could drop or reshape them into empty text.
 pub(super) fn validate_source_request(request: &Value) -> Result<(), super::ProxyError> {
+    if request
+        .get("store")
+        .is_some_and(|v| !v.is_null() && !v.is_boolean())
+    {
+        return Err(super::ProxyError::bad_request(
+            "OpenCode Zen store must be a boolean",
+        ));
+    }
     if request.get("n").is_some_and(|n| n.as_u64() != Some(1)) {
         return Err(super::ProxyError::bad_request(
             "OpenCode Zen supports one completion per request",
+        ));
+    }
+    let limits: Vec<_> = ["max_tokens", "max_output_tokens", "max_completion_tokens"]
+        .iter()
+        .filter_map(|key| request.get(*key))
+        .collect();
+    if limits.windows(2).any(|v| v[0] != v[1]) {
+        return Err(super::ProxyError::bad_request(
+            "OpenCode Zen output ceilings conflict",
+        ));
+    }
+    if request.get("stop").is_some()
+        && request.get("stop_sequences").is_some()
+        && request["stop"] != request["stop_sequences"]
+    {
+        return Err(super::ProxyError::bad_request(
+            "OpenCode Zen stop controls conflict",
         ));
     }
     for key in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
@@ -745,6 +803,16 @@ pub(super) fn validate_source_request(request: &Value) -> Result<(), super::Prox
         match value {
             Value::Array(items) => items.iter().any(media),
             Value::Object(map) => {
+                if map.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "tool_use" | "function_call" | "custom_tool_call" | "tool_search_call"
+                    )
+                }) {
+                    // Caller-defined tool arguments are opaque JSON, including
+                    // objects whose own fields happen to resemble media parts.
+                    return false;
+                }
                 map.get("type").and_then(Value::as_str).is_some_and(|kind| {
                     matches!(
                         kind,
@@ -775,10 +843,28 @@ pub(super) fn validate_source_request(request: &Value) -> Result<(), super::Prox
 }
 
 /// Convert from the actual ingress protocol, never infer it from optional fields.
+#[cfg(test)]
 pub(super) fn prepare_for_route(
     requested: &Value,
     route: super::ProxyRoute,
     endpoint: CatalogEndpoint,
+) -> Result<PreparedUpstream, super::ProxyError> {
+    prepare_for_route_inner(requested, route, endpoint, None)
+}
+
+pub(super) fn prepare_for_model(
+    requested: &Value,
+    route: super::ProxyRoute,
+    admitted: &catalog::ZenAdmission,
+) -> Result<PreparedUpstream, super::ProxyError> {
+    prepare_for_route_inner(requested, route, admitted.endpoint, Some(admitted))
+}
+
+fn prepare_for_route_inner(
+    requested: &Value,
+    route: super::ProxyRoute,
+    endpoint: CatalogEndpoint,
+    admitted: Option<&catalog::ZenAdmission>,
 ) -> Result<PreparedUpstream, super::ProxyError> {
     validate_source_request(requested)?;
     if tool_choice_rejected(requested) {
@@ -790,19 +876,30 @@ pub(super) fn prepare_for_route(
     use super::{adapters::UpstreamFormat as F, transforms as t};
     let source = super::adapters::downstream_format_for_route(route);
     let target = endpoint.wire().format();
+    // Controls are handled by this driver. In particular, a generic bridge
+    // must not turn structured output into an extra prompt instruction.
+    let mut bridge_request = requested.clone();
+    if admitted.is_some() {
+        if let Some(map) = bridge_request.as_object_mut() {
+            for key in controls::KEYS {
+                map.remove(*key);
+            }
+        }
+    }
+    let bridge = &bridge_request;
     let mut converted = match (source, target) {
-        (F::AnthropicMessages, F::OpenAiChat) => t::anthropic_to_openai_chat(requested),
-        (F::AnthropicMessages, F::OpenAiResponses) => t::anthropic_to_openai_responses(requested),
-        (F::OpenAiChat, F::AnthropicMessages) => t::openai_chat_to_anthropic(requested),
-        (F::OpenAiChat, F::OpenAiResponses) => t::openai_chat_to_responses(requested),
-        (F::OpenAiResponses, F::OpenAiChat) => t::openai_responses_to_chat(requested),
-        (F::OpenAiResponses, F::AnthropicMessages) => t::openai_responses_to_anthropic(requested),
+        (F::AnthropicMessages, F::OpenAiChat) => t::anthropic_to_openai_chat(bridge),
+        (F::AnthropicMessages, F::OpenAiResponses) => t::anthropic_to_openai_responses(bridge),
+        (F::OpenAiChat, F::AnthropicMessages) => t::openai_chat_to_anthropic(bridge),
+        (F::OpenAiChat, F::OpenAiResponses) => t::openai_chat_to_responses(bridge),
+        (F::OpenAiResponses, F::OpenAiChat) => t::openai_responses_to_chat(bridge),
+        (F::OpenAiResponses, F::AnthropicMessages) => t::openai_responses_to_anthropic(bridge),
         _ => Ok(requested.clone()),
     }
     .map_err(|error| super::ProxyError::bad_request(error.to_string()))?;
     // Shared transforms have their own defaults. The caller's explicit ceiling
     // wins, otherwise use the reviewed free-lane default for all protocols.
-    let limit = requested_limit(requested).unwrap_or(32_000);
+    let limit = output_limit(requested, admitted)?;
     for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
         converted
             .as_object_mut()
@@ -819,6 +916,10 @@ pub(super) fn prepare_for_route(
     converted[key] = Value::from(limit);
     // Zen fingerprints body bytes: no active cache hints from generic converters.
     strip_cache_hints(&mut converted);
+    if let Some(admitted) = admitted {
+        let controls = controls::translate(requested, route, admitted)?;
+        controls::apply(&mut converted, requested, controls, endpoint.wire());
+    }
     prepare_upstream_at(&converted, endpoint).map_err(|error| super::ProxyError {
         status: if error == PrepareError::ToolChoiceNone {
             http::StatusCode::FORBIDDEN
@@ -965,6 +1066,7 @@ fn chat_shaped(model: &str, requested: &Value, stream: bool) -> Value {
     if let Some(tools) = requested.get("tools") {
         body["tools"] = chat_tools(tools);
     }
+    copy_controls(&mut body, requested);
     body
 }
 
@@ -996,7 +1098,9 @@ fn responses_shaped(model: &str, requested: &Value, stream: bool) -> Value {
     if let Some(tools) = requested.get("tools") {
         body.insert("tools".to_string(), flat_tools(tools));
     }
-    Value::Object(body)
+    let mut body = Value::Object(body);
+    copy_controls(&mut body, requested);
+    body
 }
 
 fn messages_shaped(model: &str, requested: &Value, stream: bool) -> Value {
@@ -1036,7 +1140,17 @@ fn messages_shaped(model: &str, requested: &Value, stream: bool) -> Value {
     if let Some(tools) = requested.get("tools") {
         body.insert("tools".to_string(), claude_tools(tools));
     }
-    Value::Object(body)
+    let mut body = Value::Object(body);
+    copy_controls(&mut body, requested);
+    body
+}
+
+fn copy_controls(body: &mut Value, requested: &Value) {
+    for key in controls::KEYS {
+        if let Some(value) = requested.get(*key) {
+            body[*key] = value.clone();
+        }
+    }
 }
 
 fn copy_limit(body: &mut Value, requested: &Value) {
@@ -1050,6 +1164,20 @@ fn copy_limit(body: &mut Value, requested: &Value) {
     } else if let Some(value) = requested.get("max_output_tokens") {
         map.insert("max_completion_tokens".to_string(), value.clone());
     }
+}
+
+pub(super) fn output_limit(
+    request: &Value,
+    admitted: Option<&catalog::ZenAdmission>,
+) -> Result<u64, super::ProxyError> {
+    let declared = admitted.and_then(|m| m.max_output_tokens);
+    let limit = requested_limit(request).unwrap_or_else(|| declared.unwrap_or(32_000).min(32_000));
+    if declared.is_some_and(|max| limit > max) {
+        return Err(super::ProxyError::bad_request(
+            "OpenCode Zen output ceiling exceeds the model declaration",
+        ));
+    }
+    Ok(limit)
 }
 
 fn requested_limit(requested: &Value) -> Option<u64> {
@@ -1075,14 +1203,18 @@ fn chat_tools(tools: &Value) -> Value {
                     .or_else(|| tool.get("input_schema"))
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}}));
-                serde_json::json!({
+                let mut out = serde_json::json!({
                     "type": "function",
                     "function": {
                         "name": name,
                         "description": description,
                         "parameters": parameters,
                     }
-                })
+                });
+                if let Some(strict) = tool.get("strict") {
+                    out["function"]["strict"] = strict.clone();
+                }
+                out
             })
             .collect(),
     )
@@ -1105,12 +1237,14 @@ fn flat_tools(tools: &Value) -> Value {
                     return flat;
                 }
                 let function = tool.get("function").unwrap_or(tool);
-                serde_json::json!({
+                let mut out = serde_json::json!({
                     "type": "function",
                     "name": function.get("name").cloned().unwrap_or(Value::Null),
                     "description": function.get("description").cloned().unwrap_or(Value::String(String::new())),
                     "parameters": function.get("parameters").cloned().unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})),
-                })
+                });
+                if let Some(strict) = function.get("strict") { out["strict"] = strict.clone(); }
+                out
             })
             .collect(),
     )
@@ -1127,11 +1261,13 @@ fn claude_tools(tools: &Value) -> Value {
                     return tool.clone();
                 }
                 let function = tool.get("function").unwrap_or(tool);
-                serde_json::json!({
+                let mut out = serde_json::json!({
                     "name": function.get("name").cloned().unwrap_or(Value::Null),
                     "description": function.get("description").cloned().unwrap_or(Value::String(String::new())),
                     "input_schema": function.get("parameters").or_else(|| function.get("input_schema")).cloned().unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}})),
-                })
+                });
+                if let Some(strict) = function.get("strict") { out["strict"] = strict.clone(); }
+                out
             })
             .collect(),
     )
@@ -1268,40 +1404,54 @@ pub fn restore_tool_names(value: &mut Value, rename: &BTreeMap<String, String>) 
 }
 
 fn restore_tool_names_inner(value: &mut Value, rename: &BTreeMap<String, String>) {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                restore_tool_names_inner(item, rename);
-            }
+    fn name(call: &mut Value, rename: &BTreeMap<String, String>) {
+        if let Some(original) = call
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|n| rename.get(n))
+        {
+            call["name"] = Value::String(original.clone());
         }
-        Value::Object(map) => {
-            let kind = map.get("type").and_then(Value::as_str).map(str::to_string);
-            if let Some(name) = map.get("name").and_then(Value::as_str).map(str::to_string) {
-                let toolish = kind.as_deref().is_some_and(|kind| {
-                    kind.contains("tool") || kind == "function_call" || kind == "function"
-                }) || map.contains_key("arguments")
-                    || map.contains_key("input")
-                    || map.contains_key("function");
-                if toolish {
-                    if let Some(original) = rename.get(&name) {
-                        map.insert("name".to_string(), Value::String(original.clone()));
+    }
+    fn item(item: &mut Value, rename: &BTreeMap<String, String>) {
+        if let Some("tool_use" | "function_call" | "custom_tool_call") =
+            item.get("type").and_then(Value::as_str)
+        {
+            name(item, rename);
+        }
+    }
+    // Only protocol-owned envelopes are visited. Tool inputs, outputs, schemas
+    // and arbitrary nested JSON are opaque even when they resemble a call.
+    for pointer in ["/choices/0/message", "/choices/0/delta"] {
+        if let Some(message) = value.pointer_mut(pointer) {
+            if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for call in calls {
+                    if let Some(function) = call.get_mut("function") {
+                        name(function, rename);
                     }
                 }
             }
-            if let Some(function) = map.get_mut("function") {
-                if let Some(name) = function.get("name").and_then(Value::as_str) {
-                    if let Some(original) = rename.get(name) {
-                        function.as_object_mut().map(|object| {
-                            object.insert("name".to_string(), Value::String(original.clone()))
-                        });
-                    }
-                }
-            }
-            for child in map.values_mut() {
-                restore_tool_names_inner(child, rename);
+            if let Some(function) = message.get_mut("function_call") {
+                name(function, rename);
             }
         }
-        _ => {}
+    }
+    for pointer in [
+        "/output",
+        "/response/output",
+        "/content",
+        "/message/content",
+    ] {
+        if let Some(items) = value.pointer_mut(pointer).and_then(Value::as_array_mut) {
+            for entry in items {
+                item(entry, rename);
+            }
+        }
+    }
+    for pointer in ["/item", "/content_block"] {
+        if let Some(entry) = value.pointer_mut(pointer) {
+            item(entry, rename);
+        }
     }
 }
 
@@ -1437,17 +1587,24 @@ pub fn continuation_messages(
 
 #[path = "opencode_zen/catalog.rs"]
 mod catalog;
-pub(super) use catalog::CatalogEndpoint;
+mod controls;
+mod lane;
+mod validation;
 #[cfg(test)]
 use catalog::{catalog_endpoint, catalog_free_status};
-pub use catalog::{
-    catalog_fetched_at_ms, catalog_is_stale, catalog_metadata, generation_endpoint,
-    refresh_catalog, refresh_model_catalog, CATALOG_PATH,
-};
 #[cfg(test)]
 pub(crate) use catalog::{
-    clear_catalog, current_catalog, generation_allowed, store_catalog, store_catalog_payload,
+    clear_catalog, current_catalog, generation_allowed, lock_catalog_refresh_for_test,
+    store_catalog, store_catalog_payload, store_stale_catalog_payload,
 };
+pub use catalog::{refresh_model_catalog, CATALOG_PATH};
+pub(super) use catalog::{CatalogEndpoint, ZenAdmission};
+pub(super) use controls::requested_effort;
+pub(super) fn control_keys() -> &'static [&'static str] {
+    controls::KEYS
+}
+pub(super) use lane::{acquire as acquire_lane, observe_error as observe_lane_error};
+pub(super) use validation::{client_tools as validate_client_tools, validate as validate_json};
 
 /// Quota failures are not replayed. The reference observes free quota by
 /// egress IP; neither reminting sessions nor retrying invents more allowance.

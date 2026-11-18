@@ -77,3 +77,59 @@ async fn opencode_zen_catalog_invoke_requires_auth_and_never_creates_a_provider(
     assert_eq!(before_files, after_files);
     zen::clear_catalog();
 }
+
+#[tokio::test]
+async fn opencode_zen_public_and_management_catalogs_project_one_stale_capability_snapshot() {
+    use crate::proxy::opencode_zen as zen;
+    let _lock = zen::CATALOG_TEST_LOCK.lock().await;
+    zen::clear_catalog();
+    zen::store_stale_catalog_payload(
+        &json!({"data":[{"id":"test-free","name":"Test Free","type":"chat","cost":{"input":0,"output":0},"limit":{"context":123456,"output":8192},"capabilities":{"tools":{"supported":false},"reasoning":{"supported":true,"effort":["low","high"]},"structured_output":true}}]}),
+    );
+    let state = catalog_test_state("zen-stale-projection");
+    let stored = state
+        .upsert_provider_draft_command(crate::domain::providers::credentials::ProviderWriteDraft {
+            app: AppKind::Codex,
+            provider: crate::domain::providers::model::Provider {
+                id: "zen-stale-provider".into(),
+                name: "Zen".into(),
+                settings_config: json!({}),
+                category: None,
+                meta: None,
+                extra: Default::default(),
+            },
+            profile_id: Some(
+                crate::domain::providers::registry::ProfileId::parse("codex.opencode_zen").unwrap(),
+            ),
+            custom_binding: None,
+            expected_revision: None,
+            client_request_id: None,
+            credential_patches: Default::default(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let management =
+        zen::refresh_model_catalog(&state.http_client().await, &state.config_dir, false)
+            .await
+            .unwrap();
+    let public =
+        proxy_models_for_selection(&state, Some(AppKind::Codex), Some(&stored.provider.id))
+            .await
+            .unwrap()
+            .0;
+    assert_eq!(public.stale, Some(true));
+    assert_eq!(public.fetched_at_ms, Some(management.fetched_at_ms));
+    assert_eq!(public.source.as_deref(), Some(management.source));
+    assert_eq!(public.data.len(), 1);
+    assert_eq!(public.data[0].id, management.models[0].id);
+    assert_eq!(public.data[0].context_window, Some(123456));
+    assert_eq!(public.data[0].max_output_tokens, Some(8192));
+    assert_eq!(public.data[0].supports_tools, Some(false));
+    assert!(public.data[0].reasoning_efforts.is_none());
+    assert_eq!(
+        management.models[0].effective_capabilities["structuredOutput"],
+        false
+    );
+    zen::clear_catalog();
+}

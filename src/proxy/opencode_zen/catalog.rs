@@ -77,6 +77,114 @@ enum PricingSource {
     Unspecified,
 }
 
+/// Declarations are not keyless-lane acceptance receipts. Missing and false
+/// remain distinct, and stale declarations cannot enable optional controls.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ZenModelCapabilities {
+    pub tools: Option<bool>,
+    pub strict_tools: Option<bool>,
+    pub tool_choices: Vec<String>,
+    pub reasoning: Option<bool>,
+    pub reasoning_toggle: Option<bool>,
+    pub reasoning_efforts: Vec<String>,
+    pub structured_output: Option<bool>,
+    pub temperature: Option<bool>,
+    pub top_p: Option<bool>,
+    pub top_k: Option<bool>,
+    pub input_modalities: Vec<String>,
+}
+
+impl ZenModelCapabilities {
+    fn valid(&self) -> bool {
+        [
+            &self.tool_choices,
+            &self.reasoning_efforts,
+            &self.input_modalities,
+        ]
+        .iter()
+        .all(|list| {
+            list.len() <= 16
+                && list
+                    .iter()
+                    .all(|s| s.len() <= 32 && !s.chars().any(char::is_control))
+        })
+    }
+
+    fn effective(&self, stale: bool) -> Value {
+        json!({"text":true,"tools":self.tools != Some(false),"images":false,
+            "reasoningEfforts":if stale || self.reasoning != Some(true) { Vec::<String>::new() } else { self.reasoning_efforts.clone() },
+            "structuredOutput":!stale && self.structured_output == Some(true),
+            "verification":"fixture_verified","liveState":"live_pending"})
+    }
+}
+
+fn declared_capabilities(row: &Value, endpoint: Option<CatalogEndpoint>) -> ZenModelCapabilities {
+    let c = row.get("capabilities").unwrap_or(&Value::Null);
+    let protocol = endpoint.map(|e| match e.wire() {
+        ZenWire::Chat => "chat-completions",
+        ZenWire::Responses => "responses",
+        ZenWire::Messages => "messages",
+    });
+    let api = protocol.and_then(|p| row.get("api")?.get(p));
+    let tools = api.and_then(|a| a.pointer("/capabilities/tools"));
+    fn words(value: Option<&Value>, allowed: &[&str]) -> Vec<String> {
+        let mut out = Vec::new();
+        for word in value
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(32)
+            .filter_map(Value::as_str)
+        {
+            if allowed.contains(&word) && !out.iter().any(|s| s == word) {
+                out.push(word.to_string());
+            }
+        }
+        out
+    }
+    let mut input_modalities = Vec::new();
+    for word in row
+        .pointer("/modalities/input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(64)
+        .filter_map(Value::as_str)
+    {
+        let normalized = match word.split('/').next().unwrap_or(word) {
+            "text" => "text",
+            "image" => "image",
+            "audio" => "audio",
+            "video" => "video",
+            "file" | "document" | "application" => "file",
+            _ => continue,
+        };
+        if !input_modalities.iter().any(|s| s == normalized) {
+            input_modalities.push(normalized.to_string());
+        }
+    }
+    ZenModelCapabilities {
+        tools: c.pointer("/tools/supported").and_then(Value::as_bool),
+        strict_tools: tools.and_then(|t| t.get("strict")).and_then(Value::as_bool),
+        tool_choices: words(
+            tools.and_then(|t| t.get("choice")),
+            &["auto", "none", "required", "tool", "any"],
+        ),
+        reasoning: c.pointer("/reasoning/supported").and_then(Value::as_bool),
+        reasoning_toggle: c.pointer("/reasoning/toggle").and_then(Value::as_bool),
+        reasoning_efforts: words(
+            c.pointer("/reasoning/effort"),
+            &["minimal", "low", "medium", "high", "xhigh", "max"],
+        ),
+        structured_output: c.get("structured_output").and_then(Value::as_bool),
+        temperature: c.get("temperature").and_then(Value::as_bool),
+        top_p: c.get("top_p").and_then(Value::as_bool),
+        top_k: c.get("top_k").and_then(Value::as_bool),
+        input_modalities,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CatalogModel {
@@ -88,6 +196,8 @@ struct CatalogModel {
     endpoint: Option<CatalogEndpoint>,
     context_window: Option<u64>,
     max_output_tokens: Option<u64>,
+    #[serde(default)]
+    capabilities: ZenModelCapabilities,
 }
 
 impl CatalogModel {
@@ -112,7 +222,7 @@ impl CatalogModel {
         }
     }
 
-    fn view(&self) -> ZenModelView {
+    fn view(&self, stale: bool) -> ZenModelView {
         ZenModelView {
             id: self.id.clone(),
             upstream_model: self.id.clone(),
@@ -123,8 +233,11 @@ impl CatalogModel {
             selectable: self.unavailable_reason().is_none(),
             unavailable_reason: self.unavailable_reason(),
             protocol: self.endpoint.map(CatalogEndpoint::wire),
+            endpoint: self.endpoint,
             context_window: self.context_window,
             max_output_tokens: self.max_output_tokens,
+            capabilities: self.capabilities.clone(),
+            effective_capabilities: self.capabilities.effective(stale),
         }
     }
 }
@@ -132,26 +245,71 @@ impl CatalogModel {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ZenModelView {
-    id: String,
+    pub id: String,
     upstream_model: String,
-    display_name: String,
+    pub display_name: String,
     model_type: String,
     pricing: Pricing,
     pricing_source: PricingSource,
-    selectable: bool,
+    pub selectable: bool,
     unavailable_reason: Option<&'static str>,
     protocol: Option<ZenWire>,
-    context_window: Option<u64>,
-    max_output_tokens: Option<u64>,
+    #[serde(skip)]
+    endpoint: Option<CatalogEndpoint>,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub capabilities: ZenModelCapabilities,
+    pub effective_capabilities: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ZenModelCatalogView {
-    source: &'static str,
-    fetched_at_ms: i64,
-    stale: bool,
+    pub source: &'static str,
+    pub fetched_at_ms: i64,
+    pub stale: bool,
     pub models: Vec<ZenModelView>,
+}
+
+pub(in crate::proxy) struct ZenAdmission {
+    pub endpoint: CatalogEndpoint,
+    pub capabilities: ZenModelCapabilities,
+    pub stale: bool,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+}
+
+impl ZenModelCatalogView {
+    pub(in crate::proxy) fn admit(&self, id: &str) -> Result<ZenAdmission, &'static str> {
+        if !(0..=MAX_STALE_MS).contains(&now_ms().saturating_sub(self.fetched_at_ms)) {
+            return Err("OpenCode Zen catalog has expired");
+        }
+        let m = self
+            .models
+            .iter()
+            .find(|m| m.id == base_model_id(id))
+            .ok_or("OpenCode Zen catalog does not list this free-lane model")?;
+        if !m.selectable {
+            return Err("OpenCode Zen only forwards supported free-lane models");
+        }
+        let endpoint = match m
+            .protocol
+            .ok_or("OpenCode Zen model protocol is unsupported")?
+        {
+            ZenWire::Chat => CatalogEndpoint::Chat,
+            ZenWire::Responses => CatalogEndpoint::Responses,
+            ZenWire::Messages => CatalogEndpoint::Messages,
+        };
+        // Resolve the fixed legacy/modern path from this very view, not a later
+        // global snapshot. Private path state never follows arbitrary URLs.
+        Ok(ZenAdmission {
+            endpoint: m.endpoint.unwrap_or(endpoint),
+            capabilities: m.capabilities.clone(),
+            stale: self.stale,
+            context_window: m.context_window,
+            max_output_tokens: m.max_output_tokens,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,12 +335,13 @@ impl CatalogSnapshot {
     }
 
     fn view(&self) -> ZenModelCatalogView {
+        let stale = now_ms().saturating_sub(self.fetched_at_ms) >= FRESH_MS
+            || LAST_FAILED.load(Ordering::Relaxed);
         ZenModelCatalogView {
             source: "opencode_zen_live_model_catalog",
             fetched_at_ms: self.fetched_at_ms,
-            stale: now_ms().saturating_sub(self.fetched_at_ms) >= FRESH_MS
-                || LAST_FAILED.load(Ordering::Relaxed),
-            models: self.models.iter().map(CatalogModel::view).collect(),
+            stale,
+            models: self.models.iter().map(|m| m.view(stale)).collect(),
         }
     }
 }
@@ -198,6 +357,7 @@ fn snapshot() -> Option<CatalogSnapshot> {
     CATALOG.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
+#[cfg(test)]
 fn model(id: &str) -> Option<CatalogModel> {
     let guard = CATALOG.lock().unwrap_or_else(|p| p.into_inner());
     guard
@@ -220,6 +380,7 @@ pub(super) fn catalog_free_status(id: &str) -> Option<bool> {
 pub fn current_catalog() -> Option<Vec<String>> {
     snapshot().map(|s| s.ids())
 }
+#[cfg(test)]
 pub fn catalog_fetched_at_ms() -> Option<i64> {
     snapshot().map(|s| s.fetched_at_ms)
 }
@@ -227,6 +388,7 @@ pub fn catalog_is_stale() -> bool {
     snapshot().is_none_or(|s| s.view().stale)
 }
 
+#[cfg(test)]
 pub fn catalog_metadata(id: &str) -> Value {
     let Some(m) = model(id) else {
         return json!({});
@@ -241,6 +403,7 @@ pub fn catalog_metadata(id: &str) -> Value {
     Value::Object(out)
 }
 
+#[cfg(test)]
 pub fn generation_endpoint(id: &str) -> Result<CatalogEndpoint, &'static str> {
     let s = snapshot().ok_or("OpenCode Zen catalog is unavailable")?;
     if !s.usable(now_ms()) {
@@ -429,6 +592,7 @@ fn parse_model(row: &Value) -> Option<CatalogModel> {
             .or_else(|| limit(row.pointer("/limit/context"))),
         max_output_tokens: limit(row.get("max_output_tokens"))
             .or_else(|| limit(row.pointer("/limit/output"))),
+        capabilities: declared_capabilities(row, endpoint(row, id)),
     })
 }
 
@@ -454,7 +618,7 @@ fn parse_catalog(payload: &Value, fetched_at_ms: i64) -> Result<CatalogSnapshot,
     }
     // A successful empty roster is authoritative, unlike a failed refresh.
     Ok(CatalogSnapshot {
-        schema_version: 2,
+        schema_version: 3,
         fetched_at_ms,
         models: models.into_values().collect(),
     })
@@ -475,7 +639,7 @@ fn load_catalog_cache(path: &std::path::Path) -> Option<CatalogSnapshot> {
     let snapshot =
         if raw.get("schema_version").is_some() {
             let snapshot: CatalogSnapshot = serde_json::from_value(raw).ok()?;
-            if snapshot.schema_version != 2 || snapshot.models.len() > MAX_MODELS {
+            if !matches!(snapshot.schema_version, 2 | 3) || snapshot.models.len() > MAX_MODELS {
                 return None;
             }
             let mut ids = std::collections::BTreeSet::new();
@@ -485,6 +649,7 @@ fn load_catalog_cache(path: &std::path::Path) -> Option<CatalogSnapshot> {
                     || m.name.len() > 256
                     || m.name.chars().any(char::is_control)
                     || m.model_type.len() > 32
+                    || !m.capabilities.valid()
                     || m.context_window.is_some_and(|n| n == 0 || n > 100_000_000)
                     || m.max_output_tokens
                         .is_some_and(|n| n == 0 || n > 100_000_000)
@@ -515,6 +680,7 @@ fn load_catalog_cache(path: &std::path::Path) -> Option<CatalogSnapshot> {
     snapshot.usable(now_ms()).then_some(snapshot)
 }
 
+#[cfg(test)]
 pub async fn refresh_catalog(
     client: &reqwest::Client,
     config_dir: &std::path::Path,
@@ -642,6 +808,19 @@ pub(crate) fn store_catalog_payload(payload: &Value) {
 }
 
 #[cfg(test)]
+pub(crate) fn store_stale_catalog_payload(payload: &Value) {
+    *CATALOG.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some(parse_catalog(payload, now_ms() - FRESH_MS - 1).unwrap());
+    LAST_FAILED.store(true, Ordering::Relaxed);
+    RETRY_AT.store(now_ms() + REFRESH_INTERVAL_MS, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) async fn lock_catalog_refresh_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+    FETCH.lock().await
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::CATALOG_TEST_LOCK;
     use super::*;
@@ -763,6 +942,66 @@ mod tests {
         ] {
             assert!(parse_catalog(&data, now_ms()).is_err());
         }
+    }
+
+    #[test]
+    fn opencode_zen_capability_snapshot_is_atomic_and_stale_cannot_enable_controls() {
+        let _lock = super::super::CATALOG_TEST_LOCK.blocking_lock();
+        let row = json!({"id":"test-free","type":"chat","cost":{"input":0,"output":0},
+            "limit":{"context":200000,"output":16000},
+            "api":{"chat-completions":{"base_url":"https://opencode.ai/inference/openai/v1","capabilities":{"tools":{"strict":true,"choice":["auto","tool"]}}}},
+            "capabilities":{"tools":{"supported":true},"reasoning":{"supported":true,"toggle":true,"effort":["high","low","invented"]},"structured_output":true,"temperature":true},"modalities":{"input":["text","image/png"]}});
+        let snap = parse_catalog(&json!({"data":[row]}), now_ms()).unwrap();
+        let fresh = snap.view();
+        let admitted = fresh.admit("test-free(high)").unwrap();
+        assert_eq!(admitted.endpoint, CatalogEndpoint::Chat);
+        assert_eq!(admitted.context_window, Some(200000));
+        assert_eq!(admitted.capabilities.reasoning_efforts, ["high", "low"]);
+        assert_eq!(
+            fresh.models[0].capabilities.input_modalities,
+            ["text", "image"]
+        );
+        assert_eq!(fresh.models[0].effective_capabilities["images"], false);
+        *CATALOG.lock().unwrap() =
+            Some(parse_catalog(&json!([zero_model("other-free")]), now_ms()).unwrap());
+        assert!(fresh.admit("test-free").is_ok());
+        assert!(fresh.admit("other-free").is_err());
+        let mut old = snap;
+        old.fetched_at_ms = now_ms() - FRESH_MS - 1;
+        let stale = old.view();
+        assert!(stale.stale);
+        assert!(stale.models[0].capabilities.structured_output.unwrap());
+        assert_eq!(
+            stale.models[0].effective_capabilities["structuredOutput"],
+            false
+        );
+        assert_eq!(
+            stale.models[0].effective_capabilities["reasoningEfforts"],
+            json!([])
+        );
+        clear_catalog();
+    }
+
+    #[test]
+    fn opencode_zen_v2_cache_recovers_without_inventing_capabilities() {
+        let path = std::env::temp_dir().join(format!("zen-v2-{}.json", now_ms()));
+        let mut snapshot = serde_json::to_value(
+            parse_catalog(&json!([zero_model("test-free")]), now_ms()).unwrap(),
+        )
+        .unwrap();
+        snapshot["schema_version"] = json!(2);
+        snapshot["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("capabilities");
+        crate::infra::storage::write_json_pretty(&path, &snapshot).unwrap();
+        let loaded = load_catalog_cache(&path).unwrap();
+        assert_eq!(
+            loaded.models[0].capabilities,
+            ZenModelCapabilities::default()
+        );
+        assert!(loaded.view().admit("test-free").is_ok());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

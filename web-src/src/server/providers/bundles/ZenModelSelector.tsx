@@ -34,8 +34,11 @@ export function ZenUpstreamModelInput({ catalog, ...input }: ModelInputProps & {
   const { t } = useTranslation();
   const [showAll, setShowAll] = useState(false);
   const models = catalog.data?.models ?? [];
-  const selected = models.find((m) => m.id === input.value.trim());
+  const selectedId = input.value.trim().replace(/\([^()]+\)$/, "");
+  const selected = models.find((m) => m.id === selectedId);
   const missing = input.value.trim() && catalog.data && !catalog.error && !catalog.data.stale && !selected;
+  const selectedEfforts = !catalog.data?.stale && !catalog.error
+    ? selected?.effectiveCapabilities?.reasoningEfforts ?? [] : [];
   const reason = (key: NonNullable<typeof selected>["unavailableReason"]) => key ? t(`zenModels.reason.${key}`) : "";
   return <EditableModelInput {...input} ready isFetching={catalog.isFetching} refresh={catalog.refresh}
     labels={{ choose: t("zenModels.choose"), search: t("zenModels.search"), refresh: t("zenModels.refresh"), noMatch: t("zenModels.noMatch") }}
@@ -59,6 +62,13 @@ export function ZenUpstreamModelInput({ catalog, ...input }: ModelInputProps & {
       })}</span> : null}
       {catalog.data && !catalog.isFetching && !models.some((m) => m.selectable) ? <span className="block">{t("zenModels.empty")}</span> : null}
     </div>
+    {selected?.selectable ? <div className="space-y-1 text-xs text-muted-foreground">
+      {selected.maxOutputTokens ? <p>{t("zenModels.output", { count: selected.maxOutputTokens })}</p> : null}
+      {selectedEfforts.length > 0 ? <p>{t("zenModels.efforts", { values: selectedEfforts.join(", ") })}</p> : null}
+      {!catalog.data?.stale && !catalog.error && selected.effectiveCapabilities?.structuredOutput
+        ? <p>{t("zenModels.structured")}</p> : null}
+      {selected.capabilities?.tools === false ? <p>{t("zenModels.noTools")}</p> : null}
+    </div> : null}
     {missing ? <p className="text-xs text-amber-700">{t("zenModels.missing")}</p> : null}
     {selected?.unavailableReason ? <p className="text-xs text-amber-700">{reason(selected.unavailableReason)}</p> : null}
   </EditableModelInput>;

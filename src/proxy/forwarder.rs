@@ -2864,7 +2864,7 @@ async fn forward_with_attempt_inner(
             .await;
         }
         if execution.driver_is("special.opencode_zen") {
-            return forward_opencode_zen(OpencodeZenForwardOptions {
+            return Box::pin(forward_opencode_zen(OpencodeZenForwardOptions {
                 state,
                 execution,
                 stored,
@@ -2876,7 +2876,7 @@ async fn forward_with_attempt_inner(
                 started,
                 request_memory: attempt_context.request_memory().cloned(),
                 timing: attempt_context.timing.clone(),
-            })
+            }))
             .await;
         }
         if super::web_session::is_web_session_driver(execution.plan.driver_id.as_str()) {

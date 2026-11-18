@@ -16,6 +16,7 @@ pub(in crate::proxy) struct ZenStream {
     responses: crate::proxy::response_semantics::ResponsesSseInspector,
     anthropic: crate::proxy::anthropic_semantics::AnthropicSseInspector,
     tool_names: BTreeMap<u64, String>,
+    client_tools: Option<std::collections::BTreeSet<String>>,
     finish_reason: bool,
     done: bool,
     terminal_candidate: bool,
@@ -46,9 +47,11 @@ impl ZenStream {
                 include_usage,
                 Some(wire.format()),
             ),
-            responses: Default::default(),
+            responses: crate::proxy::response_semantics::ResponsesSseInspector::with_repeat_guard_and_visibility(
+                true, crate::proxy::response_semantics::ResponsesEventVisibility::StandardClient),
             anthropic: Default::default(),
             tool_names: BTreeMap::new(),
+            client_tools: None,
             finish_reason: false,
             done: false,
             terminal_candidate: false,
@@ -58,11 +61,22 @@ impl ZenStream {
         }
     }
 
+    pub(in crate::proxy) fn with_client_tools(
+        mut self,
+        names: std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.client_tools = Some(names);
+        self
+    }
+
     pub(in crate::proxy) fn retained_bytes(&self) -> usize {
         self.tool_names
             .values()
             .map(|name| name.capacity().saturating_add(64))
             .sum::<usize>()
+            .saturating_add(self.client_tools.as_ref().map_or(0, |names| {
+                names.iter().map(|n| n.capacity().saturating_add(64)).sum()
+            }))
             .saturating_add(self.pending.capacity())
             .saturating_add(self.held.capacity())
             .saturating_add(self.transformer.retained_bytes())
@@ -148,8 +162,14 @@ impl ZenStream {
         {
             return Err(ProxyError::bad_gateway("OpenCode Zen upstream error event"));
         }
+        super::validation::stream_usage(&value)?;
         match self.wire {
             ZenWire::Chat => {
+                if value.pointer("/choices/0/delta/function_call").is_some() {
+                    return Err(ProxyError::bad_gateway(
+                        "OpenCode Zen returned an unsupported legacy function delta",
+                    ));
+                }
                 if self.done {
                     return Err(ProxyError::bad_gateway("OpenCode Zen data after [DONE]"));
                 }
@@ -192,6 +212,11 @@ impl ZenStream {
                         .ok_or_else(|| {
                             ProxyError::bad_gateway("OpenCode Zen invalid Chat finish_reason")
                         })?;
+                    if self.finish_reason {
+                        return Err(ProxyError::bad_gateway(
+                            "OpenCode Zen duplicate Chat finish_reason",
+                        ));
+                    }
                     self.finish_reason = true;
                     self.terminal_candidate = true;
                     self.incomplete = matches!(reason, "length" | "content_filter");
@@ -201,10 +226,13 @@ impl ZenStream {
                 }
             }
             ZenWire::Responses => {
-                let observations = self.responses.push(raw).map_err(|_| {
+                let batch = self.responses.push_normalized(raw).map_err(|_| {
                     ProxyError::bad_gateway("OpenCode Zen invalid Responses stream")
                 })?;
-                for observation in observations {
+                if batch.normalized.is_empty() {
+                    return Ok(Bytes::new());
+                }
+                for observation in batch.observations {
                     if matches!(
                         observation,
                         crate::proxy::response_semantics::SemanticObservation::Failure(_)
@@ -220,6 +248,11 @@ impl ZenStream {
                     }
                 }
                 self.terminal_candidate = self.responses.terminal().is_some();
+                if self.terminal_candidate {
+                    if let Some(response) = value.get("response") {
+                        validate_json(response, ZenWire::Responses)?;
+                    }
+                }
                 self.incomplete = matches!(
                     self.responses.terminal(),
                     Some(crate::proxy::response_semantics::SemanticTerminal::Incomplete)
@@ -250,6 +283,9 @@ impl ZenStream {
                     .and_then(Value::as_str)
                     .is_some_and(|s| matches!(s, "max_tokens" | "pause_turn"));
             }
+        }
+        if let Some(names) = &self.client_tools {
+            validate_client_tools(&value, names)?;
         }
         // Chat servers may split a function name across deltas. Buffer only
         // prefixes of injected aliases; never expose `read_client` to callers.
@@ -291,6 +327,15 @@ impl ZenStream {
                                 ));
                             }
                             name.push_str(&fragment);
+                            if self.client_tools.as_ref().is_some_and(|names| {
+                                !names
+                                    .iter()
+                                    .any(|allowed| allowed.starts_with(name.as_str()))
+                            }) {
+                                return Err(ProxyError::bad_gateway(
+                                    "OpenCode Zen called a tool unavailable to the client",
+                                ));
+                            }
                             if let Some(original) = self.rename.get(name.as_str()) {
                                 function
                                     .insert("name".to_string(), Value::String(original.clone()));
@@ -320,6 +365,15 @@ impl ZenStream {
         if self.pending.iter().any(|b| !b.is_ascii_whitespace()) {
             return Err(ProxyError::bad_gateway(
                 "OpenCode Zen incomplete SSE event at EOF",
+            ));
+        }
+        if self
+            .client_tools
+            .as_ref()
+            .is_some_and(|names| self.tool_names.values().any(|name| !names.contains(name)))
+        {
+            return Err(ProxyError::bad_gateway(
+                "OpenCode Zen incomplete or unavailable client tool name",
             ));
         }
         if self.tool_names.values().any(|name| {
@@ -505,5 +559,111 @@ mod tests {
             CatalogEndpoint::LegacyChat
         )
         .is_err());
+    }
+    #[test]
+    fn zen_chat_usage_tail_reaches_messages_before_terminal() {
+        let mut decoder = decoder(ZenWire::Chat, ProxyRoute::ClaudeMessages);
+        let content = frame(
+            json!({"id":"c","model":"test-free","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}),
+        );
+        let finish = frame(json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}));
+        let usage = frame(
+            json!({"choices":[],"usage":{"prompt_tokens":31,"completion_tokens":17,"total_tokens":48}}),
+        );
+        let mut output = decoder.push(content.as_bytes()).unwrap().to_vec();
+        output.extend_from_slice(&decoder.push(finish.as_bytes()).unwrap());
+        assert!(!String::from_utf8_lossy(&output).contains("message_stop"));
+        output.extend_from_slice(&decoder.push(usage.as_bytes()).unwrap());
+        output.extend_from_slice(&decoder.push(b"data: [DONE]\n\n").unwrap());
+        output.extend_from_slice(&decoder.finish().unwrap());
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("\"output_tokens\":17"), "{text}");
+        assert_eq!(text.matches("event: message_stop").count(), 1);
+    }
+
+    #[test]
+    fn zen_responses_filters_private_events_and_guards_repeated_output() {
+        let mut d = decoder(ZenWire::Responses, ProxyRoute::CodexResponses);
+        for event in [
+            "responsesapi.private",
+            "codex.rate_limits",
+            "unreviewed.future",
+        ] {
+            assert!(d
+                .push(frame(json!({"type":event,"secret":"do-not-expose"})).as_bytes())
+                .unwrap()
+                .is_empty());
+        }
+        let repeated = frame(
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"repeated"}),
+        );
+        let mut failed = false;
+        for _ in 0..300 {
+            if d.push(repeated.as_bytes()).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed);
+    }
+
+    #[test]
+    fn zen_placeholder_tools_fail_in_json_and_all_stream_protocols() {
+        let names = std::collections::BTreeSet::from(["lookup".to_string()]);
+        for (wire, event) in [
+            (
+                ZenWire::Chat,
+                json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}]}}]}),
+            ),
+            (
+                ZenWire::Responses,
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc","call_id":"c","name":"shell","arguments":""}}),
+            ),
+            (
+                ZenWire::Messages,
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c","name":"shell","input":{}}}),
+            ),
+        ] {
+            let mut d =
+                decoder(wire, ProxyRoute::CodexChatCompletions).with_client_tools(names.clone());
+            if wire == ZenWire::Messages {
+                d.push(frame(json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"test-free","content":[],"usage":{"input_tokens":1,"output_tokens":0}}})).as_bytes()).unwrap();
+            }
+            assert!(d.push(frame(event).as_bytes()).is_err(), "{wire:?}");
+        }
+        assert!(validate_client_tools(
+            &json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"shell"}}]}}]}),
+            &names
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn zen_native_messages_alias_history_and_opaque_arguments_are_preserved() {
+        let request = json!({"model":"union-alpha","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"name":"read_client","type":"tool_use"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ok"}]}],"tools":[{"name":"read","description":"caller","input_schema":{"type":"object"}}]});
+        let prepared = prepare_for_route(
+            &request,
+            ProxyRoute::ClaudeMessages,
+            CatalogEndpoint::LegacyMessages,
+        )
+        .unwrap();
+        let sent: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(sent["messages"][0]["content"][0]["name"], "read_client");
+        assert_eq!(
+            sent["messages"][0]["content"][0]["input"]["name"],
+            "read_client"
+        );
+        let input = json!({"type":"tool_use","name":"read_client","function":{"name":"read_client"},"content":[{"type":"tool_use","name":"read_client"}]});
+        let mut response =
+            json!({"content":[{"type":"tool_use","name":"read_client","input":input}]});
+        restore_tool_names(&mut response, &prepared.rename);
+        assert_eq!(response["content"][0]["name"], "read");
+        assert_eq!(response["content"][0]["input"], input);
+    }
+    #[test]
+    fn zen_media_validation_keeps_tool_arguments_opaque() {
+        let tool = json!({"model":"union-alpha","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c","name":"lookup","input":{"type":"input_image","input":{"content":"opaque"}}}]}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]});
+        assert!(validate_source_request(&tool).is_ok());
+        assert!(validate_source_request(&json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,eA=="}}]}]})).is_err());
     }
 }

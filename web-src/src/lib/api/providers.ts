@@ -26,6 +26,16 @@ export interface ZenModelCatalog {
     protocol: "chat" | "responses" | "messages" | null;
     contextWindow: number | null;
     maxOutputTokens: number | null;
+    capabilities?: {
+      tools: boolean | null; strictTools: boolean | null; toolChoices: string[];
+      reasoning: boolean | null; reasoningToggle: boolean | null; reasoningEfforts: string[];
+      structuredOutput: boolean | null; temperature: boolean | null;
+      topP: boolean | null; topK: boolean | null; inputModalities: string[];
+    };
+    effectiveCapabilities?: {
+      text: boolean; tools: boolean; images: false; reasoningEfforts: string[];
+      structuredOutput: boolean; verification: "fixture_verified"; liveState: "live_pending";
+    };
   }>;
 }
 

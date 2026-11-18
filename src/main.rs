@@ -5,8 +5,27 @@ use cc_switch_server::cli::{Cli, Command};
 use cc_switch_server::logging::{LogCapture, RING_BUFFER_CAPACITY};
 use cc_switch_server::state::ServerStateInner;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    // The unoptimized shared forwarder alone uses over 2 MiB per poll. Give
+    // debug workers enough headroom without changing release stack sizes or
+    // overriding an explicitly larger RUST_MIN_STACK used by local fixtures.
+    #[cfg(debug_assertions)]
+    runtime.thread_stack_size(
+        std::env::var("RUST_MIN_STACK")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_default()
+            .max(8 * 1024 * 1024),
+    );
+    runtime
+        .build()
+        .context("initialize async runtime")?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse_args();
     let log_capture = Arc::new(LogCapture::new(RING_BUFFER_CAPACITY));
     init_tracing(&cli.log_level, log_capture.clone());

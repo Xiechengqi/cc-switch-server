@@ -1,5 +1,9 @@
 {
   "zenModels": {
+    "output": "Maximum output: {{count}} tokens (upstream declaration)",
+    "efforts": "Available reasoning efforts: {{values}}",
+    "structured": "JSON Schema output can be requested; availability depends on the upstream.",
+    "noTools": "This model declares no tool calling support.",
     "choose": "Choose upstream model",
     "search": "Search model name or ID",
     "refresh": "Refresh model catalog",

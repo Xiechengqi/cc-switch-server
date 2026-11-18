@@ -1,5 +1,9 @@
 {
   "zenModels": {
+    "output": "最大出力：{{count}} tokens（上流の宣言）",
+    "efforts": "リクエスト可能な推論強度：{{values}}",
+    "structured": "JSON Schema 出力をリクエストできます。利用可否は上流に依存します。",
+    "noTools": "このモデルはツール呼び出し非対応と宣言されています。",
     "choose": "上流モデルを選択",
     "search": "モデル名または ID を検索",
     "refresh": "モデル一覧を更新",

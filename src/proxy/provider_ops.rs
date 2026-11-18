@@ -512,8 +512,12 @@ impl ProviderExecution {
                 credential_generation,
             } => {
                 self.ensure_credential_generation(*credential_generation)?;
-                let secret = self.provider_secret_from_slots(slots, false)?;
-                static_auth(self, *auth_scheme, secret)?
+                if *auth_scheme == AuthScheme::None {
+                    AuthApplication::NoAuth(MaterializedAuth::default())
+                } else {
+                    let secret = self.provider_secret_from_slots(slots, false)?;
+                    static_auth(self, *auth_scheme, secret)?
+                }
             }
             RuntimeAuthRef::CustomCredential {
                 auth_scheme,
@@ -3209,6 +3213,34 @@ mod tests {
                 }), "app={:?} route={:?} missing {name}", case.app, case.route);
             }
         }
+    }
+
+    #[test]
+    fn opencode_zen_profile_without_credentials_materializes_no_auth_and_checks_generation() {
+        let mut execution = execution_with_auth(
+            RuntimeAuthRef::StaticCredential {
+                auth_scheme: AuthScheme::None,
+                slots: vec![],
+                credential_generation: 0,
+            },
+            UpstreamProtocol::Special,
+            json!({}),
+            0,
+        );
+        assert!(matches!(
+            execution
+                .materialize_auth(&AccountStore::default())
+                .unwrap(),
+            AuthApplication::NoAuth(_)
+        ));
+        std::sync::Arc::make_mut(&mut execution.plan).auth_ref = RuntimeAuthRef::StaticCredential {
+            auth_scheme: AuthScheme::None,
+            slots: vec![],
+            credential_generation: 1,
+        };
+        assert!(execution
+            .materialize_auth(&AccountStore::default())
+            .is_err());
     }
 
     #[test]

@@ -1700,7 +1700,7 @@ async fn proxy_models_for_selection(
     let opencode_zen_catalog = if opencode_zen_provider.is_some() {
         let client = state.http_client().await;
         Some(
-            crate::proxy::opencode_zen::refresh_catalog(&client, &state.config_dir)
+            crate::proxy::opencode_zen::refresh_model_catalog(&client, &state.config_dir, false)
                 .await
                 .map_err(|message| ApiError::new(StatusCode::BAD_GATEWAY, message))?,
         )
@@ -1713,17 +1713,19 @@ async fn proxy_models_for_selection(
     ) {
         data.clear();
         let owned_by = model_owner(provider);
-        for id in catalog {
-            let metadata = crate::proxy::opencode_zen::catalog_metadata(id);
+        for model in catalog.models.iter().filter(|model| model.selectable) {
             data.push(OpenAiModel {
-                id: id.clone(),
+                id: model.id.clone(),
                 object: "model",
                 owned_by: owned_by.clone(),
-                reasoning_efforts: None,
+                reasoning_efforts: (!catalog.stale
+                    && model.capabilities.reasoning == Some(true)
+                    && !model.capabilities.reasoning_efforts.is_empty())
+                .then(|| model.capabilities.reasoning_efforts.clone()),
                 input_modalities: Some(vec!["text".to_string()]),
-                context_window: metadata.get("context_window").and_then(Value::as_u64),
-                supports_tools: Some(true),
-                max_output_tokens: metadata.get("max_output_tokens").and_then(Value::as_u64),
+                context_window: model.context_window,
+                supports_tools: Some(model.capabilities.tools != Some(false)),
+                max_output_tokens: model.max_output_tokens,
             });
         }
         data.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1756,7 +1758,7 @@ async fn proxy_models_for_selection(
             .map(|catalog| catalog.entries.clone()),
         source: opencode_zen_catalog
             .as_ref()
-            .map(|_| "opencode_zen_live_model_catalog".to_string())
+            .map(|catalog| catalog.source.to_string())
             .or_else(|| {
                 grok_catalog
                     .as_ref()
@@ -1795,7 +1797,7 @@ async fn proxy_models_for_selection(
             }),
         stale: opencode_zen_catalog
             .as_ref()
-            .map(|_| false)
+            .map(|catalog| catalog.stale)
             .or_else(|| grok_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| trae_catalog.as_ref().map(|catalog| catalog.stale))
             .or_else(|| qoder_catalog.as_ref().map(|_| false))
@@ -1806,7 +1808,7 @@ async fn proxy_models_for_selection(
             .or_else(|| cursor_catalog.as_ref().map(|catalog| catalog.stale)),
         fetched_at_ms: opencode_zen_catalog
             .as_ref()
-            .and_then(|_| crate::proxy::opencode_zen::catalog_fetched_at_ms())
+            .map(|catalog| catalog.fetched_at_ms)
             .or_else(|| grok_catalog.and_then(|catalog| catalog.fetched_at_ms))
             .or_else(|| trae_catalog.as_ref().map(|catalog| catalog.fetched_at_ms))
             .or_else(|| qoder_catalog.as_ref().map(|catalog| catalog.fetched_at_ms))

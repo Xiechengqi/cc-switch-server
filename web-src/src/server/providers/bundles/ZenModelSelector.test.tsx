@@ -148,3 +148,31 @@ it("requires an explicit fixed model without a synthetic default", () => {
   expect(validateProviderBundleDraftIssue(fixed)?.code).toBe("upstreamModelRequired");
   expect(validateProviderBundleDraft(updateBundleModel(fixed, "single", "custom-model"))).toBeNull();
 });
+
+it("shows capability details for an effort-suffixed model without changing the saved value", async () => {
+  const data = fixture();
+  data.models[0].effectiveCapabilities = { text: true, tools: true, images: false,
+    reasoningEfforts: ["low", "high"], structuredOutput: true, verification: "fixture_verified", liveState: "live_pending" };
+  mocks.fetch.mockResolvedValue(data);
+  const view = await mount({ initial: "big-pickle(high)" });
+  try {
+    expect(view.container.textContent).toContain(i18n.t("zenModels.efforts", { values: "low, high" }));
+    expect(view.container.textContent).toContain(i18n.t("zenModels.structured"));
+    expect(view.container.textContent).not.toContain(i18n.t("zenModels.missing"));
+    expect(view.container.querySelector<HTMLInputElement>("input")!.value).toBe("big-pickle(high)");
+  } finally { await view.close(); }
+});
+
+it("hides optional capability menus when a cached catalog is stale", async () => {
+  const data = fixture();
+  data.stale = true;
+  data.models[0].effectiveCapabilities = { text: true, tools: true, images: false,
+    reasoningEfforts: ["low", "high"], structuredOutput: true, verification: "fixture_verified", liveState: "live_pending" };
+  mocks.fetch.mockResolvedValue(data);
+  const view = await mount({ initial: "big-pickle" });
+  try {
+    expect(view.container.textContent).not.toContain(i18n.t("zenModels.efforts", { values: "low, high" }));
+    expect(view.container.textContent).not.toContain(i18n.t("zenModels.structured"));
+    expect(view.container.querySelector<HTMLInputElement>("input")!.value).toBe("big-pickle");
+  } finally { await view.close(); }
+});

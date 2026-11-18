@@ -2649,6 +2649,42 @@ mod tests {
     }
 
     #[test]
+    fn opencode_zen_descriptor_exposes_probe_only_for_an_explicit_model() {
+        for app in [AppKind::Claude, AppKind::Codex] {
+            let mut provider = test_provider(ProviderType::OpenCodeZen);
+            provider.app = app;
+            provider.resource.profile_id = Some(
+                crate::domain::providers::registry::ProfileId::parse(format!(
+                    "{}.opencode_zen",
+                    app.as_str()
+                ))
+                .unwrap(),
+            );
+            provider.provider.settings_config = json!({});
+            let empty = crate::domain::providers::runtime::compile_runtime_plan(
+                &provider,
+                &AccountStore::default(),
+            )
+            .unwrap();
+            assert!(provider_model_probe(&provider, Some(&empty)).is_none());
+            provider.provider.settings_config["modelMapping"] =
+                json!({"mode":"single","upstreamModel":"selected-free"});
+            let plan = crate::domain::providers::runtime::compile_runtime_plan(
+                &provider,
+                &AccountStore::default(),
+            )
+            .unwrap();
+            let probe = provider_model_probe(&provider, Some(&plan)).unwrap();
+            assert_eq!(probe.body["model"], "selected-free");
+            assert_eq!(probe.body["stream"], true);
+            assert_eq!(
+                health::provider_probe_support(&plan),
+                health::ProviderProbeSupport::Supported
+            );
+        }
+    }
+
+    #[test]
     fn descriptor_omits_model_probe_when_the_runtime_driver_cannot_test() {
         let provider_type = ProviderType::GrokOAuth;
         let mut provider = test_provider(provider_type);

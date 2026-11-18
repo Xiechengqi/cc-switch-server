@@ -78,7 +78,7 @@ pub fn build_provider_model_probe(
     } else {
         (requested_model.clone(), None)
     };
-    let (api_type, path, body, response_mode) = match app {
+    let (api_type, path, mut body, response_mode) = match app {
         AppKind::Claude => (
             "anthropic",
             "/v1/messages".to_string(),
@@ -142,6 +142,13 @@ pub fn build_provider_model_probe(
             )
         }
     };
+    if provider_type == ProviderType::OpenCodeZen {
+        body[if app == AppKind::Claude {
+            "max_tokens"
+        } else {
+            "max_output_tokens"
+        }] = json!(256);
+    }
     ProviderModelProbe {
         api_type: api_type.to_string(),
         requested_model,
@@ -1297,7 +1304,7 @@ fn runtime_test_model(
     profiled: bool,
     defaults: &ProviderRuntimeDefaults,
 ) -> Option<String> {
-    if let Some(model) = buddy_fixed_test_model(stored) {
+    if let Some(model) = zen_fixed_test_model(stored).or_else(|| buddy_fixed_test_model(stored)) {
         return Some(model);
     }
     let model = non_empty_value(stored.provider.settings_config.get("testModel"))
@@ -1345,7 +1352,7 @@ fn runtime_test_model(
         .or_else(|| {
             if matches!(
                 stored.provider_type,
-                ProviderType::TraeRaw | ProviderType::TraeIntl
+                ProviderType::TraeRaw | ProviderType::TraeIntl | ProviderType::OpenCodeZen
             ) {
                 return None;
             }
@@ -1364,6 +1371,23 @@ fn runtime_test_model(
         }
     } else {
         Some(model)
+    }
+}
+
+/// Zen has no static fallback model. A fixed policy is the probe authority;
+/// passthrough requires an explicit probe model rather than an App-wide default.
+pub fn zen_fixed_test_model(stored: &StoredProvider) -> Option<String> {
+    if stored.provider_type != ProviderType::OpenCodeZen {
+        return None;
+    }
+    let profile = stored
+        .resource
+        .profile_id
+        .as_ref()
+        .and_then(|id| profile_by_id(id.as_str()));
+    match runtime_model_policy(stored, profile).ok()? {
+        RuntimeModelPolicy::Single { upstream_model } => Some(upstream_model),
+        RuntimeModelPolicy::Passthrough => None,
     }
 }
 
@@ -2236,6 +2260,44 @@ mod tests {
         let changed = compile_runtime_plan(&stored, &accounts).unwrap();
         assert_eq!(first.runtime_fingerprint, changed.runtime_fingerprint);
         assert_ne!(first.health_fingerprint(), changed.health_fingerprint());
+    }
+
+    #[test]
+    fn opencode_zen_probe_models_require_explicit_selection_and_follow_fixed_policy() {
+        for app in [AppKind::Claude, AppKind::Codex] {
+            let mut stored = provider(
+                &format!("{}.opencode_zen", app.as_str()),
+                ProviderType::OpenCodeZen,
+            );
+            stored.app = app;
+            let defaults = ProviderRuntimeDefaults::default();
+            assert!(runtime_test_model(&stored, true, &defaults).is_none());
+            stored.provider.settings_config["testModel"] = json!("probe-free");
+            assert_eq!(
+                runtime_test_model(&stored, true, &defaults).as_deref(),
+                Some("probe-free")
+            );
+            stored.provider.settings_config["modelMapping"] =
+                json!({"mode":"single","upstreamModel":"selected-free"});
+            let plan = compile_runtime_plan(&stored, &AccountStore::default()).unwrap();
+            assert_eq!(plan.test_model.as_deref(), Some("selected-free"));
+            let probe = build_provider_model_probe(
+                app,
+                ProviderType::OpenCodeZen,
+                "selected-free",
+                "ping",
+                true,
+                plan.health_fingerprint(),
+            );
+            assert_eq!(probe.body["model"], "selected-free");
+            assert_eq!(
+                probe
+                    .body
+                    .get("max_tokens")
+                    .or_else(|| probe.body.get("max_output_tokens")),
+                Some(&json!(256))
+            );
+        }
     }
 
     #[test]

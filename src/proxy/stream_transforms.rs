@@ -127,6 +127,7 @@ impl StreamEventTransformer {
                 // cache metering is not committed as zero.
                 let state = if stored.provider_type.is_buddy_oauth()
                     || stored.provider_type == ProviderType::OllamaCloud
+                    || stored.provider_type == ProviderType::OpenCodeZen
                 {
                     ChatAnthropicState::deferred_terminal()
                 } else {

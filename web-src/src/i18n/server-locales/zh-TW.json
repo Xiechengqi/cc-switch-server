@@ -1,5 +1,9 @@
 {
   "zenModels": {
+    "output": "最大輸出：{{count}} tokens（上游宣告）",
+    "efforts": "可請求的推理強度：{{values}}",
+    "structured": "可請求 JSON Schema 結構化輸出，實際可用性取決於上游。",
+    "noTools": "此模型宣告不支援工具呼叫。",
     "choose": "選擇上游模型",
     "search": "搜尋模型名稱或 ID",
     "refresh": "重新整理模型目錄",

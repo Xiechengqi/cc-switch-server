@@ -1167,7 +1167,8 @@ pub(in crate::api) async fn test_provider_inner(
             "testPrompt must be non-empty, trimmed, and at most 1000 characters",
         ));
     }
-    let model = crate::domain::providers::runtime::buddy_fixed_test_model(stored)
+    let model = crate::domain::providers::runtime::zen_fixed_test_model(stored)
+        .or_else(|| crate::domain::providers::runtime::buddy_fixed_test_model(stored))
         .or_else(|| {
             query
                 .model
@@ -1177,7 +1178,13 @@ pub(in crate::api) async fn test_provider_inner(
                 .map(str::to_string)
         })
         .or_else(|| execution.plan.test_model.clone())
-        .unwrap_or_else(|| provider_test_model(stored.app, stored, None, None));
+        .unwrap_or_else(|| {
+            if execution.driver_is("special.opencode_zen") {
+                String::new()
+            } else {
+                provider_test_model(stored.app, stored, None, None)
+            }
+        });
     let gemini_path = default_gemini_test_path(stored.app, &model, requested_stream);
     let grok_reconciliation_before = grok_reconciliation_snapshot(state, &execution).await;
     if let Err(error) =
@@ -1329,6 +1336,18 @@ pub(in crate::api) async fn test_provider_inner(
             model,
             requested_stream,
         )
+        .await;
+    }
+
+    if execution.driver_is("special.opencode_zen") {
+        return Box::pin(test_zen_provider_inner(
+            state,
+            execution,
+            query,
+            route,
+            model,
+            requested_stream,
+        ))
         .await;
     }
 
@@ -1655,6 +1674,157 @@ pub(in crate::api) async fn test_provider_inner(
         reconciliation,
         message,
     })
+}
+
+struct ZenProbeTaskAbortGuard(tokio::task::AbortHandle);
+
+impl Drop for ZenProbeTaskAbortGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn test_zen_provider_inner(
+    state: &ServerState,
+    execution: proxy::provider_ops::ProviderExecution,
+    query: &TestProviderQuery,
+    route: proxy::ProxyRoute,
+    model: String,
+    stream: bool,
+) -> Result<TestProviderResponse, ApiError> {
+    let stored = execution.runtime_stored_view();
+    let capability = proxy::adapters::adapter_for(stored.app, stored.provider_type)
+        .capability(stored.app, stored.provider_type);
+    let network = query.network.unwrap_or(false);
+    let mut report = TestProviderResponse {
+        ok: false,
+        outcome: ProviderOperationOutcome::InvalidConfig,
+        driver_id: execution.plan.driver_id.to_string(),
+        runtime_fingerprint: execution.plan.runtime_fingerprint.clone(),
+        provider_id: stored.provider.id.clone(),
+        app: stored.app,
+        provider_type: stored.provider_type,
+        provider_revision: stored.resource.revision,
+        adapter: capability.adapter,
+        support: capability.support,
+        endpoint: proxy::opencode_zen::ORIGIN.to_string(),
+        model: model.clone(),
+        stream,
+        header_names: Vec::new(),
+        network_checked: false,
+        network_status_code: None,
+        network_latency_ms: None,
+        network_stream_completed: None,
+        network_error: None,
+        reconciliation: None,
+        message: String::new(),
+    };
+    if model.trim().is_empty() {
+        report.message="OpenCode Zen requires an explicit test model or a fixed upstream model; select a current free model".into();
+        return Ok(report);
+    }
+    if !network {
+        report.ok = true;
+        report.outcome = ProviderOperationOutcome::Success;
+        report.message =
+            "OpenCode Zen configuration is ready; no catalog or generation request was sent".into();
+        return Ok(report);
+    }
+    ensure_provider_outbound_allowed(state, &execution).await?;
+    let probe = build_provider_model_probe(
+        stored.app,
+        stored.provider_type,
+        &model,
+        query.test_prompt.as_deref().unwrap_or("ping"),
+        stream,
+        "",
+    );
+    let timeout = query
+        .timeout_ms
+        .filter(|n| *n > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| execution.request_timeout());
+    let started = std::time::Instant::now();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-cc-switch-health-check", HeaderValue::from_static("1"));
+    // Separate polling tasks keep the HTTP control-plane, inference and stream
+    // drain frames from accumulating on the same worker stack. One timeout
+    // still covers both phases, and drop aborts every outstanding task.
+    let call = async {
+        let mut forwarding = tokio::spawn(proxy::forward_provider_test(
+            state.clone(),
+            route,
+            execution,
+            None,
+            headers,
+            Bytes::from(probe.body_json()),
+        ));
+        let _forward_owner = ZenProbeTaskAbortGuard(forwarding.abort_handle());
+        let response = (&mut forwarding).await.map_err(|_| {
+            proxy::ProxyError::bad_gateway("OpenCode Zen probe forwarding task failed")
+        })??;
+        let status = response.status().as_u16();
+        let mut draining = tokio::spawn(async move {
+            axum::body::to_bytes(
+                response.into_body(),
+                PROVIDER_TEST_RESPONSE_BODY_LIMIT_BYTES,
+            )
+            .await
+        });
+        let _body_owner = ZenProbeTaskAbortGuard(draining.abort_handle());
+        let body = (&mut draining)
+            .await
+            .map_err(|_| proxy::ProxyError::bad_gateway("OpenCode Zen probe response task failed"))?
+            .map_err(|_| {
+                proxy::ProxyError::bad_gateway(
+                    "OpenCode Zen probe response exceeded its bound or could not be read",
+                )
+            })?;
+        Ok::<_, proxy::ProxyError>((status, body))
+    };
+    report.network_checked = true;
+    match tokio::time::timeout(timeout, call).await {
+        Err(_) => {
+            report.outcome = ProviderOperationOutcome::Timeout;
+            report.message =
+                "OpenCode Zen probe deadline exceeded before the complete response".into();
+        }
+        Ok(Err(error)) => {
+            report.outcome = provider_test_outcome(
+                true,
+                Some(error.status.as_u16()),
+                Some(error.client_message()),
+            );
+            report.network_status_code = Some(error.status.as_u16());
+            report.message = redact_provider_test_error(error.client_message());
+        }
+        Ok(Ok((status, body))) => {
+            report.network_status_code = Some(status);
+            let complete = if stream {
+                buddy_probe_stream_completed(stored.app, &body, Some(256))
+            } else {
+                !body.is_empty() && serde_json::from_slice::<Value>(&body).is_ok()
+            };
+            report.network_stream_completed = stream.then_some(complete);
+            report.ok = (200..300).contains(&status) && complete;
+            report.outcome = if report.ok {
+                ProviderOperationOutcome::Success
+            } else {
+                ProviderOperationOutcome::Protocol
+            };
+            report.message = if report.ok {
+                "OpenCode Zen formal generation path and complete response verified"
+            } else {
+                "OpenCode Zen probe did not return a valid complete response"
+            }
+            .into();
+        }
+    }
+    report.network_latency_ms = Some(started.elapsed().as_millis());
+    if !report.ok {
+        report.network_error = Some(report.message.clone());
+    }
+    Ok(report)
 }
 
 async fn test_codebuddy_provider_inner(
@@ -3456,40 +3626,22 @@ pub(in crate::api) async fn fetch_provider_models_inner(
         }
         ensure_provider_outbound_allowed(state, execution).await?;
         let client = state.http_client().await;
-        let ids = crate::proxy::opencode_zen::refresh_catalog(&client, &state.config_dir)
-            .await
-            .map_err(ApiError::bad_gateway)?;
+        let catalog =
+            crate::proxy::opencode_zen::refresh_model_catalog(&client, &state.config_dir, false)
+                .await
+                .map_err(ApiError::bad_gateway)?;
         return Ok(ProviderModelsFetchResult {
-            url: format!(
-                "{}{}",
-                crate::proxy::opencode_zen::ORIGIN,
-                crate::proxy::opencode_zen::CATALOG_PATH
-            ),
-            models: ids
-                .into_iter()
-                .map(|id| FetchedProviderModel {
-                    upstream_model: id.clone(),
-                    display_name: Some(id.clone()),
-                    raw: serde_json::json!({
-                        "id": id,
-                        "source": "opencode_zen_live_model_catalog",
-                        "upstreamDeclared": crate::proxy::opencode_zen::catalog_metadata(&id),
-                        "capabilitySource": "reviewed_text_tools_only",
-                        "capabilities": {
-                            "stream": true,
-                            "tools": true,
-                            "images": false,
-                            "inputModalities": ["text"]
-                        }
-                    }),
-                    id,
-                })
-                .collect(),
-            source: Some("opencode_zen_live_model_catalog".to_string()),
-            stale: Some(crate::proxy::opencode_zen::catalog_is_stale()),
-            fetched_at_ms: crate::proxy::opencode_zen::catalog_fetched_at_ms(),
+            url: format!("{}{}", crate::proxy::opencode_zen::ORIGIN, crate::proxy::opencode_zen::CATALOG_PATH),
+            models: catalog.models.into_iter().filter(|m|m.selectable).map(|m|FetchedProviderModel {
+                upstream_model:m.id.clone(),display_name:Some(m.display_name.clone()),
+                raw:serde_json::json!({"id":m.id,"source":catalog.source,"stale":catalog.stale,
+                    "upstreamDeclared":{"context_window":m.context_window,"max_output_tokens":m.max_output_tokens,"capabilities":m.capabilities},
+                    "capabilitySource":"upstream_declaration_and_local_mapping","capabilities":m.effective_capabilities}),id:m.id,
+            }).collect(),
+            source:Some(catalog.source.to_string()),stale:Some(catalog.stale),fetched_at_ms:Some(catalog.fetched_at_ms),
         });
     }
+
     if crate::proxy::web_session::is_web_session_driver(execution.plan.driver_id.as_str()) {
         let models = crate::proxy::web_session::reviewed_models_for_driver(
             execution.plan.driver_id.as_str(),
@@ -5701,6 +5853,7 @@ pub(in crate::api) fn map_managed_account_refresh_error(
 
 #[cfg(test)]
 mod tests {
+    include!("providers/opencode_zen_tests.rs");
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

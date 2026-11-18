@@ -15,6 +15,17 @@ struct OpencodeZenForwardOptions {
 }
 
 async fn forward_opencode_zen(options: OpencodeZenForwardOptions) -> Result<Response, ProxyError> {
+    #[cfg(test)]
+    if let Some(origin) = options
+        .execution
+        .plan
+        .driver_options
+        .get("testZenOrigin")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        return forward_opencode_zen_at(options, &origin).await;
+    }
     forward_opencode_zen_at(options, super::opencode_zen::ORIGIN).await
 }
 
@@ -23,6 +34,45 @@ async fn forward_opencode_zen(options: OpencodeZenForwardOptions) -> Result<Resp
 async fn forward_opencode_zen_at(
     options: OpencodeZenForwardOptions,
     origin: &str,
+) -> Result<Response, ProxyError> {
+    let state = options.state.clone();
+    let stored = options.stored.clone();
+    let mut context = options.request_context.clone();
+    let started = options.started;
+    let mut logged = false;
+    let result = forward_opencode_zen_inner(options, origin, &mut logged).await;
+    if !logged {
+        if let Err(error) = &result {
+            context.usage_state = Some(UsageState::NotApplicable);
+            context.stream_status = Some(
+                if error.status.is_client_error() {
+                    "client_error"
+                } else {
+                    "failed"
+                }
+                .into(),
+            );
+            context.failure_kind = Some("zen_preflight_rejected".into());
+            context.error_message = Some(error.client_message().to_string());
+            log_usage(
+                &state,
+                &stored,
+                error.status.as_u16(),
+                started.elapsed().as_millis(),
+                UsageModelMetadata::default(),
+                TokenUsage::default(),
+                context,
+            )
+            .await;
+        }
+    }
+    result
+}
+
+async fn forward_opencode_zen_inner(
+    options: OpencodeZenForwardOptions,
+    origin: &str,
+    logged: &mut bool,
 ) -> Result<Response, ProxyError> {
     use super::opencode_zen as zen;
     let OpencodeZenForwardOptions {
@@ -38,6 +88,13 @@ async fn forward_opencode_zen_at(
         timing,
         request_memory,
     } = options;
+    let total_deadline = tokio::time::Instant::from_std(started) + execution.request_timeout();
+    if tokio::time::Instant::now() >= total_deadline {
+        return Err(ProxyError {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: "OpenCode Zen request deadline exceeded".into(),
+        });
+    }
     if !matches!(
         route,
         ProxyRoute::ClaudeMessages | ProxyRoute::CodexChatCompletions | ProxyRoute::CodexResponses
@@ -66,15 +123,13 @@ async fn forward_opencode_zen_at(
         .ok_or_else(|| ProxyError::bad_request("OpenCode Zen request must be a JSON object"))?;
     map.entry("stream")
         .or_insert(Value::Bool(request_context.is_streaming));
-    map.entry("model")
-        .or_insert(Value::String(zen::DEFAULT_MODEL.to_string()));
     if !requested["stream"].is_boolean() {
         return Err(ProxyError::bad_request("stream must be a boolean"));
     }
     let model = requested["model"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| ProxyError::bad_request("model must be a nonempty string"))?
+        .ok_or_else(|| ProxyError::bad_request("OpenCode Zen model is required; select a current free model or configure a fixed upstream model"))?
         .to_string();
     // Reject unsupported Responses resource semantics rather than silently
     // dropping history or promising persistence that this driver cannot provide.
@@ -95,11 +150,21 @@ async fn forward_opencode_zen_at(
         });
     }
     let client = state.http_client().await;
-    zen::refresh_catalog(&client, &state.config_dir)
-        .await
-        .map_err(ProxyError::bad_gateway)?;
-    let endpoint = zen::generation_endpoint(&model).map_err(ProxyError::bad_request)?;
-    let prepared = zen::prepare_for_route(&requested, route, endpoint)?;
+    let catalog = tokio::time::timeout_at(
+        total_deadline,
+        zen::refresh_model_catalog(&client, &state.config_dir, false),
+    )
+    .await
+    .map_err(|_| ProxyError {
+        status: StatusCode::GATEWAY_TIMEOUT,
+        message: "OpenCode Zen catalog deadline exceeded".into(),
+    })?
+    .map_err(ProxyError::bad_gateway)?;
+    let admitted = catalog.admit(&model).map_err(ProxyError::bad_request)?;
+    let prepared = zen::prepare_for_model(&requested, route, &admitted)?;
+    request_context.requested_reasoning_effort =
+        zen::requested_effort(&requested).map(str::to_string);
+    request_context.effective_reasoning_effort = request_context.requested_reasoning_effort.clone();
     ensure_share_model_available(
         &state,
         &execution,
@@ -134,6 +199,7 @@ async fn forward_opencode_zen_at(
         request_context.clone(),
     )
     .await;
+    *logged = true;
     // Preserve one request identity. Each attempt owns its own evidence; the
     // public aggregate log carries a separate current-generation observation.
     let mut evidence_context = request_context.clone();
@@ -169,7 +235,13 @@ async fn forward_opencode_zen_at(
     ))
     .map_err(|_| ProxyError::bad_request("invalid Zen conversation scope"))?;
     let session = zen::session_for_conversation(&seed);
-    let total_deadline = tokio::time::Instant::from_std(started) + execution.request_timeout();
+    let lane = match zen::acquire_lane(origin, &model, total_deadline).await {
+        Ok(lane) => lane,
+        Err(error) => {
+            finish_qoder_stream_failure(&mut guard, route, &error).await;
+            return Err(error);
+        }
+    };
     let result = async {
         series
             .lock()
@@ -206,7 +278,9 @@ async fn forward_opencode_zen_at(
             if response.status() == StatusCode::UNAUTHORIZED {
                 series.lock().await.auth_rejected().await;
             }
-            return Err(zen_http_error(&mut response, total_deadline).await);
+            let error = zen_http_error(&mut response, total_deadline).await;
+            zen::observe_lane_error(origin, &model, &error);
+            return Err(error);
         }
         let content_type = response
             .headers()
@@ -225,11 +299,16 @@ async fn forward_opencode_zen_at(
         let mut payload: Value = serde_json::from_slice(&bytes)
             .map_err(|_| ProxyError::bad_gateway("OpenCode Zen invalid JSON response"))?;
         guard.usage.observe_json(&payload);
-        if wire != zen::ZenWire::Chat
-            || zen::continuation_kind(&payload) != Some(zen::ContinuationKind::PureReasoning)
+        if wire == zen::ZenWire::Chat
+            && zen::continuation_kind(&payload) == Some(zen::ContinuationKind::PureReasoning)
         {
+            let mut candidate = payload.clone();
+            candidate["choices"][0]["finish_reason"] = json!("stop");
+            zen_validate_json(&candidate, wire)?;
+        } else {
             zen_validate_json(&payload, wire)?;
         }
+        zen::validate_client_tools(&payload, &prepared.client_tool_names)?;
         zen_observe_generation(&series, &guard.usage.snapshot(), &model).await?;
         if let Some(t) = timing.get() {
             match wire {
@@ -250,7 +329,7 @@ async fn forward_opencode_zen_at(
                 if let Some((next, continuation)) = zen_continuation_request(
                     &requested,
                     route,
-                    endpoint,
+                    &admitted,
                     kind,
                     &payload,
                     total_deadline,
@@ -308,7 +387,9 @@ async fn forward_opencode_zen_at(
                             if response.status() == StatusCode::UNAUTHORIZED {
                                 series.lock().await.auth_rejected().await;
                             }
-                            return Err(zen_http_error(&mut response, total_deadline).await);
+                            let error = zen_http_error(&mut response, total_deadline).await;
+                            zen::observe_lane_error(origin, &model, &error);
+                            return Err(error);
                         }
                         let (bytes, _memory) =
                             zen_read_json(&mut response, &budget, total_deadline).await?;
@@ -345,6 +426,7 @@ async fn forward_opencode_zen_at(
                             .saturating_add(first.streamed_text_bytes);
                         guard.usage.replace_observation(merged);
                         zen_validate_json(&continued, wire)?;
+                        zen::validate_client_tools(&continued, &continuation.client_tool_names)?;
                         zen_merge_continuation(&payload, &mut continued, kind)?;
                         Ok::<Value, ProxyError>(continued)
                     }
@@ -432,7 +514,8 @@ async fn forward_opencode_zen_at(
         tool_context,
         include_usage,
         timing.get(),
-    );
+    )
+    .with_client_tools(prepared.client_tool_names);
     let retained = match budget.reserve(
         RequestMemoryComponent::StreamRetainedState,
         decoder.retained_bytes(),
@@ -455,6 +538,7 @@ async fn forward_opencode_zen_at(
         let _owner = _owner;
         let _account = account_in_flight_guard;
         let _share = share_invocation_guard;
+        let _lane = lane;
         let _series = series.clone();
         let mut idle_deadline = tokio::time::Instant::now() + execution.stream_idle_timeout().unwrap_or(Duration::from_secs(60));
         let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(15), Duration::from_secs(15));
@@ -546,10 +630,18 @@ fn zen_status_error(status: StatusCode, headers: &HeaderMap) -> ProxyError {
     let retry = headers
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u32>().ok())
+        .and_then(|v| {
+            v.parse::<u64>().ok().or_else(|| {
+                httpdate::parse_http_date(v).ok().map(|date| {
+                    date.duration_since(std::time::SystemTime::now())
+                        .unwrap_or_default()
+                        .as_secs()
+                })
+            })
+        })
         .map(|v| v.min(86400));
     let kind = super::opencode_zen::classify_upstream_status(status.as_u16());
-    ProxyError {
+    let mut error = ProxyError {
         status: if status == StatusCode::TOO_MANY_REQUESTS
             || status == StatusCode::FORBIDDEN
             || status == StatusCode::UNAUTHORIZED
@@ -559,16 +651,22 @@ fn zen_status_error(status: StatusCode, headers: &HeaderMap) -> ProxyError {
             StatusCode::BAD_GATEWAY
         },
         message: format!(
-            "OpenCode Zen upstream {kind}: HTTP {}{}{}",
+            "OpenCode Zen upstream {kind}: HTTP {}{}",
             status.as_u16(),
             request_id
                 .map(|id| format!("; request_id={id}"))
-                .unwrap_or_default(),
-            retry
-                .map(|n| format!("; retry_after_seconds={n}"))
                 .unwrap_or_default()
         ),
+    };
+    if let Some(seconds) = retry {
+        error.message = format!(
+            "{}{}]{}",
+            ProxyError::RETRY_AFTER_PREFIX,
+            seconds,
+            error.message
+        );
     }
+    error
 }
 
 async fn zen_post(
@@ -630,51 +728,13 @@ fn zen_validate_json(
     payload: &Value,
     wire: super::opencode_zen::ZenWire,
 ) -> Result<(), ProxyError> {
-    use super::opencode_zen::ZenWire;
-    if payload.get("error").is_some_and(|e| !e.is_null()) {
-        return Err(ProxyError::bad_gateway("OpenCode Zen generation failed"));
-    }
-    let valid = match wire {
-        ZenWire::Chat => {
-            payload.pointer("/choices/0/message").is_some()
-                && payload
-                    .pointer("/choices/0/finish_reason")
-                    .and_then(Value::as_str)
-                    .is_some_and(|v| {
-                        matches!(
-                            v,
-                            "stop" | "length" | "tool_calls" | "function_call" | "content_filter"
-                        )
-                    })
-        }
-        ZenWire::Responses => {
-            payload
-                .get("status")
-                .and_then(Value::as_str)
-                .is_some_and(|v| matches!(v, "completed" | "incomplete"))
-                && payload.get("output").is_some_and(Value::is_array)
-        }
-        ZenWire::Messages => {
-            payload.get("content").is_some_and(Value::is_array)
-                && payload
-                    .get("stop_reason")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty())
-        }
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(ProxyError::bad_gateway(
-            "OpenCode Zen missing or invalid JSON terminal",
-        ))
-    }
+    super::opencode_zen::validate_json(payload, wire)
 }
 
 fn zen_continuation_request(
     requested: &Value,
     route: ProxyRoute,
-    endpoint: super::opencode_zen::CatalogEndpoint,
+    admitted: &super::opencode_zen::ZenAdmission,
     kind: super::opencode_zen::ContinuationKind,
     payload: &Value,
     deadline: tokio::time::Instant,
@@ -683,18 +743,31 @@ fn zen_continuation_request(
     if deadline.saturating_duration_since(tokio::time::Instant::now()) < Duration::from_secs(1) {
         return Ok(None);
     }
+    // A new schema-constrained document or a user stop sequence is not a
+    // suffix of a truncated answer. Preserve the original incomplete result.
+    if [
+        requested.get("response_format"),
+        requested.pointer("/text/format"),
+        requested.pointer("/output_config/format"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|f| f["type"] != "text")
+        || requested.get("stop").is_some()
+        || requested.get("stop_sequences").is_some()
+        || requested.get("tool_choice").is_some_and(|c| {
+            c.as_str() != Some("auto") && c.get("type").and_then(Value::as_str) != Some("auto")
+        })
+    {
+        return Ok(None);
+    }
     let canonical = match route {
         ProxyRoute::ClaudeMessages => super::transforms::anthropic_to_openai_chat(requested),
         ProxyRoute::CodexResponses => super::transforms::openai_responses_to_chat(requested),
         _ => Ok(requested.clone()),
     }
     .map_err(|e| ProxyError::bad_request(e.to_string()))?;
-    let total = requested
-        .get("max_tokens")
-        .or_else(|| requested.get("max_output_tokens"))
-        .or_else(|| requested.get("max_completion_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(32_000);
+    let total = zen::output_limit(requested, Some(admitted))?;
     let used = payload
         .pointer("/usage/completion_tokens")
         .and_then(Value::as_u64);
@@ -714,11 +787,33 @@ fn zen_continuation_request(
     if serde_json::to_vec(&messages).map_or(true, |bytes| bytes.len() > 128 * 1024) {
         return Ok(None);
     }
-    let mut next = json!({"model": requested["model"], "stream": false, "messages": messages, "max_completion_tokens": remaining});
-    if let Some(tools) = canonical.get("tools") {
-        next["tools"] = tools.clone();
+    let mut next = canonical;
+    let map = next
+        .as_object_mut()
+        .ok_or_else(|| ProxyError::bad_request("invalid Zen continuation request"))?;
+    for key in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+        map.remove(key);
     }
-    let prepared = zen::prepare_for_route(&next, ProxyRoute::CodexChatCompletions, endpoint)?;
+    map.insert("model".into(), requested["model"].clone());
+    map.insert("stream".into(), Value::Bool(false));
+    map.insert("messages".into(), messages);
+    map.insert("max_completion_tokens".into(), remaining.into());
+    // Preserve reviewed controls from the ingress, then run the same capability
+    // gate and fixed endpoint as generation one. No second catalog read.
+    for key in zen::control_keys() {
+        next.as_object_mut().unwrap().remove(*key);
+    }
+    for key in zen::control_keys() {
+        if let Some(value) = requested.get(*key) {
+            next[*key] = value.clone();
+        }
+    }
+    let Ok(prepared) = zen::prepare_for_model(&next, ProxyRoute::CodexChatCompletions, admitted)
+    else {
+        // The optional continuation may no longer satisfy a thinking/output
+        // budget. No second call has started; keep the valid first segment.
+        return Ok(None);
+    };
     Ok(Some((next, prepared)))
 }
 
@@ -874,8 +969,31 @@ async fn zen_http_error(
         } else {
             None
         };
-        if let Some(category) = category {
-            error.message = format!("{category}; {}", error.message);
+        let structured = serde_json::from_slice::<Value>(&body).ok();
+        let code = structured
+            .as_ref()
+            .and_then(|v| {
+                v.pointer("/error/code")
+                    .or_else(|| v.pointer("/error/type"))
+            })
+            .and_then(Value::as_str);
+        let client_category = match code {
+            Some("context_length_exceeded" | "context_window_exceeded" | "max_tokens_exceeded") => {
+                Some("context_limit")
+            }
+            Some("unsupported_parameter" | "invalid_parameter" | "invalid_request_error") => {
+                Some("parameter_rejected")
+            }
+            _ => None,
+        };
+        if category.is_none()
+            && matches!(response.status().as_u16(), 400 | 413 | 422)
+            && client_category.is_some()
+        {
+            error.status = StatusCode::BAD_REQUEST;
+        }
+        if let Some(category) = category.or(client_category) {
+            error.message.push_str(&format!("; category={category}"));
         }
     }
     error
