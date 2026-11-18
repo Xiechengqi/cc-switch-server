@@ -78,6 +78,8 @@ Messages、Chat、Responses 入口的推理强度、JSON Schema、temperature/to
 
 每个进程只有一条 public lane，所有 Provider/Share 共用并发上限；`CC_SWITCH_ZEN_MAX_CONCURRENCY` 启动时读取，1..32，默认 4，最多排队 32。队列服从总 deadline，取消释放排队资格；SSE 响应体持有许可直到终结或取消。429 按模型冷却，401/403 按通道冷却，使用受限 Retry-After 或默认 30 秒；不自动重放，不轮换出口。一次非流续写沿用首次准入快照、控制参数和剩余输出预算，续写失败也记录冷却。
 
+仅有 HTTP 429 时，检测结果归类为 `rateLimit`，表示请求受限；不能据此断言免费额度耗尽或具体重置周期。本地冷却也使用同一分类。Zen 的手动和自动模型检测均只尝试一次，不受全局检测重试次数影响，保留首次拒绝的原因。Web 的限流和额度提示适用于实际供应商，并保留脱敏错误详情，不套用其他服务的 Coding Plan 说明。
+
 Registry 已开放正式 test/connectivity。固定模型策略是检测模型权威；透传策略必须显式配置或在检测时选择模型，不借用全局 Claude/Codex 默认值。配置检查不访问目录或生成；网络检测复用正式 driver，使用 256 token 上限，完整消费 JSON/SSE 并检查结构化终态，单个超时覆盖全部响应。Router modelProbe 使用同一模型与预算；没有检测模型时不发布虚假 probe。
 
 网络检测的转发与响应读取分为可取消任务，超时或调用取消时中止未完成任务并收尾用量。调试构建的公共分发器单次 poll 栈帧超过 Tokio 默认 2 MiB，因此本地 debug 服务使用至少 8 MiB 工作线程栈，并保留显式配置的更大 RUST_MIN_STACK；release 的栈配置保持原行为。专项回归独立使用 8 MiB 工作线程，覆盖完整 JSON/SSE 与超时取消，避免仅依赖全量 fixture 的 64 MiB 测试栈掩盖问题。

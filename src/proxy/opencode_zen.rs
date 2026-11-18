@@ -1606,11 +1606,11 @@ pub(super) fn control_keys() -> &'static [&'static str] {
 pub(super) use lane::{acquire as acquire_lane, observe_error as observe_lane_error};
 pub(super) use validation::{client_tools as validate_client_tools, validate as validate_json};
 
-/// Quota failures are not replayed. The reference observes free quota by
-/// egress IP; neither reminting sessions nor retrying invents more allowance.
+/// A 429 alone proves throttling, not quota exhaustion or a reset window.
+/// Failures are not replayed; reminting sessions cannot restore allowance.
 pub fn classify_upstream_status(status: u16) -> &'static str {
     match status {
-        429 => "quota",
+        429 => "rate_limit",
         403 => "forbidden",
         401 => "rejected",
         _ => "upstream",
@@ -1754,8 +1754,8 @@ mod tests {
     }
 
     #[test]
-    fn quota_is_not_retried() {
-        assert_eq!(classify_upstream_status(429), "quota");
+    fn throttling_status_does_not_claim_quota_exhaustion() {
+        assert_eq!(classify_upstream_status(429), "rate_limit");
         assert_eq!(classify_upstream_status(403), "forbidden");
     }
 

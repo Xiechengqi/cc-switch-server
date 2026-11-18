@@ -266,7 +266,7 @@ async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() 
 }
 
 #[tokio::test]
-async fn opencode_zen_loopback_quota_failure_is_not_replayed_or_leaked() {
+async fn opencode_zen_loopback_rate_limit_is_not_replayed_or_leaked() {
     let _lock = super::super::opencode_zen::CATALOG_TEST_LOCK.lock().await;
     let state = forwarder_test_state("zen-quota");
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -294,6 +294,10 @@ async fn opencode_zen_loopback_quota_failure_is_not_replayed_or_leaked() {
     .await;
     let error = forward_opencode_zen_at(options, &origin).await.unwrap_err();
     assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(error
+        .client_message()
+        .contains("upstream rate_limit: HTTP 429"));
+    assert!(!error.client_message().contains("quota"));
     assert!(!error.message.contains("private-upstream-body"));
     assert!(error.message.contains("safe-123"));
     assert_eq!(calls.load(Ordering::SeqCst), 1);

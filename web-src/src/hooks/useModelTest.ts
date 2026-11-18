@@ -59,16 +59,31 @@ export function useModelTest(appId: AppId) {
               closeButton: true,
             },
           );
-        } else if (result.errorCategory === "quotaExceeded") {
+        } else if (
+          result.errorCategory === "quotaExceeded" ||
+          result.errorCategory === "rateLimit"
+        ) {
+          const rateLimited = result.errorCategory === "rateLimit";
+          const hint = t(
+            rateLimited
+              ? "streamCheck.rateLimitHint"
+              : "streamCheck.quotaExceededHint",
+            { defaultValue: "" },
+          );
           toast.warning(
-            t("streamCheck.quotaExceeded", {
-              providerName,
-              defaultValue: `${providerName} Coding Plan quota has been exceeded`,
-            }),
+            t(
+              rateLimited
+                ? "streamCheck.rateLimit"
+                : "streamCheck.quotaExceeded",
+              {
+                providerName,
+                defaultValue: rateLimited
+                  ? `${providerName} requests are limited; try again later`
+                  : `${providerName} upstream quota is insufficient`,
+              },
+            ),
             {
-              description: t("streamCheck.quotaExceededHint", {
-                defaultValue: "",
-              }),
+              description: [hint, result.message].filter(Boolean).join("\n"),
               duration: 10000,
               closeButton: true,
             },

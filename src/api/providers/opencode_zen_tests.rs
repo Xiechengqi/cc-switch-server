@@ -80,6 +80,14 @@ async fn zen_formal_probe_regression() {
             let sent:Value=serde_json::from_slice(&body).unwrap();
             assert_eq!(sent["model"],"chat-free");
             assert_eq!(sent["max_completion_tokens"],256);
+            if mode == 3 {
+                return Response::builder()
+                    .status(429)
+                    .header("retry-after", "3")
+                    .header("x-request-id", "zen-probe-limit")
+                    .body(Body::from("private-upstream-body"))
+                    .unwrap();
+            }
             if sent["stream"] == true {
                 let first = "data: {\"id\":\"c\",\"model\":\"chat-free\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"},\"finish_reason\":null}]}\n\n";
                 let last = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":256}}\n\ndata: [DONE]\n\n";
@@ -97,6 +105,7 @@ async fn zen_formal_probe_regression() {
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
+    let retry_app = app.clone();
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -168,6 +177,81 @@ async fn zen_formal_probe_regression() {
         .expect("probe timeout must abort body draining and settle cancellation");
         mode.store(0, std::sync::atomic::Ordering::SeqCst);
     }
+    // A plain upstream 429 and the shared local cooldown must both reach the
+    // Web API as rateLimit, without inferring quota exhaustion or replaying.
+    mode.store(3, std::sync::atomic::Ordering::SeqCst);
+    let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+    for app in [AppKind::Claude, AppKind::Codex] {
+        let execution = install_zen_test_execution(&state, app, &origin, true).await;
+        let result = test_provider_inner(
+            &state,
+            execution,
+            &TestProviderQuery {
+                app,
+                model: None,
+                network: Some(true),
+                timeout_ms: Some(2_000),
+                test_prompt: Some("ping".into()),
+                stream: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!result.ok);
+        assert_eq!(result.outcome, ProviderOperationOutcome::RateLimit);
+        assert_eq!(result.network_status_code, Some(429));
+        assert!(!result.message.contains("private-upstream-body"));
+        assert!(!result.message.contains("quota"));
+        if app == AppKind::Claude {
+            assert!(result.message.contains("upstream rate_limit: HTTP 429"));
+            assert!(result.message.contains("zen-probe-limit"));
+        } else {
+            assert!(result.message.contains("cooling down"));
+        }
+        let web_result = crate::api::invoke::handlers::map_provider_test_to_stream_check_result(
+            &result,
+            &Default::default(),
+        );
+        assert!(!web_result.success);
+        assert_eq!(web_result.error_category.as_deref(), Some("rateLimit"));
+        assert_eq!(web_result.message, result.message);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+    }
+    // Exercise the orchestration used by manual and scheduled Web model tests,
+    // including a nonzero global retry setting and a subsequent local cooldown.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let retry_origin = format!("http://{}", listener.local_addr().unwrap());
+    let retry_server = tokio::spawn(async move {
+        axum::serve(listener, retry_app).await.unwrap();
+    });
+    let execution = install_zen_test_execution(&state, AppKind::Claude, &retry_origin, true).await;
+    let mut store = state.providers_snapshot().await;
+    std::sync::Arc::make_mut(&mut store.runtime_index)
+        .insert_plan_for_test((*execution.plan).clone());
+    state.replace_provider_store_for_test(store).await;
+    let config = crate::domain::providers::runtime::ProviderHealthCheckConfig {
+        max_retries: 3,
+        ..Default::default()
+    };
+    let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+    for message in ["upstream rate_limit: HTTP 429", "cooling down"] {
+        let checked = crate::api::provider_health_scheduler::probe_provider_and_record(
+            &state,
+            &execution.stored,
+            &config,
+            "cc-switch-manual",
+        )
+        .await
+        .unwrap();
+        assert!(!checked.result.success);
+        assert_eq!(checked.result.http_status, Some(429));
+        assert_eq!(checked.result.error_category.as_deref(), Some("rateLimit"));
+        assert_eq!(checked.result.retry_count, 0);
+        assert!(checked.result.message.contains(message));
+        assert!(!checked.result.message.contains("private-upstream-body"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+    }
+    retry_server.abort();
     server.abort();
     zen::clear_catalog();
 }

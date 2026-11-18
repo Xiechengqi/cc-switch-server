@@ -1279,12 +1279,20 @@ async fn run_probe_with_retries(
             }
         };
     let runtime_fingerprint = execution.plan.health_fingerprint();
-    for attempt in 0..=config.max_retries {
+    // Zen's public lane owns its cooldown and never replays generation.
+    // Keep the first refusal instead of replacing it with a local cooldown
+    // after a retry driven by the global health-check settings.
+    let max_retries = if execution.driver_is("special.opencode_zen") {
+        0
+    } else {
+        config.max_retries
+    };
+    for attempt in 0..=max_retries {
         match test_provider_inner(state, execution.clone(), query).await {
             Ok(response) => {
                 let retry = !probe_succeeded(&response)
                     && retryable_probe(response.outcome)
-                    && attempt < config.max_retries;
+                    && attempt < max_retries;
                 let mut result = map_provider_test_to_stream_check_result(&response, config);
                 result.retry_count = attempt;
                 if result.error_category.is_none() && !result.success {
@@ -1301,7 +1309,7 @@ async fn run_probe_with_retries(
                 let retry = (error.retryable.unwrap_or(false)
                     || error.status.as_u16() == 429
                     || error.status.is_server_error())
-                    && attempt < config.max_retries;
+                    && attempt < max_retries;
                 if !retry {
                     let category = error
                         .code
