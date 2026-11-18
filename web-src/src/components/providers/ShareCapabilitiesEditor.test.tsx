@@ -125,7 +125,7 @@ afterEach(async () => {
 });
 const button = (label: string) =>
   Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
-    (b) => b.textContent === label,
+    (b) => b.textContent === label || b.getAttribute("aria-label") === label,
   )!;
 const checkbox = (label: string) =>
   Array.from(document.querySelectorAll<HTMLLabelElement>("label"))
@@ -337,7 +337,168 @@ describe("Server extension configuration", () => {
     await act(async () => {
       await expect(ref.current!.review()).rejects.toThrow("rebind unavailable");
     });
-    expect(container.textContent).toContain("rebind unavailable");
+    await act(async () => button("About extensions").click());
+    expect(document.body.textContent).toContain("rebind unavailable");
+  });
+
+  it("hides a confirmed empty card while retaining its fresh save review handle", async () => {
+    api.previewCapabilities.mockImplementation(async (id, input) => ({
+      ...preview(input, id),
+      rows: [],
+    }));
+    const ref = createRef<CapabilityReviewHandle>();
+    const policy = emptyCapabilityPolicy();
+    const onChange = vi.fn();
+    await act(async () =>
+      root.render(
+        <ShareCapabilitiesEditor
+          shareId="share"
+          revision={1}
+          policy={policy}
+          savedPolicy={policy}
+          grants={{}}
+          tokenLimit={-1}
+          onChange={onChange}
+          reviewRef={ref}
+        />,
+      ),
+    );
+    await flush();
+    expect(container.querySelector("section")).toBeNull();
+    const calls = api.previewCapabilities.mock.calls.length;
+    let approval: CapabilityApproval | null = null;
+    await act(async () => {
+      approval = await ref.current!.review();
+    });
+    expect(api.previewCapabilities.mock.calls.length).toBe(calls + 1);
+    expect(approval!.policy).toEqual(policy);
+    expect(onChange).not.toHaveBeenCalled();
+    api.previewCapabilities.mockImplementation((id, input) =>
+      Promise.resolve(preview(input, id)),
+    );
+    await act(async () =>
+      root.render(
+        <ShareCapabilitiesEditor
+          shareId="share"
+          revision={2}
+          policy={policy}
+          savedPolicy={policy}
+          grants={{}}
+          tokenLimit={-1}
+          onChange={onChange}
+          reviewRef={ref}
+        />,
+      ),
+    );
+    await flush();
+    expect(checkbox("Web search").disabled).toBe(false);
+  });
+
+  it("distinguishes a failed first read from no capabilities and recovers through retry", async () => {
+    api.previewCapabilities.mockRejectedValueOnce(new Error("fixture offline"));
+    const policy = emptyCapabilityPolicy();
+    await act(async () =>
+      root.render(
+        <ShareCapabilitiesEditor
+          shareId="share"
+          revision={1}
+          policy={policy}
+          savedPolicy={policy}
+          grants={{}}
+          tokenLimit={-1}
+          onChange={vi.fn()}
+        />,
+      ),
+    );
+    await flush();
+    expect(container.querySelector("section")?.dataset.capabilityView).toBe(
+      "compact",
+    );
+    expect(container.textContent).toContain("Extensions unavailable");
+    expect(container.textContent).not.toContain("no configurable");
+    expect(container.textContent).not.toContain("fixture offline");
+    await act(async () => button("About extensions").click());
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toContain(
+      "fixture offline",
+    );
+    expect(button("About extensions").getAttribute("aria-controls")).toBe(
+      document.querySelector('[role="tooltip"]')?.id,
+    );
+    await act(async () => button("About extensions").click());
+    await act(async () => button("Retry").click());
+    await flush();
+    expect(checkbox("Web search").disabled).toBe(false);
+  });
+
+  it("retains a pending removal of the last unavailable choice until it can be saved", async () => {
+    api.previewCapabilities.mockImplementation(async (id, input) => ({
+      ...preview(input, id),
+      rows: [],
+      requiredAcknowledgements: [],
+    }));
+    const saved: ShareCapabilityPolicy = {
+      ...emptyCapabilityPolicy(),
+      allowedOperations: ["video.generate"],
+    };
+    const ref = createRef<CapabilityReviewHandle>();
+    function Harness() {
+      const [policy, setPolicy] = useState(saved);
+      return (
+        <ShareCapabilitiesEditor
+          shareId="share"
+          revision={1}
+          policy={policy}
+          savedPolicy={saved}
+          grants={{}}
+          tokenLimit={-1}
+          onChange={setPolicy}
+          reviewRef={ref}
+        />
+      );
+    }
+    await act(async () => root.render(<Harness />));
+    await flush();
+    await act(async () => checkbox("Video generation").click());
+    await flush();
+    expect(container.textContent).toContain("Extension changes await saving");
+    let approval: CapabilityApproval | null = null;
+    await act(async () => {
+      approval = await ref.current!.review();
+    });
+    expect(approval!.policy.allowedOperations).toEqual([]);
+  });
+
+  it("explains a save conflict separately from a failed capability read", async () => {
+    api.previewCapabilities.mockImplementation(async (id, input) => ({
+      ...preview(input, id),
+      rows: [],
+      blockers: [{ scope: "owner", blocker: "MARKET_CAPABILITY_CONFLICT" }],
+    }));
+    const policy = emptyCapabilityPolicy();
+    await act(async () =>
+      root.render(
+        <ShareCapabilitiesEditor
+          shareId="share"
+          revision={1}
+          policy={policy}
+          savedPolicy={policy}
+          grants={{}}
+          tokenLimit={-1}
+          onChange={vi.fn()}
+        />,
+      ),
+    );
+    await flush();
+    expect(container.textContent).toContain(
+      "Extension changes cannot be saved yet.",
+    );
+    expect(container.textContent).not.toContain(
+      "Some extensions are unavailable.",
+    );
+    await act(async () => button("About extensions").click());
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toContain(
+      "purchased plan",
+    );
   });
 
   it("choosing a custom subset starts with the existing Share choices", async () => {

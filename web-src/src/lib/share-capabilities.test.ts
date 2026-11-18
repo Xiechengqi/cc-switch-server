@@ -8,6 +8,8 @@ import {
 } from "./share-capabilities";
 import {
   capabilityOptions,
+  capabilityPresentation,
+  capabilityWarnings,
   capabilityStatus,
   capabilityPricingText,
   capabilityPermissionMode,
@@ -17,6 +19,147 @@ import {
   preservesCapabilitySchedule,
   type CapabilityPreview,
 } from "./share-capabilities";
+
+test("empty capability display needs complete current runtime evidence", () => {
+  const preview = displayPreview();
+  preview.rows = [];
+  const policy = emptyCapabilityPolicy();
+  const input = {
+    preview,
+    policy,
+    savedPolicy: policy,
+    current: true,
+    loading: false,
+  };
+  assert.equal(capabilityPresentation(input).mode, "hidden");
+  for (const change of [
+    { current: false },
+    { loading: true },
+    { error: "offline" },
+    { preview: { ...preview, ready: false } },
+    { preview: { ...preview, displayVersion: undefined } },
+    { preview: { ...preview, expiresAt: 0 } },
+    {
+      preview: {
+        ...preview,
+        unavailableBindings: [{ app: "codex", reason: "runtime_unavailable" }],
+      },
+    },
+  ]) {
+    assert.equal(
+      capabilityPresentation({ ...input, ...change }).mode,
+      "compact",
+    );
+  }
+  assert.equal(
+    capabilityPresentation({
+      ...input,
+      current: false,
+      preview: undefined,
+      error: "offline",
+    }).status,
+    "unavailable",
+  );
+  assert.equal(
+    capabilityPresentation({ ...input, preview: displayPreview() }).mode,
+    "full",
+  );
+  const setup = displayPreview();
+  setup.rows = setup.rows.filter((row) => row.operation === image);
+  assert.equal(
+    capabilityPresentation({ ...input, preview: setup }).mode,
+    "compact",
+  );
+});
+
+test("pending policy changes and retained financial evidence keep the capability entry", () => {
+  const preview = displayPreview();
+  preview.rows = [];
+  const policy = emptyCapabilityPolicy();
+  const input = {
+    preview,
+    policy,
+    savedPolicy: policy,
+    current: true,
+    loading: false,
+  };
+  const original = JSON.stringify(input);
+  for (const change of [
+    { savedPolicy: undefined },
+    { savedPolicy: { ...policy, allowedOperations: [search] } },
+    { reviewing: true },
+    {
+      preview: {
+        ...preview,
+        requiredAcknowledgements: [
+          {
+            condition: "review",
+            scope: "owner",
+            operation: search,
+            quotaUnit: "tokens",
+            bindingFingerprint: fingerprint,
+            actor: "",
+            acceptedAtMs: 0,
+          },
+        ],
+      },
+    },
+    {
+      preview: {
+        ...preview,
+        blockers: [{ scope: "owner", blocker: "MARKET_CAPABILITY_CONFLICT" }],
+      },
+    },
+    {
+      preview: {
+        ...preview,
+        incidents: [
+          {
+            scope: "owner",
+            bindingFingerprint: fingerprint,
+            requestId: "incident",
+            resource: "image.output",
+            detectedAtMs: 0,
+          },
+        ],
+      },
+    },
+    {
+      preview: {
+        ...preview,
+        recentUsage: [
+          {
+            scope: "owner",
+            requestId: "usage",
+            attempt: 1,
+            admittedAtMs: 0,
+            meteringStatus: "not_in_usd_ledger",
+            dimensions: [],
+          },
+        ],
+      },
+    },
+  ]) {
+    assert.equal(capabilityPresentation({ ...input, ...change }).mode, "full");
+  }
+  assert.equal(JSON.stringify(input), original);
+});
+
+test("resource quota exceptions have concise visible labels and exact detail", () => {
+  const row = displayPreview().rows.find((row) => row.operation === search)!;
+  row.selected = true;
+  row.scopes = ["a", "b"].map((scope) => ({
+    scope,
+    quotaUnit: "tokens",
+    coverage: "partial",
+    reason: "resource_not_in_token_ledger",
+  }));
+  assert.equal(capabilityWarnings([row], 0).length, 1);
+  assert.match(capabilityWarnings([row], 0)[0].label, /不计入 Token/);
+  row.scopes[0].reason = "model_or_resource_price_unknown";
+  assert.match(capabilityWarnings([row], 0)[0].label, /不扣美元/);
+  assert.deepEqual(capabilityWarnings([{ ...row, selected: false }], 0), []);
+});
 
 const search = "tool.web_search" as const;
 const image = "image.generate" as const;
