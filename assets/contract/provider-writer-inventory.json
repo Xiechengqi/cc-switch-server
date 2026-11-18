@@ -13,11 +13,11 @@
     },
     {
       "path": "src/api/providers.rs",
-      "sha256": "2b682924305439dbed83cfe1eda0fc5c15ba7c279406817cf614ecc0993ffc5f"
+      "sha256": "a9ae7181c71b255d05310ab411792f70054fe5d94520a5d15d8f1cd046c3e546"
     },
     {
       "path": "src/api/types/providers.rs",
-      "sha256": "6a37fbd63936d665b8715b2a98278fce9a975c13978594404cf3f5872cebd1c3"
+      "sha256": "d268f4a0073d1ad3a5a2b8bef0e2bbc1879793ff431d5e6e2584a1d638279065"
     },
     {
       "path": "src/domain/providers/credentials.rs",

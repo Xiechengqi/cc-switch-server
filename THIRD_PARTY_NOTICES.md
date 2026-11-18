@@ -46,3 +46,12 @@ Brand names and logos remain trademarks of their respective owners.
 Rust and JavaScript dependencies retain their own licenses. `Cargo.lock`, the
 root `package-lock.json`, and `web-src/package-lock.json` are the authoritative
 dependency inventories for a particular build.
+
+The OpenCode 1.19.5 system prompt compatibility text in
+`src/proxy/opencode_zen/system-1.19.5.txt` is used under the MIT License,
+Copyright (c) 2025 opencode. Its complete terms are reproduced in
+`assets/third-party/opencode-system-prompt.LICENSE`. It is a frozen local asset;
+the reference checkout is not an input to builds or runtime. The separately
+downloaded official Bun 1.4.4 runtime retains its own MIT and bundled third-party
+licenses; its fixed artifacts and checksums are recorded in
+`assets/contract/opencode-zen-runtime.json`.

@@ -1073,6 +1073,7 @@ fn existing_cycle_result_from_usage(
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            retry_after_seconds: None,
         });
     }
     let log = log?;
@@ -1107,6 +1108,7 @@ fn existing_cycle_result_from_usage(
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
+        retry_after_seconds: None,
     })
 }
 
@@ -1147,6 +1149,7 @@ fn exact_cycle_result_from_log(
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
+        retry_after_seconds: None,
     })
 }
 
@@ -1357,6 +1360,7 @@ fn failed_probe_result(
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
+        retry_after_seconds: None,
     }
 }
 
@@ -1426,6 +1430,7 @@ async fn record_quota_block_with_identity(
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
+        retry_after_seconds: None,
     };
     let log = health_usage_log(share, provider, &result, source, false, health_fingerprint);
     let persisted = state

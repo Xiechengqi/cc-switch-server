@@ -7860,7 +7860,7 @@ async fn provider_registry_and_resource_views_publish_stable_identity() {
         official["allowedModelPolicies"],
         json!(["single", "passthrough"])
     );
-    assert_eq!(official["defaultUpstreamModel"], "gpt-5.4");
+    assert_eq!(official["defaultUpstreamModel"], "gpt-6.2-sol");
     let configurable = profiles
         .iter()
         .find(|profile| profile["profileId"] == "codex.openrouter")

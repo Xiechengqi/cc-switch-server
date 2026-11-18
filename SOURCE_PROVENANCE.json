@@ -74,6 +74,21 @@
           "upstreamIconVersion": "LobeHub icons 1.95.1 (magpie source attribution)"
         }
       ]
+    },
+    {
+      "id": "opencode-cli-system-prompt",
+      "repository": "https://github.com/anomalyco/opencode",
+      "version": "1.19.5",
+      "license": "MIT",
+      "copyright": "Copyright (c) 2025 opencode",
+      "scope": [
+        "src/proxy/opencode_zen/system-1.19.5.txt"
+      ],
+      "technicalInput": false,
+      "notice": "assets/third-party/opencode-system-prompt.LICENSE",
+      "reviewBoundary": {
+        "policy": "frozen local compatibility text captured from an isolated synthetic CLI request; no reference checkout or runtime source fetch"
+      }
     }
   ]
 }

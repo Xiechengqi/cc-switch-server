@@ -1,0 +1,31 @@
+{
+  "version": "1.4.4",
+  "artifacts": [
+    {
+      "asset": "bun-linux-x64-baseline",
+      "archiveSha256": "e0446eb55995772eb9894bebae9a6be368d985a8b9271ee124486f9946eedd76",
+      "binarySha256": "10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235",
+      "binaryBytes": 107308936
+    },
+    {
+      "asset": "bun-linux-aarch64",
+      "archiveSha256": "baa6bb36f51d6e58561e02bbea825038a9df454f673d6d776e8bbf86f8c7850e",
+      "binarySha256": "354c2b049c716aca07b2e5cddb887928ac58950675d1258bb6312083917793b6",
+      "binaryBytes": 107339768
+    },
+    {
+      "asset": "bun-linux-x64-musl-baseline",
+      "archiveSha256": "6e9c37098b293920aed28bfb51ab240e26d23bfdd9bbfecb3ad428ac166549bc",
+      "binarySha256": "29a31375a72f97c7e3fc25dd57d7dde88da5907aa8970808f57f91e0711bdad2",
+      "binaryBytes": 100902216
+    },
+    {
+      "asset": "bun-linux-aarch64-musl",
+      "archiveSha256": "57f01b02ac7113c61c935f28f38c2eab849e3c970dab21f8b640a87b1ef65009",
+      "binarySha256": "a6a3d99a48600b59597070d2d2ff8d37b65975b8aab247ee3479b1eb33d000a6",
+      "binaryBytes": 99757616
+    }
+  ],
+  "source": "https://github.com/oven-sh/bun/releases/tag/bun-v1.4.4",
+  "checksumSource": "https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/SHASUMS256.txt"
+}

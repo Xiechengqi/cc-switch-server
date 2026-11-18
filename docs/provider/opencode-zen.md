@@ -1,13 +1,13 @@
 # OpenCode Zen 免 Key 反代
 
-状态：单条公开免费车道；协议离线/本地 loopback 验证与真实供应商验收分开记录。目录已做只读在线格式核对；真实推理及 Router 链路仍为 `live_pending`。
+状态：单条公开免费车道；2026-11-18 已在 MY/HK/US 三节点的隔离 Server 上验证 HY4、DeepSeek 两种免费模型的 Claude/Codex 流式与非流式推理，以及 HY4 的三入口工具往返。验收仅覆盖这些操作；真实公网 Router 端到端链路、其他模型与可选能力仍为 `live_pending`。
 
 不使用 OpenCode Go、付费 Zen API Key、账号池或出口轮换；不注册第四个 App。Claude/Codex 的 Profile 使用 `special.opencode_zen`，无用户凭据，固定 `https://opencode.ai`，配置不可覆盖端点。Gemini Surface 不开放。
 
 ## 线格式与协议转换
 
 - 现代目录的已知协议仅映射到固定路径：Chat `/inference/openai/v1/chat/completions`、Responses `/inference/openai/v1/responses`、Messages `/inference/anthropic/v1/messages`。旧目录继续使用 `/inference/v1/*` 与既有 Muse Spark/union-alpha 协议映射。未知协议、不同 origin 或未受审路径不可选；绝不直接跟随目录 URL。
-- `Bearer public`；UA `opencode/latest/2.1.3/cli`；官方 CLI/session/affinity 头，不发 `x-opencode-request`。
+- `Bearer public`；请求规范 `opencode-1.19.5-bun-1.4.4-v1` 使用成功捕获的 CLI 1.19.5 UA、CLI/session/affinity 头，不发未经需要证明的 `x-opencode-request`。冻结的本地系统提示及环境标签提供兼容前缀，后续明确交由调用方提供实际身份、指令与工具；调用方 system/history/tool schema 保留。前缀不包含捕获时的临时目录、内置 skill 或用户对话，会占用部分输入上下文；实际计量以上游 usage 为准。
 - Session 是可解码时间戳前缀加随机尾部，6 天重铸。缓存键包含 Provider、Share、用户和下游会话；缺少会话时每次请求独立，不把全部用户折叠到 Provider ID。4096 条、哈希键、单条最旧铸造记录淘汰，不接受下游直接指定上游 session。
 - 官方 `read`、`shell` 原文指纹；冲突工具改名并恢复，Chat 名称增量支持别名分片。缓存提示不注入上游，工具 schema 中的同名属性不删除。
 - Chat JSON 关闭 HTML 转义并保持 CLI 顶层字段顺序；缺省输出上限取 32000 与当前模型声明上限的较小值；显式超出声明的上限会在发送前拒绝。`tool_choice:none` 在出站前拒绝。
@@ -16,11 +16,19 @@
 
 本 Driver 不实现 Responses 持久化资源；`store:true` 和 `previous_response_id` 显式拒绝，调用方须提供完整历史。目录仅公布受审的文本/工具能力，不开放未经实测的图像/音频能力。
 
+## 专用出站传输
+
+Zen 推理使用固定 Bun 1.4.4 的 `fetch`，不再通过共享 reqwest/rustls 推理。系统消息与传输是同机同模型差分确认的两个兼容条件；强制 TLS 1.3、换 UA 或回退旧端点均不能独立证明有效。目录请求仍使用共享 Rust HTTP client。
+
+Server 在首个真实生成的计量之前准备运行时：从官方固定版本下载，分别验证 archive 与解压 binary 的 SHA-256，原子安装在 `<config-dir>/runtime/opencode-zen/bun-1.4.4/<platform>/bun`。Linux amd64 使用 baseline，覆盖 glibc/musl 与 arm64。运行时不会追随 latest，也不依赖安装 OpenCode CLI。离线部署可预置校验清单对应的 binary，并通过绝对路径 `CC_SWITCH_ZEN_BUN_PATH` 指定；不匹配的 binary 会拒绝执行。下载失败或超时属于请求前检查失败，不产生已发送的生成计量。单个进程合并准备，后续请求复用已验证的 runtime。
+
+每个上游请求使用独立子进程和有界 stdio 协议，不监听推理 HTTP 端口，不将请求写入磁盘。子进程环境只保留所需的信任库配置；出站只使用显式 `CC_SWITCH_OUTBOUND_PROXY`，不继承环境中的其他代理或 OpenCode 凭据。上游地址与六条路径固定受审，不跟随重定向。Rust 校验 16KiB metadata，按 32KiB 增量读取，正常 EOF 还须子进程成功退出；失败不能伪装干净 EOF。取消任一阶段或丢弃未读响应都会杀掉子进程；stdout 背压、总 deadline、首语义/空闲超时与既有 Rust 解析和计量生命周期共用。
+
 ## 流式、终态与资源
 
-SSE 增量解析，支持网络任意分片、UTF-8 分片、多行 data 与 CRLF。单事件及终态尾部各最多 1 MiB；JSON 响应最多 8 MiB，并受剩余请求内存约束。解析/转换临时空间预留预算，保留状态及输出 Bytes 跟随生命周期释放。
+SSE 增量解析，支持网络任意分片、UTF-8 分片、多行 data 与 CRLF。单事件及终态尾部各最多 1 MiB；非流式调用也向上游请求 SSE，校验终态及干净 EOF 后聚合为入口协议的 JSON；累计 SSE 最多 8 MiB，并受剩余请求内存约束。解析/转换临时空间预留预算，保留状态及输出 Bytes 跟随生命周期释放。
 
-Chat 必须有合法 finish_reason 与 `[DONE]`；Responses/Messages 使用公共严格检查器。非 Chat 终态后不接受数据；错误事件、非法 JSON、残缺帧或缺失终态不能成为成功。成功终态输出保留至干净 EOF，语义内容在 EOF 前增量交付；length/incomplete/max_tokens 保留不完整状态。
+Chat 必须有合法 finish_reason 与 `[DONE]`；HY4 已确认会在完整用量尾帧中重复同一终态，仅允许一次无新增内容的相同终态用量尾帧并归一为 choices=[]，冲突终态仍拒绝；Responses/Messages 使用公共严格检查器。非 Chat 终态后不接受数据；错误事件、非法 JSON、残缺帧或缺失终态不能成为成功。成功终态输出保留至干净 EOF，语义内容在 EOF 前增量交付；length/incomplete/max_tokens 保留不完整状态。
 
 总 deadline 覆盖目录刷新、并发准入、上游头和完整响应；首语义 deadline 不因 role/usage/心跳重置。空闲时限只由上游字节推进，下游每 15 秒的 SSE 心跳不延长它。慢下游采用拉取背压；丢弃响应体时取消上游并记录 client_cancelled。账户/Share in-flight、请求预算和计量证据随响应体持有；响应从未被读取时也有取消收尾。
 
@@ -34,7 +42,7 @@ Chat 必须有合法 finish_reason 与 `[DONE]`；Responses/Messages 使用公�
 
 ## 错误与模型目录
 
-429、403、401 不自动重放，分别保留对应 HTTP 状态；其他供应商错误映射为网关错误。客户端和日志不拼接上游原始正文/HTML，只保留固定类别、原状态、受限请求 ID 及合法数字或 HTTP-date Retry-After 提示，并通过公共错误元数据向客户端透传。已识别的参数/上下文错误映射为 400；不能识别的错误仍按网关错误处理。重铸 session 不会创造新额度。
+`FreeUsageLimitError`、`FreeTierError` 与地区拒绝保留受限类别，不把所有 429 解释为付费套餐额度耗尽。模型测试将合法 Retry-After 单独传给 Web；本地冷却使用独立类别，明确本次未发送上游请求。429、403、401 不自动重放，分别保留对应 HTTP 状态；其他供应商错误映射为网关错误。客户端和日志不拼接上游原始正文/HTML，只保留固定类别、原状态、受限请求 ID 及合法数字或 HTTP-date Retry-After 提示，并通过公共错误元数据向客户端透传。已识别的参数/上下文错误映射为 400；不能识别的错误仍按网关错误处理。重铸 session 不会创造新额度。
 
 公开目录、管理发现与生成准入共用缓存：8 分钟 fresh，失败后旧成功目录最多保留 24 小时；冷启动无可用目录则拒绝生成，不使用写死清单。单次刷新最多 15 秒、响应 1 MiB、512 个模型、每 ID 256 字节；并发 single-flight，失败退避 30 秒。模型类型、免费分类和协议共同决定准入；decision/image/未知类型及决策模型 `jev*` 不作为 Chat 模型开放。手动刷新可绕过 fresh，但受 30 秒最短间隔、并发合并和失败退避限制。
 
@@ -45,6 +53,10 @@ Chat 必须有合法 finish_reason 与 `[DONE]`；Responses/Messages 使用公�
 参考身份和逐文件 SHA-256 见根 `PROTOCOL_EVIDENCE.md`，只读参考 `zen-gate` HEAD `58fa1b7`。外部仓库不参与构建、测试、发布或运行。
 
 本仓回归覆盖协议矩阵、工具往返、逐字节分片、错误/终态、缓存恢复与冷启动并发退避；forwarder loopback 验证增量交付、未读取响应取消、续写拼接/用量及限流无重放。完整验证与 review 结果由实施回执记录，离线通过不代表厂商真实通过。
+
+2026-11-18 本轮真实验收使用固定请求规范及 Bun 传输的完整 Server 二进制（SHA-256 `825386de4666283687c97007aabad4a6f8324eb62e311b46fd0eedeecc82c235`）。每个节点均通过 `hy4-flash-free` / `deepseek-v4.1-flash-free` × Claude/Codex × 流/非流的 8 项管理 HTTP 模型检测，合计 24/24；HY4 经签名 Share 入口完成 Chat/Responses/Messages 的工具调用与结果回传，每节点 3 组，合计 9/9。Share 验证使用独立临时身份和签名，不能冒称实际公网 Router 端到端验收。US 另通过显式认证 CONNECT 代理验证自动下载与推理，三节点均启用 IPv4 约束。临时服务和配置已清理，既有 Server 进程未被本轮验收重启；MY 的独立进程核对说明见根证据。本轮未替换生产二进制。该结果不扩展为 arm64/musl、其他免费模型、媒体或可选控制参数的实测证明。
+
+本轮最终整体 review 与验证完成：Rust 库 4574 通过 / 0 失败 / 5 忽略、API 契约 139/139、两个独立集成目标各 1/1；Zen 相关回归 66/66，另两项固定 Bun 进程测试显式运行 2/2 通过。完整静态检查通过，包含严格 Clippy、全部 src/include 格式、Node 审计 2205/2205 与 smoke 脚本回归 13/13、Web 类型检查及 61 文件 / 451 项测试。最终 check/build、本地 10 步 HTTP smoke、生成契约与文档索引通过；源码及传输资产摘要与真实验收版本一致。离线 readiness 的 failures=0，仍因未提供全产品真实输入及部署验收而为 `blocked_inputs`。完整命令、忽略项和验收边界见根 `PROTOCOL_EVIDENCE.md` 的 CLI request/transport rejection repair 条目。
 
 整体 review 修正了无凭据 Profile 的创建与运行时准入、Responses 终态后数据校验、慢下游对空闲超时的影响、分片事件解析前的内存预留，以及续写准入失败时的 attempt 编号。SQLite loopback 同时核对一条公开日志的汇总用量与两个独立 USD attempt，防止最后一个 attempt 重复计入首段。Chat 错误帧按公共协议携带错误后以 `[DONE]` 结束；该分隔符本身不是成功证据，成功还须有效终态、干净 EOF 和完成日志。
 

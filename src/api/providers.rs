@@ -1211,6 +1211,7 @@ pub(in crate::api) async fn test_provider_inner(
                 network_latency_ms: None,
                 network_stream_completed: None,
                 network_error: Some(error.message.clone()),
+                retry_after_seconds: None,
                 reconciliation: grok_reconciliation_report(
                     &execution,
                     grok_reconciliation_before.as_ref(),
@@ -1248,6 +1249,7 @@ pub(in crate::api) async fn test_provider_inner(
             network_latency_ms: None,
             network_stream_completed: None,
             network_error: Some(message.clone()),
+            retry_after_seconds: None,
             reconciliation: grok_reconciliation_report(
                 &execution,
                 grok_reconciliation_before.as_ref(),
@@ -1310,6 +1312,7 @@ pub(in crate::api) async fn test_provider_inner(
                 network_latency_ms: None,
                 network_stream_completed: None,
                 network_error: blocking.then(|| snapshot.credential_reason.clone()),
+                retry_after_seconds: None,
                 reconciliation: grok_reconciliation_report(
                     &execution,
                     Some(snapshot),
@@ -1426,6 +1429,7 @@ pub(in crate::api) async fn test_provider_inner(
                     network_latency_ms: None,
                     network_stream_completed: None,
                     network_error: Some(message.clone()),
+                    retry_after_seconds: None,
                     reconciliation: grok_reconciliation_report(
                         &execution,
                         grok_reconciliation_before.as_ref(),
@@ -1671,6 +1675,7 @@ pub(in crate::api) async fn test_provider_inner(
         network_latency_ms,
         network_stream_completed,
         network_error,
+        retry_after_seconds: None,
         reconciliation,
         message,
     })
@@ -1716,6 +1721,7 @@ async fn test_zen_provider_inner(
         network_latency_ms: None,
         network_stream_completed: None,
         network_error: None,
+        retry_after_seconds: None,
         reconciliation: None,
         message: String::new(),
     };
@@ -1790,6 +1796,7 @@ async fn test_zen_provider_inner(
                 "OpenCode Zen probe deadline exceeded before the complete response".into();
         }
         Ok(Err(error)) => {
+            report.retry_after_seconds = error.retry_after_seconds();
             report.outcome = provider_test_outcome(
                 true,
                 Some(error.status.as_u16()),
@@ -1876,6 +1883,7 @@ async fn test_codebuddy_provider_inner(
         network_latency_ms: latency,
         network_stream_completed: stream_completed,
         network_error: network_error.map(|message| message.replace("CodeBuddy", product)),
+        retry_after_seconds: None,
         reconciliation: None,
         message: message.replace("CodeBuddy", product),
     };
@@ -2170,6 +2178,7 @@ async fn test_trae_provider_inner(
         network_latency_ms: latency,
         network_stream_completed: stream_completed,
         network_error,
+        retry_after_seconds: None,
         reconciliation: None,
         message,
     };
@@ -3066,6 +3075,7 @@ fn deepseek_provider_test_response(
         network_latency_ms,
         network_stream_completed,
         network_error,
+        retry_after_seconds: None,
         reconciliation: None,
         message,
     }
@@ -3135,6 +3145,7 @@ fn cursor_provider_test_response(
         network_latency_ms,
         network_stream_completed,
         network_error,
+        retry_after_seconds: None,
         reconciliation: None,
         message,
     }

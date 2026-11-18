@@ -65,6 +65,20 @@ async function run(result: StreamCheckResult, name = "OpenCode Zen/Codex") {
 }
 
 describe("model test quota and rate limit feedback", () => {
+  it.each(["zh", "zh-TW", "en", "ja"])("distinguishes Zen free access and cooldown with a retry time in %s", async (language) => {
+    await act(async () => { await i18n.changeLanguage(language); });
+    await run({ ...failed, errorCategory: "zenFreeUsageLimit", retryAfterSeconds: 43200 });
+    expect(mocks.warning.mock.calls[0][0]).toBe(i18n.t("streamCheck.zenFreeAccess", { providerName: "OpenCode Zen/Codex" }));
+    expect(mocks.warning.mock.calls[0][1].description).toContain(i18n.t("streamCheck.zenFreeAccessHint"));
+    expect(mocks.warning.mock.calls[0][1].description).toContain(failed.message);
+    expect(mocks.warning.mock.calls[0][1].description).not.toContain("streamCheck.");
+    mocks.warning.mockClear();
+    mocks.testProvider.mockClear();
+    await run({ ...failed, errorCategory: "zenLocalCooldown", retryAfterSeconds: 60 });
+    expect(mocks.warning.mock.calls[0][1].description).toContain(i18n.t("streamCheck.zenLocalCooldownHint"));
+    expect(mocks.warning.mock.calls[0][1].description.split("\n")).toHaveLength(3);
+  });
+
   it.each(["zh", "zh-TW", "en", "ja"])(
     "shows rate limiting with the returned detail in %s",
     async (language) => {

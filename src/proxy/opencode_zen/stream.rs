@@ -17,12 +17,15 @@ pub(in crate::proxy) struct ZenStream {
     anthropic: crate::proxy::anthropic_semantics::AnthropicSseInspector,
     tool_names: BTreeMap<u64, String>,
     client_tools: Option<std::collections::BTreeSet<String>>,
-    finish_reason: bool,
+    finish_reason: Option<String>,
+    chat_usage_tail: bool,
     done: bool,
     terminal_candidate: bool,
     pub(in crate::proxy) semantic: bool,
     pub(in crate::proxy) incomplete: bool,
     timing: Option<crate::proxy::request_timing::ForwardTiming>,
+    aggregation: Option<super::aggregate::ZenAggregation>,
+    aggregate_input_bytes: usize,
 }
 
 impl ZenStream {
@@ -52,12 +55,15 @@ impl ZenStream {
             anthropic: Default::default(),
             tool_names: BTreeMap::new(),
             client_tools: None,
-            finish_reason: false,
+            finish_reason: None,
+            chat_usage_tail: false,
             done: false,
             terminal_candidate: false,
             semantic: false,
             incomplete: false,
             timing,
+            aggregation: None,
+            aggregate_input_bytes: 0,
         }
     }
 
@@ -79,9 +85,24 @@ impl ZenStream {
             }))
             .saturating_add(self.pending.capacity())
             .saturating_add(self.held.capacity())
+            .saturating_add(self.finish_reason.as_ref().map_or(0, String::capacity))
             .saturating_add(self.transformer.retained_bytes())
             .saturating_add(self.responses.retained_transport_bytes())
             .saturating_add(self.anthropic.retained_bytes())
+            .saturating_add(self.aggregation.as_ref().map_or(0, |a| a.retained_bytes()))
+    }
+
+    pub(in crate::proxy) fn with_aggregation(mut self) -> Self {
+        self.aggregation = Some(super::aggregate::ZenAggregation::new(self.wire));
+        self
+    }
+
+    pub(in crate::proxy) fn finish_document(mut self) -> Result<Value, ProxyError> {
+        self.finish()?;
+        self.aggregation
+            .take()
+            .ok_or_else(|| ProxyError::bad_gateway("OpenCode Zen missing aggregation"))?
+            .finish()
     }
 
     pub(in crate::proxy) fn working_bytes(&self, incoming: &[u8]) -> usize {
@@ -92,9 +113,28 @@ impl ZenStream {
                 incoming,
             ))
             .saturating_mul(4)
+            .saturating_add(self.aggregation.as_ref().map_or(0, |a| a.working_bytes()))
+            .saturating_add(if self.aggregation.is_some() {
+                // An encoded tool-argument string may become a dense JSON
+                // collection when a later block_stop completes this chunk.
+                self.pending
+                    .len()
+                    .saturating_add(incoming.len())
+                    .saturating_mul(128)
+            } else {
+                0
+            })
     }
 
     pub(in crate::proxy) fn push(&mut self, chunk: &[u8]) -> Result<Bytes, ProxyError> {
+        if self.aggregation.is_some() {
+            self.aggregate_input_bytes = self.aggregate_input_bytes.saturating_add(chunk.len());
+            if self.aggregate_input_bytes > 8 * 1024 * 1024 {
+                return Err(ProxyError::bad_gateway(
+                    "OpenCode Zen aggregate exceeds 8 MiB",
+                ));
+            }
+        }
         // Apply the cap to each event rather than to an arbitrary network chunk.
         let mut output = Vec::new();
         for part in chunk.split_inclusive(|byte| *byte == b'\n') {
@@ -145,11 +185,14 @@ impl ZenStream {
             return Err(ProxyError::bad_gateway("OpenCode Zen data after terminal"));
         }
         if data == "[DONE]" {
-            if self.wire != ZenWire::Chat || !self.finish_reason || self.done {
+            if self.wire != ZenWire::Chat || self.finish_reason.is_none() || self.done {
                 return Err(ProxyError::bad_gateway("OpenCode Zen unexpected [DONE]"));
             }
             self.done = true;
             self.terminal_candidate = true;
+            if self.aggregation.is_some() {
+                return Ok(Bytes::new());
+            }
             return self
                 .transformer
                 .push(Bytes::from_static(b"data: [DONE]\n\n"));
@@ -174,7 +217,7 @@ impl ZenStream {
                     return Err(ProxyError::bad_gateway("OpenCode Zen data after [DONE]"));
                 }
                 let semantic = value.pointer("/choices/0/delta").is_some_and(|delta| {
-                    ["content", "reasoning_content", "reasoning"]
+                    ["content", "reasoning_content", "reasoning", "refusal"]
                         .iter()
                         .any(|key| {
                             delta
@@ -187,7 +230,7 @@ impl ZenStream {
                             .and_then(Value::as_array)
                             .is_some_and(|calls| !calls.is_empty())
                 });
-                if self.finish_reason && semantic {
+                if self.finish_reason.is_some() && semantic {
                     return Err(ProxyError::bad_gateway(
                         "OpenCode Zen content after finish_reason",
                     ));
@@ -212,14 +255,37 @@ impl ZenStream {
                         .ok_or_else(|| {
                             ProxyError::bad_gateway("OpenCode Zen invalid Chat finish_reason")
                         })?;
-                    if self.finish_reason {
-                        return Err(ProxyError::bad_gateway(
-                            "OpenCode Zen duplicate Chat finish_reason",
-                        ));
+                    if let Some(previous) = &self.finish_reason {
+                        let empty_delta = value
+                            .pointer("/choices/0/delta")
+                            .and_then(Value::as_object)
+                            .is_some_and(|delta| {
+                                delta.iter().all(|(key, value)| match key.as_str() {
+                                    "role" => value == "assistant",
+                                    "content" => value.is_null() || value.as_str() == Some(""),
+                                    _ => false,
+                                })
+                            });
+                        let usage_tail = value["choices"]
+                            .as_array()
+                            .is_some_and(|choices| choices.len() == 1)
+                            && value.pointer("/choices/0/index").and_then(Value::as_u64) == Some(0)
+                            && ["prompt_tokens", "completion_tokens"]
+                                .iter()
+                                .all(|key| value["usage"][*key].as_u64().is_some());
+                        if previous != reason || self.chat_usage_tail || !empty_delta || !usage_tail
+                        {
+                            return Err(ProxyError::bad_gateway(
+                                "OpenCode Zen duplicate Chat finish_reason",
+                            ));
+                        }
+                        self.chat_usage_tail = true;
+                        value["choices"] = serde_json::json!([]);
+                    } else {
+                        self.finish_reason = Some(reason.to_string());
+                        self.terminal_candidate = true;
+                        self.incomplete = matches!(reason, "length" | "content_filter");
                     }
-                    self.finish_reason = true;
-                    self.terminal_candidate = true;
-                    self.incomplete = matches!(reason, "length" | "content_filter");
                 }
                 if let Some(timing) = &self.timing {
                     timing.observe_chat_value(&value);
@@ -354,6 +420,10 @@ impl ZenStream {
             }
         }
         restore_tool_names(&mut value, &self.rename);
+        if let Some(aggregation) = &mut self.aggregation {
+            aggregation.observe(&value, event)?;
+            return Ok(Bytes::new());
+        }
         let prefix = event
             .map(|event| format!("event: {event}\n"))
             .unwrap_or_default();
@@ -399,6 +469,9 @@ impl ZenStream {
                 })?;
             }
             _ => {}
+        }
+        if self.aggregation.is_some() {
+            return Ok(Bytes::new());
         }
         let tail = self.transformer.finish()?;
         let mut output = std::mem::take(&mut self.held);
@@ -462,6 +535,155 @@ mod tests {
             None,
         )
     }
+    #[test]
+    fn zen_nonstream_aggregation_preserves_all_protocols_and_requires_clean_eof() {
+        for wire in [ZenWire::Chat, ZenWire::Responses, ZenWire::Messages] {
+            let bytes = upstream(wire);
+            let mut aggregate = decoder(wire, ProxyRoute::CodexChatCompletions).with_aggregation();
+            for byte in bytes.as_bytes() {
+                assert!(aggregate.push(&[*byte]).unwrap().is_empty());
+            }
+            let result = aggregate.finish_document().unwrap();
+            validate_json(&result, wire).unwrap();
+            assert!(result.to_string().contains("hello世界"));
+            assert_eq!(result["usage"], document(wire)["usage"]);
+            let mut truncated = decoder(wire, ProxyRoute::CodexChatCompletions).with_aggregation();
+            truncated
+                .push(&bytes.as_bytes()[..bytes.len() - 10])
+                .unwrap();
+            assert!(truncated.finish_document().is_err(), "{wire:?}");
+            let mut trailing = decoder(wire, ProxyRoute::CodexChatCompletions).with_aggregation();
+            trailing.push(bytes.as_bytes()).unwrap();
+            assert!(trailing.push(b"data: {\"type\":\"error\"}\n\n").is_err());
+        }
+    }
+
+    #[test]
+    fn zen_nonstream_aggregation_preserves_split_tool_arguments_and_reasoning() {
+        let mut chat = decoder(ZenWire::Chat, ProxyRoute::CodexChatCompletions).with_aggregation();
+        for value in [
+            json!({"id":"chat_test","model":"test-free","choices":[{"index":0,"delta":{"reasoning_content":"think","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"rea","arguments":"{\"path\":"}}]},"finish_reason":null}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"d","arguments":"\"a\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":1}}),
+        ] {
+            chat.push(frame(value).as_bytes()).unwrap();
+        }
+        chat.push(b"data: [DONE]\n\n").unwrap();
+        let doc = chat.finish_document().unwrap();
+        validate_json(&doc, ZenWire::Chat).unwrap();
+        assert_eq!(doc["choices"][0]["message"]["reasoning_content"], "think");
+        assert_eq!(
+            doc["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "read"
+        );
+        assert_eq!(
+            doc["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"a\"}"
+        );
+        let mut messages =
+            decoder(ZenWire::Messages, ProxyRoute::ClaudeMessages).with_aggregation();
+        for value in [
+            json!({"type":"message_start","message":{"id":"msg_test","model":"test-free","type":"message","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":2,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"read","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"a\"}"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}),
+            json!({"type":"message_stop"}),
+        ] {
+            messages.push(frame(value).as_bytes()).unwrap();
+        }
+        let doc = messages.finish_document().unwrap();
+        validate_json(&doc, ZenWire::Messages).unwrap();
+        assert_eq!(doc["content"][0]["input"], json!({"path":"a"}));
+    }
+
+    #[test]
+    fn zen_nonstream_responses_accepts_sse_event_name_without_payload_type() {
+        let mut aggregate =
+            decoder(ZenWire::Responses, ProxyRoute::CodexResponses).with_aggregation();
+        let frame = format!(
+            "event: response.completed\ndata: {}\n\n",
+            serde_json::json!({"response":document(ZenWire::Responses)})
+        );
+        aggregate.push(frame.as_bytes()).unwrap();
+        assert_eq!(
+            aggregate.finish_document().unwrap(),
+            document(ZenWire::Responses)
+        );
+    }
+
+    #[test]
+    fn zen_hy4_usage_tail_is_normalized_once_in_all_routes_and_modes() {
+        let first = frame(
+            serde_json::json!({"id":"chat_tail","model":"test-free","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}),
+        );
+        let terminal = frame(
+            serde_json::json!({"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]}),
+        );
+        let tail = serde_json::json!({"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}});
+        for route in [
+            ProxyRoute::ClaudeMessages,
+            ProxyRoute::CodexChatCompletions,
+            ProxyRoute::CodexResponses,
+        ] {
+            for aggregate in [false, true] {
+                let mut decoder = decoder(ZenWire::Chat, route);
+                if aggregate {
+                    decoder = decoder.with_aggregation();
+                }
+                let mut output = Vec::new();
+                for byte in [
+                    first.clone(),
+                    terminal.clone(),
+                    frame(tail.clone()),
+                    "data: [DONE]\n\n".into(),
+                ]
+                .concat()
+                .as_bytes()
+                {
+                    output.extend_from_slice(&decoder.push(&[*byte]).unwrap());
+                }
+                if aggregate {
+                    let doc = decoder.finish_document().unwrap();
+                    validate_json(&doc, ZenWire::Chat).unwrap();
+                    assert_eq!(doc["usage"]["prompt_tokens"], 2);
+                    assert_eq!(doc["choices"][0]["message"]["content"], "hello");
+                } else {
+                    output.extend_from_slice(&decoder.finish().unwrap());
+                    let output = String::from_utf8(output).unwrap();
+                    assert!(output.contains("hello"));
+                    let terminal = match route {
+                        ProxyRoute::ClaudeMessages => "\"type\":\"message_stop\"",
+                        ProxyRoute::CodexResponses => "\"type\":\"response.completed\"",
+                        _ => "\"finish_reason\":\"stop\"",
+                    };
+                    assert_eq!(output.matches(terminal).count(), 1, "{route:?}: {output}");
+                }
+            }
+        }
+        for variant in [0, 1, 2, 3] {
+            let mut decoder =
+                decoder(ZenWire::Chat, ProxyRoute::CodexChatCompletions).with_aggregation();
+            decoder.push(first.as_bytes()).unwrap();
+            decoder.push(terminal.as_bytes()).unwrap();
+            let mut invalid = tail.clone();
+            match variant {
+                0 => invalid["choices"][0]["finish_reason"] = serde_json::json!("length"),
+                1 => invalid["choices"][0]["delta"]["content"] = serde_json::json!("extra"),
+                2 => {
+                    invalid.as_object_mut().unwrap().remove("usage");
+                }
+                _ => {
+                    decoder.push(frame(tail.clone()).as_bytes()).unwrap();
+                }
+            }
+            assert!(
+                decoder.push(frame(invalid).as_bytes()).is_err(),
+                "variant {variant}"
+            );
+        }
+    }
+
     #[test]
     fn zen_all_eighteen_protocol_and_mode_combinations() {
         for wire in [ZenWire::Chat, ZenWire::Responses, ZenWire::Messages] {

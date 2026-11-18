@@ -90,7 +90,7 @@ async fn zen_formal_probe_regression() {
             }
             if sent["stream"] == true {
                 let first = "data: {\"id\":\"c\",\"model\":\"chat-free\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"},\"finish_reason\":null}]}\n\n";
-                let last = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":256}}\n\ndata: [DONE]\n\n";
+                let last = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"length\"}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":256}}\n\ndata: [DONE]\n\n";
                 let body = Body::from_stream(async_stream::stream! {
                     yield Ok::<Bytes,std::io::Error>(Bytes::from_static(first.as_bytes()));
                     if mode == 2 { std::future::pending::<()>().await; }
@@ -213,7 +213,16 @@ async fn zen_formal_probe_regression() {
             &Default::default(),
         );
         assert!(!web_result.success);
-        assert_eq!(web_result.error_category.as_deref(), Some("rateLimit"));
+        assert_eq!(
+            web_result.error_category.as_deref(),
+            Some(if app == AppKind::Claude {
+                "rateLimit"
+            } else {
+                "zenLocalCooldown"
+            })
+        );
+        assert!(matches!(result.retry_after_seconds, Some(1..=4)));
+        assert_eq!(web_result.retry_after_seconds, result.retry_after_seconds);
         assert_eq!(web_result.message, result.message);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before + 1);
     }
@@ -245,7 +254,15 @@ async fn zen_formal_probe_regression() {
         .unwrap();
         assert!(!checked.result.success);
         assert_eq!(checked.result.http_status, Some(429));
-        assert_eq!(checked.result.error_category.as_deref(), Some("rateLimit"));
+        assert_eq!(
+            checked.result.error_category.as_deref(),
+            Some(if message.contains("cooling down") {
+                "zenLocalCooldown"
+            } else {
+                "rateLimit"
+            })
+        );
+        assert!(matches!(checked.result.retry_after_seconds, Some(1..=4)));
         assert_eq!(checked.result.retry_count, 0);
         assert!(checked.result.message.contains(message));
         assert!(!checked.result.message.contains("private-upstream-body"));
@@ -279,4 +296,39 @@ async fn opencode_zen_test_without_model_is_configuration_error_without_network(
     assert!(!result.ok);
     assert!(!result.network_checked);
     assert_eq!(result.outcome, ProviderOperationOutcome::InvalidConfig);
+}
+
+#[tokio::test]
+async fn opencode_zen_free_limit_maps_to_specific_web_diagnostic() {
+    let state = provider_api_test_state("zen-free-limit-web");
+    let execution =
+        install_zen_test_execution(&state, AppKind::Codex, "http://127.0.0.1:9", false).await;
+    let mut response = test_provider_inner(
+        &state,
+        execution,
+        &TestProviderQuery {
+            app: AppKind::Codex,
+            model: Some("hy4-flash-free".into()),
+            network: Some(false),
+            timeout_ms: None,
+            test_prompt: None,
+            stream: Some(false),
+        },
+    )
+    .await
+    .unwrap();
+    response.ok = false;
+    response.network_checked = true;
+    response.network_status_code = Some(429);
+    response.outcome = ProviderOperationOutcome::RateLimit;
+    response.network_error =
+        Some("OpenCode Zen upstream rate_limit: HTTP 429; category=free_usage_limit".into());
+    response.retry_after_seconds = Some(43200);
+    let result = crate::api::invoke::handlers::map_provider_test_to_stream_check_result(
+        &response,
+        &Default::default(),
+    );
+    assert_eq!(result.error_category.as_deref(), Some("zenFreeUsageLimit"));
+    assert_eq!(result.retry_after_seconds, Some(43200));
+    assert!(!result.success);
 }

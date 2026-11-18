@@ -734,6 +734,7 @@ mod tests {
                 output_tokens: 0,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                retry_after_seconds: None,
             },
             provider_id: "provider-test".to_string(),
             provider_name: "Provider Test".to_string(),

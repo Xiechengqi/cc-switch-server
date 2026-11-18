@@ -26,6 +26,12 @@ export function useModelTest(appId: AppId) {
 
       try {
         const result = await modelTestProvider(appId, providerId);
+        const retryHint = typeof result.retryAfterSeconds === "number" &&
+          Number.isFinite(result.retryAfterSeconds) && result.retryAfterSeconds > 0
+          ? t("streamCheck.retryAt", {
+              time: new Date(Date.now() + Math.min(result.retryAfterSeconds, 86400) * 1000).toLocaleString(),
+            })
+          : "";
 
         if (result.status === "operational") {
           toast.success(
@@ -60,12 +66,23 @@ export function useModelTest(appId: AppId) {
             },
           );
         } else if (
-          result.errorCategory === "quotaExceeded" ||
-          result.errorCategory === "rateLimit"
+          result.errorCategory === "zenFreeUsageLimit" ||
+          result.errorCategory === "zenFreeTierGate"
         ) {
-          const rateLimited = result.errorCategory === "rateLimit";
+          toast.warning(t("streamCheck.zenFreeAccess", { providerName }), {
+            description: [t("streamCheck.zenFreeAccessHint"), retryHint, result.message].filter(Boolean).join("\n"),
+            duration: 10000,
+            closeButton: true,
+          });
+        } else if (
+          result.errorCategory === "quotaExceeded" ||
+          result.errorCategory === "rateLimit" ||
+          result.errorCategory === "zenLocalCooldown"
+        ) {
+          const localCooldown = result.errorCategory === "zenLocalCooldown";
+          const rateLimited = result.errorCategory === "rateLimit" || localCooldown;
           const hint = t(
-            rateLimited
+            localCooldown ? "streamCheck.zenLocalCooldownHint" : rateLimited
               ? "streamCheck.rateLimitHint"
               : "streamCheck.quotaExceededHint",
             { defaultValue: "" },
@@ -83,7 +100,7 @@ export function useModelTest(appId: AppId) {
               },
             ),
             {
-              description: [hint, result.message].filter(Boolean).join("\n"),
+              description: [hint, retryHint, result.message].filter(Boolean).join("\n"),
               duration: 10000,
               closeButton: true,
             },

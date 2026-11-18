@@ -418,6 +418,8 @@ pub(in crate::api) struct TestProviderResponse {
     pub(in crate::api) network_stream_completed: Option<bool>,
     pub(in crate::api) network_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) retry_after_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::api) reconciliation: Option<GrokProviderReconciliationReport>,
     pub(in crate::api) message: String,
 }

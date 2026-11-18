@@ -16,6 +16,65 @@ const PROVISION_IP_FAMILY_ENV: &str = "CC_SWITCH_PROVISION_IP_FAMILY";
 pub const OUTBOUND_PROXY_ENV: &str = "CC_SWITCH_OUTBOUND_PROXY";
 const MAX_PROXY_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 
+/// Explicit outbound proxy for the Zen fetch child; never inherit ambient proxies.
+pub(crate) fn outbound_proxy_url() -> anyhow::Result<Option<String>> {
+    Ok(outbound_proxy_config()?.map(|proxy| {
+        let mut url = proxy.endpoint;
+        if let Some(username) = proxy.username {
+            let _ = url.set_username(&username);
+        }
+        if let Some(password) = proxy.password {
+            let _ = url.set_password(Some(&password));
+        }
+        url.to_string()
+    }))
+}
+
+pub(crate) fn zen_ip_family_selected() -> bool {
+    provision_ip_family().is_some()
+}
+
+/// Keep Zen's TLS in Bun while the existing Server IP-family setting controls
+/// the TCP hop (or the explicit proxy's TCP hop) just as with reqwest.
+pub(crate) async fn connect_zen_tcp(host: &str, port: u16) -> anyhow::Result<TcpStream> {
+    let proxy = outbound_proxy_config()?;
+    let (dial_host, dial_port) = if let Some(proxy) = &proxy {
+        (
+            proxy.endpoint.host_str().context("missing proxy host")?,
+            proxy
+                .endpoint
+                .port_or_known_default()
+                .context("missing proxy port")?,
+        )
+    } else {
+        (host, port)
+    };
+    let family = provision_ip_family();
+    let addresses = tokio::net::lookup_host((dial_host, dial_port))
+        .await?
+        .filter(|address| match family {
+            Some(ProvisionIpFamily::V4) => address.is_ipv4(),
+            Some(ProvisionIpFamily::V6) => address.is_ipv6(),
+            None => true,
+        })
+        .collect::<Vec<_>>();
+    let mut stream = TcpStream::connect(addresses.as_slice()).await?;
+    if let Some(proxy) = proxy {
+        let mut request = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+        if let Some(authorization) = proxy.authorization_header() {
+            request.push_str(&format!("Proxy-Authorization: {authorization}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).await?;
+        let status = read_connect_response_status(&mut stream).await?;
+        anyhow::ensure!(
+            (200..300).contains(&status),
+            "outbound proxy rejected CONNECT"
+        );
+    }
+    Ok(stream)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BoundedResponseBodyError {
     #[error("read upstream response body: {0}")]
@@ -349,7 +408,7 @@ fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
-fn self_update_redirect_policy() -> reqwest::redirect::Policy {
+pub(crate) fn self_update_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         if attempt.previous().len() >= 10 {
             return attempt.error("too many redirects");

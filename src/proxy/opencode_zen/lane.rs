@@ -36,7 +36,7 @@ fn check(origin: &str, model: &str) -> Result<(), ProxyError> {
             .saturating_add(1)
             .min(86400);
         return Err(ProxyError::rate_limited(
-            "OpenCode Zen public lane is cooling down",
+            "OpenCode Zen public lane is cooling down; category=local_cooldown",
             seconds,
         ));
     }

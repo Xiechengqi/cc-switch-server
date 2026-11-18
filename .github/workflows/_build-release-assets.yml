@@ -81,6 +81,14 @@ jobs:
           cargo test --locked workbuddy_value --lib
           cargo test --locked codex_websocket_large_upload --lib -- --test-threads=1
 
+      - name: Install pinned Zen fetch test runtime
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Validate Zen fetch process lifecycle
+        run: CC_SWITCH_ZEN_TEST_BUN="$(command -v bun)" cargo test --locked zen_bun_ --lib -- --include-ignored
+
   # The committed web-dist can lag web-src. Generate release assets once and
   # pass exactly those bytes to both architecture builds.
   web:

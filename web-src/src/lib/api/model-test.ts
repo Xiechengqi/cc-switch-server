@@ -16,6 +16,7 @@ export interface StreamCheckResult {
   retryCount: number;
   /** 细粒度错误分类，如 "modelNotFound" */
   errorCategory?: string;
+  retryAfterSeconds?: number;
   /** 实际探测使用的模型名（用于错误消息中提示哪个模型未找到） */
   modelUsed?: string;
   inputTokens: number;

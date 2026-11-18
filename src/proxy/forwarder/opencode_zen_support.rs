@@ -89,6 +89,12 @@ async fn forward_opencode_zen_inner(
         request_memory,
     } = options;
     let total_deadline = tokio::time::Instant::from_std(started) + execution.request_timeout();
+    let first_deadline = total_deadline.min(
+        tokio::time::Instant::from_std(started)
+            + execution
+                .stream_first_byte_timeout()
+                .unwrap_or(Duration::from_secs(60)),
+    );
     if tokio::time::Instant::now() >= total_deadline {
         return Err(ProxyError {
             status: StatusCode::GATEWAY_TIMEOUT,
@@ -172,6 +178,15 @@ async fn forward_opencode_zen_inner(
         Some(&model),
     )
     .await?;
+    // Provision/verify before marking a generation sent or reserving its USD
+    // attempt. A runtime download failure is a preflight failure.
+    #[cfg(test)]
+    let loopback = origin.starts_with("http://127.0.0.1:") || origin.starts_with("http://[::1]:");
+    #[cfg(not(test))]
+    let loopback = false;
+    if !loopback {
+        zen::runtime::ensure(&state.config_dir, first_deadline).await?;
+    }
     let wire = prepared.wire;
     let tool_context = super::transforms::responses_tool_context(&requested);
     let metadata = routed_model_metadata(
@@ -187,7 +202,14 @@ async fn forward_opencode_zen_inner(
     request_context.usage_state = Some(UsageState::Pending);
     request_context.stream_status = prepared.stream.then(|| "pending".to_string());
     let payload_memory = budget
-        .reserve(RequestMemoryComponent::NormalizedBody, prepared.body.len())
+        .reserve(
+            RequestMemoryComponent::NormalizedBody,
+            prepared
+                .body
+                .len()
+                .saturating_mul(2)
+                .saturating_add(128 * 1024),
+        )
         .map_err(|error| error.into_proxy_error())?;
     let request_id = log_usage(
         &state,
@@ -225,17 +247,24 @@ async fn forward_opencode_zen_inner(
     if let Some(t) = timing.get() {
         budget.set_timing(t);
     }
+    let probe_session = format!("probe:{}:{}", zen::WIRE_PROFILE, zen::base_model_id(&model));
+    let conversation = if request_context.is_health_check {
+        probe_session.as_str()
+    } else {
+        request_context.session_id.as_deref().unwrap_or(&request_id)
+    };
     let seed = serde_json::to_string(&(
+        zen::WIRE_PROFILE,
         stored.app.as_str(),
         stored.provider.id.as_str(),
         execution.plan.runtime_fingerprint.as_str(),
         request_context.share_id.as_deref(),
         request_context.user_email.as_deref(),
-        request_context.session_id.as_deref().unwrap_or(&request_id),
+        conversation,
     ))
     .map_err(|_| ProxyError::bad_request("invalid Zen conversation scope"))?;
     let session = zen::session_for_conversation(&seed);
-    let lane = match zen::acquire_lane(origin, &model, total_deadline).await {
+    let lane = match zen::acquire_lane(origin, &model, first_deadline).await {
         Ok(lane) => lane,
         Err(error) => {
             finish_qoder_stream_failure(&mut guard, route, &error).await;
@@ -243,6 +272,12 @@ async fn forward_opencode_zen_inner(
         }
     };
     let result = async {
+        if tokio::time::Instant::now() >= first_deadline {
+            return Err(ProxyError {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message: "OpenCode Zen first-byte deadline exceeded before generation".into(),
+            });
+        }
         series
             .lock()
             .await
@@ -258,22 +293,14 @@ async fn forward_opencode_zen_inner(
         let mut response = zen_post(
             origin,
             &client,
+            &state.config_dir,
+            total_deadline,
             &prepared,
             &session,
-            if prepared.stream {
-                total_deadline.min(
-                    tokio::time::Instant::from_std(started)
-                        + execution
-                            .stream_first_byte_timeout()
-                            .unwrap_or(Duration::from_secs(60)),
-                )
-            } else {
-                total_deadline
-            },
+            first_deadline,
             timing.get().as_ref(),
         )
         .await?;
-        drop(payload_memory);
         if !response.status().is_success() {
             if response.status() == StatusCode::UNAUTHORIZED {
                 series.lock().await.auth_rejected().await;
@@ -287,7 +314,7 @@ async fn forward_opencode_zen_inner(
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if prepared.stream && !content_type.starts_with("text/event-stream") {
+        if !content_type.starts_with("text/event-stream") {
             return Err(ProxyError::bad_gateway(
                 "OpenCode Zen expected an SSE response",
             ));
@@ -295,10 +322,19 @@ async fn forward_opencode_zen_inner(
         if prepared.stream {
             return Ok((Some(response), None, false));
         }
-        let (bytes, _raw_memory) = zen_read_json(&mut response, &budget, total_deadline).await?;
-        let mut payload: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| ProxyError::bad_gateway("OpenCode Zen invalid JSON response"))?;
-        guard.usage.observe_json(&payload);
+        let (mut payload, _raw_memory) = zen_read_document(
+            response,
+            &stored,
+            &prepared,
+            &budget,
+            &execution,
+            started,
+            total_deadline,
+            timing.get(),
+            &mut guard.usage,
+            &mut guard.first_token_ms,
+        )
+        .await?;
         if wire == zen::ZenWire::Chat
             && zen::continuation_kind(&payload) == Some(zen::ContinuationKind::PureReasoning)
         {
@@ -364,11 +400,12 @@ async fn forward_opencode_zen_inner(
                                 )
                             })?;
                         series.lock().await.sent();
+                        let continuation_started = Instant::now();
                         if let Some(t) = timing.begin_for_driver(
                             stored.provider_type,
                             execution.plan.driver_id.as_str(),
                             forward_timing_surface(route, None),
-                            Instant::now(),
+                            continuation_started,
                         ) {
                             budget.set_timing(t);
                         }
@@ -377,9 +414,16 @@ async fn forward_opencode_zen_inner(
                         let mut response = zen_post(
                             origin,
                             &client,
+                            &state.config_dir,
+                            total_deadline,
                             &continuation,
                             &session,
-                            total_deadline,
+                            total_deadline.min(
+                                tokio::time::Instant::from_std(continuation_started)
+                                    + execution
+                                        .stream_first_byte_timeout()
+                                        .unwrap_or(Duration::from_secs(60)),
+                            ),
                             timing.get().as_ref(),
                         )
                         .await?;
@@ -391,14 +435,20 @@ async fn forward_opencode_zen_inner(
                             zen::observe_lane_error(origin, &model, &error);
                             return Err(error);
                         }
-                        let (bytes, _memory) =
-                            zen_read_json(&mut response, &budget, total_deadline).await?;
-                        let mut continued: Value =
-                            serde_json::from_slice(&bytes).map_err(|_| {
-                                ProxyError::bad_gateway("OpenCode Zen invalid continuation JSON")
-                            })?;
                         let mut observer = StreamUsageAccumulator::new(wire.semantics());
-                        observer.observe_json(&continued);
+                        let (mut continued, _memory) = zen_read_document(
+                            response,
+                            &stored,
+                            &continuation,
+                            &budget,
+                            &execution,
+                            continuation_started,
+                            total_deadline,
+                            timing.get(),
+                            &mut observer,
+                            &mut None,
+                        )
+                        .await?;
                         let second = observer.finish_with_status();
                         state
                             .update_usage_log(&request_id, |log| {
@@ -527,15 +577,12 @@ async fn forward_opencode_zen_inner(
             return Err(error);
         }
     };
-    let first_deadline = tokio::time::Instant::from_std(started)
-        + execution
-            .stream_first_byte_timeout()
-            .unwrap_or(Duration::from_secs(60));
     let mut upstream = upstream.bytes_stream();
     // The guard is captured before the generator's first poll: even an unread
     // response settles cancellation and releases in-flight ownership.
     let stream = async_stream::stream! {
         let _owner = _owner;
+        let _payload_memory = payload_memory;
         let _account = account_in_flight_guard;
         let _share = share_invocation_guard;
         let _lane = lane;
@@ -669,59 +716,167 @@ fn zen_status_error(status: StatusCode, headers: &HeaderMap) -> ProxyError {
     error
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn zen_post(
     origin: &str,
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
+    config_dir: &std::path::Path,
+    total_deadline: tokio::time::Instant,
     prepared: &super::opencode_zen::PreparedUpstream,
     session: &str,
     deadline: tokio::time::Instant,
     timing: Option<&ForwardTiming>,
-) -> Result<reqwest::Response, ProxyError> {
+) -> Result<super::opencode_zen::transport::ZenResponse, ProxyError> {
     if let Some(t) = timing {
         t.mark(Milestone::SendStarted);
     }
-    let mut request = client
-        .post(format!("{origin}{}", prepared.path))
-        .body(prepared.body.clone());
-    for (name, value) in super::opencode_zen::gateway_headers(session, prepared.stream) {
-        request = request.header(name, value);
+    #[cfg(test)]
+    if origin.starts_with("http://127.0.0.1:") || origin.starts_with("http://[::1]:") {
+        let mut request = _client
+            .post(format!("{origin}{}", prepared.path))
+            .body(prepared.body.clone());
+        for (name, value) in super::opencode_zen::gateway_headers(session, true) {
+            request = request.header(name, value);
+        }
+        let response = tokio::time::timeout_at(deadline, request.send())
+            .await
+            .map_err(|_| ProxyError {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message: "OpenCode Zen header deadline exceeded".into(),
+            })?
+            .map_err(|_| ProxyError::bad_gateway("OpenCode Zen upstream transport failed"))?;
+        if let Some(t) = timing {
+            t.mark(Milestone::Headers);
+        }
+        return Ok(super::opencode_zen::transport::ZenResponse::from_reqwest(
+            response,
+        ));
     }
-    let response = tokio::time::timeout_at(deadline, request.send())
-        .await
-        .map_err(|_| ProxyError {
-            status: StatusCode::GATEWAY_TIMEOUT,
-            message: "OpenCode Zen header deadline exceeded".to_string(),
-        })?
-        .map_err(|_| ProxyError::bad_gateway("OpenCode Zen upstream transport failed"))?;
+    let executable = super::opencode_zen::runtime::ensure(config_dir, deadline).await?;
+    let response = super::opencode_zen::transport::post(
+        &executable,
+        &format!("{origin}{}", prepared.path),
+        &prepared.body,
+        session,
+        true,
+        total_deadline,
+        deadline,
+    )
+    .await?;
     if let Some(t) = timing {
         t.mark(Milestone::Headers);
     }
     Ok(response)
 }
 
-async fn zen_read_json(
-    response: &mut reqwest::Response,
+#[allow(clippy::too_many_arguments)]
+async fn zen_read_document(
+    response: super::opencode_zen::transport::ZenResponse,
+    stored: &StoredProvider,
+    prepared: &super::opencode_zen::PreparedUpstream,
     budget: &RequestMemoryBudget,
+    execution: &ProviderExecution,
+    started: Instant,
     deadline: tokio::time::Instant,
-) -> Result<(Bytes, RequestMemoryReservation), ProxyError> {
-    let limit = budget.remaining_bytes().min(8 * 1024 * 1024);
-    let bytes = tokio::time::timeout_at(
-        deadline,
-        crate::infra::http::read_response_body_limited(response, limit),
+    timing: Option<ForwardTiming>,
+    usage: &mut StreamUsageAccumulator,
+    first_token_ms: &mut Option<u128>,
+) -> Result<(Value, RequestMemoryReservation), ProxyError> {
+    use super::opencode_zen as zen;
+    if !response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/event-stream"))
+    {
+        return Err(ProxyError::bad_gateway(
+            "OpenCode Zen expected an SSE response",
+        ));
+    }
+    let mut decoder = zen::ZenStream::new(
+        stored,
+        ProxyRoute::CodexChatCompletions,
+        prepared.wire,
+        Default::default(),
+        Default::default(),
+        true,
+        timing,
     )
-    .await
-    .map_err(|_| ProxyError {
-        status: StatusCode::GATEWAY_TIMEOUT,
-        message: "OpenCode Zen response deadline exceeded".to_string(),
-    })?
-    .map_err(|_| ProxyError::bad_gateway("OpenCode Zen response invalid or exceeds body limit"))?;
-    let memory = budget
+    .with_client_tools(prepared.client_tool_names.clone())
+    .with_aggregation();
+    let retained = budget
         .reserve(
-            RequestMemoryComponent::TransportPending,
-            super::request_memory::json_parse_working_bytes(&bytes).saturating_mul(4),
+            RequestMemoryComponent::StreamRetainedState,
+            decoder.retained_bytes(),
         )
         .map_err(|e| e.into_proxy_error())?;
-    Ok((bytes, memory))
+    let first_deadline = tokio::time::Instant::from_std(started)
+        + execution
+            .stream_first_byte_timeout()
+            .unwrap_or(Duration::from_secs(60));
+    let idle = execution
+        .stream_idle_timeout()
+        .unwrap_or(Duration::from_secs(60));
+    let mut idle_deadline = tokio::time::Instant::now() + idle;
+    let mut stream = response.bytes_stream();
+    loop {
+        let read_deadline = if decoder.semantic {
+            deadline
+        } else {
+            deadline.min(first_deadline)
+        };
+        let chunk = tokio::time::timeout_at(read_deadline.min(idle_deadline), stream.next())
+            .await
+            .map_err(|_| ProxyError {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message: "OpenCode Zen stream deadline exceeded".into(),
+            })?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let chunk = chunk?;
+        idle_deadline = tokio::time::Instant::now() + idle;
+        let _pending = budget
+            .reserve(RequestMemoryComponent::TransportPending, chunk.len())
+            .map_err(|e| e.into_proxy_error())?;
+        retained
+            .resize(
+                decoder
+                    .retained_bytes()
+                    .saturating_add(usage.retained_bytes())
+                    .saturating_add(decoder.working_bytes(&chunk)),
+            )
+            .map_err(|e| e.into_proxy_error())?;
+        usage.push(&chunk);
+        decoder.push(&chunk)?;
+        if decoder.semantic && first_token_ms.is_none() {
+            *first_token_ms = Some(started.elapsed().as_millis());
+        }
+        retained
+            .resize(
+                decoder
+                    .retained_bytes()
+                    .saturating_add(usage.retained_bytes()),
+            )
+            .map_err(|e| e.into_proxy_error())?;
+    }
+    let payload = decoder.finish_document()?;
+    let argument_working = payload
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|call| call.pointer("/function/arguments").and_then(Value::as_str))
+        .map(|args| super::request_memory::json_parse_working_bytes(args.as_bytes()))
+        .sum::<usize>();
+    retained
+        .resize(
+            super::request_memory::retained_json_bytes(&payload)
+                .saturating_mul(4)
+                .saturating_add(argument_working),
+        )
+        .map_err(|e| e.into_proxy_error())?;
+    Ok((payload, retained))
 }
 
 fn zen_validate_json(
@@ -947,24 +1102,25 @@ async fn zen_observe_generation(
 }
 
 async fn zen_http_error(
-    response: &mut reqwest::Response,
+    response: &mut super::opencode_zen::transport::ZenResponse,
     deadline: tokio::time::Instant,
 ) -> ProxyError {
     let mut error = zen_status_error(response.status(), response.headers());
-    if let Ok(Ok(body)) = tokio::time::timeout_at(
-        deadline,
-        crate::infra::http::read_response_body_limited(response, 16 * 1024),
-    )
-    .await
+    if let Ok(Ok(body)) = tokio::time::timeout_at(deadline, response.read_limited(16 * 1024)).await
     {
         let lower = String::from_utf8_lossy(&body).to_ascii_lowercase();
-        let category = if lower.contains("freetiererror") {
+        let category = if lower.contains("freeusagelimiterror") {
+            Some("free_usage_limit")
+        } else if lower.contains("freetiererror") {
             Some("free_tier_gate")
         } else if lower.trim_start().starts_with("<!doctype html")
             || lower.trim_start().starts_with("<html")
         {
             Some("front_proxy_refused")
-        } else if lower.contains("unsupported_country") || lower.contains("region_not_supported") {
+        } else if lower.contains("regionerror")
+            || lower.contains("unsupported_country")
+            || lower.contains("region_not_supported")
+        {
             Some("region_rejected")
         } else {
             None

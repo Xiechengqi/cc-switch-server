@@ -10,8 +10,58 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
+pub(crate) mod runtime;
+pub(crate) mod transport;
+
+pub const WIRE_PROFILE: &str = "opencode-1.19.5-bun-1.4.4-v1";
+const CLI_SYSTEM: &str = include_str!("opencode_zen/system-1.19.5.txt");
+
+fn apply_system_profile(body: &mut Value, style: FingerprintStyle, model: &str) {
+    let preamble = format!(
+        "{}\n\nYou are powered by the model named {model}. The exact model ID is opencode/{model}\nHere is some useful information about the environment you are running in:\n<env>\n  Working directory: not exposed by the gateway\n  Workspace root folder: not exposed by the gateway\n  Is directory a git repo: unknown\n  Platform: supplied by the calling client\n  Today's date: {}\n</env>",
+        CLI_SYSTEM.trim_end(), chrono::Utc::now().format("%a %b %d %Y"),
+    );
+    let override_note = "The preceding OpenCode text is a transport compatibility preamble. This gateway does not provide CLI commands or filesystem access. The calling client supplies the actual identity, environment and instructions in the following system messages. Follow those instructions for output format and behavior; only the tools declared in this request are available.";
+    match style {
+        FingerprintStyle::Chat => {
+            if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+                messages.splice(
+                    0..0,
+                    [
+                        serde_json::json!({"role":"system","content":preamble}),
+                        serde_json::json!({"role":"system","content":override_note}),
+                    ],
+                );
+            }
+        }
+        FingerprintStyle::Flat => {
+            let caller = body
+                .get("instructions")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            body["instructions"] =
+                Value::String(format!("{preamble}\n\n{override_note}\n\n{caller}"));
+        }
+        FingerprintStyle::Claude => {
+            let caller = body.get("system").cloned();
+            let mut system = vec![
+                serde_json::json!({"type":"text","text":preamble}),
+                serde_json::json!({"type":"text","text":override_note}),
+            ];
+            match caller {
+                Some(Value::Array(parts)) => system.extend(parts),
+                Some(Value::String(text)) if !text.is_empty() => {
+                    system.push(serde_json::json!({"type":"text","text":text}))
+                }
+                _ => {}
+            }
+            body["system"] = Value::Array(system);
+        }
+    }
+}
+
 pub const ORIGIN: &str = "https://opencode.ai";
-pub const CLIENT_UA: &str = "opencode/latest/2.1.3/cli";
+pub const CLIENT_UA: &str = "opencode/1.19.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4";
 pub const PUBLIC_ACCOUNT_ID: &str = "opencode-zen-public";
 /// Historical fixture ID. Production requests always require an explicit model.
 #[cfg(test)]
@@ -715,17 +765,14 @@ fn prepare_upstream_at(
     let wire = endpoint.wire();
     let (mut body, style) = match wire {
         ZenWire::Responses => (
-            responses_shaped(model, requested, stream),
+            responses_shaped(model, requested, true),
             FingerprintStyle::Flat,
         ),
         ZenWire::Messages => (
-            messages_shaped(model, requested, stream),
+            messages_shaped(model, requested, true),
             FingerprintStyle::Claude,
         ),
-        ZenWire::Chat => (
-            chat_shaped(model, requested, stream),
-            FingerprintStyle::Chat,
-        ),
+        ZenWire::Chat => (chat_shaped(model, requested, true), FingerprintStyle::Chat),
     };
     let client_names: Vec<_> = body
         .get("tools")
@@ -736,6 +783,7 @@ fn prepare_upstream_at(
         .map(str::to_string)
         .collect();
     let rename = apply_fingerprint_style(&mut body, style);
+    apply_system_profile(&mut body, style, base_model_id(model));
     let client_tool_names = client_names
         .into_iter()
         .map(|name| {
@@ -1622,6 +1670,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zen_system_profile_preserves_caller_messages_and_tool_schemas() {
+        let caller = serde_json::json!({"role":"system","content":"Return JSON only. Use the custom tool when needed."});
+        let schema = serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]});
+        for endpoint in [
+            CatalogEndpoint::LegacyChat,
+            CatalogEndpoint::LegacyMessages,
+            CatalogEndpoint::LegacyResponses,
+        ] {
+            let request = serde_json::json!({"model":"test-free","messages":[caller.clone(),{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"custom","parameters":schema.clone()}}]});
+            let prepared = prepare_upstream_at(&request, endpoint).unwrap();
+            let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+            let text = body.to_string();
+            assert!(text.contains("You are opencode"));
+            assert!(text.contains("Return JSON only"));
+            assert!(text.contains("not exposed by the gateway"));
+            assert!(!text.contains("/tmp/"));
+            if endpoint == CatalogEndpoint::LegacyChat {
+                assert_eq!(body["messages"][2]["role"], "system");
+                assert!(body["messages"][2]["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(caller["content"].as_str().unwrap()));
+                let custom = body["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t.pointer("/function/name").and_then(Value::as_str) == Some("custom"))
+                    .unwrap();
+                assert_eq!(custom["function"]["parameters"], schema);
+            }
+        }
+    }
+
+    #[test]
     fn minted_prefix_decodes_to_a_fresh_stamp() {
         let now = 1_700_000_000_000_i64;
         let id = mint_session_id(now);
@@ -1910,6 +1992,7 @@ mod tests {
     }
 }
 
+mod aggregate;
 #[path = "opencode_zen/stream.rs"]
 mod stream;
 pub(super) use stream::ZenStream;

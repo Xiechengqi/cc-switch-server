@@ -46,6 +46,32 @@ async fn zen_test_options(state: &ServerState, body: Value) -> OpencodeZenForwar
     }
 }
 
+fn zen_fixture_sse(payload: Value, wire: super::super::opencode_zen::ZenWire) -> Response {
+    use super::super::opencode_zen::ZenWire;
+    let frame = |v: Value| format!("data: {v}\n\n");
+    let body = match wire {
+        ZenWire::Chat => [frame(json!({"id":payload["id"],"model":payload["model"],"choices":[{"index":0,"delta":payload["choices"][0]["message"],"finish_reason":payload["choices"][0]["finish_reason"]}],"usage":payload["usage"]})), "data: [DONE]\n\n".into()].concat(),
+        ZenWire::Responses => frame(json!({"type":"response.completed","response":payload})),
+        ZenWire::Messages => {
+            let mut start = payload.clone();
+            start["content"] = json!([]);
+            start["stop_reason"] = Value::Null;
+            let mut events = frame(json!({"type":"message_start","message":start}));
+            for (index, block) in payload["content"].as_array().unwrap().iter().enumerate() {
+                events.push_str(&frame(json!({"type":"content_block_start","index":index,"content_block":block})));
+                events.push_str(&frame(json!({"type":"content_block_stop","index":index})));
+            }
+            events.push_str(&frame(json!({"type":"message_delta","delta":{"stop_reason":payload["stop_reason"]},"usage":payload["usage"]})));
+            events.push_str(&frame(json!({"type":"message_stop"})));
+            events
+        }
+    };
+    Response::builder()
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn opencode_zen_loopback_is_incremental_and_unread_bodies_settle_cancellation() {
     let _lock = super::super::opencode_zen::CATALOG_TEST_LOCK.lock().await;
@@ -194,8 +220,9 @@ async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() 
             }
             let sent: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(sent["model"], "chat-free");
+            assert_eq!(sent["stream"], true);
             if n == 1 { assert!(sent["messages"].to_string().contains("partial")); }
-            axum::Json(json!({"id":"chat_1","object":"chat.completion","model":"chat-free","choices":[{"index":0,"message":{"role":"assistant","content":if n==0 {"partial"} else {" rest"}},"finish_reason":if n==0 {"length"} else {"stop"}}],"usage":{"prompt_tokens":10,"completion_tokens":100,"total_tokens":110}}))
+            zen_fixture_sse(json!({"id":"chat_1","object":"chat.completion","model":"chat-free","choices":[{"index":0,"message":{"role":"assistant","content":if n==0 {"partial"} else {" rest"}},"finish_reason":if n==0 {"length"} else {"stop"}}],"usage":{"prompt_tokens":10,"completion_tokens":100,"total_tokens":110}}), super::super::opencode_zen::ZenWire::Chat)
         }
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -433,12 +460,13 @@ async fn opencode_zen_fixed_models_choose_upstream_wire_before_conversion() {
                 assert_eq!(uri.path(), zen::endpoint_for(model));
                 let sent: Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(sent["model"], model);
+                assert_eq!(sent["stream"], true);
                 let payload = match zen::wire_for(model) {
                     zen::ZenWire::Chat => json!({"id":"chat_test","model":model,"choices":[{"index":0,"message":{"role":"assistant","content":"fixed"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}),
                     zen::ZenWire::Responses => json!({"id":"resp_test","object":"response","model":model,"status":"completed","output":[{"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"fixed","annotations":[]}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}),
                     zen::ZenWire::Messages => json!({"id":"msg_test","type":"message","model":model,"role":"assistant","content":[{"type":"text","text":"fixed"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}),
                 };
-                axum::Json(payload)
+                zen_fixture_sse(payload, zen::wire_for(model))
             }));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -539,6 +567,39 @@ fn opencode_zen_retry_after_accepts_http_date_and_never_echoes_unsafe_identifier
     let error = zen_status_error(StatusCode::TOO_MANY_REQUESTS, &headers);
     assert!(matches!(error.retry_after_seconds(), Some(28..=30)));
     assert!(!error.client_message().contains("private"));
+}
+
+#[tokio::test]
+async fn opencode_zen_typed_free_errors_preserve_retry_without_private_body() {
+    for (kind, category) in [
+        ("FreeUsageLimitError", "free_usage_limit"),
+        ("FreeTierError", "free_tier_gate"),
+        ("RegionError", "region_rejected"),
+    ] {
+        let raw = http::Response::builder()
+            .status(429)
+            .header("retry-after", "43200")
+            .header("cf-ray", "zen-safe-ray")
+            .body(
+                json!({"error":{"type":kind,"message":"private credential=do-not-leak"}})
+                    .to_string(),
+            )
+            .unwrap();
+        let response: reqwest::Response = raw.into();
+        let mut response =
+            super::super::opencode_zen::transport::ZenResponse::from_reqwest(response);
+        let error = zen_http_error(
+            &mut response,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert!(error
+            .client_message()
+            .contains(&format!("category={category}")));
+        assert_eq!(error.retry_after_seconds(), Some(43200));
+        assert!(error.client_message().contains("zen-safe-ray"));
+        assert!(!error.message.contains("do-not-leak"));
+    }
 }
 
 #[test]

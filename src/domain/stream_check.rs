@@ -32,6 +32,8 @@ pub struct StreamCheckResult {
     pub retry_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
     #[serde(default)]
     pub input_tokens: u32,
     #[serde(default)]
@@ -151,6 +153,7 @@ fn build_reachability_result(
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            retry_after_seconds: None,
         },
         Err(message) => StreamCheckResult {
             status: HealthStatus::Failed,
@@ -167,6 +170,7 @@ fn build_reachability_result(
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            retry_after_seconds: None,
         },
     }
 }
@@ -210,6 +214,7 @@ fn failed_result(message: impl Into<String>, retry_count: u32) -> StreamCheckRes
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
+        retry_after_seconds: None,
     }
 }
 

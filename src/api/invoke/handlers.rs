@@ -215,6 +215,7 @@ pub(in crate::api) fn map_provider_test_to_stream_check_result(
         tested_at: chrono::Utc::now().timestamp(),
         retry_count: 0,
         error_category: provider_test_error_category(response),
+        retry_after_seconds: response.retry_after_seconds,
         input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,
@@ -223,6 +224,21 @@ pub(in crate::api) fn map_provider_test_to_stream_check_result(
 }
 
 fn provider_test_error_category(response: &TestProviderResponse) -> Option<String> {
+    if response.driver_id == "special.opencode_zen" {
+        let detail = response
+            .network_error
+            .as_deref()
+            .unwrap_or(&response.message);
+        for (marker, category) in [
+            ("category=free_usage_limit", "zenFreeUsageLimit"),
+            ("category=free_tier_gate", "zenFreeTierGate"),
+            ("category=local_cooldown", "zenLocalCooldown"),
+        ] {
+            if detail.contains(marker) {
+                return Some(category.into());
+            }
+        }
+    }
     if response.network_stream_completed == Some(false)
         && response
             .network_status_code
