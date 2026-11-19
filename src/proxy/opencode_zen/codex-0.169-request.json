@@ -1,0 +1,43 @@
+{
+  "model": "codex-client-model",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "Return ZEN_CODEX_OK. Do not call tools." }]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "echo_probe",
+      "description": "Return the supplied text.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string" },
+          "client_metadata": { "type": "object", "properties": { "mode": { "type": "string" } } }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      },
+      "strict": false
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "reasoning": { "summary": "auto" },
+  "store": false,
+  "stream": true,
+  "include": ["reasoning.encrypted_content"],
+  "prompt_cache_key": "synthetic-client-session",
+  "client_metadata": {
+    "root_turn_id": "synthetic-root-turn",
+    "session_id": "synthetic-client-session",
+    "thread_id": "synthetic-client-thread",
+    "turn_id": "synthetic-client-turn",
+    "x-codex-window-id": "synthetic-client-window",
+    "x-codex-installation-id": "synthetic-client-installation",
+    "x-codex-turn-metadata": "{\"workspaces\":[{\"path\":\"/synthetic/private-workspace\"}]}"
+  }
+}

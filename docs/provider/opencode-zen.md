@@ -1,6 +1,6 @@
 # OpenCode Zen 免 Key 反代
 
-状态：单条公开免费车道；2026-11-18 已在 MY/HK/US 三节点的隔离 Server 上验证 HY4、DeepSeek 两种免费模型的 Claude/Codex 流式与非流式推理，以及 HY4 的三入口工具往返。验收仅覆盖这些操作；真实公网 Router 端到端链路、其他模型与可选能力仍为 `live_pending`。
+状态：单条公开免费车道；2026-11-18 已在 MY/HK/US 三节点的隔离 Server 上验证 HY4、DeepSeek 两种免费模型的 Claude/Codex 流式与非流式推理，以及 HY4 的三入口工具往返。Codex 客户端封装修复另在 US 隔离 Server 的签名 Share 路径上验证：完整 Codex 0.169 字段形状配合合成内容，两款模型流/非流 4/4 成功，HY4 工具往返 1/1 成功；这不是实际 CLI 会话或生产部署验收。验收仅覆盖这些操作；真实公网 Router 端到端链路、其他模型与可选能力仍为 `live_pending`。
 
 不使用 OpenCode Go、付费 Zen API Key、账号池或出口轮换；不注册第四个 App。Claude/Codex 的 Profile 使用 `special.opencode_zen`，无用户凭据，固定 `https://opencode.ai`，配置不可覆盖端点。Gemini Surface 不开放。
 
@@ -15,6 +15,10 @@
 入口协议与模型的上游协议独立。使用 Server 自有 transforms 与 stateful stream bridge，覆盖 Messages/Chat/Responses 三入口 × 三上游协议 × 流/非流的 18 个基础组合。请求转换保留 system/instructions、工具调用 ID、工具结果与历史，响应转换遵循入口格式，Chat 的 created 使用统一兼容边界。
 
 本 Driver 不实现 Responses 持久化资源；`store:true` 和 `previous_response_id` 显式拒绝，调用方须提供完整历史。目录仅公布受审的文本/工具能力，不开放未经实测的图像/音频能力。
+
+Codex CLI 的 Responses 客户端封装与生成控制分别处理：`client_metadata` 只接受字符串值对象或 null，作为会话/窗口记账信息在出站前移除，不传给 Zen，也不作为上游 session 权威。`reasoning.summary=auto` 与 `text.verbosity=medium` 按中性默认值兼容；Chat/Messages 不因这些默认值额外启用推理或改写提示词。`include=["reasoning.encrypted_content"]` 是可选输出投影，Chat/Messages 没有 OpenAI 密文时不发送该投影，也不伪造密文。原生 Responses 在新鲜推理声明下保留 summary，原生投影按原值保留。显式 effort、JSON Schema、strict 工具与不支持的非默认 summary/verbosity 仍受原有能力约束。
+
+本通道没有托管 Web 搜索；Codex CLI 若启用 `web_search` 工具，会明确提示关闭该项，可为该供应商使用 `codex -c 'web_search="disabled"'`。普通客户端 function 工具及既有 namespace/custom 映射不受影响。卡片的精简 curl 检测不代表已覆盖 CLI 全部字段；本仓另用完整 Codex 0.169 请求形状覆盖三上游协议和流/非流路径，CI 显式运行 Zen 模块回归。
 
 ## 专用出站传输
 

@@ -16,6 +16,10 @@ pub(crate) mod transport;
 pub const WIRE_PROFILE: &str = "opencode-1.19.5-bun-1.4.4-v1";
 const CLI_SYSTEM: &str = include_str!("opencode_zen/system-1.19.5.txt");
 
+#[cfg(test)]
+pub(in crate::proxy) const CODEX_CLI_FIXTURE: &str =
+    include_str!("opencode_zen/codex-0.169-request.json");
+
 fn apply_system_profile(body: &mut Value, style: FingerprintStyle, model: &str) {
     let preamble = format!(
         "{}\n\nYou are powered by the model named {model}. The exact model ID is opencode/{model}\nHere is some useful information about the environment you are running in:\n<env>\n  Working directory: not exposed by the gateway\n  Workspace root folder: not exposed by the gateway\n  Is directory a git repo: unknown\n  Platform: supplied by the calling client\n  Today's date: {}\n</env>",
@@ -962,8 +966,8 @@ fn prepare_for_route_inner(
         _ => "max_tokens",
     };
     converted[key] = Value::from(limit);
-    // Zen fingerprints body bytes: no active cache hints from generic converters.
-    strip_cache_hints(&mut converted);
+    // Client bookkeeping and active cache hints do not belong on the Zen wire.
+    strip_client_transport_hints(&mut converted);
     if let Some(admitted) = admitted {
         let controls = controls::translate(requested, route, admitted)?;
         controls::apply(&mut converted, requested, controls, endpoint.wire());
@@ -978,12 +982,13 @@ fn prepare_for_route_inner(
     })
 }
 
-fn strip_cache_hints(value: &mut Value) {
+fn strip_client_transport_hints(value: &mut Value) {
     let Some(map) = value.as_object_mut() else {
         return;
     };
     map.remove("cache_control");
     map.remove("prompt_cache_key");
+    map.remove("client_metadata");
     for key in ["system", "tools"] {
         if let Some(items) = map.get_mut(key).and_then(Value::as_array_mut) {
             for item in items {

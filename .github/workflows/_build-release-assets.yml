@@ -80,6 +80,7 @@ jobs:
           cargo test --locked capability --lib
           cargo test --locked workbuddy_value --lib
           cargo test --locked codex_websocket_large_upload --lib -- --test-threads=1
+          cargo test --locked opencode_zen --lib
 
       - name: Install pinned Zen fetch test runtime
         uses: oven-sh/setup-bun@v2

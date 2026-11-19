@@ -66,6 +66,11 @@ fn tools(request: &Value, route: ProxyRoute, admitted: &ZenAdmission) -> Result<
             && admitted.endpoint.wire() != ZenWire::Responses
             && matches!(kind, Some("custom" | "namespace" | "tool_search"));
         if !regular && !emulated {
+            if matches!(kind, Some("web_search" | "web_search_preview")) {
+                return Err(unsupported(
+                    "hosted web_search; disable Codex CLI web_search for this provider",
+                ));
+            }
             return Err(unsupported("hosted or native advanced tools"));
         }
         if tool["type"] == "namespace" {
@@ -213,6 +218,7 @@ pub(super) fn translate(
         "store",
         "previous_response_id",
         "metadata",
+        "client_metadata",
         "user",
         "safety_identifier",
         "prompt_cache_key",
@@ -222,6 +228,16 @@ pub(super) fn translate(
         if !ALLOWED.contains(&key.as_str()) && !KEYS.contains(&key.as_str()) {
             return Err(unsupported("unknown request field"));
         }
+    }
+    if request.get("client_metadata").is_some_and(|value| {
+        !value.is_null()
+            && !value
+                .as_object()
+                .is_some_and(|map| map.values().all(Value::is_string))
+    }) {
+        return Err(ProxyError::bad_request(
+            "OpenCode Zen client_metadata must be an object of strings",
+        ));
     }
     if let Some(options) = request.get("stream_options") {
         if !options.as_object().is_some_and(|m| {
@@ -237,10 +253,10 @@ pub(super) fn translate(
                 ProxyError::bad_request(format!("OpenCode Zen {key} must be an object"))
             })?;
             let allowed: &[&str] = match key {
-                "reasoning" => &["effort"],
+                "reasoning" => &["effort", "summary"],
                 "thinking" => &["type", "effort", "budget_tokens"],
                 "output_config" => &["effort", "format"],
-                _ => &["format"],
+                _ => &["format", "verbosity"],
             };
             for field in value.keys() {
                 if !allowed.contains(&field.as_str()) {
@@ -375,6 +391,32 @@ pub(super) fn translate(
             }
         }
     }
+    if let Some(summary) = request
+        .pointer("/reasoning/summary")
+        .filter(|value| !value.is_null())
+    {
+        let summary = summary
+            .as_str()
+            .filter(|value| matches!(*value, "auto" | "concise" | "detailed"))
+            .ok_or_else(|| unsupported("reasoning.summary"))?;
+        if summary != "auto" {
+            if wire != ZenWire::Responses {
+                return Err(unsupported("reasoning.summary on this protocol"));
+            }
+            require(caps.reasoning, admitted.stale, "reasoning.summary")?;
+        }
+        if wire == ZenWire::Responses && caps.reasoning == Some(true) && !admitted.stale {
+            out.entry("reasoning").or_insert_with(|| json!({}))["summary"] = json!(summary);
+        }
+    }
+    if let Some(verbosity) = request
+        .pointer("/text/verbosity")
+        .filter(|value| !value.is_null())
+    {
+        if verbosity.as_str() != Some("medium") {
+            return Err(unsupported("text.verbosity"));
+        }
+    }
     if let Some(thinking) = request.get("thinking") {
         let has_native = thinking.get("type").is_some() || thinking.get("budget_tokens").is_some();
         if wire != ZenWire::Messages && has_native {
@@ -448,15 +490,15 @@ pub(super) fn translate(
         }
     }
     if let Some(include) = request.get("include") {
-        if wire != ZenWire::Responses
-            || !include.as_array().is_some_and(|v| {
-                v.iter()
-                    .all(|v| v.as_str() == Some("reasoning.encrypted_content"))
-            })
-        {
+        if !include.as_array().is_some_and(|v| {
+            v.iter()
+                .all(|v| v.as_str() == Some("reasoning.encrypted_content"))
+        }) {
             return Err(unsupported("include"));
         }
-        out.insert("include".into(), include.clone());
+        if wire == ZenWire::Responses {
+            out.insert("include".into(), include.clone());
+        }
     }
     if let Some(choice) = request.get("tool_choice") {
         let kind = choice
@@ -618,7 +660,7 @@ mod tests {
                 request["input"] = json!("hello");
                 request["tools"] = json!([{"type":"function","name":"lookup","parameters":{"type":"object"},"strict":true}]);
                 request["reasoning"] = json!({"effort":"high"});
-                request["text"] = json!({"format":{"type":"json_schema","name":"answer","schema":{"type":"object"}}});
+                request["text"] = json!({"verbosity":"medium","format":{"type":"json_schema","name":"answer","schema":{"type":"object"}}});
             }
             _ => {
                 request["messages"] = json!([{"role":"user","content":"hello"}]);
@@ -631,6 +673,138 @@ mod tests {
         request["top_p"] = json!(0.9);
         request["parallel_tool_calls"] = json!(false);
         request
+    }
+
+    #[test]
+    fn zen_codex_cli_envelope_defaults_survive_all_wires_and_modes_without_metadata_leaks() {
+        for endpoint in [
+            CatalogEndpoint::Chat,
+            CatalogEndpoint::Responses,
+            CatalogEndpoint::Messages,
+        ] {
+            for stale in [false, true] {
+                for stream in [false, true] {
+                    let mut request: Value =
+                        serde_json::from_str(super::super::CODEX_CLI_FIXTURE).unwrap();
+                    request["text"] = json!({"verbosity":"medium"});
+                    request["stream"] = json!(stream);
+                    let mut admitted = admission(endpoint);
+                    admitted.stale = stale;
+                    let prepared =
+                        prepare_for_model(&request, ProxyRoute::CodexResponses, &admitted).unwrap();
+                    assert_eq!(prepared.stream, stream);
+                    let sent: Value = serde_json::from_slice(&prepared.body).unwrap();
+                    assert_eq!(sent["stream"], true);
+                    assert!(sent.get("client_metadata").is_none());
+                    assert!(sent.get("prompt_cache_key").is_none());
+                    assert!(!sent.to_string().contains("synthetic-client-"));
+                    assert!(!sent.to_string().contains("private-workspace"));
+                    let tool = sent["tools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|tool| super::super::tool_name(tool) == Some("echo_probe"))
+                        .unwrap();
+                    let schema = tool
+                        .pointer("/function/parameters")
+                        .or_else(|| tool.get("parameters"))
+                        .or_else(|| tool.get("input_schema"))
+                        .unwrap();
+                    assert_eq!(
+                        schema["properties"]["client_metadata"]["properties"]["mode"]["type"],
+                        "string"
+                    );
+                    if endpoint.wire() == ZenWire::Responses {
+                        assert_eq!(sent["include"], request["include"]);
+                        if !stale {
+                            assert_eq!(sent["reasoning"]["summary"], "auto");
+                        } else {
+                            assert!(sent.get("reasoning").is_none());
+                        }
+                    } else {
+                        assert!(sent.get("include").is_none());
+                        assert!(sent.get("reasoning").is_none());
+                    }
+                    assert!(sent.get("text").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zen_codex_cli_envelope_does_not_weaken_explicit_generation_controls() {
+        let fixture: Value = serde_json::from_str(super::super::CODEX_CLI_FIXTURE).unwrap();
+        for endpoint in [
+            CatalogEndpoint::Chat,
+            CatalogEndpoint::Responses,
+            CatalogEndpoint::Messages,
+        ] {
+            let mut request = fixture.clone();
+            request["reasoning"]["effort"] = json!("high");
+            let mut admitted = admission(endpoint);
+            let prepared =
+                prepare_for_model(&request, ProxyRoute::CodexResponses, &admitted).unwrap();
+            let sent: Value = serde_json::from_slice(&prepared.body).unwrap();
+            let effort = match endpoint.wire() {
+                ZenWire::Chat => &sent["reasoning_effort"],
+                ZenWire::Responses => &sent["reasoning"]["effort"],
+                ZenWire::Messages => &sent["output_config"]["effort"],
+            };
+            assert_eq!(effort, "high");
+            admitted.capabilities.reasoning = Some(false);
+            assert!(prepare_for_model(&request, ProxyRoute::CodexResponses, &admitted).is_err());
+            for changes in [
+                json!({"client_metadata":[]}),
+                json!({"client_metadata":{"flag":true}}),
+                json!({"reasoning":{"summary":true}}),
+                json!({"reasoning":{"summary":"unexpected"}}),
+                json!({"reasoning":{"private-unknown-field":true}}),
+                json!({"text":{"verbosity":"high"}}),
+                json!({"text":{"verbosity":"low"}}),
+                json!({"text":{"verbosity":false}}),
+                json!({"include":["unreviewed.projection"]}),
+                json!({"private-sensitive-unknown-value":true}),
+                json!({"tools":[{"type":"web_search"}]}),
+            ] {
+                let mut invalid = fixture.clone();
+                invalid
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(changes.as_object().unwrap().clone());
+                let error =
+                    prepare_for_model(&invalid, ProxyRoute::CodexResponses, &admitted).unwrap_err();
+                assert_eq!(error.status, 400);
+                assert!(!error.message.contains("private-unknown"));
+                assert!(!error.message.contains("private-sensitive"));
+            }
+        }
+    }
+
+    #[test]
+    fn zen_codex_cli_summary_styles_require_native_fresh_reasoning_support() {
+        for summary in ["concise", "detailed"] {
+            for endpoint in [
+                CatalogEndpoint::Chat,
+                CatalogEndpoint::Responses,
+                CatalogEndpoint::Messages,
+            ] {
+                let mut request: Value =
+                    serde_json::from_str(super::super::CODEX_CLI_FIXTURE).unwrap();
+                request["reasoning"]["summary"] = json!(summary);
+                let mut admitted = admission(endpoint);
+                let result = prepare_for_model(&request, ProxyRoute::CodexResponses, &admitted);
+                if endpoint.wire() == ZenWire::Responses {
+                    let sent: Value = serde_json::from_slice(&result.unwrap().body).unwrap();
+                    assert_eq!(sent["reasoning"]["summary"], summary);
+                    admitted.stale = true;
+                    assert!(
+                        prepare_for_model(&request, ProxyRoute::CodexResponses, &admitted).is_err()
+                    );
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+        }
     }
 
     #[test]

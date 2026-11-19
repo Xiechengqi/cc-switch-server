@@ -439,6 +439,74 @@ async fn opencode_zen_role_only_stream_cannot_extend_first_semantic_deadline() {
 }
 
 #[tokio::test]
+async fn opencode_zen_codex_cli_envelope_uses_formal_forwarder_on_all_wires_and_modes() {
+    use super::super::opencode_zen as zen;
+    let _lock = zen::CATALOG_TEST_LOCK.lock().await;
+    for model in ["chat-free", "muse-spark-free", "union-alpha"] {
+        for stream in [false, true] {
+            let state = forwarder_test_state("zen-codex-cli-envelope");
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = calls.clone();
+            let router = axum::Router::new().fallback(axum::routing::post(move |body: Bytes| {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let sent: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(sent["model"], model);
+                    assert_eq!(sent["stream"], true);
+                    assert!(sent.get("client_metadata").is_none());
+                    assert!(sent.get("prompt_cache_key").is_none());
+                    assert!(sent.get("reasoning").is_none());
+                    assert!(!sent.to_string().contains("synthetic-client-"));
+                    let payload = match zen::wire_for(model) {
+                        zen::ZenWire::Chat => json!({"id":"chat_codex","model":model,"choices":[{"index":0,"message":{"role":"assistant","content":"ZEN_CODEX_OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}),
+                        zen::ZenWire::Responses => json!({"id":"resp_codex","object":"response","model":model,"status":"completed","output":[{"id":"msg_codex","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ZEN_CODEX_OK","annotations":[]}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}),
+                        zen::ZenWire::Messages => json!({"id":"msg_codex","type":"message","model":model,"role":"assistant","content":[{"type":"text","text":"ZEN_CODEX_OK"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}),
+                    };
+                    zen_fixture_sse(payload, zen::wire_for(model))
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let mut request: Value = serde_json::from_str(zen::CODEX_CLI_FIXTURE).unwrap();
+            request["stream"] = json!(stream);
+            let mut options = zen_test_options(&state, request).await;
+            options.route = ProxyRoute::CodexResponses;
+            Arc::make_mut(&mut options.execution.plan).model_policy =
+                crate::domain::providers::runtime::RuntimeModelPolicy::Single {
+                    upstream_model: model.into(),
+                };
+            zen::store_catalog(vec![model.into()], current_time_ms() as i64);
+            let response = forward_opencode_zen_at(options, &origin).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains("ZEN_CODEX_OK"), "{model} {stream}: {text}");
+            if stream {
+                assert!(text.contains("response.completed"));
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&text).unwrap()["status"],
+                    "completed"
+                );
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let usage = state.usage_snapshot().await;
+            let log = usage.request_detail("zen-receipt").unwrap();
+            assert_eq!(log.requested_model.as_deref(), Some("codex-client-model"));
+            assert_eq!(log.actual_model.as_deref(), Some(model));
+            assert_eq!(log.stream_status.as_deref(), Some("completed"));
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
 async fn opencode_zen_fixed_models_choose_upstream_wire_before_conversion() {
     use super::super::opencode_zen as zen;
     let _lock = zen::CATALOG_TEST_LOCK.lock().await;
