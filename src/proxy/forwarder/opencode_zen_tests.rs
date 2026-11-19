@@ -201,6 +201,117 @@ fn zen_fixture_sse(payload: Value, wire: super::super::opencode_zen::ZenWire) ->
 }
 
 #[tokio::test]
+async fn opencode_zen_codex_lite_exec_completes_the_formal_driver_roundtrip() {
+    use super::super::opencode_zen as zen;
+    let _lock = zen::CATALOG_TEST_LOCK.lock().await;
+    let fixture: Value = serde_json::from_str(zen::CODEX_LITE_FIXTURE).unwrap();
+    let source = fixture["toolCall"]["input"].as_str().unwrap().to_string();
+    let observed_source = source.clone();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
+    let upstream = axum::Router::new().fallback(axum::routing::post(move |body: Bytes| {
+        let source = observed_source.clone();
+        let count = count.clone();
+        async move {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let sent: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(sent["model"], "chat-free");
+            assert_eq!(sent["reasoning_effort"], "high");
+            assert!(sent.get("reasoning").is_none());
+            let tool = sent["tools"].as_array().unwrap().iter().find(|tool| {
+                tool["function"]["description"] == "Synthetic Code Mode tool"
+            }).unwrap();
+            let name = tool["function"]["name"].as_str().unwrap();
+            assert_eq!(tool["function"]["parameters"]["additionalProperties"], false);
+            let messages = sent["messages"].as_array().unwrap();
+            if let Some(result) = messages.iter().find(|message| message["role"] == "tool") {
+                assert_eq!(result["tool_call_id"], "synthetic-code-mode");
+                assert!(result["content"].to_string().contains("SYNTHETIC_EXEC_OK"));
+                let previous = messages.iter().find(|message| message.get("tool_calls").is_some()).unwrap();
+                assert_eq!(previous["tool_calls"][0]["function"]["name"], name);
+                let args: Value = serde_json::from_str(previous["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+                assert_eq!(args["input"], source);
+                return zen_fixture_sse(
+                    json!({"id":"chatcmpl_followup","model":"chat-free","choices":[{"index":0,"message":{"role":"assistant","content":"ZEN_CODE_MODE_DONE"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}),
+                    zen::ZenWire::Chat,
+                );
+            }
+            let arguments = json!({"input": source}).to_string();
+            let (first, last) = arguments.split_at(arguments.find("Keep").unwrap());
+            let frame = |delta: Value, reason: Value, usage: Value| format!(
+                "data: {}\n\n",
+                json!({"id":"chatcmpl_tool","model":"chat-free","choices":[{"index":0,"delta":delta,"finish_reason":reason}],"usage":usage})
+            );
+            let data = [
+                frame(json!({"tool_calls":[{"index":0,"id":"synthetic-code-mode","type":"function","function":{"name":&name[..1],"arguments":first}}]}), Value::Null, Value::Null),
+                frame(json!({"tool_calls":[{"index":0,"function":{"name":&name[1..],"arguments":last}}]}), Value::Null, Value::Null),
+                frame(json!({}), json!("tool_calls"), json!({"prompt_tokens":10,"completion_tokens":2,"total_tokens":12})),
+                "data: [DONE]\n\n".to_string(),
+            ].concat();
+            Response::builder().header(CONTENT_TYPE,"text/event-stream").body(Body::from(data)).unwrap()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    for stream in [true, false] {
+        let mut body = fixture["request"].clone();
+        body["stream"] = json!(stream);
+        for follow_up in [false, true] {
+            if follow_up {
+                body["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend([fixture["toolCall"].clone(), fixture["toolResult"].clone()]);
+            }
+            let state = forwarder_test_state("zen-codex-lite");
+            let mut options = zen_test_options(&state, body.clone()).await;
+            options.route = ProxyRoute::CodexResponses;
+            Arc::make_mut(&mut options.execution.plan).model_policy =
+                crate::domain::providers::runtime::RuntimeModelPolicy::Single {
+                    upstream_model: "chat-free".into(),
+                };
+            zen::store_catalog_payload(&json!({"data":[{"id":"chat-free","type":"chat",
+                "limit":{"output":32000},"cost":{"text":{"input":{"price":0},"output":{"price":0}}},
+                "api":{"chat-completions":{"base_url":"https://opencode.ai/inference/openai/v1"}},
+                "capabilities":{"reasoning":{"supported":true,"effort":["high"]},"tools":{"supported":true}}}]}));
+            let response = forward_opencode_zen_at(options, &origin).await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let response: Value = if stream {
+                String::from_utf8(bytes.to_vec())
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .find(|event| event["type"] == "response.completed")
+                    .unwrap()["response"]
+                    .clone()
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            assert_eq!(response["status"], "completed");
+            if follow_up {
+                assert!(response.to_string().contains("ZEN_CODE_MODE_DONE"));
+            } else {
+                let call = response["output"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["type"] == "custom_tool_call")
+                    .unwrap();
+                assert_eq!(call["namespace"], "functions");
+                assert_eq!(call["call_id"], "synthetic-code-mode");
+                assert_eq!(call["input"], source);
+            }
+        }
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    server.abort();
+}
+
+#[tokio::test]
 async fn opencode_zen_loopback_is_incremental_and_unread_bodies_settle_cancellation() {
     let _lock = super::super::opencode_zen::CATALOG_TEST_LOCK.lock().await;
     for unread in [false, true] {

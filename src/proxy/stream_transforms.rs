@@ -5034,8 +5034,17 @@ impl ChatResponsesState {
                 state.emitted_arguments = state.arguments.len();
                 frames.push(tool_arguments_delta_frame(state, &arguments));
             }
-            let item =
-                tool_response_item(state, "completed", &arguments, &self.responses_tool_context);
+            let wire_arguments = if state.custom {
+                &state.arguments
+            } else {
+                &arguments
+            };
+            let item = tool_response_item(
+                state,
+                "completed",
+                wire_arguments,
+                &self.responses_tool_context,
+            );
             let output_index = state.output_index.unwrap_or(0);
             frames.push(tool_arguments_done_frame(state, &arguments));
             frames.push(StreamFrame::json(json!({

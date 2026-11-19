@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 
 mod claude;
+mod codex;
 pub(crate) mod runtime;
 pub(crate) mod transport;
 
@@ -20,6 +21,10 @@ const CLI_SYSTEM: &str = include_str!("opencode_zen/system-1.19.5.txt");
 #[cfg(test)]
 pub(in crate::proxy) const CODEX_CLI_FIXTURE: &str =
     include_str!("opencode_zen/codex-0.169-request.json");
+
+#[cfg(test)]
+pub(in crate::proxy) const CODEX_LITE_FIXTURE: &str =
+    include_str!("opencode_zen/codex-0.170-request.json");
 
 #[cfg(test)]
 pub(in crate::proxy) const CLAUDE_CLI_FIXTURE: &str =
@@ -683,7 +688,7 @@ pub fn marshal_chat_body(body: &Value) -> Result<Vec<u8>, String> {
         first = false;
         out.extend(serde_json::to_vec(&Value::String(key.to_string())).map_err(|e| e.to_string())?);
         out.push(b':');
-        out.extend(marshal_no_escape(value)?);
+        out.extend(serde_json::to_vec(value).map_err(|error| error.to_string())?);
         Ok(())
     };
     for key in CHAT_KEY_ORDER {
@@ -699,19 +704,6 @@ pub fn marshal_chat_body(body: &Value) -> Result<Vec<u8>, String> {
     }
     out.push(b'}');
     Ok(out)
-}
-
-fn marshal_no_escape(value: &Value) -> Result<Vec<u8>, String> {
-    let mut raw = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    let text = String::from_utf8(raw.clone()).map_err(|error| error.to_string())?;
-    if text.contains("\\u003c") || text.contains("\\u003e") || text.contains("\\u0026") {
-        raw = text
-            .replace("\\u003c", "<")
-            .replace("\\u003e", ">")
-            .replace("\\u0026", "&")
-            .into_bytes();
-    }
-    Ok(raw)
 }
 
 /// Build one chat completion body for a free-lane model. `rename` maps a
@@ -737,6 +729,8 @@ pub struct PreparedUpstream {
     pub wire: ZenWire,
     /// Client-declared names on the sent wire, excluding injected placeholders.
     pub client_tool_names: std::collections::BTreeSet<String>,
+    pub(super) response_tools: super::transforms::ResponsesToolContext,
+    pub(super) codex_exec_tool: Option<String>,
 }
 
 /// Translate a Claude Messages or OpenAI Chat/Responses body onto the wire
@@ -810,6 +804,8 @@ fn prepare_upstream_at(
         stream,
         wire,
         client_tool_names,
+        response_tools: Default::default(),
+        codex_exec_tool: None,
     })
 }
 
@@ -937,11 +933,24 @@ fn prepare_for_route_inner(
     // Controls are handled by this driver. In particular, a generic bridge
     // must not turn structured output into an extra prompt instruction.
     let mut bridge_request = requested.clone();
-    if route == super::ProxyRoute::ClaudeMessages {
-        if let Some(admitted) = admitted {
+    let codex_exec = match (route, admitted) {
+        (super::ProxyRoute::ClaudeMessages, Some(admitted)) => {
             claude::prepare_bridge(&mut bridge_request, admitted)?;
+            false
         }
-    }
+        (super::ProxyRoute::CodexResponses, Some(admitted)) => {
+            codex::prepare_bridge(&mut bridge_request, admitted)?
+        }
+        _ => false,
+    };
+    let control_source = if route == super::ProxyRoute::CodexResponses {
+        &bridge_request
+    } else {
+        requested
+    };
+    let mapped_controls = admitted
+        .map(|admitted| controls::translate(control_source, route, admitted))
+        .transpose()?;
     if admitted.is_some() {
         if let Some(map) = bridge_request.as_object_mut() {
             for key in controls::KEYS {
@@ -950,6 +959,11 @@ fn prepare_for_route_inner(
         }
     }
     let bridge = &bridge_request;
+    let response_tools = t::responses_tool_context(if source == F::OpenAiResponses {
+        bridge
+    } else {
+        requested
+    });
     let mut converted = match (source, target) {
         (F::AnthropicMessages, F::OpenAiChat) => t::anthropic_to_openai_chat_preserving_history(
             bridge,
@@ -958,11 +972,24 @@ fn prepare_for_route_inner(
         (F::AnthropicMessages, F::OpenAiResponses) => t::anthropic_to_openai_responses(bridge),
         (F::OpenAiChat, F::AnthropicMessages) => t::openai_chat_to_anthropic(bridge),
         (F::OpenAiChat, F::OpenAiResponses) => t::openai_chat_to_responses(bridge),
-        (F::OpenAiResponses, F::OpenAiChat) => t::openai_responses_to_chat(bridge),
+        (F::OpenAiResponses, F::OpenAiChat) => t::openai_responses_to_chat_with_context(
+            bridge,
+            t::ReasoningEffortMode::Passthrough,
+            &response_tools,
+        ),
         (F::OpenAiResponses, F::AnthropicMessages) => t::openai_responses_to_anthropic(bridge),
         _ => Ok(bridge_request.clone()),
     }
     .map_err(|error| super::ProxyError::bad_request(error.to_string()))?;
+    if target == F::OpenAiChat
+        && source == F::OpenAiResponses
+        && admitted.is_some()
+        && requested
+            .pointer("/reasoning/context")
+            .is_some_and(|value| !value.is_null())
+    {
+        codex::validate_chat_replay(bridge, &converted)?;
+    }
     // Shared transforms have their own defaults. The caller's explicit ceiling
     // wins, otherwise use the reviewed free-lane default for all protocols.
     for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
@@ -981,18 +1008,35 @@ fn prepare_for_route_inner(
     converted[key] = Value::from(limit);
     // Client bookkeeping and active cache hints do not belong on the Zen wire.
     strip_client_transport_hints(&mut converted);
-    if let Some(admitted) = admitted {
-        let controls = controls::translate(requested, route, admitted)?;
+    if let Some(controls) = mapped_controls {
         controls::apply(&mut converted, bridge, controls, endpoint.wire());
     }
-    prepare_upstream_at(&converted, endpoint).map_err(|error| super::ProxyError {
-        status: if error == PrepareError::ToolChoiceNone {
-            http::StatusCode::FORBIDDEN
-        } else {
-            http::StatusCode::BAD_REQUEST
-        },
-        message: error.to_string(),
-    })
+    let exec = if codex_exec {
+        let name = response_tools
+            .chat_name_for_response_function(codex::EXEC_NAME, Some(codex::EXEC_NAMESPACE));
+        codex::constrain_exec_schema(&mut converted, &name)?;
+        Some(name)
+    } else {
+        None
+    };
+    let mut prepared =
+        prepare_upstream_at(&converted, endpoint).map_err(|error| super::ProxyError {
+            status: if error == PrepareError::ToolChoiceNone {
+                http::StatusCode::FORBIDDEN
+            } else {
+                http::StatusCode::BAD_REQUEST
+            },
+            message: error.to_string(),
+        })?;
+    prepared.response_tools = response_tools;
+    prepared.codex_exec_tool = exec.map(|name| {
+        prepared
+            .rename
+            .iter()
+            .find_map(|(alias, original)| (original == &name).then(|| alias.clone()))
+            .unwrap_or(name)
+    });
+    Ok(prepared)
 }
 
 fn strip_client_transport_hints(value: &mut Value) {
@@ -1271,6 +1315,23 @@ pub(super) fn claude_continuation_chat(
     .map_err(|error| super::ProxyError::bad_request(error.to_string()))
 }
 
+pub(super) fn codex_continuation_chat(
+    requested: &Value,
+    admitted: &catalog::ZenAdmission,
+) -> Result<Value, super::ProxyError> {
+    let mut bridge = requested.clone();
+    codex::prepare_bridge(&mut bridge, admitted)?;
+    let chat = super::transforms::openai_responses_to_chat(&bridge)
+        .map_err(|error| super::ProxyError::bad_request(error.to_string()))?;
+    if bridge
+        .pointer("/reasoning/context")
+        .is_some_and(|value| !value.is_null())
+    {
+        codex::validate_chat_replay(&bridge, &chat)?;
+    }
+    Ok(chat)
+}
+
 fn requested_limit(requested: &Value) -> Option<u64> {
     ["max_completion_tokens", "max_tokens", "max_output_tokens"]
         .iter()
@@ -1474,7 +1535,7 @@ pub fn marshal_upstream(body: &Value) -> Result<Vec<u8>, String> {
     {
         return marshal_chat_body(body);
     }
-    marshal_no_escape(body)
+    serde_json::to_vec(body).map_err(|error| error.to_string())
 }
 
 /// Map a sent tool name back to the name the caller declared.
@@ -1681,7 +1742,7 @@ mod catalog;
 mod controls;
 mod lane;
 mod validation;
-pub(crate) use catalog::ZenClaudeCodeConnections;
+pub(crate) use catalog::ZenCliConnections;
 #[cfg(test)]
 use catalog::{catalog_endpoint, catalog_free_status};
 #[cfg(test)]

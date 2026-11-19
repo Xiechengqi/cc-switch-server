@@ -736,6 +736,32 @@ impl ProxyError {
             ("unsupported parameter `candidateCount`", "candidateCount"),
             ("unsupported parameter `stream`", "stream"),
             ("unsupported parameter `tools`", "tools"),
+            ("unsupported parameter `reasoning`", "reasoning"),
+            (
+                "unsupported parameter `reasoning.context`",
+                "reasoning.context",
+            ),
+            (
+                "unsupported parameter `reasoning.effort`",
+                "reasoning.effort",
+            ),
+            ("unsupported parameter `thinking`", "thinking"),
+            ("unsupported parameter `output_config`", "output_config"),
+            ("unsupported parameter `text`", "text"),
+            ("unsupported parameter `text.verbosity`", "text.verbosity"),
+            ("unsupported parameter `tools.format`", "tools.format"),
+            (
+                "unsupported parameter `input.additional_tools`",
+                "input.additional_tools",
+            ),
+            (
+                "unsupported parameter `input.custom_tool_call`",
+                "input.custom_tool_call",
+            ),
+            (
+                "unsupported parameter `input.custom_tool_call_output`",
+                "input.custom_tool_call_output",
+            ),
         ] {
             if message.starts_with(prefix) {
                 return Some(parameter);

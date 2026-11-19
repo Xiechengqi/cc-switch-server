@@ -167,7 +167,7 @@ async fn forward_opencode_zen_inner(
     })?
     .map_err(ProxyError::bad_gateway)?;
     let admitted = catalog.admit(&model).map_err(ProxyError::bad_request)?;
-    let prepared = zen::prepare_for_model(&requested, route, &admitted)?;
+    let mut prepared = zen::prepare_for_model(&requested, route, &admitted)?;
     request_context.requested_reasoning_effort =
         zen::requested_effort(&requested).map(str::to_string);
     request_context.effective_reasoning_effort = request_context.requested_reasoning_effort.clone();
@@ -188,7 +188,7 @@ async fn forward_opencode_zen_inner(
         zen::runtime::ensure(&state.config_dir, first_deadline).await?;
     }
     let wire = prepared.wire;
-    let tool_context = super::transforms::responses_tool_context(&requested);
+    let tool_context = std::mem::take(&mut prepared.response_tools);
     let metadata = routed_model_metadata(
         routed.requested_model.as_deref().unwrap_or(&model),
         zen::base_model_id(&model),
@@ -325,6 +325,7 @@ async fn forward_opencode_zen_inner(
         let (mut payload, _raw_memory) = zen_read_document(
             response,
             &stored,
+            route,
             &prepared,
             &budget,
             &execution,
@@ -439,6 +440,7 @@ async fn forward_opencode_zen_inner(
                         let (mut continued, _memory) = zen_read_document(
                             response,
                             &stored,
+                            ProxyRoute::CodexChatCompletions,
                             &continuation,
                             &budget,
                             &execution,
@@ -565,7 +567,8 @@ async fn forward_opencode_zen_inner(
         include_usage,
         timing.get(),
     )
-    .with_client_tools(prepared.client_tool_names);
+    .with_client_tools(prepared.client_tool_names)
+    .with_codex_exec(prepared.codex_exec_tool);
     let retained = match budget.reserve(
         RequestMemoryComponent::StreamRetainedState,
         decoder.retained_bytes(),
@@ -773,6 +776,7 @@ async fn zen_post(
 async fn zen_read_document(
     response: super::opencode_zen::transport::ZenResponse,
     stored: &StoredProvider,
+    route: ProxyRoute,
     prepared: &super::opencode_zen::PreparedUpstream,
     budget: &RequestMemoryBudget,
     execution: &ProviderExecution,
@@ -795,7 +799,7 @@ async fn zen_read_document(
     }
     let mut decoder = zen::ZenStream::new(
         stored,
-        ProxyRoute::CodexChatCompletions,
+        route,
         prepared.wire,
         Default::default(),
         Default::default(),
@@ -803,6 +807,7 @@ async fn zen_read_document(
         timing,
     )
     .with_client_tools(prepared.client_tool_names.clone())
+    .with_codex_exec(prepared.codex_exec_tool.clone())
     .with_aggregation();
     let retained = budget
         .reserve(
@@ -918,8 +923,7 @@ fn zen_continuation_request(
     }
     let canonical = match route {
         ProxyRoute::ClaudeMessages => zen::claude_continuation_chat(requested, admitted)?,
-        ProxyRoute::CodexResponses => super::transforms::openai_responses_to_chat(requested)
-            .map_err(|e| ProxyError::bad_request(e.to_string()))?,
+        ProxyRoute::CodexResponses => zen::codex_continuation_chat(requested, admitted)?,
         _ => requested.clone(),
     };
     let total = zen::output_limit(requested, Some(admitted), route)?;
@@ -961,6 +965,11 @@ fn zen_continuation_request(
     for key in zen::control_keys() {
         if let Some(value) = requested.get(*key) {
             next[*key] = value.clone();
+        }
+    }
+    if route == ProxyRoute::CodexResponses {
+        if let Some(reasoning) = next.get_mut("reasoning").and_then(Value::as_object_mut) {
+            reasoning.remove("context");
         }
     }
     let Ok(prepared) = zen::prepare_for_model(&next, ProxyRoute::CodexChatCompletions, admitted)

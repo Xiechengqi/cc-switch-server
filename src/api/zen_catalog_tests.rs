@@ -127,6 +127,8 @@ async fn opencode_zen_public_and_management_catalogs_project_one_stale_capabilit
     assert_eq!(public.data[0].max_output_tokens, Some(8192));
     assert_eq!(public.data[0].supports_tools, Some(false));
     assert!(public.data[0].reasoning_efforts.is_none());
+    assert!(public.codex_cli.unwrap().models.is_empty());
+    assert!(public.claude_code.is_none());
     assert_eq!(
         management.models[0].effective_capabilities["structuredOutput"],
         false

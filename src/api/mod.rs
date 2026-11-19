@@ -1549,6 +1549,7 @@ async fn proxy_models_for_selection(
             fetched_at_ms: catalog.fetched_at_ms,
             catalog_entries: None,
             claude_code: None,
+            codex_cli: None,
         }));
     }
     let mut data = openai_model_list(&providers.providers, app, provider_id);
@@ -1751,17 +1752,26 @@ async fn proxy_models_for_selection(
         }
         data.sort_by(|left, right| left.id.cmp(&right.id));
     }
+    let zen_connections = opencode_zen_provider
+        .as_ref()
+        .zip(opencode_zen_catalog.as_ref())
+        .and_then(|(provider, catalog)| {
+            let plan = providers.runtime_plan(provider.app, &provider.provider.id)?;
+            Some((
+                provider.app,
+                catalog.cli_connections(provider.app, &plan.model_policy),
+            ))
+        });
+    let (claude_code, codex_cli) = match zen_connections {
+        Some((AppKind::Claude, connections)) => (Some(connections), None),
+        Some((AppKind::Codex, connections)) => (None, Some(connections)),
+        _ => (None, None),
+    };
     Ok(Json(OpenAiModelsResponse {
         object: "list",
         data,
-        claude_code: opencode_zen_provider
-            .as_ref()
-            .filter(|provider| provider.app == AppKind::Claude)
-            .and_then(|provider| {
-                let plan = providers.runtime_plan(provider.app, &provider.provider.id)?;
-                let catalog = opencode_zen_catalog.as_ref()?;
-                Some(catalog.claude_code_connections(&plan.model_policy))
-            }),
+        claude_code,
+        codex_cli,
         catalog_entries: qoder_catalog
             .as_ref()
             .map(|catalog| catalog.entries.clone()),

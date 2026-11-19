@@ -1,0 +1,61 @@
+{
+  "request": {
+    "model": "gpt-6.2-sol",
+    "input": [
+      {
+        "type": "additional_tools",
+        "id": "synthetic-tool-inventory",
+        "role": "developer",
+        "tools": [
+          {
+            "type": "namespace",
+            "name": "functions",
+            "description": "Synthetic client tools",
+            "tools": [
+              {
+                "type": "custom",
+                "name": "exec",
+                "description": "Synthetic Code Mode tool",
+                "format": {
+                  "type": "grammar",
+                  "syntax": "lark",
+                  "definition": "\nstart: pragma_source | plain_source\npragma_source: PRAGMA_LINE NEWLINE SOURCE\nplain_source: SOURCE\n\nPRAGMA_LINE: /[ \\t]*\\/\\/ @exec:[^\\r\\n]*/\nNEWLINE: /\\r?\\n/\nSOURCE: /[\\s\\S]+/\n"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [{ "type": "input_text", "text": "Return the synthetic marker." }]
+      }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": false,
+    "reasoning": { "effort": "high", "summary": "auto", "context": "all_turns" },
+    "text": { "verbosity": "medium" },
+    "store": false,
+    "stream": true,
+    "include": ["reasoning.encrypted_content"],
+    "prompt_cache_key": "synthetic-session",
+    "client_metadata": { "session_id": "synthetic-session" }
+  },
+  "defaultControls": {
+    "reasoning": { "effort": "low", "context": "all_turns" },
+    "text": { "verbosity": "low" }
+  },
+  "toolCall": {
+    "type": "custom_tool_call",
+    "namespace": "functions",
+    "name": "exec",
+    "call_id": "synthetic-code-mode",
+    "input": "{\"input\":\"Keep these literal bytes 世界 \\\\u003c\\n\"}"
+  },
+  "toolResult": {
+    "type": "custom_tool_call_output",
+    "call_id": "synthetic-code-mode",
+    "output": "SYNTHETIC_EXEC_OK"
+  }
+}

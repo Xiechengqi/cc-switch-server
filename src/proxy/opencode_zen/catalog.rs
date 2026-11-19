@@ -280,17 +280,18 @@ pub struct ZenModelCatalogView {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ZenClaudeCodeConnections {
+pub(crate) struct ZenCliConnections {
     pub fixed: bool,
-    pub models: Vec<ZenClaudeCodeModel>,
+    pub models: Vec<ZenCliModel>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ZenClaudeCodeModel {
+pub(crate) struct ZenCliModel {
     id: String,
     display_name: String,
-    max_output_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u64>,
     effort: String,
 }
 
@@ -303,10 +304,12 @@ pub(in crate::proxy) struct ZenAdmission {
 }
 
 impl ZenModelCatalogView {
-    pub(crate) fn claude_code_connections(
+    pub(crate) fn cli_connections(
         &self,
+        app: crate::domain::providers::model::AppKind,
         policy: &crate::domain::providers::runtime::RuntimeModelPolicy,
-    ) -> ZenClaudeCodeConnections {
+    ) -> ZenCliConnections {
+        use crate::domain::providers::model::AppKind;
         use crate::domain::providers::runtime::RuntimeModelPolicy;
         let fixed = match policy {
             RuntimeModelPolicy::Single { upstream_model } => Some(upstream_model.as_str()),
@@ -327,24 +330,30 @@ impl ZenModelCatalogView {
                 {
                     return None;
                 }
-                let max_output_tokens = admitted.max_output_tokens?.min(32_000);
+                let max_output_tokens = if app == AppKind::Claude {
+                    Some(admitted.max_output_tokens?.min(32_000))
+                } else {
+                    None
+                };
                 let suffix = selection
                     .trim()
                     .strip_suffix(')')
                     .and_then(|s| s.rsplit_once('('))
                     .map(|(_, effort)| effort.trim());
-                let effort =
-                    ["high", "medium", "low", "xhigh", "max"]
-                        .into_iter()
-                        .find(|effort| {
-                            suffix.is_none_or(|suffix| suffix == *effort)
-                                && admitted
-                                    .capabilities
-                                    .reasoning_efforts
-                                    .iter()
-                                    .any(|value| value == *effort)
-                        })?;
-                Some(ZenClaudeCodeModel {
+                let efforts: &[&str] = if app == AppKind::Claude {
+                    &["high", "medium", "low", "xhigh", "max"]
+                } else {
+                    &["high", "medium", "low", "xhigh", "max", "minimal"]
+                };
+                let effort = efforts.iter().copied().find(|effort| {
+                    suffix.is_none_or(|suffix| suffix == *effort)
+                        && admitted
+                            .capabilities
+                            .reasoning_efforts
+                            .iter()
+                            .any(|value| value == *effort)
+                })?;
+                Some(ZenCliModel {
                     id: model.id.clone(),
                     display_name: model.display_name.clone(),
                     max_output_tokens,
@@ -352,7 +361,7 @@ impl ZenModelCatalogView {
                 })
             })
             .collect();
-        ZenClaudeCodeConnections {
+        ZenCliConnections {
             fixed: fixed.is_some(),
             models,
         }
@@ -910,7 +919,8 @@ mod tests {
     }
 
     #[test]
-    fn opencode_zen_claude_code_settings_use_the_admitted_model_and_effort() {
+    fn opencode_zen_cli_settings_use_the_admitted_model_and_effort() {
+        use crate::domain::providers::model::AppKind;
         use crate::domain::providers::runtime::RuntimeModelPolicy;
         let mut compatible = zero_model("chat-free");
         compatible["limit"]["output"] = json!(25000);
@@ -925,20 +935,29 @@ mod tests {
         .unwrap();
         let mut catalog = snapshot.view();
         catalog.stale = false;
-        let passthrough = catalog.claude_code_connections(&RuntimeModelPolicy::Passthrough);
+        let passthrough =
+            catalog.cli_connections(AppKind::Claude, &RuntimeModelPolicy::Passthrough);
         assert!(!passthrough.fixed);
         assert_eq!(passthrough.models.len(), 1);
-        assert_eq!(passthrough.models[0].max_output_tokens, 25000);
+        assert_eq!(passthrough.models[0].max_output_tokens, Some(25000));
         assert_eq!(passthrough.models[0].effort, "high");
-        let fixed = catalog.claude_code_connections(&RuntimeModelPolicy::Single {
+        let policy = RuntimeModelPolicy::Single {
             upstream_model: " chat-free(low) ".into(),
-        });
+        };
+        let fixed = catalog.cli_connections(AppKind::Claude, &policy);
         assert!(fixed.fixed);
         assert_eq!(fixed.models[0].id, "chat-free");
         assert_eq!(fixed.models[0].effort, "low");
+        let codex = catalog.cli_connections(AppKind::Codex, &policy);
+        assert_eq!(
+            serde_json::to_value(codex).unwrap(),
+            json!({
+                "fixed":true,"models":[{"id":"chat-free","displayName":"A free model","effort":"low"}],
+            })
+        );
         catalog.stale = true;
         assert!(catalog
-            .claude_code_connections(&RuntimeModelPolicy::Passthrough)
+            .cli_connections(AppKind::Codex, &RuntimeModelPolicy::Passthrough)
             .models
             .is_empty());
     }

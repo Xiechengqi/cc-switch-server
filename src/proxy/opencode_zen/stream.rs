@@ -17,6 +17,7 @@ pub(in crate::proxy) struct ZenStream {
     anthropic: crate::proxy::anthropic_semantics::AnthropicSseInspector,
     tool_names: BTreeMap<u64, String>,
     client_tools: Option<std::collections::BTreeSet<String>>,
+    codex_tool_calls: Option<super::codex::ChatToolCalls>,
     finish_reason: Option<String>,
     chat_usage_tail: bool,
     done: bool,
@@ -55,6 +56,8 @@ impl ZenStream {
             anthropic: Default::default(),
             tool_names: BTreeMap::new(),
             client_tools: None,
+            codex_tool_calls: (wire == ZenWire::Chat && route == ProxyRoute::CodexResponses)
+                .then(Default::default),
             finish_reason: None,
             chat_usage_tail: false,
             done: false,
@@ -75,6 +78,13 @@ impl ZenStream {
         self
     }
 
+    pub(in crate::proxy) fn with_codex_exec(mut self, name: Option<String>) -> Self {
+        if let Some(calls) = &mut self.codex_tool_calls {
+            calls.exec_name = name;
+        }
+        self
+    }
+
     pub(in crate::proxy) fn retained_bytes(&self) -> usize {
         self.tool_names
             .values()
@@ -85,6 +95,11 @@ impl ZenStream {
             }))
             .saturating_add(self.pending.capacity())
             .saturating_add(self.held.capacity())
+            .saturating_add(
+                self.codex_tool_calls
+                    .as_ref()
+                    .map_or(0, |calls| calls.retained_bytes()),
+            )
             .saturating_add(self.finish_reason.as_ref().map_or(0, String::capacity))
             .saturating_add(self.transformer.retained_bytes())
             .saturating_add(self.responses.retained_transport_bytes())
@@ -114,6 +129,11 @@ impl ZenStream {
             ))
             .saturating_mul(4)
             .saturating_add(self.aggregation.as_ref().map_or(0, |a| a.working_bytes()))
+            .saturating_add(
+                self.codex_tool_calls
+                    .as_ref()
+                    .map_or(0, |calls| calls.retained_bytes().saturating_mul(4)),
+            )
             .saturating_add(if self.aggregation.is_some() {
                 // An encoded tool-argument string may become a dense JSON
                 // collection when a later block_stop completes this chunk.
@@ -351,6 +371,11 @@ impl ZenStream {
             }
         }
         if let Some(names) = &self.client_tools {
+            // Responses publishes the tool identity on item creation. Assemble
+            // split Chat names and arguments before creating that item.
+            if let Some(calls) = &mut self.codex_tool_calls {
+                calls.observe(&mut value, names, EVENT_LIMIT)?;
+            }
             validate_client_tools(&value, names)?;
         }
         // Chat servers may split a function name across deltas. Buffer only
@@ -503,6 +528,108 @@ mod tests {
     }
     fn frame(value: Value) -> String {
         format!("data: {value}\n\n")
+    }
+
+    #[test]
+    fn opencode_zen_codex_stream_publishes_complete_client_tool_names() {
+        let context = crate::proxy::transforms::responses_tool_context(&json!({
+            "tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}}],
+        }));
+        let mut decoder = ZenStream::new(
+            &stored(),
+            ProxyRoute::CodexResponses,
+            ZenWire::Chat,
+            BTreeMap::new(),
+            context,
+            true,
+            None,
+        )
+        .with_client_tools(["exec_command".to_string()].into_iter().collect());
+        for (name, arguments) in [("ex", r#"{"cmd":"#), ("ec_command", r#""printf marker"}"#)] {
+            let delta = frame(
+                json!({"id":"chatcmpl_function","model":"chat-free","choices":[
+                    {"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function",
+                      "function":{"name":name,"arguments":arguments}}]},"finish_reason":null}
+                ]}),
+            );
+            let output = decoder.push(delta.as_bytes()).unwrap();
+            assert!(!String::from_utf8_lossy(&output).contains("function_call"));
+        }
+        let terminal = frame(
+            json!({"id":"chatcmpl_function","model":"chat-free","choices":[
+                {"index":0,"delta":{},"finish_reason":"tool_calls"}
+            ]}),
+        );
+        assert!(decoder.push(terminal.as_bytes()).unwrap().is_empty());
+        assert!(decoder.push(b"data: [DONE]\n\n").unwrap().is_empty());
+        let output = decoder.finish().unwrap();
+        let output = String::from_utf8_lossy(&output);
+        let calls: Vec<Value> = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .filter(|event| event["item"]["type"] == "function_call")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|call| call["item"]["name"] == "exec_command"));
+        assert_eq!(calls[1]["item"]["arguments"], r#"{"cmd":"printf marker"}"#);
+    }
+
+    #[test]
+    fn opencode_zen_codex_exec_arguments_never_escape_before_validation() {
+        let fixture: Value = serde_json::from_str(super::super::CODEX_LITE_FIXTURE).unwrap();
+        let context = crate::proxy::transforms::responses_tool_context(&fixture["request"]);
+        let name = context.chat_name_for_response_function("exec", Some("functions"));
+        let valid = r#"{"input":"return 1"}"#;
+        for (arguments, terminal, invalid) in [
+            (r#"{"input":"first","input":"second"}"#, "tool_calls", true),
+            (r#"["return 1"]"#, "tool_calls", true),
+            (r#"{"input":""}"#, "tool_calls", true),
+            (r#"{"input":"return 1","unknown":true}"#, "tool_calls", true),
+            ("{", "length", false),
+            (valid, "tool_calls", false),
+        ] {
+            let mut decoder = ZenStream::new(
+                &stored(),
+                ProxyRoute::CodexResponses,
+                ZenWire::Chat,
+                BTreeMap::new(),
+                context.clone(),
+                true,
+                None,
+            )
+            .with_client_tools([name.clone()].into_iter().collect())
+            .with_codex_exec(Some(name.clone()));
+            let first = frame(json!({"id":"chatcmpl_code","model":"chat-free","choices":[
+                {"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1",
+                  "type":"function","function":{"name":name,"arguments":arguments}
+                }]},"finish_reason":null}
+            ]}));
+            let partial = decoder.push(first.as_bytes()).unwrap();
+            assert!(!String::from_utf8_lossy(&partial).contains("custom_tool_call"));
+            let tail = frame(json!({"id":"chatcmpl_code","model":"chat-free","choices":[
+                {"index":0,"delta":{},"finish_reason":terminal}
+            ]}));
+            if invalid {
+                assert!(decoder
+                    .push(tail.as_bytes())
+                    .unwrap_err()
+                    .message
+                    .contains("malformed"));
+            } else if terminal == "length" {
+                assert!(decoder.push(tail.as_bytes()).unwrap().is_empty());
+                assert!(decoder.push(b"data: [DONE]\n\n").unwrap().is_empty());
+                let output = decoder.finish().unwrap();
+                let output = String::from_utf8_lossy(&output);
+                assert!(output.contains("response.incomplete"));
+                assert!(!output.contains("custom_tool_call"));
+            } else {
+                assert!(decoder.push(tail.as_bytes()).unwrap().is_empty());
+                assert!(decoder.finish().is_err());
+            }
+        }
     }
     fn document(wire: ZenWire) -> Value {
         match wire {

@@ -1,7 +1,7 @@
 //! Model/protocol-aware controls. Unrepresentable semantics fail before send;
 //! neither the generic bridges nor fingerprint shaping may silently weaken them.
 use super::{catalog::ZenAdmission, ZenWire};
-use crate::proxy::{ProxyError, ProxyRoute};
+use crate::proxy::{transforms::response_input_items, ProxyError, ProxyRoute};
 use serde_json::{json, Map, Value};
 
 pub(super) const KEYS: &[&str] = &[
@@ -22,6 +22,12 @@ pub(super) const KEYS: &[&str] = &[
 
 fn unsupported(parameter: &str) -> ProxyError {
     ProxyError::bad_request(format!("OpenCode Zen unsupported control: {parameter}; this model/protocol has no current reviewed mapping"))
+}
+
+pub(super) fn parameter_error(parameter: &str, message: &str) -> ProxyError {
+    ProxyError::bad_request(format!(
+        "unsupported parameter `{parameter}`: OpenCode Zen {message}"
+    ))
 }
 
 pub(in crate::proxy) fn requested_effort(request: &Value) -> Option<&str> {
@@ -88,8 +94,20 @@ fn tools(request: &Value, route: ProxyRoute, admitted: &ZenAdmission) -> Result<
             }
             tools(&json!({"tools":children}), route, admitted)?;
         }
-        if kind == Some("custom") && tool.pointer("/format/type").is_some_and(|v| v != "text") {
-            return Err(unsupported("custom tool grammar"));
+        if kind == Some("custom")
+            && tool
+                .get("format")
+                .filter(|v| !v.is_null())
+                .is_some_and(|format| {
+                    format
+                        .as_object()
+                        .is_none_or(|fields| fields.len() != 1 || format["type"] != "text")
+                })
+        {
+            return Err(parameter_error(
+                "tools.format",
+                "has no reviewed mapping for this custom tool grammar",
+            ));
         }
         if tool
             .get("strict")
@@ -256,6 +274,9 @@ pub(super) fn translate(
                 ProxyError::bad_request(format!("OpenCode Zen {key} must be an object"))
             })?;
             let allowed: &[&str] = match key {
+                "reasoning" if route == ProxyRoute::CodexResponses => {
+                    &["effort", "summary", "context"]
+                }
                 "reasoning" => &["effort", "summary"],
                 "thinking" if route == ProxyRoute::ClaudeMessages => {
                     &["type", "effort", "budget_tokens", "display"]
@@ -266,30 +287,27 @@ pub(super) fn translate(
             };
             for field in value.keys() {
                 if !allowed.contains(&field.as_str()) {
-                    return Err(unsupported("nested control field"));
+                    return Err(parameter_error(
+                        key,
+                        "has an unsupported nested control field",
+                    ));
                 }
             }
         }
     }
-    if let Some(items) = request.get("input").and_then(Value::as_array) {
-        for item in items {
-            match item.get("type").and_then(Value::as_str) {
-                Some("compaction_trigger" | "compaction") => return Err(unsupported("compaction")),
-                Some("additional_tools") if admitted.endpoint.wire() == ZenWire::Responses => {
-                    return Err(unsupported("native additional_tools"))
-                }
-                _ => {}
+    for item in response_input_items(request) {
+        match item["type"].as_str() {
+            Some("compaction_trigger" | "compaction" | "context_compaction") => {
+                return Err(unsupported("compaction"));
             }
-        }
-    }
-    if let Some(items) = request.get("input").and_then(Value::as_array) {
-        for item in items.iter().filter(|i| {
-            matches!(
-                i["type"].as_str(),
-                Some("additional_tools" | "tool_search_output")
-            )
-        }) {
-            tools(item, route, admitted)?;
+            Some("additional_tools") if admitted.endpoint.wire() == ZenWire::Responses => {
+                return Err(parameter_error(
+                    "input.additional_tools",
+                    "has no reviewed native mapping on this model/protocol",
+                ));
+            }
+            Some("additional_tools" | "tool_search_output") => tools(item, route, admitted)?,
+            _ => {}
         }
     }
     tools(request, route, admitted)?;
@@ -361,6 +379,12 @@ pub(super) fn translate(
         .and_then(|m| m.rsplit_once('('))
         .map(|(_, e)| e.trim());
     if suffix.is_some() && suffix != effort {
+        if route == ProxyRoute::CodexResponses {
+            return Err(parameter_error(
+                "reasoning.effort",
+                "conflicts with the bound model's effort suffix",
+            ));
+        }
         return Err(ProxyError::bad_request(
             "OpenCode Zen model suffix and reasoning effort conflict",
         ));
@@ -375,12 +399,24 @@ pub(super) fn translate(
     .flatten()
     {
         if explicit.as_str().is_none() || explicit.as_str() != effort {
+            if route == ProxyRoute::CodexResponses {
+                return Err(parameter_error(
+                    "reasoning.effort",
+                    "requires matching reasoning effort strings",
+                ));
+            }
             return Err(ProxyError::bad_request(
                 "OpenCode Zen reasoning effort values must be matching strings",
             ));
         }
     }
     if let Some(effort) = effort {
+        if route == ProxyRoute::CodexResponses && (admitted.stale || caps.reasoning != Some(true)) {
+            return Err(parameter_error(
+                "reasoning.effort",
+                "requires a current reasoning capability for the resolved model",
+            ));
+        }
         require(caps.reasoning, admitted.stale, "reasoning effort")?;
         if !caps.reasoning_efforts.iter().any(|e| e == effort) {
             if route == ProxyRoute::ClaudeMessages && !caps.reasoning_efforts.is_empty() {
@@ -390,6 +426,16 @@ pub(super) fn translate(
                     .unwrap_or("");
                 return Err(ProxyError::bad_request(format!(
                     "OpenCode Zen reasoning effort is not in the model menu for {model}; available: {}",
+                    caps.reasoning_efforts.join(", ")
+                )));
+            }
+            if route == ProxyRoute::CodexResponses {
+                let model = request["model"]
+                    .as_str()
+                    .map(super::base_model_id)
+                    .unwrap_or("");
+                return Err(parameter_error("reasoning.effort", &format!(
+                    "reasoning effort is not in the model menu for {model} (available: {}). Select the bound Zen model in Codex CLI",
                     caps.reasoning_efforts.join(", ")
                 )));
             }
@@ -430,7 +476,10 @@ pub(super) fn translate(
         .filter(|value| !value.is_null())
     {
         if verbosity.as_str() != Some("medium") {
-            return Err(unsupported("text.verbosity"));
+            return Err(parameter_error(
+                "text.verbosity",
+                "supports the neutral medium verbosity. Select the bound Zen model in Codex CLI",
+            ));
         }
     }
     if let Some(thinking) = request.get("thinking") {
@@ -704,6 +753,155 @@ mod tests {
         request["top_p"] = json!(0.9);
         request["parallel_tool_calls"] = json!(false);
         request
+    }
+
+    #[test]
+    fn opencode_zen_codex_lite_validates_controls_and_preserves_the_requested_history() {
+        let fixture: Value = serde_json::from_str(super::super::CODEX_LITE_FIXTURE).unwrap();
+        let mut request = fixture["request"].clone();
+        request["model"] = json!("resolved-free");
+        let route = ProxyRoute::CodexResponses;
+        let mut model = admission(CatalogEndpoint::Chat);
+        model.capabilities.reasoning_efforts = vec!["high".into()];
+        model.capabilities.chat_reasoning_content = false;
+        let prepared = prepare_for_model(&request, route, &model).unwrap();
+        assert!(prepared.codex_exec_tool.is_some());
+        let wire: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(wire["reasoning_effort"], "high");
+        assert!(wire.get("reasoning").is_none());
+        assert!(wire.get("client_metadata").is_none());
+        let tool = wire["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"].as_str() == prepared.codex_exec_tool.as_deref())
+            .unwrap();
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["input"]["minLength"],
+            1
+        );
+        assert_eq!(
+            tool["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        for (field, parameter) in [
+            ("reasoning", "reasoning.effort"),
+            ("text", "text.verbosity"),
+        ] {
+            let mut default = request.clone();
+            default[field] = fixture["defaultControls"][field].clone();
+            let error = prepare_for_model(&default, route, &model).unwrap_err();
+            assert_eq!(error.error_param(), Some(parameter));
+        }
+        let mut malformed = request.clone();
+        malformed["reasoning"]["effort"] = json!(5);
+        assert_eq!(
+            prepare_for_model(&malformed, route, &model)
+                .unwrap_err()
+                .error_param(),
+            Some("reasoning.effort")
+        );
+        request["reasoning"]["context"] = json!("future-scope");
+        assert_eq!(
+            prepare_for_model(&request, route, &model)
+                .unwrap_err()
+                .error_param(),
+            Some("reasoning.context")
+        );
+        request["reasoning"]["context"] = json!("all_turns");
+        let previous = json!({"type":"reasoning","id":"old","summary":[{"type":"summary_text","text":"preserve me"}],
+            "content":null,"encrypted_content":null});
+        request["input"].as_array_mut().unwrap().extend([
+            previous.clone(),
+            json!({"type":"message","role":"assistant","content":"prior reply"}),
+            json!({"type":"message","role":"user","content":"next turn"}),
+        ]);
+        assert_eq!(
+            prepare_for_model(&request, route, &model)
+                .unwrap_err()
+                .error_param(),
+            Some("reasoning.context")
+        );
+        model.capabilities.chat_reasoning_content = true;
+        let wire: Value =
+            serde_json::from_slice(&prepare_for_model(&request, route, &model).unwrap().body)
+                .unwrap();
+        assert!(wire["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["reasoning_content"] == "preserve me"));
+        request["input"][2]["encrypted_content"] = json!("unavailable-ciphertext");
+        assert_eq!(
+            prepare_for_model(&request, route, &model)
+                .unwrap_err()
+                .error_param(),
+            Some("reasoning.context")
+        );
+        request["reasoning"]["context"] = json!("current_turn");
+        let wire: Value =
+            serde_json::from_slice(&prepare_for_model(&request, route, &model).unwrap().body)
+                .unwrap();
+        assert!(!wire.to_string().contains("preserve me"));
+        request["input"].as_array_mut().unwrap().push(previous);
+        assert_eq!(
+            prepare_for_model(&request, route, &model)
+                .unwrap_err()
+                .error_param(),
+            Some("reasoning.context")
+        );
+    }
+
+    #[test]
+    fn opencode_zen_codex_lite_admits_only_reviewed_exec_and_matching_history() {
+        let fixture: Value = serde_json::from_str(super::super::CODEX_LITE_FIXTURE).unwrap();
+        let request = fixture["request"].clone();
+        let route = ProxyRoute::CodexResponses;
+        let model = admission(CatalogEndpoint::Chat);
+        let mut invalid = request.clone();
+        invalid["input"][0]["tools"][0]["tools"][0]["format"]["definition"] =
+            json!("start: /other/");
+        assert_eq!(
+            prepare_for_model(&invalid, route, &model)
+                .unwrap_err()
+                .error_param(),
+            Some("tools.format")
+        );
+        invalid["input"] = invalid["input"][0].clone();
+        assert_eq!(
+            prepare_for_model(&invalid, route, &model)
+                .unwrap_err()
+                .error_param(),
+            Some("tools.format")
+        );
+        let error =
+            prepare_for_model(&request, route, &admission(CatalogEndpoint::Messages)).unwrap_err();
+        assert_eq!(error.error_param(), Some("tools.format"));
+        let mut ambiguous = request.clone();
+        ambiguous["tools"] = json!([{
+            "type":"namespace","name":"functions",
+            "tools":[{"type":"custom","name":"exec","format":{"type":"text"}}]
+        }]);
+        assert_eq!(
+            prepare_for_model(&ambiguous, route, &model)
+                .unwrap_err()
+                .error_param(),
+            Some("input.additional_tools")
+        );
+        for items in [
+            vec![fixture["toolResult"].clone(), fixture["toolCall"].clone()],
+            vec![fixture["toolResult"].clone()],
+            vec![fixture["toolCall"].clone()],
+        ] {
+            let mut follow_up = request.clone();
+            follow_up["input"].as_array_mut().unwrap().extend(items);
+            assert_eq!(
+                prepare_for_model(&follow_up, route, &model)
+                    .unwrap_err()
+                    .error_param(),
+                Some("input.custom_tool_call_output")
+            );
+        }
     }
 
     #[test]

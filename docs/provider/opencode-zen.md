@@ -20,6 +20,14 @@ Codex CLI 的 Responses 客户端封装与生成控制分别处理：`client_met
 
 本通道没有托管 Web 搜索；Codex CLI 若启用 `web_search` 工具，会明确提示关闭该项，可为该供应商使用 `codex -c 'web_search="disabled"'`。普通客户端 function 工具及既有 namespace/custom 映射不受影响。卡片的精简 curl 检测不代表已覆盖 CLI 全部字段；本仓另用完整 Codex 0.169 请求形状覆盖三上游协议和流/非流路径，CI 显式运行 Zen 模块回归。
 
+## Codex CLI 连接与 Responses Lite
+
+在 Router Share 的「连接」弹窗展开 Codex CLI 配置。固定模式显示实际绑定模型，透传模式列出有效目录中具备兼容 CLI 推理档位的免费模型。用 Share API Key 设置 `TOKENSWITCH_API_KEY`，再运行启动或验证命令。命令显式选择 HTTP Responses、当前模型和推理档位，例如 `hy4-flash-free` 的 `high`。命令还设置默认摘要和中性 verbosity，并关闭托管 Web 搜索。
+
+Codex 0.170.0 选用 GPT-6.2 别名时可能携带 Responses Lite 的 `reasoning.context` 和 `additional_tools`。Server 校验推理范围和目标协议。在 Chat 目标提供新鲜的明文推理回放声明时，检查所需的思考文本确实出现在对应回合。HY4 的目录目前只声明推理档位。需要回放其无法表示的历史时，返回 `reasoning.context` 字段及连接提示。显式档位与 verbosity 仍符合实际模型的能力。
+
+当前审计过的 Codex 0.170.0 内置 `functions.exec` 声明可桥接到 Chat 目标。完整参数包含唯一的非空 `input` 字符串，源码和可选 pragma 由 CLI 在原有权限下处理。Server 在收到干净的 SSE 终态后交付完整工具调用，保留跨分片的普通工具名和 Code Mode 调用标识。遗失、冲突或无法验证的 Code Mode 参数和结果收到明确错误。
+
 ## Claude Code 连接与工具发现
 
 在 Router Share 的「连接」弹窗展开 Claude Code 配置。Router 读取签名绑定上的 Zen 目录，固定模式显示绑定模型，透传模式可以选择当前可用模型。用 Share API Key 设置 `TOKENSWITCH_API_KEY`，再复制启动或 `claude -p` 验证命令。命令根据新鲜目录的模型声明选择可用推理档位，输出上限取声明值与 32,000 中较小的一个。已有 curl 继续用于测试模型连通性。

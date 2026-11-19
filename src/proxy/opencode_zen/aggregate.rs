@@ -31,6 +31,41 @@ fn append(target: &mut Value, fragment: &Value) -> Result<(), ProxyError> {
     Ok(())
 }
 
+pub(super) fn collect_chat_tool_deltas(
+    items: &mut BTreeMap<u64, Value>,
+    calls: &Value,
+) -> Result<(), ProxyError> {
+    for call in calls.as_array().ok_or_else(invalid)? {
+        let index = call["index"].as_u64().ok_or_else(invalid)?;
+        if items.len() >= 128 && !items.contains_key(&index) {
+            return Err(invalid());
+        }
+        let tool = items
+            .entry(index)
+            .or_insert_with(|| json!({"type":"function","function":{"name":"","arguments":""}}));
+        if let Some(id) = call.get("id") {
+            if !id.is_string() || tool.get("id").is_some_and(|old| old != id) {
+                return Err(invalid());
+            }
+            tool["id"] = id.clone();
+        }
+        if call.get("type").is_some_and(|v| v != "function") {
+            return Err(invalid());
+        }
+        if let Some(function) = call.get("function") {
+            if !function.is_object() {
+                return Err(invalid());
+            }
+            for key in ["name", "arguments"] {
+                if let Some(fragment) = function.get(key) {
+                    append(&mut tool["function"][key], fragment)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ZenAggregation {
     pub(super) fn new(wire: ZenWire) -> Self {
         Self {
@@ -139,34 +174,7 @@ impl ZenAggregation {
             }
         }
         if let Some(calls) = delta.get("tool_calls").filter(|v| !v.is_null()) {
-            for call in calls.as_array().ok_or_else(invalid)? {
-                let index = call["index"].as_u64().ok_or_else(invalid)?;
-                if self.items.len() >= 128 && !self.items.contains_key(&index) {
-                    return Err(invalid());
-                }
-                let tool = self.items.entry(index).or_insert_with(
-                    || json!({"type":"function","function":{"name":"","arguments":""}}),
-                );
-                if let Some(id) = call.get("id") {
-                    if !id.is_string() || tool.get("id").is_some_and(|old| old != id) {
-                        return Err(invalid());
-                    }
-                    tool["id"] = id.clone();
-                }
-                if call.get("type").is_some_and(|v| v != "function") {
-                    return Err(invalid());
-                }
-                if let Some(function) = call.get("function") {
-                    if !function.is_object() {
-                        return Err(invalid());
-                    }
-                    for key in ["name", "arguments"] {
-                        if let Some(fragment) = function.get(key) {
-                            append(&mut tool["function"][key], fragment)?;
-                        }
-                    }
-                }
-            }
+            collect_chat_tool_deltas(&mut self.items, calls)?;
         }
         if let Some(reason) = choice.get("finish_reason").filter(|v| !v.is_null()) {
             self.document["choices"][0]["finish_reason"] = reason.clone();

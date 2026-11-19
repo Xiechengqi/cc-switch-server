@@ -24,7 +24,9 @@ pub(in crate::api) struct OpenAiModelsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::api) fetched_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(in crate::api) claude_code: Option<crate::proxy::opencode_zen::ZenClaudeCodeConnections>,
+    pub(in crate::api) claude_code: Option<crate::proxy::opencode_zen::ZenCliConnections>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::api) codex_cli: Option<crate::proxy::opencode_zen::ZenCliConnections>,
     /// Qoder scene observations, including disabled/discovery-only rows.
     /// The standard data array remains the executable model catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]

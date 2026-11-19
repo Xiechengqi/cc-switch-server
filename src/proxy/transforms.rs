@@ -125,7 +125,11 @@ impl ResponsesToolContext {
             .any(|spec| spec.kind == kind)
     }
 
-    fn chat_name_for_response_function(&self, name: &str, namespace: Option<&str>) -> String {
+    pub(super) fn chat_name_for_response_function(
+        &self,
+        name: &str,
+        namespace: Option<&str>,
+    ) -> String {
         let Some(namespace) = namespace.filter(|value| !value.is_empty()) else {
             return name.to_string();
         };
@@ -1659,9 +1663,17 @@ pub(crate) fn openai_responses_to_chat_with_reasoning_effort(
     input: &Value,
     effort_mode: ReasoningEffortMode,
 ) -> Result<Value, TransformError> {
+    let tool_context = responses_tool_context(input);
+    openai_responses_to_chat_with_context(input, effort_mode, &tool_context)
+}
+
+pub(super) fn openai_responses_to_chat_with_context(
+    input: &Value,
+    effort_mode: ReasoningEffortMode,
+    tool_context: &ResponsesToolContext,
+) -> Result<Value, TransformError> {
     validate_response_tool_type_collisions(input)?;
     super::responses_phase::observe_items(input, "input", "chat", "request");
-    let tool_context = responses_tool_context(input);
     tool_context.validate_bridge_request(input)?;
     let mut messages = Vec::new();
     let mut pending_media = Vec::new();
@@ -1681,7 +1693,7 @@ pub(crate) fn openai_responses_to_chat_with_reasoning_effort(
             for item in items {
                 append_response_input_item_to_chat_messages(
                     item,
-                    &tool_context,
+                    tool_context,
                     &mut messages,
                     &mut pending_media,
                     &mut pending_reasoning,
@@ -1692,7 +1704,7 @@ pub(crate) fn openai_responses_to_chat_with_reasoning_effort(
         }
         Some(value @ Value::Object(_)) => append_response_input_item_to_chat_messages(
             value,
-            &tool_context,
+            tool_context,
             &mut messages,
             &mut pending_media,
             &mut pending_reasoning,
@@ -1739,13 +1751,13 @@ pub(crate) fn openai_responses_to_chat_with_reasoning_effort(
             output.insert("reasoning_effort".to_string(), effort);
         }
     }
-    if let Some(tools) = openai_response_tools_to_chat(input, &tool_context)? {
+    if let Some(tools) = openai_response_tools_to_chat(input, tool_context)? {
         output.insert("tools".to_string(), tools);
     }
     if let Some(tool_choice) = input.get("tool_choice") {
         output.insert(
             "tool_choice".to_string(),
-            openai_response_tool_choice_to_chat(tool_choice, &tool_context)?,
+            openai_response_tool_choice_to_chat(tool_choice, tool_context)?,
         );
     }
     if let Some(format) = input.pointer("/text/format") {
@@ -4564,7 +4576,7 @@ pub(crate) fn responses_custom_tool_names_from_bytes(input: &[u8]) -> BTreeSet<S
         .unwrap_or_default()
 }
 
-fn response_tools_from_request(input: &Value) -> Vec<&Value> {
+pub(super) fn response_tools_from_request(input: &Value) -> Vec<&Value> {
     let mut tools = input
         .get("tools")
         .and_then(Value::as_array)
@@ -4581,7 +4593,7 @@ fn response_tools_from_request(input: &Value) -> Vec<&Value> {
     tools
 }
 
-fn response_input_items(input: &Value) -> &[Value] {
+pub(super) fn response_input_items(input: &Value) -> &[Value] {
     match input.get("input") {
         Some(Value::Array(items)) => items,
         Some(item @ Value::Object(_)) => std::slice::from_ref(item),
