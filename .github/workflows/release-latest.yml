@@ -88,21 +88,51 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Delete existing latest release and tag
+      # Update the reference before replacing the release so a tag failure
+      # leaves the existing downloads available.
+      - name: Set latest tag through GitHub API
         if: steps.freshness.outputs.fresh == 'true'
-        run: |
-          gh release delete latest --yes || true
-          git push origin :refs/tags/latest || true
         env:
           GH_TOKEN: ${{ github.token }}
-
-      - name: Create latest tag
-        if: steps.freshness.outputs.fresh == 'true'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f latest "${GITHUB_SHA}"
-          git push -f origin latest
+          git_api="repos/${GITHUB_REPOSITORY}/git"
+          for attempt in 1 2 3; do
+            if tag_sha="$(gh api "${git_api}/matching-refs/tags/latest" \
+              --jq '.[] | select(.ref == "refs/tags/latest") | .object.sha')"; then
+              if [[ "${tag_sha}" == "${GITHUB_SHA}" ]]; then
+                exit 0
+              fi
+              if [[ -n "${tag_sha}" ]]; then
+                if gh api --silent --method PATCH "${git_api}/refs/tags/latest" \
+                  --raw-field "sha=${GITHUB_SHA}" --field force=true; then
+                  exit 0
+                fi
+              elif gh api --silent --method POST "${git_api}/refs" \
+                --raw-field ref=refs/tags/latest --raw-field "sha=${GITHUB_SHA}"; then
+                exit 0
+              fi
+            fi
+            if [[ "${attempt}" != 3 ]]; then
+              echo "Retrying latest tag update after attempt ${attempt}" >&2
+              sleep "${attempt}"
+            fi
+          done
+          echo "Could not set the latest tag to ${GITHUB_SHA}" >&2
+          exit 1
+
+      - name: Delete existing latest release
+        if: steps.freshness.outputs.fresh == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          releases_api="repos/${GITHUB_REPOSITORY}/releases"
+          release_ids="$(gh api --paginate "${releases_api}?per_page=100" \
+            --jq '.[] | select(.tag_name == "latest") | .id')"
+          while IFS= read -r release_id; do
+            if [[ -n "${release_id}" ]]; then
+              gh api --silent --method DELETE "${releases_api}/${release_id}"
+            fi
+          done <<< "${release_ids}"
 
       - name: Create complete latest draft
         if: steps.freshness.outputs.fresh == 'true'
@@ -148,5 +178,5 @@ jobs:
             --jq ".isDraft and (.body | contains(\"cc-switch-latest-run:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}\"))" \
             2>/dev/null || true)"
           if [[ "${owned_draft}" == "true" ]]; then
-            gh release delete latest --yes --cleanup-tag || true
+            gh release delete latest --yes || true
           fi
