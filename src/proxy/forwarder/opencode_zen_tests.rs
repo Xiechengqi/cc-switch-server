@@ -1,8 +1,16 @@
 // Repository-owned loopback receipts, never a vendor live acceptance receipt.
 async fn zen_test_options(state: &ServerState, body: Value) -> OpencodeZenForwardOptions {
+    zen_test_options_for(state, AppKind::Codex, body).await
+}
+
+async fn zen_test_options_for(
+    state: &ServerState,
+    app: AppKind,
+    body: Value,
+) -> OpencodeZenForwardOptions {
     let stored = state
         .upsert_provider_draft_command(crate::domain::providers::credentials::ProviderWriteDraft {
-            app: AppKind::Codex,
+            app,
             provider: Provider {
                 id: "zen-loopback".into(),
                 name: "Zen loopback".into(),
@@ -12,7 +20,11 @@ async fn zen_test_options(state: &ServerState, body: Value) -> OpencodeZenForwar
                 extra: Default::default(),
             },
             profile_id: Some(
-                crate::domain::providers::registry::ProfileId::parse("codex.opencode_zen").unwrap(),
+                crate::domain::providers::registry::ProfileId::parse(format!(
+                    "{}.opencode_zen",
+                    app.as_str()
+                ))
+                .unwrap(),
             ),
             custom_binding: None,
             expected_revision: None,
@@ -32,7 +44,11 @@ async fn zen_test_options(state: &ServerState, body: Value) -> OpencodeZenForwar
         state: state.clone(),
         execution,
         stored,
-        route: ProxyRoute::CodexChatCompletions,
+        route: if app == AppKind::Claude {
+            ProxyRoute::ClaudeMessages
+        } else {
+            ProxyRoute::CodexChatCompletions
+        },
         body: Bytes::from(body.to_string()),
         request_context: UsageLogContext {
             request_id: Some("zen-receipt".into()),
@@ -43,6 +59,118 @@ async fn zen_test_options(state: &ServerState, body: Value) -> OpencodeZenForwar
         started: Instant::now(),
         timing: Default::default(),
         request_memory: None,
+    }
+}
+
+#[tokio::test]
+async fn opencode_zen_claude_cli_deferred_tools_cross_all_wires_and_both_modes() {
+    use super::super::opencode_zen as zen;
+    let _lock = zen::CATALOG_TEST_LOCK.lock().await;
+    let fixture: Value = serde_json::from_str(zen::CLAUDE_CLI_FIXTURE).unwrap();
+    for (wire, protocol, origin_path) in [
+        (zen::ZenWire::Chat, "chat-completions", "openai"),
+        (zen::ZenWire::Responses, "responses", "openai"),
+        (zen::ZenWire::Messages, "messages", "anthropic"),
+    ] {
+        for stream in [false, true] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = calls.clone();
+            let router = axum::Router::new().fallback(axum::routing::post(move |body: Bytes| {
+                let count = count.clone();
+                async move {
+                    let turn = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let sent: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(sent["model"], "chat-free");
+                    assert_eq!(sent["stream"], true);
+                    assert!(sent.get("metadata").is_none());
+                    assert!(sent.get("context_management").is_none());
+                    let tools = sent["tools"].as_array().unwrap();
+                    assert!(tools.iter().all(|tool| tool.get("defer_loading").is_none()));
+                    let has_name = |tool: &Value, name: &str| tool["name"] == name || tool["function"]["name"] == name;
+                    assert!(tools.iter().any(|tool| has_name(tool, "ToolSearch")));
+                    assert!(!tools.iter().any(|tool| has_name(tool, "DeferredToolPlaceholder")));
+                    let selected = tools.iter().find(|tool| has_name(tool, "EchoProbe"));
+                    assert_eq!(selected.is_some(), turn == 1);
+                    if let Some(selected) = selected {
+                        let schema = selected.get("parameters").or_else(|| selected.get("input_schema")).or_else(|| selected.pointer("/function/parameters")).unwrap();
+                        assert_eq!(schema["properties"]["text"]["type"], "string");
+                        let text = sent.to_string();
+                        assert!(text.contains("Available tool:"));
+                        assert!(text.contains("synthetic-search-call"));
+                        assert!(!text.contains("tool_reference"));
+                        if wire == zen::ZenWire::Chat {
+                            let messages = sent["messages"].as_array().unwrap();
+                            let index = messages.iter().position(|message| message["role"] == "tool").unwrap();
+                            assert_eq!(messages[index - 1]["role"], "assistant");
+                            assert_eq!(messages[index + 1]["role"], "user");
+                        }
+                    }
+                    let payload = match wire {
+                        zen::ZenWire::Chat => json!({"id":"chat_claude","model":"chat-free","choices":[{"index":0,"message":{"role":"assistant","content":"ZEN_CLAUDE_OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}),
+                        zen::ZenWire::Responses => json!({"id":"resp_claude","object":"response","model":"chat-free","status":"completed","output":[{"id":"msg_claude","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ZEN_CLAUDE_OK","annotations":[]}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}),
+                        zen::ZenWire::Messages => json!({"id":"msg_claude","type":"message","model":"chat-free","role":"assistant","content":[{"type":"text","text":"ZEN_CLAUDE_OK"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}),
+                    };
+                    zen_fixture_sse(payload, wire)
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let mut request = fixture["request"].clone();
+            request["stream"] = json!(stream);
+            request["context_management"] =
+                fixture["defaultControls"]["context_management"].clone();
+            for follow_up in [false, true] {
+                let state = forwarder_test_state("zen-claude-cli");
+                if follow_up {
+                    request["messages"].as_array_mut().unwrap().extend([
+                        fixture["searchTurn"].clone(),
+                        fixture["searchResult"].clone(),
+                    ]);
+                    request["tools"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(fixture["recentTool"].clone());
+                }
+                let mut options =
+                    zen_test_options_for(&state, AppKind::Claude, request.clone()).await;
+                Arc::make_mut(&mut options.execution.plan).model_policy =
+                    crate::domain::providers::runtime::RuntimeModelPolicy::Single {
+                        upstream_model: "chat-free".into(),
+                    };
+                let receipt = format!("zen-claude-{follow_up}");
+                options.request_context.request_id = Some(receipt.clone());
+                zen::store_catalog_payload(&json!({"data":[{"id":"chat-free","type":"chat",
+                    "limit":{"output":32000},"cost":{"text":{"input":{"price":0},"output":{"price":0}}},
+                    "api":{(protocol):{"base_url":format!("https://opencode.ai/inference/{origin_path}/v1")}},
+                    "capabilities":{"reasoning":{"supported":true,"effort":["high"]},"tools":{"supported":true}}}]}));
+                let response = forward_opencode_zen_at(options, &origin).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                assert!(
+                    text.contains("ZEN_CLAUDE_OK"),
+                    "{protocol} {stream}: {text}"
+                );
+                if stream {
+                    assert!(text.contains("message_stop"));
+                } else {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&text).unwrap()["stop_reason"],
+                        "end_turn"
+                    );
+                }
+                let usage = state.usage_snapshot().await;
+                let log = usage.request_detail(&receipt).unwrap();
+                assert_eq!(log.requested_model.as_deref(), Some("claude-sonnet-4-6"));
+                assert_eq!(log.actual_model.as_deref(), Some("chat-free"));
+                assert_eq!(log.stream_status.as_deref(), Some("completed"));
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            server.abort();
+        }
     }
 }
 

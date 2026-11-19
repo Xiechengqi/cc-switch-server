@@ -225,7 +225,10 @@ pub(super) fn translate(
         "cache_control",
     ];
     for key in object.keys() {
-        if !ALLOWED.contains(&key.as_str()) && !KEYS.contains(&key.as_str()) {
+        let known = ALLOWED.contains(&key.as_str())
+            || KEYS.contains(&key.as_str())
+            || (route == ProxyRoute::ClaudeMessages && key == "context_management");
+        if !known {
             return Err(unsupported("unknown request field"));
         }
     }
@@ -254,6 +257,9 @@ pub(super) fn translate(
             })?;
             let allowed: &[&str] = match key {
                 "reasoning" => &["effort", "summary"],
+                "thinking" if route == ProxyRoute::ClaudeMessages => {
+                    &["type", "effort", "budget_tokens", "display"]
+                }
                 "thinking" => &["type", "effort", "budget_tokens"],
                 "output_config" => &["effort", "format"],
                 _ => &["format", "verbosity"],
@@ -377,6 +383,16 @@ pub(super) fn translate(
     if let Some(effort) = effort {
         require(caps.reasoning, admitted.stale, "reasoning effort")?;
         if !caps.reasoning_efforts.iter().any(|e| e == effort) {
+            if route == ProxyRoute::ClaudeMessages && !caps.reasoning_efforts.is_empty() {
+                let model = request["model"]
+                    .as_str()
+                    .map(super::base_model_id)
+                    .unwrap_or("");
+                return Err(ProxyError::bad_request(format!(
+                    "OpenCode Zen reasoning effort is not in the model menu for {model}; available: {}",
+                    caps.reasoning_efforts.join(", ")
+                )));
+            }
             return Err(unsupported("reasoning effort is not in the model menu"));
         }
         match wire {
@@ -418,8 +434,22 @@ pub(super) fn translate(
         }
     }
     if let Some(thinking) = request.get("thinking") {
+        if route == ProxyRoute::ClaudeMessages
+            && thinking
+                .get("display")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(unsupported(
+                "Claude thinking.display requires native signed thinking; set CLAUDE_CODE_DISABLE_THINKING=1 and use a supported effort",
+            ));
+        }
         let has_native = thinking.get("type").is_some() || thinking.get("budget_tokens").is_some();
         if wire != ZenWire::Messages && has_native {
+            if route == ProxyRoute::ClaudeMessages && thinking["type"] == "adaptive" {
+                return Err(unsupported(
+                    "Claude adaptive thinking; set CLAUDE_CODE_DISABLE_THINKING=1 and use a supported effort",
+                ));
+            }
             return Err(unsupported("thinking budget/toggle on this protocol"));
         }
         require(caps.reasoning, admitted.stale, "thinking")?;
@@ -442,7 +472,7 @@ pub(super) fn translate(
             Some("enabled") => {
                 let budget = thinking.get("budget_tokens").and_then(Value::as_u64).filter(|n| *n>=1024)
                     .ok_or_else(||ProxyError::bad_request("OpenCode Zen enabled thinking requires an integer budget_tokens >= 1024"))?;
-                if super::output_limit(request, Some(admitted))? <= budget {
+                if super::output_limit(request, Some(admitted), route)? <= budget {
                     return Err(ProxyError::bad_request(
                         "OpenCode Zen thinking budget must be below the output limit",
                     ));
@@ -639,6 +669,7 @@ mod tests {
                 reasoning: Some(true),
                 reasoning_toggle: Some(true),
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                chat_reasoning_content: endpoint.wire() == ZenWire::Chat,
                 structured_output: Some(true),
                 temperature: Some(true),
                 top_p: Some(true),
@@ -673,6 +704,157 @@ mod tests {
         request["top_p"] = json!(0.9);
         request["parallel_tool_calls"] = json!(false);
         request
+    }
+
+    #[test]
+    fn zen_claude_cli_reports_model_controls_and_retains_only_representable_thinking() {
+        let fixture: Value = serde_json::from_str(super::super::CLAUDE_CLI_FIXTURE).unwrap();
+        let mut admitted = admission(CatalogEndpoint::Chat);
+        admitted.max_output_tokens = Some(32_000);
+        let mut request = fixture["request"].clone();
+        request["model"] = json!("resolved-free");
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(fixture["defaultControls"].as_object().unwrap().clone());
+        let prepare = |request: &Value, admitted: &ZenAdmission| {
+            prepare_for_model(request, ProxyRoute::ClaudeMessages, admitted)
+        };
+        let error = prepare(&request, &admitted).unwrap_err();
+        assert!(error
+            .message
+            .contains("resolved-free (requested 128000, maximum 32000)"));
+        request["max_tokens"] = 32000.into();
+        let error = prepare(&request, &admitted).unwrap_err();
+        assert!(error.message.contains("available: low, high"));
+        request["output_config"]["effort"] = json!("high");
+        assert!(prepare(&request, &admitted)
+            .unwrap_err()
+            .message
+            .contains("thinking.display"));
+        request["thinking"]
+            .as_object_mut()
+            .unwrap()
+            .remove("display");
+        assert!(prepare(&request, &admitted)
+            .unwrap_err()
+            .message
+            .contains("CLAUDE_CODE_DISABLE_THINKING=1"));
+        request.as_object_mut().unwrap().remove("thinking");
+        request["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":[{"type":"thinking","thinking":"synthetic reasoning","signature":""},{"type":"text","text":"a previous answer"}]}),
+            json!({"role":"user","content":"next"}),
+        ]);
+        let prepared = prepare(&request, &admitted).unwrap();
+        let wire: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert!(wire.get("context_management").is_none());
+        let history = wire["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        assert_eq!(history["reasoning_content"], "synthetic reasoning");
+        request["messages"][1]["content"][0]["signature"] = json!("opaque-native-signature");
+        assert!(prepare(&request, &admitted)
+            .unwrap_err()
+            .message
+            .contains("cannot retain"));
+        admitted = admission(CatalogEndpoint::Messages);
+        admitted.max_output_tokens = Some(32_000);
+        let prepared = prepare(&request, &admitted).unwrap();
+        let wire: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(
+            wire["messages"][1]["content"][0],
+            request["messages"][1]["content"][0]
+        );
+        request["context_management"]["edits"][0]["keep"] = json!(1);
+        assert!(prepare(&request, &admitted)
+            .unwrap_err()
+            .message
+            .contains("keep=all"));
+    }
+
+    #[test]
+    fn zen_claude_cli_rejects_tool_references_outside_the_client_search_result() {
+        let fixture: Value = serde_json::from_str(super::super::CLAUDE_CLI_FIXTURE).unwrap();
+        let mut request = fixture["request"].clone();
+        request["max_tokens"] = 8000.into();
+        request["messages"].as_array_mut().unwrap().extend([
+            fixture["searchTurn"].clone(),
+            fixture["searchResult"].clone(),
+        ]);
+        let admitted = admission(CatalogEndpoint::Chat);
+        let prepare =
+            |request: &Value| prepare_for_model(request, ProxyRoute::ClaudeMessages, &admitted);
+        assert!(prepare(&request)
+            .unwrap_err()
+            .message
+            .contains("no current client tool schema"));
+        request["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(fixture["recentTool"].clone());
+        request["messages"][1]["content"][0]["name"] = json!("AnotherTool");
+        assert!(prepare(&request)
+            .unwrap_err()
+            .message
+            .contains("preceding client ToolSearch call"));
+        request["messages"][1]["content"][0]["name"] = json!("ToolSearch");
+        request["tools"][2]["defer_loading"] = json!("true");
+        assert!(prepare(&request)
+            .unwrap_err()
+            .message
+            .contains("boolean defer_loading"));
+        request["tools"][2]["defer_loading"] = json!(true);
+        request["messages"].as_array_mut().unwrap().truncate(1);
+        request["tool_choice"] = json!({"type":"tool","name":"EchoProbe"});
+        assert!(prepare(&request)
+            .unwrap_err()
+            .message
+            .contains("cannot force an unavailable deferred tool"));
+    }
+
+    #[test]
+    fn zen_claude_keeps_tool_failure_in_chat_and_native_results() {
+        let request = json!({
+            "model":"chat-free","max_tokens":8000,
+            "messages":[
+                {"role":"user","content":"Use the tool"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"synthetic-fail","name":"echo","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"synthetic-fail","is_error":true,"content":"synthetic failure"}]}
+            ],
+            "tools":[{"name":"echo","input_schema":{"type":"object"}}]
+        });
+        let chat = prepare_for_model(
+            &request,
+            ProxyRoute::ClaudeMessages,
+            &admission(CatalogEndpoint::Chat),
+        )
+        .unwrap();
+        let wire: Value = serde_json::from_slice(&chat.body).unwrap();
+        let tool = wire["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["role"] == "tool")
+            .unwrap();
+        assert_eq!(tool["tool_call_id"], "synthetic-fail");
+        assert_eq!(
+            tool["content"],
+            "[Tool execution failed]\nsynthetic failure"
+        );
+        let native = prepare_for_model(
+            &request,
+            ProxyRoute::ClaudeMessages,
+            &admission(CatalogEndpoint::Messages),
+        )
+        .unwrap();
+        let wire: Value = serde_json::from_slice(&native.body).unwrap();
+        assert_eq!(
+            wire["messages"][2]["content"][0],
+            request["messages"][2]["content"][0]
+        );
     }
 
     #[test]

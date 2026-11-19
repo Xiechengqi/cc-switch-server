@@ -3445,6 +3445,32 @@ pub fn gemini_stream_to_openai_chat(input: &Value) -> Vec<StreamFrame> {
 }
 
 pub fn anthropic_to_openai_chat(input: &Value) -> Result<Value, TransformError> {
+    anthropic_to_openai_chat_with_history(input, AnthropicChatHistory::Standard)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnthropicChatHistory {
+    Standard,
+    ToolResultsFirst,
+    ToolResultsAndThinking,
+}
+
+pub(super) fn anthropic_to_openai_chat_preserving_history(
+    input: &Value,
+    replay_plain_thinking: bool,
+) -> Result<Value, TransformError> {
+    let history = if replay_plain_thinking {
+        AnthropicChatHistory::ToolResultsAndThinking
+    } else {
+        AnthropicChatHistory::ToolResultsFirst
+    };
+    anthropic_to_openai_chat_with_history(input, history)
+}
+
+fn anthropic_to_openai_chat_with_history(
+    input: &Value,
+    history: AnthropicChatHistory,
+) -> Result<Value, TransformError> {
     let messages = input
         .get("messages")
         .and_then(Value::as_array)
@@ -3454,7 +3480,7 @@ pub fn anthropic_to_openai_chat(input: &Value) -> Result<Value, TransformError> 
         output_messages.push(system);
     }
     for message in messages {
-        output_messages.extend(anthropic_message_to_openai_chat(message));
+        output_messages.extend(anthropic_message_to_openai_chat(message, history));
     }
 
     let mut output = Map::new();
@@ -5890,7 +5916,17 @@ fn anthropic_thinking_to_gemini(input: &Value) -> Option<Value> {
     Some(Value::Object(output))
 }
 
-fn anthropic_message_to_openai_chat(message: &Value) -> Vec<Value> {
+pub(super) fn plain_anthropic_thinking(block: &Value) -> Option<&str> {
+    if block
+        .get("signature")
+        .is_some_and(|signature| signature.as_str() != Some(""))
+    {
+        return None;
+    }
+    block.get("thinking").and_then(Value::as_str)
+}
+
+fn anthropic_message_to_openai_chat(message: &Value, history: AnthropicChatHistory) -> Vec<Value> {
     let role = message
         .get("role")
         .and_then(Value::as_str)
@@ -5899,6 +5935,7 @@ fn anthropic_message_to_openai_chat(message: &Value) -> Vec<Value> {
     let mut content_items = Vec::new();
     let mut tool_calls = Vec::new();
     let mut pending_media = Vec::new();
+    let mut thinking = String::new();
 
     for block in anthropic_content_blocks(message) {
         match block.get("type").and_then(Value::as_str) {
@@ -5913,16 +5950,36 @@ fn anthropic_message_to_openai_chat(message: &Value) -> Vec<Value> {
                     .cloned()
                     .unwrap_or(Value::String(String::new()));
                 let extraction = extract_tool_media(&output, ToolMediaScope::ChatNative);
+                let content = extraction
+                    .as_ref()
+                    .map(|value| json!(sanitized_tool_text(&value.sanitized)))
+                    .unwrap_or(output);
+                let content =
+                    if history != AnthropicChatHistory::Standard && block["is_error"] == true {
+                        // Chat's tool message has no failure flag. Preserve the
+                        // status in the same text form used by Responses.
+                        responses_tool_output_with_error(
+                            Value::String(sanitized_tool_text(&content)),
+                            block.get("is_error"),
+                        )
+                    } else {
+                        content
+                    };
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": extraction
-                        .as_ref()
-                        .map(|value| json!(sanitized_tool_text(&value.sanitized)))
-                        .unwrap_or(output)
+                    "content": content
                 }));
                 if let Some(extraction) = extraction {
                     queue_chat_media(&mut pending_media, call_id, &extraction.media);
+                }
+            }
+            Some("thinking")
+                if role == "assistant"
+                    && history == AnthropicChatHistory::ToolResultsAndThinking =>
+            {
+                if let Some(text) = plain_anthropic_thinking(block) {
+                    thinking.push_str(text);
                 }
             }
             Some("thinking" | "redacted_thinking") => {}
@@ -5930,7 +5987,7 @@ fn anthropic_message_to_openai_chat(message: &Value) -> Vec<Value> {
         }
     }
 
-    if !content_items.is_empty() || !tool_calls.is_empty() {
+    if !content_items.is_empty() || !tool_calls.is_empty() || !thinking.is_empty() {
         let mut base = Map::new();
         base.insert(
             "role".to_string(),
@@ -5944,7 +6001,16 @@ fn anthropic_message_to_openai_chat(message: &Value) -> Vec<Value> {
         if !tool_calls.is_empty() {
             base.insert("tool_calls".to_string(), Value::Array(tool_calls));
         }
-        messages.insert(0, Value::Object(base));
+        if !thinking.is_empty() {
+            base.insert("reasoning_content".to_string(), Value::String(thinking));
+        }
+        if history == AnthropicChatHistory::Standard {
+            messages.insert(0, Value::Object(base));
+        } else {
+            // A Chat tool result must directly follow the assistant call,
+            // even when a Claude user turn also carries a text block.
+            messages.push(Value::Object(base));
+        }
     }
     flush_chat_media(&mut messages, &mut pending_media);
     messages

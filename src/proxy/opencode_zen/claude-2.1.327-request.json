@@ -1,0 +1,51 @@
+{
+  "request": {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 32000,
+    "stream": true,
+    "system": [{ "type": "text", "text": "Synthetic instructions.", "cache_control": { "type": "ephemeral" } }],
+    "metadata": { "user_id": "synthetic-claude-session" },
+    "output_config": { "effort": "high" },
+    "messages": [{ "role": "user", "content": [{ "type": "text", "text": "Find the local EchoProbe tool." }] }],
+    "tools": [
+      {
+        "name": "ToolSearch",
+        "description": "Search the client tools.",
+        "input_schema": {
+          "type": "object",
+          "properties": { "query": { "type": "string" }, "max_results": { "type": "number" } },
+          "required": ["query"]
+        }
+      },
+      {
+        "name": "DeferredToolPlaceholder",
+        "description": "Reserved placeholder that keeps deferred tool loading active; never call this tool.",
+        "input_schema": { "type": "object", "properties": {} },
+        "defer_loading": true
+      }
+    ]
+  },
+  "defaultControls": {
+    "max_tokens": 128000,
+    "context_management": { "edits": [{ "type": "clear_thinking_20251015", "keep": "all" }] },
+    "thinking": { "type": "adaptive", "display": "omitted" },
+    "output_config": { "effort": "medium" }
+  },
+  "recentTool": {
+    "name": "EchoProbe",
+    "description": "Return the supplied text.",
+    "input_schema": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] },
+    "defer_loading": true
+  },
+  "searchTurn": {
+    "role": "assistant",
+    "content": [{ "type": "tool_use", "id": "synthetic-search-call", "name": "ToolSearch", "input": { "query": "select:EchoProbe" } }]
+  },
+  "searchResult": {
+    "role": "user",
+    "content": [
+      { "type": "tool_result", "tool_use_id": "synthetic-search-call", "content": [{ "type": "tool_reference", "tool_name": "EchoProbe" }] },
+      { "type": "text", "text": "Continue using the selected tool." }
+    ]
+  }
+}

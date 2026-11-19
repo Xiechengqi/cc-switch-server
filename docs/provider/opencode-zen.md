@@ -20,6 +20,16 @@ Codex CLI 的 Responses 客户端封装与生成控制分别处理：`client_met
 
 本通道没有托管 Web 搜索；Codex CLI 若启用 `web_search` 工具，会明确提示关闭该项，可为该供应商使用 `codex -c 'web_search="disabled"'`。普通客户端 function 工具及既有 namespace/custom 映射不受影响。卡片的精简 curl 检测不代表已覆盖 CLI 全部字段；本仓另用完整 Codex 0.169 请求形状覆盖三上游协议和流/非流路径，CI 显式运行 Zen 模块回归。
 
+## Claude Code 连接与工具发现
+
+在 Router Share 的「连接」弹窗展开 Claude Code 配置。Router 读取签名绑定上的 Zen 目录，固定模式显示绑定模型，透传模式可以选择当前可用模型。用 Share API Key 设置 `TOKENSWITCH_API_KEY`，再复制启动或 `claude -p` 验证命令。命令根据新鲜目录的模型声明选择可用推理档位，输出上限取声明值与 32,000 中较小的一个。已有 curl 继续用于测试模型连通性。
+
+连接命令设置 `CLAUDE_CODE_DISABLE_THINKING=1` 并显式选择 Zen 的推理档位。Claude 的自适应思考与原生签名显示要求按实际协议校验。显式上限和档位保持严格校验，例如 Sonnet 默认的 128,000 对输出上限较小的固定模型会得到含实际模型和可用上限的错误。只识别 `clear_thinking_20251015` 的 `keep:"all"`，并检查历史在目标协议上能否保留。Chat 在新鲜目录明确声明 `reasoning_content` 时保留客户端返回的无签名文本思考历史，原生 Messages 保留实际的原生块。
+
+连接命令默认立即加载普通工具。需要 Claude 本地 `ToolSearch` 时可移除 `ENABLE_TOOL_SEARCH=false`。Server 验证搜索调用、`tool_reference` 与当前工具声明的配对，再转发已选工具及结果。搜索和工具执行由客户端完成。托管搜索与原生签名显示仍按各自的能力校验返回明确错误。
+
+2026-11-19 使用 Claude Code 2.1.327，经隔离 Router Share 隧道和模拟 Zen 上游通过 8 项验收，覆盖 HY4 与 DeepSeek 的固定模型、透传、普通工具和延迟工具。另用固定 US 出口向真实 Zen 发起的两个模型请求均返回 HTTP 429 `free_usage_limit`，真实生成继续记为 `live_pending`。测试版本与细节见根目录 `PROTOCOL_EVIDENCE.md`。
+
 ## 专用出站传输
 
 Zen 推理使用固定 Bun 1.4.4 的 `fetch`，不再通过共享 reqwest/rustls 推理。系统消息与传输是同机同模型差分确认的两个兼容条件；强制 TLS 1.3、换 UA 或回退旧端点均不能独立证明有效。目录请求仍使用共享 Rust HTTP client。

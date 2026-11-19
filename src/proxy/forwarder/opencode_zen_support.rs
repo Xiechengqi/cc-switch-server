@@ -917,12 +917,12 @@ fn zen_continuation_request(
         return Ok(None);
     }
     let canonical = match route {
-        ProxyRoute::ClaudeMessages => super::transforms::anthropic_to_openai_chat(requested),
-        ProxyRoute::CodexResponses => super::transforms::openai_responses_to_chat(requested),
-        _ => Ok(requested.clone()),
-    }
-    .map_err(|e| ProxyError::bad_request(e.to_string()))?;
-    let total = zen::output_limit(requested, Some(admitted))?;
+        ProxyRoute::ClaudeMessages => zen::claude_continuation_chat(requested, admitted)?,
+        ProxyRoute::CodexResponses => super::transforms::openai_responses_to_chat(requested)
+            .map_err(|e| ProxyError::bad_request(e.to_string()))?,
+        _ => requested.clone(),
+    };
+    let total = zen::output_limit(requested, Some(admitted), route)?;
     let used = payload
         .pointer("/usage/completion_tokens")
         .and_then(Value::as_u64);

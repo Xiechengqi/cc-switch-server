@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
+mod claude;
 pub(crate) mod runtime;
 pub(crate) mod transport;
 
@@ -19,6 +20,10 @@ const CLI_SYSTEM: &str = include_str!("opencode_zen/system-1.19.5.txt");
 #[cfg(test)]
 pub(in crate::proxy) const CODEX_CLI_FIXTURE: &str =
     include_str!("opencode_zen/codex-0.169-request.json");
+
+#[cfg(test)]
+pub(in crate::proxy) const CLAUDE_CLI_FIXTURE: &str =
+    include_str!("opencode_zen/claude-2.1.327-request.json");
 
 fn apply_system_profile(body: &mut Value, style: FingerprintStyle, model: &str) {
     let preamble = format!(
@@ -928,9 +933,15 @@ fn prepare_for_route_inner(
     use super::{adapters::UpstreamFormat as F, transforms as t};
     let source = super::adapters::downstream_format_for_route(route);
     let target = endpoint.wire().format();
+    let limit = output_limit(requested, admitted, route)?;
     // Controls are handled by this driver. In particular, a generic bridge
     // must not turn structured output into an extra prompt instruction.
     let mut bridge_request = requested.clone();
+    if route == super::ProxyRoute::ClaudeMessages {
+        if let Some(admitted) = admitted {
+            claude::prepare_bridge(&mut bridge_request, admitted)?;
+        }
+    }
     if admitted.is_some() {
         if let Some(map) = bridge_request.as_object_mut() {
             for key in controls::KEYS {
@@ -940,18 +951,20 @@ fn prepare_for_route_inner(
     }
     let bridge = &bridge_request;
     let mut converted = match (source, target) {
-        (F::AnthropicMessages, F::OpenAiChat) => t::anthropic_to_openai_chat(bridge),
+        (F::AnthropicMessages, F::OpenAiChat) => t::anthropic_to_openai_chat_preserving_history(
+            bridge,
+            admitted.is_some_and(claude::replay_chat_thinking),
+        ),
         (F::AnthropicMessages, F::OpenAiResponses) => t::anthropic_to_openai_responses(bridge),
         (F::OpenAiChat, F::AnthropicMessages) => t::openai_chat_to_anthropic(bridge),
         (F::OpenAiChat, F::OpenAiResponses) => t::openai_chat_to_responses(bridge),
         (F::OpenAiResponses, F::OpenAiChat) => t::openai_responses_to_chat(bridge),
         (F::OpenAiResponses, F::AnthropicMessages) => t::openai_responses_to_anthropic(bridge),
-        _ => Ok(requested.clone()),
+        _ => Ok(bridge_request.clone()),
     }
     .map_err(|error| super::ProxyError::bad_request(error.to_string()))?;
     // Shared transforms have their own defaults. The caller's explicit ceiling
     // wins, otherwise use the reviewed free-lane default for all protocols.
-    let limit = output_limit(requested, admitted)?;
     for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
         converted
             .as_object_mut()
@@ -970,7 +983,7 @@ fn prepare_for_route_inner(
     strip_client_transport_hints(&mut converted);
     if let Some(admitted) = admitted {
         let controls = controls::translate(requested, route, admitted)?;
-        controls::apply(&mut converted, requested, controls, endpoint.wire());
+        controls::apply(&mut converted, bridge, controls, endpoint.wire());
     }
     prepare_upstream_at(&converted, endpoint).map_err(|error| super::ProxyError {
         status: if error == PrepareError::ToolChoiceNone {
@@ -1222,15 +1235,40 @@ fn copy_limit(body: &mut Value, requested: &Value) {
 pub(super) fn output_limit(
     request: &Value,
     admitted: Option<&catalog::ZenAdmission>,
+    route: super::ProxyRoute,
 ) -> Result<u64, super::ProxyError> {
     let declared = admitted.and_then(|m| m.max_output_tokens);
     let limit = requested_limit(request).unwrap_or_else(|| declared.unwrap_or(32_000).min(32_000));
-    if declared.is_some_and(|max| limit > max) {
-        return Err(super::ProxyError::bad_request(
-            "OpenCode Zen output ceiling exceeds the model declaration",
-        ));
+    if let Some(maximum) = declared.filter(|maximum| limit > *maximum) {
+        let model = request
+            .get("model")
+            .and_then(Value::as_str)
+            .map(base_model_id)
+            .unwrap_or("");
+        let mut message = format!(
+            "OpenCode Zen output ceiling exceeds the model declaration for {model} (requested {limit}, maximum {maximum})"
+        );
+        if route == super::ProxyRoute::ClaudeMessages {
+            message.push_str(&format!(
+                "; for Claude Code set CLAUDE_CODE_MAX_OUTPUT_TOKENS={maximum} or lower"
+            ));
+        }
+        return Err(super::ProxyError::bad_request(message));
     }
     Ok(limit)
+}
+
+pub(super) fn claude_continuation_chat(
+    requested: &Value,
+    admitted: &catalog::ZenAdmission,
+) -> Result<Value, super::ProxyError> {
+    let mut bridge = requested.clone();
+    claude::prepare_bridge(&mut bridge, admitted)?;
+    super::transforms::anthropic_to_openai_chat_preserving_history(
+        &bridge,
+        claude::replay_chat_thinking(admitted),
+    )
+    .map_err(|error| super::ProxyError::bad_request(error.to_string()))
 }
 
 fn requested_limit(requested: &Value) -> Option<u64> {
@@ -1643,6 +1681,7 @@ mod catalog;
 mod controls;
 mod lane;
 mod validation;
+pub(crate) use catalog::ZenClaudeCodeConnections;
 #[cfg(test)]
 use catalog::{catalog_endpoint, catalog_free_status};
 #[cfg(test)]

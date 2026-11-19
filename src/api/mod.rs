@@ -1548,6 +1548,7 @@ async fn proxy_models_for_selection(
             stale: catalog.stale,
             fetched_at_ms: catalog.fetched_at_ms,
             catalog_entries: None,
+            claude_code: None,
         }));
     }
     let mut data = openai_model_list(&providers.providers, app, provider_id);
@@ -1753,6 +1754,14 @@ async fn proxy_models_for_selection(
     Ok(Json(OpenAiModelsResponse {
         object: "list",
         data,
+        claude_code: opencode_zen_provider
+            .as_ref()
+            .filter(|provider| provider.app == AppKind::Claude)
+            .and_then(|provider| {
+                let plan = providers.runtime_plan(provider.app, &provider.provider.id)?;
+                let catalog = opencode_zen_catalog.as_ref()?;
+                Some(catalog.claude_code_connections(&plan.model_policy))
+            }),
         catalog_entries: qoder_catalog
             .as_ref()
             .map(|catalog| catalog.entries.clone()),

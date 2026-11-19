@@ -88,6 +88,8 @@ pub struct ZenModelCapabilities {
     pub reasoning: Option<bool>,
     pub reasoning_toggle: Option<bool>,
     pub reasoning_efforts: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chat_reasoning_content: bool,
     pub structured_output: Option<bool>,
     pub temperature: Option<bool>,
     pub top_p: Option<bool>,
@@ -177,6 +179,11 @@ fn declared_capabilities(row: &Value, endpoint: Option<CatalogEndpoint>) -> ZenM
             c.pointer("/reasoning/effort"),
             &["minimal", "low", "medium", "high", "xhigh", "max"],
         ),
+        chat_reasoning_content: endpoint.is_some_and(|e| e.wire() == ZenWire::Chat)
+            && api
+                .and_then(|a| a.pointer("/compatibility/reasoning_field"))
+                .and_then(Value::as_str)
+                == Some("reasoning_content"),
         structured_output: c.get("structured_output").and_then(Value::as_bool),
         temperature: c.get("temperature").and_then(Value::as_bool),
         top_p: c.get("top_p").and_then(Value::as_bool),
@@ -271,6 +278,22 @@ pub struct ZenModelCatalogView {
     pub models: Vec<ZenModelView>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ZenClaudeCodeConnections {
+    pub fixed: bool,
+    pub models: Vec<ZenClaudeCodeModel>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ZenClaudeCodeModel {
+    id: String,
+    display_name: String,
+    max_output_tokens: u64,
+    effort: String,
+}
+
 pub(in crate::proxy) struct ZenAdmission {
     pub endpoint: CatalogEndpoint,
     pub capabilities: ZenModelCapabilities,
@@ -280,6 +303,61 @@ pub(in crate::proxy) struct ZenAdmission {
 }
 
 impl ZenModelCatalogView {
+    pub(crate) fn claude_code_connections(
+        &self,
+        policy: &crate::domain::providers::runtime::RuntimeModelPolicy,
+    ) -> ZenClaudeCodeConnections {
+        use crate::domain::providers::runtime::RuntimeModelPolicy;
+        let fixed = match policy {
+            RuntimeModelPolicy::Single { upstream_model } => Some(upstream_model.as_str()),
+            RuntimeModelPolicy::Passthrough => None,
+        };
+        let models = self
+            .models
+            .iter()
+            .filter_map(|model| {
+                let selection = fixed.unwrap_or(&model.id);
+                if super::base_model_id(selection) != model.id {
+                    return None;
+                }
+                let admitted = self.admit(selection).ok()?;
+                if admitted.stale
+                    || admitted.capabilities.reasoning != Some(true)
+                    || admitted.capabilities.tools == Some(false)
+                {
+                    return None;
+                }
+                let max_output_tokens = admitted.max_output_tokens?.min(32_000);
+                let suffix = selection
+                    .trim()
+                    .strip_suffix(')')
+                    .and_then(|s| s.rsplit_once('('))
+                    .map(|(_, effort)| effort.trim());
+                let effort =
+                    ["high", "medium", "low", "xhigh", "max"]
+                        .into_iter()
+                        .find(|effort| {
+                            suffix.is_none_or(|suffix| suffix == *effort)
+                                && admitted
+                                    .capabilities
+                                    .reasoning_efforts
+                                    .iter()
+                                    .any(|value| value == *effort)
+                        })?;
+                Some(ZenClaudeCodeModel {
+                    id: model.id.clone(),
+                    display_name: model.display_name.clone(),
+                    max_output_tokens,
+                    effort: effort.into(),
+                })
+            })
+            .collect();
+        ZenClaudeCodeConnections {
+            fixed: fixed.is_some(),
+            models,
+        }
+    }
+
     pub(in crate::proxy) fn admit(&self, id: &str) -> Result<ZenAdmission, &'static str> {
         if !(0..=MAX_STALE_MS).contains(&now_ms().saturating_sub(self.fetched_at_ms)) {
             return Err("OpenCode Zen catalog has expired");
@@ -829,6 +907,40 @@ mod tests {
         json!({"id":id,"name":"A free model","type":"chat", "limit":{"context":200000,"output":32000},
             "cost":{"text":{"input":{"price":0,"cache":{"read":0}},"output":{"price":0}}},
             "api":{"chat-completions":{"base_url":"https://opencode.ai/inference/openai/v1"}}})
+    }
+
+    #[test]
+    fn opencode_zen_claude_code_settings_use_the_admitted_model_and_effort() {
+        use crate::domain::providers::runtime::RuntimeModelPolicy;
+        let mut compatible = zero_model("chat-free");
+        compatible["limit"]["output"] = json!(25000);
+        compatible["capabilities"]["reasoning"] = json!({"supported":true,"effort":["low","high"]});
+        let mut text_only = compatible.clone();
+        text_only["id"] = json!("text-only-free");
+        text_only["capabilities"]["tools"] = json!({"supported":false});
+        let snapshot = parse_catalog(
+            &json!({"data":[compatible, text_only, zero_model("unknown-free")]}),
+            now_ms(),
+        )
+        .unwrap();
+        let mut catalog = snapshot.view();
+        catalog.stale = false;
+        let passthrough = catalog.claude_code_connections(&RuntimeModelPolicy::Passthrough);
+        assert!(!passthrough.fixed);
+        assert_eq!(passthrough.models.len(), 1);
+        assert_eq!(passthrough.models[0].max_output_tokens, 25000);
+        assert_eq!(passthrough.models[0].effort, "high");
+        let fixed = catalog.claude_code_connections(&RuntimeModelPolicy::Single {
+            upstream_model: " chat-free(low) ".into(),
+        });
+        assert!(fixed.fixed);
+        assert_eq!(fixed.models[0].id, "chat-free");
+        assert_eq!(fixed.models[0].effort, "low");
+        catalog.stale = true;
+        assert!(catalog
+            .claude_code_connections(&RuntimeModelPolicy::Passthrough)
+            .models
+            .is_empty());
     }
 
     #[test]
