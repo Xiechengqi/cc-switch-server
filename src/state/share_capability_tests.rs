@@ -287,6 +287,11 @@ async fn capability_gate_checks_owner_token_grants_and_changed_runtime_before_pr
         .is_none());
     let config = state.config_snapshot().await;
     let providers = state.providers.read().await;
+    let accounts = state.accounts.read().await.clone();
+    let sources = share_capability::ShareCapabilityRuntime {
+        providers: &providers,
+        accounts: &accounts,
+    };
     let mut share = state
         .shares
         .read()
@@ -310,8 +315,7 @@ async fn capability_gate_checks_owner_token_grants_and_changed_runtime_before_pr
             },
             "unpriced-model",
             Some(&plan),
-            &providers,
-            None,
+            sources,
             &config
         )
         .unwrap_err()
@@ -319,15 +323,7 @@ async fn capability_gate_checks_owner_token_grants_and_changed_runtime_before_pr
         .contains("SHARE_CAPABILITY_DISABLED"));
     plan.binding_fingerprint = Some("f".repeat(64));
     assert!(state
-        .check_share_capabilities(
-            &share,
-            &context,
-            "model",
-            Some(&plan),
-            &providers,
-            None,
-            &config
-        )
+        .check_share_capabilities(&share, &context, "model", Some(&plan), sources, &config)
         .unwrap_err()
         .to_string()
         .contains("CAPABILITY_STATE_CHANGED"));
@@ -1082,40 +1078,21 @@ async fn grant_capability_save_is_personal_signed_and_replayable() {
         ..Default::default()
     };
     let config = state.config_snapshot().await;
+    let accounts = state.accounts.read().await.clone();
+    let sources = share_capability::ShareCapabilityRuntime {
+        providers: &providers,
+        accounts: &accounts,
+    };
     assert!(state
-        .check_share_capabilities(
-            &saved,
-            &context,
-            "model",
-            Some(&plan),
-            &providers,
-            None,
-            &config
-        )
+        .check_share_capabilities(&saved, &context, "model", Some(&plan), sources, &config)
         .is_ok());
     context.user_email = Some("public@example.com".into());
     assert!(state
-        .check_share_capabilities(
-            &saved,
-            &context,
-            "model",
-            Some(&plan),
-            &providers,
-            None,
-            &config
-        )
+        .check_share_capabilities(&saved, &context, "model", Some(&plan), sources, &config)
         .is_err());
     context.user_email = Some("owner@example.com".into());
     assert!(state
-        .check_share_capabilities(
-            &saved,
-            &context,
-            "model",
-            Some(&plan),
-            &providers,
-            None,
-            &config
-        )
+        .check_share_capabilities(&saved, &context, "model", Some(&plan), sources, &config)
         .is_err());
 
     let mut conflict = patch;

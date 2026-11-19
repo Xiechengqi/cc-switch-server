@@ -17,6 +17,12 @@ use std::collections::BTreeMap;
 mod grants;
 pub(crate) use grants::migrate_grant_capabilities;
 
+#[derive(Clone, Copy)]
+pub(super) struct ShareCapabilityRuntime<'a> {
+    pub providers: &'a ProviderStore,
+    pub accounts: &'a AccountStore,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityPreviewInput {
@@ -867,14 +873,13 @@ impl ServerStateInner {
     }
     /// Called while holding the same short commit gate as policy writes. Independent of
     /// model pricing success, user quota unit, owner privileges, and health-check flags.
-    pub(crate) fn check_share_capabilities(
+    pub(super) fn check_share_capabilities(
         &self,
         share: &Share,
         context: &UsageLogContext,
         model: &str,
         resource_plan: Option<&ResourcePlan>,
-        providers: &ProviderStore,
-        accounts: Option<&AccountStore>,
+        sources: ShareCapabilityRuntime<'_>,
         config: &ServerConfig,
     ) -> anyhow::Result<()> {
         let email = context.user_email.as_deref();
@@ -925,7 +930,8 @@ impl ServerStateInner {
             .iter()
             .find(|b| b.app == app)
             .context("CAPABILITY_STATE_CHANGED")?;
-        let runtime = providers
+        let runtime = sources
+            .providers
             .runtime_plan(app, &binding.provider_id)
             .context("CAPABILITY_STATE_CHANGED")?;
         let fingerprint = binding_fingerprint(&runtime);
@@ -966,9 +972,9 @@ impl ServerStateInner {
                 );
                 anyhow::ensure!(implemented(&runtime, op)
                     && runtime.configuration_state != crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
-                    && accounts.and_then(|accounts| crate::domain::providers::share_operations::observed_account_state(
-                        &runtime, accounts, op, now_ms() as i64
-                    )) != Some(crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported),
+                    && crate::domain::providers::share_operations::observed_account_state(
+                        &runtime, sources.accounts, op, now_ms() as i64
+                    ) != Some(crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported),
                     "CAPABILITY_NOT_SUPPORTED");
                 anyhow::ensure!(
                     policy

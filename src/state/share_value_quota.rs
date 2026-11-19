@@ -4,6 +4,7 @@
 //! bounded overshoot and never falsely lock a user out. Only grants with an
 //! active `policy.valueQuota` enforce USD; ordinary Token grants retain
 //! independent evidence without reserving USD capacity or requiring a price.
+use super::share_capability::ShareCapabilityRuntime;
 use super::*;
 use crate::domain::sharing::router_contract::{
     PendingValueQuota, ShareGrantManager, ShareTokenPeriod, ShareUserGrant, ShareUserPolicy,
@@ -2234,8 +2235,10 @@ impl ServerStateInner {
                 context,
                 effective_model,
                 resource_plan.as_ref(),
-                &providers,
-                Some(&accounts),
+                ShareCapabilityRuntime {
+                    providers: &providers,
+                    accounts: &accounts,
+                },
                 &config,
             )?;
             if let Some(plan) = resource_plan

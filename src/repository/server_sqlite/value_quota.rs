@@ -1443,25 +1443,32 @@ fn admit_with_trial_in_tx(
             "VALUE_QUOTA_TRIAL_IDENTITY_CONFLICT"
         );
     }
-    // A missing resource price must never discard the known text/model tariff.
-    // policy_epoch is deliberately not part of the identity: a retry after a
-    // policy edit is the same request in the same real window.
-    let existing: Option<(String, String, String, String, String, i64, Option<bool>, String)> = tx
+    struct PreviousAdmission {
+        scope: String,
+        pricing_revision: String,
+        effective_model: String,
+        effective_tier: String,
+        window_id: String,
+        started_at_ms: i64,
+        quota_enforced: Option<bool>,
+        policy_epoch: String,
+    }
+    let existing = tx
         .query_row(
             "SELECT scope,pricing_revision,effective_model,effective_tier,window_id,started_at_ms,quota_enforced,policy_epoch
              FROM value_quota_attempts WHERE request_id=?1 AND attempt_id=?2",
             params![a.request_id, a.attempt_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                ))
+            |row| {
+                Ok(PreviousAdmission {
+                    scope: row.get(0)?,
+                    pricing_revision: row.get(1)?,
+                    effective_model: row.get(2)?,
+                    effective_tier: row.get(3)?,
+                    window_id: row.get(4)?,
+                    started_at_ms: row.get(5)?,
+                    quota_enforced: row.get(6)?,
+                    policy_epoch: row.get(7)?,
+                })
             },
         )
         .optional()?;
@@ -1469,23 +1476,20 @@ fn admit_with_trial_in_tx(
         // Re-pricing replaces the stored revision but records the one the
         // attempt was admitted with; a replay of that admission is the same
         // request, not a conflict.
-        let admitted_revision = old.1 == a.pricing_revision
+        let admitted_revision = old.pricing_revision == a.pricing_revision
             || read_attempt_meta(tx, a.request_id, a.attempt_id)?
                 .and_then(|meta| meta.admission_revision)
                 .is_some_and(|revision| revision == a.pricing_revision);
         ensure!(
-            old.6
-                .or_else(|| (old.7 == "evidence").then_some(false))
+            old.quota_enforced
+                .or_else(|| (old.policy_epoch == "evidence").then_some(false))
                 .is_none_or(|mode| mode == a.enforce)
                 && admitted_revision
-                && (old.0, old.2, old.3, old.4, old.5)
-                    == (
-                        key,
-                        a.effective_model.into(),
-                        a.effective_tier.into(),
-                        a.window.id.clone(),
-                        a.started_at_ms
-                    ),
+                && old.scope == key
+                && old.effective_model == a.effective_model
+                && old.effective_tier == a.effective_tier
+                && old.window_id == a.window.id
+                && old.started_at_ms == a.started_at_ms,
             "VALUE_QUOTA_REQUEST_IDENTITY_CONFLICT"
         );
         if let Some(trial) = trial {
