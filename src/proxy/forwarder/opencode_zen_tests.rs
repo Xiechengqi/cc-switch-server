@@ -200,6 +200,13 @@ fn zen_fixture_sse(payload: Value, wire: super::super::opencode_zen::ZenWire) ->
         .unwrap()
 }
 
+fn zen_hy4_catalog() -> Value {
+    json!({"data":[{"id":"hy4-flash-free","type":"chat",
+        "limit":{"output":65536},"cost":{"text":{"input":{"price":0},"output":{"price":0}}},
+        "api":{"chat-completions":{"base_url":"https://opencode.ai/inference/openai/v1"}},
+        "capabilities":{"reasoning":{"supported":true,"effort":["none","high"]},"tools":{"supported":true}}}]})
+}
+
 #[tokio::test]
 async fn opencode_zen_codex_lite_exec_completes_the_formal_driver_roundtrip() {
     use super::super::opencode_zen as zen;
@@ -215,15 +222,17 @@ async fn opencode_zen_codex_lite_exec_completes_the_formal_driver_roundtrip() {
         async move {
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let sent: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(sent["model"], "chat-free");
+            assert_eq!(sent["model"], "hy4-flash-free");
             assert_eq!(sent["reasoning_effort"], "high");
             assert!(sent.get("reasoning").is_none());
+            assert!(sent.get("text").is_none());
             let tool = sent["tools"].as_array().unwrap().iter().find(|tool| {
                 tool["function"]["description"] == "Synthetic Code Mode tool"
             }).unwrap();
             let name = tool["function"]["name"].as_str().unwrap();
             assert_eq!(tool["function"]["parameters"]["additionalProperties"], false);
             let messages = sent["messages"].as_array().unwrap();
+            assert!(messages.iter().all(|message| message.get("reasoning_content").is_none()));
             if let Some(result) = messages.iter().find(|message| message["role"] == "tool") {
                 assert_eq!(result["tool_call_id"], "synthetic-code-mode");
                 assert!(result["content"].to_string().contains("SYNTHETIC_EXEC_OK"));
@@ -232,7 +241,7 @@ async fn opencode_zen_codex_lite_exec_completes_the_formal_driver_roundtrip() {
                 let args: Value = serde_json::from_str(previous["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
                 assert_eq!(args["input"], source);
                 return zen_fixture_sse(
-                    json!({"id":"chatcmpl_followup","model":"chat-free","choices":[{"index":0,"message":{"role":"assistant","content":"ZEN_CODE_MODE_DONE"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}),
+                    json!({"id":"chatcmpl_followup","model":"hy4-flash-free","choices":[{"index":0,"message":{"role":"assistant","content":"ZEN_CODE_MODE_DONE"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}),
                     zen::ZenWire::Chat,
                 );
             }
@@ -240,7 +249,7 @@ async fn opencode_zen_codex_lite_exec_completes_the_formal_driver_roundtrip() {
             let (first, last) = arguments.split_at(arguments.find("Keep").unwrap());
             let frame = |delta: Value, reason: Value, usage: Value| format!(
                 "data: {}\n\n",
-                json!({"id":"chatcmpl_tool","model":"chat-free","choices":[{"index":0,"delta":delta,"finish_reason":reason}],"usage":usage})
+                json!({"id":"chatcmpl_tool","model":"hy4-flash-free","choices":[{"index":0,"delta":delta,"finish_reason":reason}],"usage":usage})
             );
             let data = [
                 frame(json!({"tool_calls":[{"index":0,"id":"synthetic-code-mode","type":"function","function":{"name":&name[..1],"arguments":first}}]}), Value::Null, Value::Null),
@@ -257,24 +266,27 @@ async fn opencode_zen_codex_lite_exec_completes_the_formal_driver_roundtrip() {
     for stream in [true, false] {
         let mut body = fixture["request"].clone();
         body["stream"] = json!(stream);
+        body["reasoning"] = fixture["defaultControls"]["reasoning"].clone();
+        body["text"] = fixture["defaultControls"]["text"].clone();
         for follow_up in [false, true] {
             if follow_up {
                 body["input"]
                     .as_array_mut()
                     .unwrap()
-                    .extend([fixture["toolCall"].clone(), fixture["toolResult"].clone()]);
+                    .extend([
+                        json!({"type":"reasoning","summary":[{"type":"summary_text","text":"Plain history"}],
+                            "content":null,"encrypted_content":null}),
+                        fixture["toolCall"].clone(), fixture["toolResult"].clone(),
+                    ]);
             }
             let state = forwarder_test_state("zen-codex-lite");
             let mut options = zen_test_options(&state, body.clone()).await;
             options.route = ProxyRoute::CodexResponses;
             Arc::make_mut(&mut options.execution.plan).model_policy =
                 crate::domain::providers::runtime::RuntimeModelPolicy::Single {
-                    upstream_model: "chat-free".into(),
+                    upstream_model: "hy4-flash-free".into(),
                 };
-            zen::store_catalog_payload(&json!({"data":[{"id":"chat-free","type":"chat",
-                "limit":{"output":32000},"cost":{"text":{"input":{"price":0},"output":{"price":0}}},
-                "api":{"chat-completions":{"base_url":"https://opencode.ai/inference/openai/v1"}},
-                "capabilities":{"reasoning":{"supported":true,"effort":["high"]},"tools":{"supported":true}}}]}));
+            zen::store_catalog_payload(&zen_hy4_catalog());
             let response = forward_opencode_zen_at(options, &origin).await.unwrap();
             let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
                 .await
@@ -292,6 +304,12 @@ async fn opencode_zen_codex_lite_exec_completes_the_formal_driver_roundtrip() {
                 serde_json::from_slice(&bytes).unwrap()
             };
             assert_eq!(response["status"], "completed");
+            let usage = state.usage_snapshot().await;
+            let log = usage.request_detail("zen-receipt").unwrap();
+            assert_eq!(log.requested_model.as_deref(), Some("gpt-6.2-sol"));
+            assert_eq!(log.actual_model.as_deref(), Some("hy4-flash-free"));
+            assert_eq!(log.requested_reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(log.effective_reasoning_effort.as_deref(), Some("high"));
             if follow_up {
                 assert!(response.to_string().contains("ZEN_CODE_MODE_DONE"));
             } else {
@@ -405,7 +423,8 @@ async fn opencode_zen_loopback_is_incremental_and_unread_bodies_settle_cancellat
 
 #[tokio::test]
 async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() {
-    let _lock = super::super::opencode_zen::CATALOG_TEST_LOCK.lock().await;
+    use super::super::opencode_zen as zen;
+    let _lock = zen::CATALOG_TEST_LOCK.lock().await;
     let state = forwarder_test_state("zen-continuation");
     use crate::repository::server_sqlite::{self, value_quota as ledger};
     state
@@ -428,7 +447,7 @@ async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() 
         "../../../tests/fixtures/share-value-pricing-v1.json"
     ))
     .unwrap();
-    fixture["snapshot"]["models"]["chat-free"] =
+    fixture["snapshot"]["models"]["hy4-flash-free"] =
         fixture["snapshot"]["models"]["text-model"].clone();
     let snapshot: crate::domain::usage::value_pricing::PricingSnapshot =
         serde_json::from_value(fixture["snapshot"].clone()).unwrap();
@@ -448,20 +467,26 @@ async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() 
     let router = axum::Router::new().fallback(axum::routing::post(move |uri: axum::http::Uri, body: Bytes| {
         let n = count.fetch_add(1, Ordering::SeqCst);
         async move {
-            assert_eq!(uri.path(), "/inference/v1/chat/completions");
+            assert_eq!(uri.path(), "/inference/openai/v1/chat/completions");
             if n == 0 {
                 // A concurrent refresh changes the catalog's route; continuation
                 // must retain the admitted protocol of the original generation.
-                super::super::opencode_zen::store_catalog_payload(&json!({"data":[{
-                    "id":"chat-free","type":"chat","cost":{"input":0,"output":0},
+                zen::store_catalog_payload(&json!({"data":[{
+                    "id":"hy4-flash-free","type":"chat","cost":{"input":0,"output":0},
                     "api":{"messages":{"base_url":"https://opencode.ai/inference/anthropic/v1"}}
                 }]}));
             }
             let sent: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(sent["model"], "chat-free");
+            assert_eq!(sent["model"], "hy4-flash-free");
             assert_eq!(sent["stream"], true);
-            if n == 1 { assert!(sent["messages"].to_string().contains("partial")); }
-            zen_fixture_sse(json!({"id":"chat_1","object":"chat.completion","model":"chat-free","choices":[{"index":0,"message":{"role":"assistant","content":if n==0 {"partial"} else {" rest"}},"finish_reason":if n==0 {"length"} else {"stop"}}],"usage":{"prompt_tokens":10,"completion_tokens":100,"total_tokens":110}}), super::super::opencode_zen::ZenWire::Chat)
+            assert_eq!(sent["reasoning_effort"], "high");
+            assert!(sent.get("text").is_none());
+            assert_eq!(sent["max_completion_tokens"], if n == 0 { 2048 } else { 1948 });
+            let messages = sent["messages"].as_array().unwrap();
+            assert!(messages.iter().any(|message| message["content"] == "prior answer"));
+            assert!(messages.iter().all(|message| message.get("reasoning_content").is_none()));
+            if n == 1 { assert!(messages.iter().any(|message| message["content"] == "partial")); }
+            zen_fixture_sse(json!({"id":"chat_1","object":"chat.completion","model":"hy4-flash-free","choices":[{"index":0,"message":{"role":"assistant","content":if n==0 {"partial"} else {" rest"}},"finish_reason":if n==0 {"length"} else {"stop"}}],"usage":{"prompt_tokens":10,"completion_tokens":100,"total_tokens":110}}), zen::ZenWire::Chat)
         }
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -469,11 +494,20 @@ async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() 
     let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    let mut options = zen_test_options(&state, json!({"model":"downstream-alias","stream":false,"max_tokens":2048,"messages":[{"role":"user","content":"hi"}]})).await;
+    let request = json!({"model":"hy4-flash-free","stream":false,"max_output_tokens":2048,
+    "reasoning":{"effort":"low","context":"all_turns"},"text":{"verbosity":"low"},"input":[
+        {"type":"message","role":"user","content":"earlier question"},
+        {"type":"reasoning","summary":[{"type":"summary_text","text":"earlier reasoning"}]},
+        {"type":"message","role":"assistant","content":"prior answer"},
+        {"type":"message","role":"user","content":"hi"}
+    ]});
+    let mut options = zen_test_options(&state, request.clone()).await;
+    options.route = ProxyRoute::CodexResponses;
     Arc::make_mut(&mut options.execution.plan).model_policy =
         crate::domain::providers::runtime::RuntimeModelPolicy::Single {
-            upstream_model: "chat-free".into(),
+            upstream_model: "hy4-flash-free".into(),
         };
+    zen::store_catalog_payload(&zen_hy4_catalog());
     state.mutate_shares_immediate(|store| {
         store.shares.push(serde_json::from_value(json!({
             "id":"zen-share","app":"codex","providerId":"zen-loopback","providerType":"opencode_zen","ownerEmail":"owner@example.test","enabled":true,"status":"active",
@@ -485,14 +519,17 @@ async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() 
     options.request_context.user_email = Some("owner@example.test".into());
     options.request_context.started_at_ms = Some(current_time_ms());
     options.request_context.quota_app = Some(AppKind::Codex);
+    let execution = options.execution.clone();
+    let context = options.request_context.clone();
     let response = forward_opencode_zen_at(options, &origin).await.unwrap();
     let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap();
     let response: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(response["choices"][0]["message"]["content"], "partial rest");
-    assert_eq!(response["usage"]["prompt_tokens"], 20);
-    assert_eq!(response["usage"]["completion_tokens"], 200);
+    assert_eq!(response["status"], "completed");
+    assert_eq!(response["output_text"], "partial rest");
+    assert_eq!(response["usage"]["input_tokens"], 20);
+    assert_eq!(response["usage"]["output_tokens"], 200);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let log = state
         .usage_snapshot()
@@ -503,6 +540,8 @@ async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() 
     assert_eq!(log.output_tokens, Some(200));
     assert_eq!(log.input_tokens, Some(20));
     assert_eq!(log.attempt_count, 2);
+    assert_eq!(log.requested_reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(log.effective_reasoning_effort.as_deref(), Some("high"));
     assert_eq!(log.value_generation_usage.unwrap().output_tokens, Some(100));
     let db = rusqlite::Connection::open(server_sqlite::database_path(&state.config_dir)).unwrap();
     let mut query = db.prepare("SELECT attempt_id,usage_picos FROM value_quota_attempts WHERE request_id='zen-receipt' ORDER BY attempt_id").unwrap();
@@ -528,6 +567,29 @@ async fn opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage() 
             .count(),
         1
     );
+
+    let mut invalid = request;
+    invalid["input"][1]["encrypted_content"] = json!("opaque");
+    let mut rejected = zen_test_options(&state, invalid).await;
+    rejected.route = ProxyRoute::CodexResponses;
+    rejected.execution = execution;
+    rejected.request_context = context;
+    rejected.request_context.request_id = Some("zen-rejected".into());
+    zen::store_catalog_payload(&zen_hy4_catalog());
+    let error = forward_opencode_zen_at(rejected, &origin)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, 400);
+    assert_eq!(error.error_param(), Some("reasoning.context"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let attempts: u64 = db
+        .query_row(
+            "SELECT count(*) FROM value_quota_attempts WHERE request_id='zen-rejected'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 0);
     server.abort();
 }
 
@@ -595,34 +657,31 @@ async fn opencode_zen_loopback_rate_limit_is_not_replayed_or_leaked() {
 
 #[test]
 fn opencode_zen_continuation_uses_remaining_budget_and_rejects_tools() {
+    use super::super::opencode_zen as zen;
     let request = json!({"model":"chat-free","max_tokens":1000,"messages":[]});
     let first = json!({"choices":[{"message":{"content":"prefix"},"finish_reason":"length"}],"usage":{"completion_tokens":100}});
-    let prepared = zen_continuation_request(
-        &request,
-        ProxyRoute::CodexChatCompletions,
-        &super::super::opencode_zen::ZenAdmission {
-            endpoint: super::super::opencode_zen::CatalogEndpoint::LegacyChat,
-            capabilities: Default::default(),
-            stale: false,
-            context_window: None,
-            max_output_tokens: None,
-        },
-        super::super::opencode_zen::ContinuationKind::MaxTokens,
+    let admitted = zen::ZenAdmission {
+        endpoint: zen::CatalogEndpoint::LegacyChat,
+        capabilities: Default::default(),
+        stale: false,
+        context_window: None,
+        max_output_tokens: None,
+    };
+    let mut initial =
+        zen::prepare_for_model(&request, ProxyRoute::CodexChatCompletions, &admitted, None)
+            .unwrap();
+    let prepared = zen::prepare_continuation(
+        &mut initial,
+        &admitted,
+        zen::ContinuationKind::MaxTokens,
         &first,
         tokio::time::Instant::now() + Duration::from_secs(10),
     )
-    .unwrap()
-    .unwrap()
-    .1;
+    .unwrap();
     let payload: Value = serde_json::from_slice(&prepared.body).unwrap();
     assert_eq!(payload["max_completion_tokens"], 900);
     let mut tool = json!({"choices":[{"message":{"content":"","tool_calls":[{"id":"bad"}]}}]});
-    assert!(zen_merge_continuation(
-        &first,
-        &mut tool,
-        super::super::opencode_zen::ContinuationKind::MaxTokens
-    )
-    .is_err());
+    assert!(zen_merge_continuation(&first, &mut tool, zen::ContinuationKind::MaxTokens).is_err());
 }
 
 #[tokio::test]
@@ -826,6 +885,37 @@ async fn opencode_zen_fixed_models_choose_upstream_wire_before_conversion() {
 }
 
 #[tokio::test]
+async fn opencode_zen_fixed_codex_stale_catalog_returns_retryable_preflight() {
+    use super::super::opencode_zen as zen;
+    let _lock = zen::CATALOG_TEST_LOCK.lock().await;
+    let state = forwarder_test_state("zen-fixed-codex-stale");
+    let mut options = zen_test_options(
+        &state,
+        json!({
+            "model":"gpt-6.2-sol","input":"hi","reasoning":{"effort":"low"}
+        }),
+    )
+    .await;
+    options.route = ProxyRoute::CodexResponses;
+    Arc::make_mut(&mut options.execution.plan).model_policy =
+        crate::domain::providers::runtime::RuntimeModelPolicy::Single {
+            upstream_model: "hy4-flash-free".into(),
+        };
+    zen::store_stale_catalog_payload(&zen_hy4_catalog());
+    let error = forward_opencode_zen_at(options, "http://127.0.0.1:9")
+        .await
+        .unwrap_err();
+    zen::clear_catalog();
+    assert_eq!(error.status, 503);
+    assert!(error.message.contains("catalog is temporarily unavailable"));
+    assert!(error.retryable());
+    let usage = state.usage_snapshot().await;
+    let log = usage.request_detail("zen-receipt").unwrap();
+    assert_eq!(log.usage_state, UsageState::NotApplicable);
+    assert_eq!(log.failure_kind.as_deref(), Some("zen_preflight_rejected"));
+}
+
+#[tokio::test]
 async fn opencode_zen_catalog_wait_obeys_total_deadline_and_records_preflight_failure_once() {
     use super::super::opencode_zen as zen;
     let _lock = zen::CATALOG_TEST_LOCK.lock().await;
@@ -914,21 +1004,23 @@ fn opencode_zen_does_not_append_a_second_schema_document_to_a_truncated_answer()
     use super::super::opencode_zen as zen;
     let request = json!({"model":"chat-free","messages":[],"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}});
     let first = json!({"choices":[{"message":{"content":"{\"partial\":"},"finish_reason":"length"}],"usage":{"completion_tokens":100}});
-    let admitted = zen::ZenAdmission {
+    let mut admitted = zen::ZenAdmission {
         endpoint: zen::CatalogEndpoint::Chat,
         capabilities: Default::default(),
         stale: false,
         context_window: None,
         max_output_tokens: None,
     };
-    assert!(zen_continuation_request(
-        &request,
-        ProxyRoute::CodexChatCompletions,
+    admitted.capabilities.structured_output = Some(true);
+    let mut initial =
+        zen::prepare_for_model(&request, ProxyRoute::CodexChatCompletions, &admitted, None)
+            .unwrap();
+    assert!(zen::prepare_continuation(
+        &mut initial,
         &admitted,
         zen::ContinuationKind::MaxTokens,
         &first,
         tokio::time::Instant::now() + Duration::from_secs(2)
     )
-    .unwrap()
     .is_none());
 }

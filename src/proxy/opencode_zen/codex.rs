@@ -1,4 +1,4 @@
-use super::{catalog::ZenAdmission, controls::parameter_error, ZenWire};
+use super::{catalog::ZenAdmission, catalog_unavailable, controls::parameter_error, ZenWire};
 use crate::proxy::{
     transforms::{response_input_items, response_tools_from_request},
     ProxyError,
@@ -24,13 +24,14 @@ SOURCE: /[\s\S]+/
 pub(super) fn prepare_bridge(
     request: &mut Value,
     admitted: &ZenAdmission,
-) -> Result<bool, ProxyError> {
-    scope_reasoning(request, admitted)?;
+    fixed_model: bool,
+) -> Result<(bool, usize), ProxyError> {
+    let omitted = scope_reasoning(request, admitted, fixed_model)?;
     let exec = normalize_exec_declaration(request, admitted)?;
     if exec {
         validate_exec_history(request)?;
     }
-    Ok(exec)
+    Ok((exec, omitted))
 }
 
 fn reasoning_error(message: &str) -> ProxyError {
@@ -41,32 +42,49 @@ fn is_user_turn(item: &Value) -> bool {
     item["role"] == "user" && (item["content"].is_string() || item["content"].is_array())
 }
 
-fn scope_reasoning(request: &mut Value, admitted: &ZenAdmission) -> Result<(), ProxyError> {
-    let Some(value) = request.pointer("/reasoning/context") else {
-        return Ok(());
-    };
-    if value.is_null() {
-        return Ok(());
+fn scope_reasoning(
+    request: &mut Value,
+    admitted: &ZenAdmission,
+    fixed_model: bool,
+) -> Result<usize, ProxyError> {
+    let explicit_scope = request
+        .pointer("/reasoning/context")
+        .filter(|value| !value.is_null());
+    if explicit_scope.is_none() && !fixed_model {
+        return Ok(0);
     }
-    let scope = value
-        .as_str()
-        .filter(|scope| matches!(*scope, "auto" | "current_turn" | "all_turns"))
-        .ok_or_else(|| reasoning_error("expects auto, current_turn or all_turns"))?;
-    let current_turn = scope == "current_turn";
-    let automatic = scope == "auto";
+    let scope = explicit_scope
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|scope| matches!(*scope, "auto" | "current_turn" | "all_turns"))
+                .ok_or_else(|| reasoning_error("expects auto, current_turn or all_turns"))
+        })
+        .transpose()?;
+    let current_turn = scope == Some("current_turn");
+    let automatic = scope == Some("auto");
+    let explicit = scope.is_some();
     let Some(input) = request.get_mut("input") else {
-        return Ok(());
+        return Ok(0);
     };
     let items = match input {
         Value::Array(items) => items.as_mut_slice(),
         Value::Object(_) => std::slice::from_mut(input),
-        _ => return Ok(()),
+        _ => return Ok(0),
     };
-    let boundary = items.iter().rposition(is_user_turn);
-    let chat_replay = admitted.endpoint.wire() == ZenWire::Chat
+    let boundary = current_turn
+        .then(|| items.iter().rposition(is_user_turn))
+        .flatten();
+    let outside_scope = |index| boundary.is_some_and(|last| index < last);
+    let chat = admitted.endpoint.wire() == ZenWire::Chat;
+    let fixed_chat = fixed_model && chat;
+    let chat_replay = chat
         && !admitted.stale
         && admitted.capabilities.reasoning == Some(true)
         && admitted.capabilities.chat_reasoning_content;
+    let omit_plain_history = fixed_chat && !chat_replay;
+    let mut omitted = 0;
+    let mut scoped_text = false;
     for (index, item) in items.iter().enumerate() {
         match item["type"].as_str() {
             Some("compaction" | "context_compaction" | "compaction_trigger" | "item_reference") => {
@@ -74,13 +92,18 @@ fn scope_reasoning(request: &mut Value, admitted: &ZenAdmission) -> Result<(), P
                     "cannot retain opaque or referenced reasoning history on this model/protocol",
                 ));
             }
-            Some("reasoning") if current_turn && boundary.is_some_and(|last| index < last) => {}
+            Some("reasoning") if outside_scope(index) => {}
             Some("reasoning") => {
                 let has_text = plain_reasoning_item(item).ok_or_else(|| {
                     reasoning_error("cannot retain opaque or unsupported reasoning history on this model/protocol")
                 })?;
-                if has_text && (automatic || !chat_replay) {
-                    return Err(reasoning_error("cannot preserve the requested reasoning scope on this model/protocol. Select the bound Zen model in Codex CLI"));
+                if fixed_chat {
+                    scoped_text |= has_text;
+                    omitted += usize::from(omit_plain_history);
+                } else if has_text && explicit && (automatic || !chat_replay) {
+                    return Err(reasoning_error(
+                        "cannot preserve the requested reasoning scope on this model/protocol",
+                    ));
                 }
             }
             _ if ["reasoning", "reasoning_content", "reasoning_text"]
@@ -94,15 +117,23 @@ fn scope_reasoning(request: &mut Value, admitted: &ZenAdmission) -> Result<(), P
             _ => {}
         }
     }
-    if let (true, Some(last), Value::Array(items)) = (current_turn, boundary, input) {
-        let mut index = 0;
-        items.retain(|item| {
-            let keep = index >= last || item["type"] != "reasoning";
-            index += 1;
-            keep
-        });
+    if fixed_chat && admitted.stale && scoped_text {
+        return Err(catalog_unavailable());
     }
-    Ok(())
+    if boundary.is_some() || omitted != 0 {
+        if let Value::Array(items) = input {
+            let mut index = 0;
+            items.retain(|item| {
+                let keep =
+                    item["type"] != "reasoning" || (!outside_scope(index) && !omit_plain_history);
+                index += 1;
+                keep
+            });
+        } else {
+            *input = json!([]);
+        }
+    }
+    Ok(omitted)
 }
 
 fn plain_reasoning_item(item: &Value) -> Option<bool> {
@@ -123,7 +154,7 @@ fn plain_reasoning_item(item: &Value) -> Option<bool> {
                     {
                         return None;
                     }
-                    has_text |= !part["text"].as_str()?.is_empty();
+                    has_text |= !part["text"].as_str()?.trim().is_empty();
                 }
             }
             _ => return None,
@@ -145,12 +176,13 @@ pub(super) fn validate_chat_replay(request: &Value, chat: &Value) -> Result<(), 
             continue;
         }
         let text = crate::proxy::reasoning_bridge::reasoning_summary_text(item);
+        let text = text.trim();
         if text.is_empty() {
             continue;
         }
         loop {
             if target_turn == source_turn {
-                if let Some(offset) = rest.find(&text) {
+                if let Some(offset) = rest.find(text) {
                     rest = &rest[offset + text.len()..];
                     break;
                 }

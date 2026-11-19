@@ -16,15 +16,19 @@
 
 本 Driver 不实现 Responses 持久化资源；`store:true` 和 `previous_response_id` 显式拒绝，调用方须提供完整历史。目录仅公布受审的文本/工具能力，不开放未经实测的图像/音频能力。
 
-Codex CLI 的 Responses 客户端封装与生成控制分别处理：`client_metadata` 只接受字符串值对象或 null，作为会话/窗口记账信息在出站前移除，不传给 Zen，也不作为上游 session 权威。`reasoning.summary=auto` 与 `text.verbosity=medium` 按中性默认值兼容；Chat/Messages 不因这些默认值额外启用推理或改写提示词。`include=["reasoning.encrypted_content"]` 是可选输出投影，Chat/Messages 没有 OpenAI 密文时不发送该投影，也不伪造密文。原生 Responses 在新鲜推理声明下保留 summary，原生投影按原值保留。显式 effort、JSON Schema、strict 工具与不支持的非默认 summary/verbosity 仍受原有能力约束。
+Codex CLI 的 Responses 客户端封装与生成控制分别处理。`client_metadata` 只接受字符串值对象或 null，作为会话和窗口记账信息在出站前移除。`reasoning.summary=auto` 与 `text.verbosity=medium` 兼容上游默认行为。`include=["reasoning.encrypted_content"]` 是可选输出投影，仅在原生 Responses 保留。原生 Responses 在新鲜推理声明下保留 summary。显式推理摘要、JSON Schema 与 strict 工具按实际协议和模型能力校验。
 
 本通道没有托管 Web 搜索；Codex CLI 若启用 `web_search` 工具，会明确提示关闭该项，可为该供应商使用 `codex -c 'web_search="disabled"'`。普通客户端 function 工具及既有 namespace/custom 映射不受影响。卡片的精简 curl 检测不代表已覆盖 CLI 全部字段；本仓另用完整 Codex 0.169 请求形状覆盖三上游协议和流/非流路径，CI 显式运行 Zen 模块回归。
 
 ## Codex CLI 连接与 Responses Lite
 
-在 Router Share 的「连接」弹窗展开 Codex CLI 配置。固定模式显示实际绑定模型，透传模式列出有效目录中具备兼容 CLI 推理档位的免费模型。用 Share API Key 设置 `TOKENSWITCH_API_KEY`，再运行启动或验证命令。命令显式选择 HTTP Responses、当前模型和推理档位，例如 `hy4-flash-free` 的 `high`。命令还设置默认摘要和中性 verbosity，并关闭托管 Web 搜索。
+Router Share 的「连接」弹窗提供新连接使用的 Codex CLI 命令。固定模式显示实际绑定模型，透传模式列出有效目录中具备兼容 CLI 推理档位的免费模型。用 Share API Key 设置 `TOKENSWITCH_API_KEY` 后即可运行启动或验证命令。
 
-Codex 0.170.0 选用 GPT-6.2 别名时可能携带 Responses Lite 的 `reasoning.context` 和 `additional_tools`。Server 校验推理范围和目标协议。在 Chat 目标提供新鲜的明文推理回放声明时，检查所需的思考文本确实出现在对应回合。HY4 的目录目前只声明推理档位。需要回放其无法表示的历史时，返回 `reasoning.context` 字段及连接提示。显式档位与 verbosity 仍符合实际模型的能力。
+固定上游模型的 Responses 请求可以继续使用原有 Codex 模型别名、默认参数和会话。Server 校验客户端传入的档位类型、值与冲突。绑定后缀固定可用档位，其余请求优先使用模型声明的同名档位，或按 `minimal → low → medium → high → xhigh → max` 选最近的档位，等距取较低一档。HY4 把 `low` 和 `medium` 映射为 `high`。省略档位时采用绑定后缀或上游默认。显式 `none` 仅在原生 Messages 有新鲜的禁用能力声明时映射到 `thinking.type=disabled`。透传模式按目标模型的实际档位校验。
+
+固定模式对 `low`、`medium`、`high` verbosity 使用上游默认，并独立校验 `text.format`。Codex 0.170.0 的 Responses Lite 可能携带 `reasoning.context` 和 `additional_tools`。Chat 在新鲜目录声明 `reasoning_content` 时，Server 验证明文推理出现在所需回合。`current_turn` 仅保留最近一轮的推理，`all_turns`、`auto` 或缺省允许回放完整明文历史。HY4 等缺少回放声明的 Chat 目标仅省略经过结构校验的明文推理项，并保留对话消息、工具调用标识和结果。作用域要求回放的密文、压缩历史和远端历史引用收到明确错误。依赖目录声明的适配在目录过期或刷新失败时返回可重试错误。
+
+请求日志分别记录客户端请求的档位和实际发出的档位，Router 可显示 `low → high`。verbosity 回退与明文推理省略在调试日志中使用固定原因和计数。
 
 当前审计过的 Codex 0.170.0 内置 `functions.exec` 声明可桥接到 Chat 目标。完整参数包含唯一的非空 `input` 字符串，源码和可选 pragma 由 CLI 在原有权限下处理。Server 在收到干净的 SSE 终态后交付完整工具调用，保留跨分片的普通工具名和 Code Mode 调用标识。遗失、冲突或无法验证的 Code Mode 参数和结果收到明确错误。
 
@@ -56,7 +60,7 @@ Chat 必须有合法 finish_reason 与 `[DONE]`；HY4 已确认会在完整用�
 
 ## 一次非流续写与计量
 
-仅对 Chat 上游的纯推理中断、仅推理正常结束及输出上限截断评估一次续写，不在已提交 SSE 中发起第二次生成。显式结构化输出、stop 或强制工具选择不做拼接续写，保留原有不完整结果。续写须有实际 output usage、至少 512 剩余 token、上下文检查点符合本地保守上限且总时间尚有余量；第二段最多 8192 token，不重置请求总预算。没有 usage 时不猜测剩余预算。
+仅对 Chat 上游的纯推理中断、仅推理正常结束及输出上限截断评估一次非流式续写。显式结构化输出、stop 或强制工具选择保留原有不完整结果。续写复用首轮的 Chat 历史、已映射的控制和目录快照，并要求实际 output usage、至少 512 剩余 token、上下文检查点符合本地保守上限且总时间尚有余量。第二段最多使用 8192 token，并受请求总预算约束。
 
 截断回答保留第一段并追加续写，不以第二段替换第一段。不同生成的 usage 相加，同次 SSE 累计 usage 由公共累积器去重；Messages 采用 Exclusive 输入语义。续写失败保留有效首段及原有截断状态，无有效回答时返回失败。工具生成不会触发续写；续写意外调用工具会失败，不执行工具。
 

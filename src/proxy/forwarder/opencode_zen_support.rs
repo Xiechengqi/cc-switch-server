@@ -122,6 +122,14 @@ async fn forward_opencode_zen_inner(
         ..Default::default()
     };
     execution.enforce_model_policy(&mut routed)?;
+    let fixed_codex = (route == ProxyRoute::CodexResponses
+        && matches!(
+            execution.plan.model_policy,
+            crate::domain::providers::runtime::RuntimeModelPolicy::Single { .. }
+        ))
+    .then_some(zen::FixedCodexModel {
+        requested_model: routed.requested_model.as_deref(),
+    });
     let mut requested: Value = serde_json::from_slice(&routed.body)
         .map_err(|_| ProxyError::bad_request("OpenCode Zen request must be a JSON object"))?;
     let map = requested
@@ -165,17 +173,33 @@ async fn forward_opencode_zen_inner(
         status: StatusCode::GATEWAY_TIMEOUT,
         message: "OpenCode Zen catalog deadline exceeded".into(),
     })?
-    .map_err(ProxyError::bad_gateway)?;
-    let admitted = catalog.admit(&model).map_err(ProxyError::bad_request)?;
-    let mut prepared = zen::prepare_for_model(&requested, route, &admitted)?;
-    request_context.requested_reasoning_effort =
-        zen::requested_effort(&requested).map(str::to_string);
-    request_context.effective_reasoning_effort = request_context.requested_reasoning_effort.clone();
+    .map_err(|error| {
+        if fixed_codex.is_some() {
+            zen::catalog_unavailable()
+        } else {
+            ProxyError::bad_gateway(error)
+        }
+    })?;
+    let admitted = catalog.admit(&model).map_err(|error| {
+        if fixed_codex.is_some() && catalog.stale {
+            zen::catalog_unavailable()
+        } else {
+            ProxyError::bad_request(error)
+        }
+    })?;
+    let mut prepared = zen::prepare_for_model(&requested, route, &admitted, fixed_codex)?;
+    let include_usage = requested
+        .pointer("/stream_options/include_usage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    drop(requested);
+    request_context.requested_reasoning_effort = prepared.adaptations.requested_effort.take();
+    request_context.effective_reasoning_effort = prepared.adaptations.effective_effort.take();
     ensure_share_model_available(
         &state,
         &execution,
         request_context.share_id.as_deref(),
-        Some(&model),
+        Some(zen::base_model_id(&model)),
     )
     .await?;
     // Provision/verify before marking a generation sent or reserving its USD
@@ -222,6 +246,16 @@ async fn forward_opencode_zen_inner(
     )
     .await;
     *logged = true;
+    if prepared.adaptations.defaulted_verbosity || prepared.adaptations.omitted_plain_reasoning != 0
+    {
+        tracing::debug!(
+            %request_id,
+            verbosity = ?prepared.adaptations.defaulted_verbosity.then_some("upstream_default"),
+            history = ?(prepared.adaptations.omitted_plain_reasoning != 0).then_some("chat_reasoning_replay_unavailable"),
+            omitted_reasoning_items = prepared.adaptations.omitted_plain_reasoning,
+            "adapted OpenCode Zen fixed-model Codex controls"
+        );
+    }
     // Preserve one request identity. Each attempt owns its own evidence; the
     // public aggregate log carries a separate current-generation observation.
     let mut evidence_context = request_context.clone();
@@ -363,14 +397,13 @@ async fn forward_opencode_zen_inner(
             && !guard.usage.snapshot().response_model.conflict
         {
             if let Some(kind) = zen::continuation_kind(&payload) {
-                if let Some((next, continuation)) = zen_continuation_request(
-                    &requested,
-                    route,
+                if let Some(continuation) = zen::prepare_continuation(
+                    &mut prepared,
                     &admitted,
                     kind,
                     &payload,
                     total_deadline,
-                )? {
+                ) {
                     let continuation_result = async {
                         series
                             .lock()
@@ -497,7 +530,6 @@ async fn forward_opencode_zen_inner(
                             }
                         }
                     }
-                    drop(next);
                 }
             }
         }
@@ -554,10 +586,6 @@ async fn forward_opencode_zen_inner(
     }
     let upstream =
         upstream.ok_or_else(|| ProxyError::bad_gateway("OpenCode Zen missing stream"))?;
-    let include_usage = requested
-        .pointer("/stream_options/include_usage")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let mut decoder = zen::ZenStream::new(
         &stored,
         route,
@@ -889,96 +917,6 @@ fn zen_validate_json(
     wire: super::opencode_zen::ZenWire,
 ) -> Result<(), ProxyError> {
     super::opencode_zen::validate_json(payload, wire)
-}
-
-fn zen_continuation_request(
-    requested: &Value,
-    route: ProxyRoute,
-    admitted: &super::opencode_zen::ZenAdmission,
-    kind: super::opencode_zen::ContinuationKind,
-    payload: &Value,
-    deadline: tokio::time::Instant,
-) -> Result<Option<(Value, super::opencode_zen::PreparedUpstream)>, ProxyError> {
-    use super::opencode_zen as zen;
-    if deadline.saturating_duration_since(tokio::time::Instant::now()) < Duration::from_secs(1) {
-        return Ok(None);
-    }
-    // A new schema-constrained document or a user stop sequence is not a
-    // suffix of a truncated answer. Preserve the original incomplete result.
-    if [
-        requested.get("response_format"),
-        requested.pointer("/text/format"),
-        requested.pointer("/output_config/format"),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|f| f["type"] != "text")
-        || requested.get("stop").is_some()
-        || requested.get("stop_sequences").is_some()
-        || requested.get("tool_choice").is_some_and(|c| {
-            c.as_str() != Some("auto") && c.get("type").and_then(Value::as_str) != Some("auto")
-        })
-    {
-        return Ok(None);
-    }
-    let canonical = match route {
-        ProxyRoute::ClaudeMessages => zen::claude_continuation_chat(requested, admitted)?,
-        ProxyRoute::CodexResponses => zen::codex_continuation_chat(requested, admitted)?,
-        _ => requested.clone(),
-    };
-    let total = zen::output_limit(requested, Some(admitted), route)?;
-    let used = payload
-        .pointer("/usage/completion_tokens")
-        .and_then(Value::as_u64);
-    // Without an actual usage receipt, no second generation is authorized by
-    // an invented remaining token budget.
-    let Some(used) = used else {
-        return Ok(None);
-    };
-    let remaining = total.saturating_sub(used).min(8192);
-    if remaining < 512 {
-        return Ok(None);
-    }
-    let Some(messages) = zen::continuation_messages(&canonical, kind, payload) else {
-        return Ok(None);
-    };
-    // Local conservative context guard; do not claim an unmeasured model window.
-    if serde_json::to_vec(&messages).map_or(true, |bytes| bytes.len() > 128 * 1024) {
-        return Ok(None);
-    }
-    let mut next = canonical;
-    let map = next
-        .as_object_mut()
-        .ok_or_else(|| ProxyError::bad_request("invalid Zen continuation request"))?;
-    for key in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
-        map.remove(key);
-    }
-    map.insert("model".into(), requested["model"].clone());
-    map.insert("stream".into(), Value::Bool(false));
-    map.insert("messages".into(), messages);
-    map.insert("max_completion_tokens".into(), remaining.into());
-    // Preserve reviewed controls from the ingress, then run the same capability
-    // gate and fixed endpoint as generation one. No second catalog read.
-    for key in zen::control_keys() {
-        next.as_object_mut().unwrap().remove(*key);
-    }
-    for key in zen::control_keys() {
-        if let Some(value) = requested.get(*key) {
-            next[*key] = value.clone();
-        }
-    }
-    if route == ProxyRoute::CodexResponses {
-        if let Some(reasoning) = next.get_mut("reasoning").and_then(Value::as_object_mut) {
-            reasoning.remove("context");
-        }
-    }
-    let Ok(prepared) = zen::prepare_for_model(&next, ProxyRoute::CodexChatCompletions, admitted)
-    else {
-        // The optional continuation may no longer satisfy a thinking/output
-        // budget. No second call has started; keep the valid first segment.
-        return Ok(None);
-    };
-    Ok(Some((next, prepared)))
 }
 
 fn zen_merge_continuation(

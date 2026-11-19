@@ -1,5 +1,21 @@
 # Protocol evidence policy
 
+## 2026-11-19 OpenCode Zen fixed-model Codex defaults
+
+Request `51873f43-04d9-4b5a-bf0e-c4b5ccc28a2e` selected the OpenCode Zen Share bound to `hy4-flash-free`. Server resolved the upstream model and rejected `reasoning.effort` locally before a generation attempt. The error listed `high` as the only positive rung. The production log has no original effort value. A synthetic turn with official Codex CLI 0.170.0 sent `low` effort, `low` verbosity and `all_turns` with `gpt-6.2-sol`.
+
+The read-only zen-gate reference at `58fa1b7` uses model-declared effort menus in `internal/gateway/effort_rungs.go`. Server validates fixed-model Codex Responses controls and uses its own catalog snapshot to select the nearest declared positive rung. A valid operator suffix pins an admitted effort. The existing native Messages toggle handles `none` when declared. The HY4 wire keeps `high`, defaults verbosity, and omits validated plain reasoning when its Chat protocol lacks a replay declaration. Declared Chat reasoning replay is checked against the corresponding user turn. Optional continuation uses the first validated Chat request's controls and history.
+
+Official Codex CLI 0.170.0 passed eight scenarios through an isolated Router `61e091b` Share tunnel, Server based on `816ead5`, and a controlled HTTPS Zen upstream using the pinned Bun 1.4.4 transport. The CLI used its default effort and verbosity for existing fixed-model connections. Both `gpt-6.2-sol` and `gpt-6.2-astra` sent `low` effort and `low` verbosity. Their HY4 Code Mode and session resumption requests sent `high` to Zen, preserving the tool call IDs and results. The HY4 path omitted plain reasoning in four requests. DeepSeek received plain reasoning on the tool follow-up and resumed turn and preserved `low`. Direct model, passthrough and ordinary tool cases also completed. All 16 generations delivered a completed SSE terminal and the Router persisted the matching requested and effective effort and token counts. The Server binary passed all ten local HTTP smoke steps.
+
+The behavior-tested `src` and `tests` digest is `9c4d2a5d4faf33fae7395682cdef76afe6795fa031c4361722d2ba7717d5a107` for 503 sorted paths using path, NUL, contents, NUL. Server binary SHA-256 is `89c8ccd85bcc9f8f73b62706f021d18840495cc807924663181884fb37fd7c0f`. Router binary SHA-256 is `875bae7e6aa5bccc509b66f9a9db550d86f3952c87ebea1aa58dfc91e6d2fd0c`. Rustfmt then reordered two catalog imports. The final formatted source digest is `bf7e9e80c3c2e42198cd980cc8fadac9747b332e2f317a9037e8655f490ce66c`.
+
+`cargo test --locked --all-targets --no-fail-fast -- --test-threads=4` passed 4,597 library tests, 139 API contract tests and both independent integration targets, with five default ignores. Both opt-in pinned Bun transport tests passed separately. The Router's 49 Share model probe and connection tests passed.
+
+`cargo check --locked` and `scripts/static-checks.sh` passed. Static checks covered strict all-target Clippy, 2,205 Node audits, 13 smoke-script tests and 448 Web tests. Offline release readiness reported zero check failures and `blocked_inputs` with the release inputs unavailable and its local test step disabled.
+
+The public Zen catalog returned HY4's `none` and `high` declarations and DeepSeek's `reasoning_content` declaration. A single real HY4 request with the unchanged `gpt-6.2-sol` defaults reached Zen and received HTTP 429 `free_usage_limit` with `Retry-After`. The CLI received a retryable upstream limit error. Real generation stays `live_pending`. The isolated Router and Server processes exited after the receipts.
+
 ## 2026-11-19 OpenCode Zen Codex Responses Lite compatibility
 
 The deployed Server at `f04eb68` selected OpenCode Zen and returned a local HTTP 400 before creating a generation attempt for request `ed66252f-fe07-4b6e-9780-0163723fae55`. Router `2405038` had the Share bound to `hy4-flash-free`. The error snapshot contains the rejection response and request ID. The fixture reconstructs the shape observed in a separate synthetic turn from official Codex CLI 0.170.0.

@@ -177,7 +177,7 @@ fn declared_capabilities(row: &Value, endpoint: Option<CatalogEndpoint>) -> ZenM
         reasoning_toggle: c.pointer("/reasoning/toggle").and_then(Value::as_bool),
         reasoning_efforts: words(
             c.pointer("/reasoning/effort"),
-            &["minimal", "low", "medium", "high", "xhigh", "max"],
+            super::controls::EFFORT_RUNGS,
         ),
         chat_reasoning_content: endpoint.is_some_and(|e| e.wire() == ZenWire::Chat)
             && api
@@ -335,11 +335,7 @@ impl ZenModelCatalogView {
                 } else {
                     None
                 };
-                let suffix = selection
-                    .trim()
-                    .strip_suffix(')')
-                    .and_then(|s| s.rsplit_once('('))
-                    .map(|(_, effort)| effort.trim());
+                let suffix = super::effort_suffix(selection);
                 let efforts: &[&str] = if app == AppKind::Claude {
                     &["high", "medium", "low", "xhigh", "max"]
                 } else {

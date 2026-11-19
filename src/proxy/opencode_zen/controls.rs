@@ -1,6 +1,9 @@
 //! Model/protocol-aware controls. Unrepresentable semantics fail before send;
 //! neither the generic bridges nor fingerprint shaping may silently weaken them.
-use super::{catalog::ZenAdmission, ZenWire};
+use super::{
+    catalog::ZenAdmission, catalog_unavailable, effort_suffix, FixedCodexModel, RequestAdaptations,
+    ZenWire,
+};
 use crate::proxy::{transforms::response_input_items, ProxyError, ProxyRoute};
 use serde_json::{json, Map, Value};
 
@@ -30,20 +33,165 @@ pub(super) fn parameter_error(parameter: &str, message: &str) -> ProxyError {
     ))
 }
 
-pub(in crate::proxy) fn requested_effort(request: &Value) -> Option<&str> {
-    request
-        .get("reasoning_effort")
-        .or_else(|| request.pointer("/reasoning/effort"))
-        .or_else(|| request.pointer("/output_config/effort"))
-        .or_else(|| request.pointer("/thinking/effort"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            let model = request.get("model")?.as_str()?.trim();
-            model
-                .strip_suffix(')')?
-                .rsplit_once('(')
-                .map(|(_, suffix)| suffix.trim())
-        })
+pub(super) const EFFORT_RUNGS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+
+fn effort_rank(effort: &str) -> Option<usize> {
+    EFFORT_RUNGS.iter().position(|&rung| rung == effort)
+}
+
+fn source_effort<'a>(
+    request: &'a Value,
+    model: Option<&'a str>,
+    route: ProxyRoute,
+) -> Result<Option<&'a str>, ProxyError> {
+    let mut effort = None;
+    for explicit in [
+        request.get("reasoning_effort"),
+        request.pointer("/reasoning/effort"),
+        request.pointer("/output_config/effort"),
+        request.pointer("/thinking/effort"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        effort = Some(
+            explicit
+                .as_str()
+                .filter(|value| effort.is_none_or(|prior| prior == *value))
+                .ok_or_else(|| {
+                    if route == ProxyRoute::CodexResponses {
+                        parameter_error(
+                            "reasoning.effort",
+                            "requires matching reasoning effort strings",
+                        )
+                    } else {
+                        ProxyError::bad_request(
+                            "OpenCode Zen reasoning effort values must be matching strings",
+                        )
+                    }
+                })?,
+        );
+    }
+    let suffix = model.and_then(effort_suffix);
+    if suffix
+        .zip(effort)
+        .is_some_and(|(suffix, effort)| suffix != effort)
+    {
+        return Err(if route == ProxyRoute::CodexResponses {
+            parameter_error(
+                "reasoning.effort",
+                "conflicts with the request model's effort suffix",
+            )
+        } else {
+            ProxyError::bad_request("OpenCode Zen model suffix and reasoning effort conflict")
+        });
+    }
+    Ok(effort.or(suffix))
+}
+
+struct EffortSelection<'a> {
+    requested: Option<&'a str>,
+    effective: Option<&'a str>,
+}
+
+fn select_effort<'a>(
+    request: &'a Value,
+    route: ProxyRoute,
+    admitted: &'a ZenAdmission,
+    fixed_codex: Option<FixedCodexModel<'a>>,
+) -> Result<EffortSelection<'a>, ProxyError> {
+    let model = request.get("model").and_then(Value::as_str);
+    let requested = source_effort(
+        request,
+        fixed_codex.map_or(model, |fixed| fixed.requested_model),
+        route,
+    )?;
+    let pinned = fixed_codex.and_then(|_| model.and_then(effort_suffix));
+    let mut selection = EffortSelection {
+        requested,
+        effective: pinned.or(requested),
+    };
+    let Some(effort) = selection.effective else {
+        return Ok(selection);
+    };
+
+    let caps = &admitted.capabilities;
+    if fixed_codex.is_some() {
+        if requested.is_some_and(|value| value != "none" && effort_rank(value).is_none()) {
+            return Err(parameter_error(
+                "reasoning.effort",
+                "has an unknown effort value",
+            ));
+        }
+        if pinned.is_some_and(|value| value != "none" && effort_rank(value).is_none()) {
+            return Err(parameter_error(
+                "reasoning.effort",
+                "has an invalid fixed upstream effort suffix",
+            ));
+        }
+        if requested == Some("none") && effort != "none" {
+            return Err(parameter_error(
+                "reasoning.effort",
+                "cannot disable reasoning with the fixed upstream effort suffix",
+            ));
+        }
+        if admitted.stale {
+            return Err(catalog_unavailable());
+        }
+        if effort == "none" {
+            if admitted.endpoint.wire() == ZenWire::Messages
+                && caps.reasoning == Some(true)
+                && caps.reasoning_toggle == Some(true)
+            {
+                return Ok(selection);
+            }
+            return Err(parameter_error(
+                "reasoning.effort",
+                "has no reviewed reasoning-disable mapping for the resolved model",
+            ));
+        }
+    }
+    if route == ProxyRoute::CodexResponses && (admitted.stale || caps.reasoning != Some(true)) {
+        return Err(parameter_error(
+            "reasoning.effort",
+            "requires a current reasoning capability for the resolved model",
+        ));
+    }
+    require(caps.reasoning, admitted.stale, "reasoning effort")?;
+    if caps.reasoning_efforts.iter().any(|rung| rung == effort) {
+        return Ok(selection);
+    }
+    if let Some(rank) = effort_rank(effort).filter(|_| fixed_codex.is_some() && pinned.is_none()) {
+        let nearest = caps
+            .reasoning_efforts
+            .iter()
+            .filter_map(|rung| effort_rank(rung).map(|position| (position, rung.as_str())))
+            .min_by_key(|(position, _)| (position.abs_diff(rank), *position));
+        if let Some((_, nearest)) = nearest {
+            selection.effective = Some(nearest);
+            return Ok(selection);
+        }
+    }
+
+    let model = model.map(super::base_model_id).unwrap_or("");
+    let menu = caps.reasoning_efforts.join(", ");
+    if route == ProxyRoute::CodexResponses {
+        let control = if pinned.is_some() {
+            "fixed upstream effort suffix"
+        } else {
+            "reasoning effort"
+        };
+        return Err(parameter_error(
+            "reasoning.effort",
+            &format!("{control} is not in the model menu for {model} (available: {menu})"),
+        ));
+    }
+    if route == ProxyRoute::ClaudeMessages && !menu.is_empty() {
+        return Err(ProxyError::bad_request(format!(
+            "OpenCode Zen reasoning effort is not in the model menu for {model}; available: {menu}"
+        )));
+    }
+    Err(unsupported("reasoning effort is not in the model menu"))
 }
 
 fn require(supported: Option<bool>, stale: bool, parameter: &str) -> Result<(), ProxyError> {
@@ -215,7 +363,8 @@ pub(super) fn translate(
     request: &Value,
     route: ProxyRoute,
     admitted: &ZenAdmission,
-) -> Result<Map<String, Value>, ProxyError> {
+    fixed_codex: Option<FixedCodexModel<'_>>,
+) -> Result<(Map<String, Value>, RequestAdaptations), ProxyError> {
     let object = request
         .as_object()
         .ok_or_else(|| ProxyError::bad_request("OpenCode Zen request must be an object"))?;
@@ -371,84 +520,20 @@ pub(super) fn translate(
             value,
         );
     }
-    let effort = requested_effort(request);
-    let suffix = request
-        .get("model")
-        .and_then(Value::as_str)
-        .and_then(|m| m.trim().strip_suffix(')'))
-        .and_then(|m| m.rsplit_once('('))
-        .map(|(_, e)| e.trim());
-    if suffix.is_some() && suffix != effort {
-        if route == ProxyRoute::CodexResponses {
-            return Err(parameter_error(
-                "reasoning.effort",
-                "conflicts with the bound model's effort suffix",
-            ));
-        }
-        return Err(ProxyError::bad_request(
-            "OpenCode Zen model suffix and reasoning effort conflict",
-        ));
-    }
-    for explicit in [
-        request.get("reasoning_effort"),
-        request.pointer("/reasoning/effort"),
-        request.pointer("/output_config/effort"),
-        request.pointer("/thinking/effort"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if explicit.as_str().is_none() || explicit.as_str() != effort {
-            if route == ProxyRoute::CodexResponses {
-                return Err(parameter_error(
-                    "reasoning.effort",
-                    "requires matching reasoning effort strings",
-                ));
-            }
-            return Err(ProxyError::bad_request(
-                "OpenCode Zen reasoning effort values must be matching strings",
-            ));
-        }
-    }
+    let selection = select_effort(request, route, admitted, fixed_codex)?;
+    let effort = selection.effective;
     if let Some(effort) = effort {
-        if route == ProxyRoute::CodexResponses && (admitted.stale || caps.reasoning != Some(true)) {
-            return Err(parameter_error(
-                "reasoning.effort",
-                "requires a current reasoning capability for the resolved model",
-            ));
-        }
-        require(caps.reasoning, admitted.stale, "reasoning effort")?;
-        if !caps.reasoning_efforts.iter().any(|e| e == effort) {
-            if route == ProxyRoute::ClaudeMessages && !caps.reasoning_efforts.is_empty() {
-                let model = request["model"]
-                    .as_str()
-                    .map(super::base_model_id)
-                    .unwrap_or("");
-                return Err(ProxyError::bad_request(format!(
-                    "OpenCode Zen reasoning effort is not in the model menu for {model}; available: {}",
-                    caps.reasoning_efforts.join(", ")
-                )));
-            }
-            if route == ProxyRoute::CodexResponses {
-                let model = request["model"]
-                    .as_str()
-                    .map(super::base_model_id)
-                    .unwrap_or("");
-                return Err(parameter_error("reasoning.effort", &format!(
-                    "reasoning effort is not in the model menu for {model} (available: {}). Select the bound Zen model in Codex CLI",
-                    caps.reasoning_efforts.join(", ")
-                )));
-            }
-            return Err(unsupported("reasoning effort is not in the model menu"));
-        }
-        match wire {
-            ZenWire::Chat => {
+        match (wire, effort) {
+            (ZenWire::Chat, _) => {
                 out.insert("reasoning_effort".into(), json!(effort));
             }
-            ZenWire::Responses => {
+            (ZenWire::Responses, _) => {
                 out.insert("reasoning".into(), json!({"effort":effort}));
             }
-            ZenWire::Messages => {
+            (ZenWire::Messages, "none") => {
+                out.insert("thinking".into(), json!({"type":"disabled"}));
+            }
+            (ZenWire::Messages, _) => {
                 out.insert("output_config".into(), json!({"effort":effort}));
             }
         }
@@ -471,15 +556,20 @@ pub(super) fn translate(
             out.entry("reasoning").or_insert_with(|| json!({}))["summary"] = json!(summary);
         }
     }
+    let mut defaulted_verbosity = false;
     if let Some(verbosity) = request
         .pointer("/text/verbosity")
         .filter(|value| !value.is_null())
     {
-        if verbosity.as_str() != Some("medium") {
-            return Err(parameter_error(
-                "text.verbosity",
-                "supports the neutral medium verbosity. Select the bound Zen model in Codex CLI",
-            ));
+        match verbosity.as_str() {
+            Some("medium") => {}
+            Some("low" | "high") if fixed_codex.is_some() => defaulted_verbosity = true,
+            _ => {
+                return Err(parameter_error(
+                    "text.verbosity",
+                    "has no reviewed mapping for the requested value",
+                ))
+            }
         }
     }
     if let Some(thinking) = request.get("thinking") {
@@ -508,9 +598,15 @@ pub(super) fn translate(
                 "OpenCode Zen thinking budget requires type enabled",
             ));
         }
-        if kind == Some("disabled") && effort.is_some() {
+        if kind == Some("disabled") && effort.is_some_and(|value| value != "none") {
             return Err(ProxyError::bad_request(
                 "OpenCode Zen disabled thinking conflicts with reasoning effort",
+            ));
+        }
+        if has_native && kind != Some("disabled") && effort == Some("none") {
+            return Err(parameter_error(
+                "reasoning.effort",
+                "conflicts with enabled thinking",
             ));
         }
         match kind {
@@ -640,7 +736,15 @@ pub(super) fn translate(
         // Applied after the shared tool-choice bridge has run.
         out.insert("parallel_tool_calls".into(), json!(parallel));
     }
-    Ok(out)
+    Ok((
+        out,
+        RequestAdaptations {
+            requested_effort: selection.requested.map(str::to_owned),
+            effective_effort: effort.map(str::to_owned),
+            defaulted_verbosity,
+            ..Default::default()
+        },
+    ))
 }
 
 pub(super) fn apply(
@@ -702,8 +806,31 @@ pub(super) fn apply(
 mod tests {
     use super::*;
     use crate::proxy::opencode_zen::{
-        catalog::ZenModelCapabilities, prepare_for_model, CatalogEndpoint,
+        catalog::ZenModelCapabilities, CatalogEndpoint, PreparedUpstream,
     };
+
+    fn prepare_for_model(
+        request: &Value,
+        route: ProxyRoute,
+        admitted: &ZenAdmission,
+    ) -> Result<PreparedUpstream, ProxyError> {
+        super::super::prepare_for_model(request, route, admitted, None)
+    }
+
+    fn prepare_fixed(
+        request: &Value,
+        admitted: &ZenAdmission,
+        requested_model: &str,
+    ) -> Result<PreparedUpstream, ProxyError> {
+        super::super::prepare_for_model(
+            request,
+            ProxyRoute::CodexResponses,
+            admitted,
+            Some(FixedCodexModel {
+                requested_model: Some(requested_model),
+            }),
+        )
+    }
 
     fn admission(endpoint: CatalogEndpoint) -> ZenAdmission {
         ZenAdmission {
@@ -753,6 +880,209 @@ mod tests {
         request["top_p"] = json!(0.9);
         request["parallel_tool_calls"] = json!(false);
         request
+    }
+
+    #[test]
+    fn opencode_zen_fixed_codex_effort_uses_the_current_target_menu() {
+        let mut model = admission(CatalogEndpoint::Chat);
+        let mut request = json!({"model":"hy4-flash-free","input":"hello"});
+        for (menu, incoming, effective) in [
+            (&["high"][..], "low", "high"),
+            (&["high"][..], "medium", "high"),
+            (&["max", "high", "low"][..], "medium", "low"),
+            (&["max", "high", "low"][..], "xhigh", "high"),
+            (&["max", "high", "low"][..], "low", "low"),
+        ] {
+            model.capabilities.reasoning_efforts = menu.iter().map(|rung| (*rung).into()).collect();
+            request["reasoning"] = json!({"effort":incoming});
+            let prepared = prepare_fixed(&request, &model, "gpt-6.2-sol").unwrap();
+            let sent: Value = serde_json::from_slice(&prepared.body).unwrap();
+            assert_eq!(sent["reasoning_effort"], effective);
+            assert_eq!(
+                prepared.adaptations.requested_effort.as_deref(),
+                Some(incoming)
+            );
+            assert_eq!(
+                prepared.adaptations.effective_effort.as_deref(),
+                Some(effective)
+            );
+        }
+
+        request["model"] = json!("hy4-flash-free(high)");
+        let prepared = prepare_fixed(&request, &model, "gpt-6.2-astra(low)").unwrap();
+        assert_eq!(
+            prepared.adaptations.requested_effort.as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            prepared.adaptations.effective_effort.as_deref(),
+            Some("high")
+        );
+        let sent: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(sent["model"], "hy4-flash-free");
+        assert_eq!(sent["reasoning_effort"], "high");
+        model.capabilities.reasoning_efforts = vec!["low".into()];
+        let error = prepare_fixed(&request, &model, "gpt-6.2-astra").unwrap_err();
+        assert!(error.message.contains("fixed upstream effort suffix"));
+
+        request["model"] = json!("hy4-flash-free");
+        request.as_object_mut().unwrap().remove("reasoning");
+        model.stale = true;
+        let prepared = prepare_fixed(&request, &model, "gpt-6.2-astra").unwrap();
+        let sent: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert!(sent.get("reasoning_effort").is_none());
+        assert!(prepared.adaptations.requested_effort.is_none());
+        assert!(prepared.adaptations.effective_effort.is_none());
+    }
+
+    #[test]
+    fn opencode_zen_fixed_codex_validates_effort_before_applying_the_operator_pin() {
+        let model = admission(CatalogEndpoint::Chat);
+        for (client_model, fields) in [
+            ("gpt-6.2-sol", json!({"reasoning":{"effort":null}})),
+            ("gpt-6.2-sol", json!({"reasoning":{"effort":5}})),
+            ("gpt-6.2-sol", json!({"reasoning":{"effort":"future"}})),
+            (
+                "gpt-6.2-sol",
+                json!({"reasoning":{"effort":"medium"},"reasoning_effort":"low"}),
+            ),
+            ("gpt-6.2-sol(high)", json!({"reasoning":{"effort":"low"}})),
+            ("gpt-6.2-sol", json!({"reasoning":{"effort":"none"}})),
+        ] {
+            let mut request = json!({"model":"hy4-flash-free(high)","input":"hello"});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let error = prepare_fixed(&request, &model, client_model).unwrap_err();
+            assert_eq!(error.error_param(), Some("reasoning.effort"));
+            assert!(!error.retryable());
+        }
+        let request =
+            json!({"model":"hy4-flash-free","input":"hello","reasoning":{"effort":"none"}});
+        let error = prepare_fixed(&request, &model, "gpt-6.2-sol").unwrap_err();
+        assert!(error
+            .message
+            .contains("no reviewed reasoning-disable mapping"));
+
+        let mut native = admission(CatalogEndpoint::Messages);
+        let prepared = prepare_fixed(&request, &native, "gpt-6.2-sol").unwrap();
+        let sent: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(sent["thinking"], json!({"type":"disabled"}));
+        assert_eq!(
+            prepared.adaptations.effective_effort.as_deref(),
+            Some("none")
+        );
+        native.capabilities.reasoning_toggle = None;
+        assert_eq!(
+            prepare_fixed(&request, &native, "gpt-6.2-sol")
+                .unwrap_err()
+                .error_param(),
+            Some("reasoning.effort")
+        );
+    }
+
+    #[test]
+    fn opencode_zen_fixed_codex_verbosity_keeps_response_format_validation() {
+        let mut model = admission(CatalogEndpoint::Chat);
+        let mut request = json!({"model":"hy4-flash-free","input":"hello","text":{
+            "verbosity":"low","format":{"type":"json_schema","name":"result","schema":{"type":"object"}}
+        }});
+        for verbosity in ["low", "medium", "high"] {
+            request["text"]["verbosity"] = json!(verbosity);
+            let prepared = prepare_fixed(&request, &model, "gpt-6.2-sol").unwrap();
+            let sent: Value = serde_json::from_slice(&prepared.body).unwrap();
+            assert_eq!(
+                sent["response_format"]["json_schema"]["schema"],
+                json!({"type":"object"})
+            );
+            assert!(sent.get("text").is_none());
+            assert_eq!(
+                prepared.adaptations.defaulted_verbosity,
+                verbosity != "medium"
+            );
+        }
+        request["text"]["verbosity"] = json!(true);
+        assert_eq!(
+            prepare_fixed(&request, &model, "gpt-6.2-sol")
+                .unwrap_err()
+                .error_param(),
+            Some("text.verbosity")
+        );
+        request["text"]["verbosity"] = json!("high");
+        model.capabilities.structured_output = None;
+        assert!(prepare_fixed(&request, &model, "gpt-6.2-sol")
+            .unwrap_err()
+            .message
+            .contains("structured output"));
+    }
+
+    #[test]
+    fn opencode_zen_fixed_codex_validates_scoped_history_before_omitting_plain_items() {
+        let mut model = admission(CatalogEndpoint::Chat);
+        let thought = |text| {
+            json!({"type":"reasoning","content":null,"encrypted_content":null,
+                "summary":[{"type":"summary_text","text":text}]
+            })
+        };
+        let mut request = json!({"model":"fixed-free","reasoning":{"context":"all_turns"},"input":[
+            {"type":"message","role":"user","content":"question one"},
+            thought("older reasoning"),
+            {"type":"message","role":"assistant","content":"answer one"},
+            {"type":"message","role":"user","content":"question two"},
+            thought("\ncurrent reasoning \t"),
+            {"type":"message","role":"assistant","content":"answer two"}
+        ]});
+        for (scope, earlier) in [("all_turns", true), ("auto", true), ("current_turn", false)] {
+            request["reasoning"]["context"] = json!(scope);
+            let prepared = prepare_fixed(&request, &model, "gpt-6.2-astra").unwrap();
+            let sent: Value = serde_json::from_slice(&prepared.body).unwrap();
+            let messages = sent["messages"].as_array().unwrap();
+            let replies: Vec<_> = messages
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .collect();
+            assert_eq!(
+                replies[0]["reasoning_content"].as_str(),
+                earlier.then_some("older reasoning")
+            );
+            assert_eq!(replies[1]["reasoning_content"], "current reasoning");
+        }
+        model.capabilities.chat_reasoning_content = false;
+        request["reasoning"]["context"] = json!("all_turns");
+        let prepared = prepare_fixed(&request, &model, "gpt-6.2-astra").unwrap();
+        let sent: Value = serde_json::from_slice(&prepared.body).unwrap();
+        let messages = sent["messages"].as_array().unwrap();
+        assert!(messages
+            .iter()
+            .all(|message| message.get("reasoning_content").is_none()));
+        assert!(messages
+            .iter()
+            .any(|message| message["content"] == "answer one"));
+        assert!(messages
+            .iter()
+            .any(|message| message["content"] == "answer two"));
+        assert_eq!(prepared.adaptations.omitted_plain_reasoning, 2);
+
+        request.as_object_mut().unwrap().remove("reasoning");
+        request["input"][4]["encrypted_content"] = json!("opaque");
+        let error = prepare_fixed(&request, &model, "gpt-6.2-astra").unwrap_err();
+        assert_eq!(error.error_param(), Some("reasoning.context"));
+        for kind in ["item_reference", "compaction", "compaction_trigger"] {
+            request["input"][4] = json!({"type":kind,"id":"remote-item"});
+            assert_eq!(
+                prepare_fixed(&request, &model, "gpt-6.2-astra")
+                    .unwrap_err()
+                    .error_param(),
+                Some("reasoning.context")
+            );
+        }
+        request["input"][4] = thought("current reasoning");
+        model.stale = true;
+        model.capabilities.chat_reasoning_content = true;
+        let error = prepare_fixed(&request, &model, "gpt-6.2-astra").unwrap_err();
+        assert_eq!(error.status, 503);
+        assert!(error.retryable());
     }
 
     #[test]

@@ -116,6 +116,14 @@ pub fn base_model_id(model: &str) -> &str {
     trimmed
 }
 
+fn effort_suffix(model: &str) -> Option<&str> {
+    model
+        .trim()
+        .strip_suffix(')')?
+        .rsplit_once('(')
+        .map(|(_, effort)| effort.trim())
+}
+
 #[cfg(test)]
 pub fn wire_for(model: &str) -> ZenWire {
     catalog_endpoint(model).map_or_else(|| legacy_wire_for(model), CatalogEndpoint::wire)
@@ -731,6 +739,21 @@ pub struct PreparedUpstream {
     pub client_tool_names: std::collections::BTreeSet<String>,
     pub(super) response_tools: super::transforms::ResponsesToolContext,
     pub(super) codex_exec_tool: Option<String>,
+    pub(super) adaptations: RequestAdaptations,
+    continuation: Option<Value>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RequestAdaptations {
+    pub(super) requested_effort: Option<String>,
+    pub(super) effective_effort: Option<String>,
+    pub(super) defaulted_verbosity: bool,
+    pub(super) omitted_plain_reasoning: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct FixedCodexModel<'a> {
+    pub(super) requested_model: Option<&'a str>,
 }
 
 /// Translate a Claude Messages or OpenAI Chat/Responses body onto the wire
@@ -806,6 +829,8 @@ fn prepare_upstream_at(
         client_tool_names,
         response_tools: Default::default(),
         codex_exec_tool: None,
+        adaptations: Default::default(),
+        continuation: None,
     })
 }
 
@@ -902,15 +927,22 @@ pub(super) fn prepare_for_route(
     route: super::ProxyRoute,
     endpoint: CatalogEndpoint,
 ) -> Result<PreparedUpstream, super::ProxyError> {
-    prepare_for_route_inner(requested, route, endpoint, None)
+    prepare_for_route_inner(requested, route, endpoint, None, None)
 }
 
 pub(super) fn prepare_for_model(
     requested: &Value,
     route: super::ProxyRoute,
     admitted: &catalog::ZenAdmission,
+    fixed_codex: Option<FixedCodexModel<'_>>,
 ) -> Result<PreparedUpstream, super::ProxyError> {
-    prepare_for_route_inner(requested, route, admitted.endpoint, Some(admitted))
+    prepare_for_route_inner(
+        requested,
+        route,
+        admitted.endpoint,
+        Some(admitted),
+        fixed_codex,
+    )
 }
 
 fn prepare_for_route_inner(
@@ -918,6 +950,7 @@ fn prepare_for_route_inner(
     route: super::ProxyRoute,
     endpoint: CatalogEndpoint,
     admitted: Option<&catalog::ZenAdmission>,
+    fixed_codex: Option<FixedCodexModel<'_>>,
 ) -> Result<PreparedUpstream, super::ProxyError> {
     validate_source_request(requested)?;
     if tool_choice_rejected(requested) {
@@ -933,15 +966,15 @@ fn prepare_for_route_inner(
     // Controls are handled by this driver. In particular, a generic bridge
     // must not turn structured output into an extra prompt instruction.
     let mut bridge_request = requested.clone();
-    let codex_exec = match (route, admitted) {
+    let (codex_exec, omitted_plain_reasoning) = match (route, admitted) {
         (super::ProxyRoute::ClaudeMessages, Some(admitted)) => {
             claude::prepare_bridge(&mut bridge_request, admitted)?;
-            false
+            (false, 0)
         }
         (super::ProxyRoute::CodexResponses, Some(admitted)) => {
-            codex::prepare_bridge(&mut bridge_request, admitted)?
+            codex::prepare_bridge(&mut bridge_request, admitted, fixed_codex.is_some())?
         }
-        _ => false,
+        _ => (false, 0),
     };
     let control_source = if route == super::ProxyRoute::CodexResponses {
         &bridge_request
@@ -949,7 +982,7 @@ fn prepare_for_route_inner(
         requested
     };
     let mapped_controls = admitted
-        .map(|admitted| controls::translate(control_source, route, admitted))
+        .map(|admitted| controls::translate(control_source, route, admitted, fixed_codex))
         .transpose()?;
     if admitted.is_some() {
         if let Some(map) = bridge_request.as_object_mut() {
@@ -984,9 +1017,10 @@ fn prepare_for_route_inner(
     if target == F::OpenAiChat
         && source == F::OpenAiResponses
         && admitted.is_some()
-        && requested
-            .pointer("/reasoning/context")
-            .is_some_and(|value| !value.is_null())
+        && (fixed_codex.is_some()
+            || requested
+                .pointer("/reasoning/context")
+                .is_some_and(|value| !value.is_null()))
     {
         codex::validate_chat_replay(bridge, &converted)?;
     }
@@ -1008,9 +1042,12 @@ fn prepare_for_route_inner(
     converted[key] = Value::from(limit);
     // Client bookkeeping and active cache hints do not belong on the Zen wire.
     strip_client_transport_hints(&mut converted);
-    if let Some(controls) = mapped_controls {
-        controls::apply(&mut converted, bridge, controls, endpoint.wire());
-    }
+    let mut adaptations =
+        mapped_controls.map_or_else(RequestAdaptations::default, |(controls, adaptations)| {
+            controls::apply(&mut converted, bridge, controls, endpoint.wire());
+            adaptations
+        });
+    adaptations.omitted_plain_reasoning = omitted_plain_reasoning;
     let exec = if codex_exec {
         let name = response_tools
             .chat_name_for_response_function(codex::EXEC_NAME, Some(codex::EXEC_NAMESPACE));
@@ -1036,6 +1073,14 @@ fn prepare_for_route_inner(
             .find_map(|(alias, original)| (original == &name).then(|| alias.clone()))
             .unwrap_or(name)
     });
+    prepared.adaptations = adaptations;
+    if admitted.is_some()
+        && prepared.wire == ZenWire::Chat
+        && !prepared.stream
+        && allows_continuation(requested)
+    {
+        prepared.continuation = Some(converted);
+    }
     Ok(prepared)
 }
 
@@ -1302,34 +1347,52 @@ pub(super) fn output_limit(
     Ok(limit)
 }
 
-pub(super) fn claude_continuation_chat(
-    requested: &Value,
-    admitted: &catalog::ZenAdmission,
-) -> Result<Value, super::ProxyError> {
-    let mut bridge = requested.clone();
-    claude::prepare_bridge(&mut bridge, admitted)?;
-    super::transforms::anthropic_to_openai_chat_preserving_history(
-        &bridge,
-        claude::replay_chat_thinking(admitted),
-    )
-    .map_err(|error| super::ProxyError::bad_request(error.to_string()))
+fn allows_continuation(requested: &Value) -> bool {
+    // A schema-constrained document, a user stop sequence or a forced tool
+    // choice cannot be satisfied by appending a second answer.
+    let constrained_format = [
+        requested.get("response_format"),
+        requested.pointer("/text/format"),
+        requested.pointer("/output_config/format"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|format| format["type"] != "text");
+    let stop = requested.get("stop").is_some() || requested.get("stop_sequences").is_some();
+    let forced_tool = requested
+        .get("tool_choice")
+        .is_some_and(|choice| choice.as_str() != Some("auto") && choice["type"] != "auto");
+    !constrained_format && !stop && !forced_tool
 }
 
-pub(super) fn codex_continuation_chat(
-    requested: &Value,
+pub(super) fn prepare_continuation(
+    prepared: &mut PreparedUpstream,
     admitted: &catalog::ZenAdmission,
-) -> Result<Value, super::ProxyError> {
-    let mut bridge = requested.clone();
-    codex::prepare_bridge(&mut bridge, admitted)?;
-    let chat = super::transforms::openai_responses_to_chat(&bridge)
-        .map_err(|error| super::ProxyError::bad_request(error.to_string()))?;
-    if bridge
-        .pointer("/reasoning/context")
-        .is_some_and(|value| !value.is_null())
+    kind: ContinuationKind,
+    payload: &Value,
+    deadline: tokio::time::Instant,
+) -> Option<PreparedUpstream> {
+    if deadline.saturating_duration_since(tokio::time::Instant::now())
+        < std::time::Duration::from_secs(1)
     {
-        codex::validate_chat_replay(&bridge, &chat)?;
+        return None;
     }
-    Ok(chat)
+    // Reuse the validated Chat request before tool renames and system shaping.
+    // Use the actual usage receipt to authorize only the remaining output.
+    let mut next = prepared.continuation.take()?;
+    let used = payload.pointer("/usage/completion_tokens")?.as_u64()?;
+    let remaining = requested_limit(&next)?.saturating_sub(used).min(8192);
+    if remaining < 512 {
+        return None;
+    }
+    let messages = continuation_messages(&next, kind, payload)?;
+    // Keep the existing conservative context ceiling for a second generation.
+    if serde_json::to_vec(&messages).ok()?.len() > 128 * 1024 {
+        return None;
+    }
+    next["messages"] = messages;
+    next["max_completion_tokens"] = remaining.into();
+    prepare_upstream_at(&next, admitted.endpoint).ok()
 }
 
 fn requested_limit(requested: &Value) -> Option<u64> {
@@ -1742,6 +1805,9 @@ mod catalog;
 mod controls;
 mod lane;
 mod validation;
+pub(super) use catalog::CatalogEndpoint;
+#[cfg(test)]
+pub(super) use catalog::ZenAdmission;
 pub(crate) use catalog::ZenCliConnections;
 #[cfg(test)]
 use catalog::{catalog_endpoint, catalog_free_status};
@@ -1751,13 +1817,16 @@ pub(crate) use catalog::{
     store_catalog, store_catalog_payload, store_stale_catalog_payload,
 };
 pub use catalog::{refresh_model_catalog, CATALOG_PATH};
-pub(super) use catalog::{CatalogEndpoint, ZenAdmission};
-pub(super) use controls::requested_effort;
-pub(super) fn control_keys() -> &'static [&'static str] {
-    controls::KEYS
-}
 pub(super) use lane::{acquire as acquire_lane, observe_error as observe_lane_error};
 pub(super) use validation::{client_tools as validate_client_tools, validate as validate_json};
+
+pub(super) fn catalog_unavailable() -> super::ProxyError {
+    super::ProxyError {
+        status: http::StatusCode::SERVICE_UNAVAILABLE,
+        message: "OpenCode Zen catalog is temporarily unavailable for fixed-model Codex Responses"
+            .into(),
+    }
+}
 
 /// A 429 alone proves throttling, not quota exhaustion or a reset window.
 /// Failures are not replayed; reminting sessions cannot restore allowance.
