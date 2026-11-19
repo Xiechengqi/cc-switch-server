@@ -12,10 +12,11 @@ async fn capability_test_state() -> ServerState {
         .record_router_quota_capability(
             &config,
             client::RouterShareCapabilities {
-                share_contract_version: 13,
+                share_contract_version: 14,
                 capabilities: vec![
                     "usdEquivalentQuotaV1".into(),
                     "shareCapabilityPolicyV1".into(),
+                    "shareGrantCapabilitiesV1".into(),
                 ],
             },
         )
@@ -43,6 +44,9 @@ async fn capability_test_state() -> ServerState {
                 .iter_mut()
                 .find(|s| s.id == "cap-share")
                 .unwrap();
+            // Explicit v13 fixture for the historical settings and migration tests.
+            share.grant_capabilities = None;
+            share.capability_policy = Some(Default::default());
             share.token_limit = Some(1_000_000);
             share.tokens_used = 42;
         })
@@ -195,7 +199,13 @@ async fn capability_policy_is_atomic_replayable_and_preserves_history() {
         .get("cap-share")
         .unwrap()
         .clone();
-    assert_eq!(before_replay.capability_policy, saved.capability_policy);
+    assert!(before_replay.capability_policy.is_none());
+    let migrated = before_replay.grant_capabilities.as_ref().unwrap();
+    assert_eq!(migrated.len(), 1);
+    assert_eq!(
+        migrated["owner@example.com"].allowed_operations,
+        vec![crate::domain::sharing::capabilities::ShareOperation::WebSearch]
+    );
     assert_eq!(before_replay.tokens_used, 42);
     assert_eq!(
         restored
@@ -301,6 +311,7 @@ async fn capability_gate_checks_owner_token_grants_and_changed_runtime_before_pr
             "unpriced-model",
             Some(&plan),
             &providers,
+            None,
             &config
         )
         .unwrap_err()
@@ -308,7 +319,15 @@ async fn capability_gate_checks_owner_token_grants_and_changed_runtime_before_pr
         .contains("SHARE_CAPABILITY_DISABLED"));
     plan.binding_fingerprint = Some("f".repeat(64));
     assert!(state
-        .check_share_capabilities(&share, &context, "model", Some(&plan), &providers, &config)
+        .check_share_capabilities(
+            &share,
+            &context,
+            "model",
+            Some(&plan),
+            &providers,
+            None,
+            &config
+        )
         .unwrap_err()
         .to_string()
         .contains("CAPABILITY_STATE_CHANGED"));
@@ -932,4 +951,278 @@ async fn capability_only_edit_preserves_scheduled_financial_terms_usage_and_acti
     let active = &activated.get("cap-share").unwrap().user_grants["owner@example.com"];
     assert!(active.pending_value_quota.is_none());
     assert_eq!(active.policy, pending.policy);
+}
+
+#[tokio::test]
+async fn grant_capability_save_is_personal_signed_and_replayable() {
+    use crate::domain::sharing::capabilities::{
+        CapabilityConsent, GrantCapabilityEdit, ShareOperation,
+    };
+    use crate::domain::sharing::router_contract::{
+        ShareSettingsEditContext, ShareSettingsPatch, ShareUserGrantEdit, ShareUserPolicy,
+    };
+    let state = capability_test_state().await;
+    let providers = state.providers.read().await.clone();
+    assert_eq!(
+        state
+            .mutate_shares_immediate(|store| {
+                assert_eq!(
+                    share_capability::migrate_grant_capabilities(store, &providers),
+                    1
+                );
+                share_capability::migrate_grant_capabilities(store, &providers)
+            })
+            .await
+            .unwrap(),
+        0
+    );
+
+    let before = state.shares.read().await.get("cap-share").unwrap().clone();
+    let email = "alice@example.com";
+    let operation = ShareOperation::WebSearch;
+    let quota_edits = BTreeMap::from([(
+        email.into(),
+        ShareUserGrantEdit {
+            expected_revision: 0,
+            policy: Some(ShareUserPolicy::default()),
+        },
+    )]);
+    let capability_edits = BTreeMap::from([(
+        email.into(),
+        GrantCapabilityEdit {
+            expected_revision: 0,
+            operations: vec![operation],
+            reconfirm: vec![],
+        },
+    )]);
+    let preview = state
+        .preview_share_permissions(
+            "cap-share",
+            json!({
+                "expectedConfigRevision":before.config_revision,
+                "grantCapabilityEdits":capability_edits,"userGrantEdits":quota_edits
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(preview.get("recentUsage").is_none());
+    let required = preview["requiredAcknowledgements"].as_array().unwrap();
+    assert_eq!(required.len(), 1);
+    assert_eq!(required[0]["scope"], email);
+    let mut patch = ShareSettingsPatch {
+        user_grant_edits: Some(quota_edits),
+        grant_capability_edits: Some(capability_edits),
+        capability_consent: Some(CapabilityConsent {
+            credential: preview["previewCredential"].as_str().unwrap().into(),
+            accept_uncovered: vec![],
+        }),
+        edit_context: Some(ShareSettingsEditContext {
+            operation_id: "personal-capability-1".into(),
+            expected_config_revision: before.config_revision,
+            actor: None,
+        }),
+        ..Default::default()
+    };
+    assert!(state
+        .apply_share_settings_patch_immediate("cap-share", patch.clone())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("QUOTA_COVERAGE_REQUIRED"));
+    patch
+        .capability_consent
+        .as_mut()
+        .unwrap()
+        .accept_uncovered
+        .push(required[0]["condition"].as_str().unwrap().into());
+    let saved = state
+        .apply_share_settings_patch_immediate("cap-share", patch.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let replay = state
+        .apply_share_settings_patch_immediate("cap-share", patch.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.config_revision, saved.config_revision);
+    let persisted =
+        crate::repository::server_sqlite::load_authoritative(&state.config_dir).unwrap();
+    assert_eq!(
+        persisted
+            .shares
+            .get("cap-share")
+            .unwrap()
+            .grant_capabilities,
+        saved.grant_capabilities
+    );
+    assert_eq!(saved.tokens_used, before.tokens_used);
+    assert!(saved.capability_policy.is_none());
+    let permissions = saved.grant_capabilities.as_ref().unwrap();
+    assert_eq!(permissions.len(), 1);
+    assert_eq!(permissions[email].allowed_operations, vec![operation]);
+    assert_eq!(
+        permissions[email].coverage_acknowledgements[0].actor,
+        "owner@example.com"
+    );
+
+    let runtime = providers
+        .runtime_plan(AppKind::Codex, "cap-provider")
+        .unwrap();
+    let mut plan = crate::domain::usage::value_pricing::resource_request_plan(
+        &json!({"tools":[{"type":"web_search"}]}),
+        crate::domain::usage::store::InferenceOperation::Responses,
+    );
+    plan.binding_fingerprint =
+        Some(crate::domain::sharing::capability_intent::binding_fingerprint(&runtime));
+    let mut context = crate::domain::usage::store::UsageLogContext {
+        quota_app: Some(AppKind::Codex),
+        operation: crate::domain::usage::store::InferenceOperation::Responses,
+        user_email: Some(email.into()),
+        ..Default::default()
+    };
+    let config = state.config_snapshot().await;
+    assert!(state
+        .check_share_capabilities(
+            &saved,
+            &context,
+            "model",
+            Some(&plan),
+            &providers,
+            None,
+            &config
+        )
+        .is_ok());
+    context.user_email = Some("public@example.com".into());
+    assert!(state
+        .check_share_capabilities(
+            &saved,
+            &context,
+            "model",
+            Some(&plan),
+            &providers,
+            None,
+            &config
+        )
+        .is_err());
+    context.user_email = Some("owner@example.com".into());
+    assert!(state
+        .check_share_capabilities(
+            &saved,
+            &context,
+            "model",
+            Some(&plan),
+            &providers,
+            None,
+            &config
+        )
+        .is_err());
+
+    let mut conflict = patch;
+    conflict
+        .grant_capability_edits
+        .as_mut()
+        .unwrap()
+        .get_mut(email)
+        .unwrap()
+        .operations
+        .clear();
+    assert!(state
+        .apply_share_settings_patch_immediate("cap-share", conflict)
+        .await
+        .is_err());
+
+    let mut descriptor =
+        descriptor_for_share_with_accounts_and_usage(&saved, &providers, None, None);
+    apply_value_descriptor_projection(&mut descriptor, false, false, false).unwrap();
+    assert_eq!(descriptor.contract_version, 14);
+
+    let incomplete = state
+        .mutate_providers_immediate(|providers| {
+            providers.upsert(
+                AppKind::Claude,
+                test_provider("missing-runtime", "Incomplete provider"),
+            )
+        })
+        .await
+        .unwrap();
+    state
+        .mutate_shares_immediate(|store| {
+            let share = &mut store.shares[0];
+            let mut missing = share.bindings[0].clone();
+            missing.app = AppKind::Claude;
+            missing.provider_id = "missing-runtime".into();
+            missing.provider_type = incomplete.provider_type;
+            share.bindings.push(missing);
+            share.enabled_apps = None;
+        })
+        .await
+        .unwrap();
+    // The stored binding remains valid while its runtime cannot be read.
+    state.replace_provider_store_for_test(providers).await;
+    let current = state.shares.read().await.get("cap-share").unwrap().clone();
+    let revision = current.user_grants[email].revision;
+    let candidates = state
+        .preview_share_permissions(
+            "cap-share",
+            json!({"expectedConfigRevision":current.config_revision,"subject":email}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(candidates["unavailable"], true);
+    assert!(candidates["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| { row["operation"] == "tool.web_search" && row["available"] == true }));
+    let reconfirm = json!({
+        "expectedConfigRevision":current.config_revision,
+        "grantCapabilityEdits":{(email):{"operations":[operation],"reconfirm":[operation],"expectedRevision":revision}}
+    });
+    assert_eq!(
+        state
+            .preview_share_permissions("cap-share", reconfirm)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "CAPABILITY_STATE_CHANGED"
+    );
+    let revoke = json!({
+        "expectedConfigRevision":current.config_revision,
+        "grantCapabilityEdits":{(email):{"operations":[],"expectedRevision":revision}}
+    });
+    assert!(state
+        .preview_share_permissions("cap-share", revoke)
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn grant_capability_migration_keeps_only_confirmed_named_bindings() {
+    use crate::domain::sharing::capabilities::ShareOperation;
+    let state = capability_test_state().await;
+    let patch = capability_enable_search(&state, "legacy-capability").await;
+    let saved = state
+        .apply_share_settings_patch_immediate("cap-share", patch)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut store = state.shares.read().await.clone();
+    let providers = state.providers.read().await.clone();
+    assert_eq!(
+        share_capability::migrate_grant_capabilities(&mut store, &providers),
+        1
+    );
+    let migrated = store.get("cap-share").unwrap();
+    let permissions = migrated.grant_capabilities.as_ref().unwrap();
+    assert!(!permissions.contains_key("$default"));
+    let owner = permissions.get("owner@example.com").unwrap();
+    assert_eq!(owner.allowed_operations, vec![ShareOperation::WebSearch]);
+    assert_eq!(
+        owner.operation_bindings[&ShareOperation::WebSearch].len(),
+        1
+    );
+    assert_eq!(owner.coverage_acknowledgements.len(), 1);
+    assert_eq!(migrated.tokens_used, saved.tokens_used);
+    assert!(migrated.capability_policy.is_none());
 }

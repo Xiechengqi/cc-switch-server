@@ -20902,6 +20902,7 @@ async fn forward_codebuddy(options: CodeBuddyForwardOptions) -> Result<Response,
                     reason_code: "model_unresolved",
                     model: model_id,
                     tier: "standard".into(),
+                    resource_dimensions: Vec::new(),
                     active_pricing_revision: None,
                     pending_pricing_revision: None,
                     effective_from_ms: None,
@@ -27902,7 +27903,7 @@ async fn ensure_grok_media_policy(
         .iter()
         .find(|share| share.id == share_id)
         .ok_or_else(|| ProxyError::bad_request("Grok media Share is unavailable"))?;
-    if share.capability_policy.is_some() {
+    if share.grant_capabilities.is_some() || share.capability_policy.is_some() {
         return Ok(());
     }
     let policy = share.grok_media_policy;

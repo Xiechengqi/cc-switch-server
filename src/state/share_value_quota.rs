@@ -876,7 +876,7 @@ impl ServerStateInner {
         &self,
         share_id: &str,
         expected_revision: u64,
-        policies: BTreeMap<String, ShareUserPolicy>,
+        mut policies: BTreeMap<String, ShareUserPolicy>,
     ) -> anyhow::Result<Value> {
         let share = self
             .shares
@@ -889,6 +889,11 @@ impl ServerStateInner {
             share.config_revision == expected_revision,
             "VALUE_QUOTA_REVISION_CONFLICT"
         );
+        if share.grant_capabilities.is_some() {
+            policies
+                .values_mut()
+                .for_each(crate::domain::sharing::shares::normalize_grant_quota_terms);
+        }
         let providers = self.providers.read().await.clone();
         let config = self.config_snapshot().await;
         let now = now_ms_i64();
@@ -2154,18 +2159,19 @@ impl ServerStateInner {
         }
         let config = self.config_snapshot().await;
         let providers = self.providers.read().await;
+        let accounts = self.accounts.read().await;
         // Serializes policy reads + durable admission with policy commits. The
         // gate is released before any upstream I/O or response body lifetime.
         let usage = self.usage.read().await;
         let _admission = self.shares_persistence.gate.lock().await;
+        let grant_capabilities;
         {
             let shares = self.shares.read().await;
             let share = shares.get(share_id).context("VALUE_QUOTA_SHARE_REVOKED")?;
+            grant_capabilities = share.grant_capabilities.is_some();
+            let has_operation_policy = grant_capabilities || share.capability_policy.is_some();
             if let Some(plan) = &mut resource_plan {
-                plan.policy_revision = share
-                    .capability_policy
-                    .as_ref()
-                    .map(|_| share.config_revision);
+                plan.policy_revision = has_operation_policy.then_some(share.config_revision);
                 if !matches!(
                     context.operation,
                     crate::domain::usage::store::InferenceOperation::ImageEdit
@@ -2184,7 +2190,7 @@ impl ServerStateInner {
                     }
                 }
             }
-            if share.capability_policy.is_some() {
+            if has_operation_policy {
                 if let Some(plan) = &mut resource_plan {
                     if plan.continuation {
                         let scope = crate::repository::server_sqlite::capability_context::scope(
@@ -2229,12 +2235,13 @@ impl ServerStateInner {
                 effective_model,
                 resource_plan.as_ref(),
                 &providers,
+                Some(&accounts),
                 &config,
             )?;
-            if share.capability_policy.is_some() && !context.is_health_check {
-                let plan = resource_plan
-                    .as_ref()
-                    .context("CAPABILITY_REQUEST_INVALID")?;
+            if let Some(plan) = resource_plan
+                .as_ref()
+                .filter(|_| has_operation_policy && !context.is_health_check)
+            {
                 crate::repository::server_sqlite::capability_context::admit(
                     &self.config_dir,
                     &crate::repository::server_sqlite::capability_context::scope(&config, context)?,
@@ -2248,6 +2255,7 @@ impl ServerStateInner {
                 )?;
             }
         }
+        drop(accounts);
         drop(providers);
         if context.is_health_check {
             return Ok(None);
@@ -2432,7 +2440,7 @@ impl ServerStateInner {
         {
             return Ok(None);
         }
-        let quota = grant.policy.value_quota.clone().unwrap_or_else(|| {
+        let mut quota = grant.policy.value_quota.clone().unwrap_or_else(|| {
             crate::domain::usage::value_pricing::ValueQuota {
                 unpriced_usage: Default::default(),
                 limit_usd_micros: "1".into(),
@@ -2444,6 +2452,13 @@ impl ServerStateInner {
                 .into(),
             }
         });
+        if enforce && grant_capabilities && grant.manager != ShareGrantManager::RouterShareMarket {
+            quota.unpriced_usage = crate::domain::usage::value_pricing::UnpricedUsage::Reject;
+            if resource_plan.as_ref().is_some_and(|plan| plan.requires_v2) {
+                quota.tariff_policy_id =
+                    crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY.into();
+            }
+        }
         let result = async {
             let binding = if enforce {
                 grant
@@ -2477,6 +2492,7 @@ impl ServerStateInner {
                         effective_model,
                     ),
                     tier: "unknown".into(),
+                    resource_dimensions: Vec::new(),
                     active_pricing_revision: None,
                     pending_pricing_revision: None,
                     effective_from_ms: None,

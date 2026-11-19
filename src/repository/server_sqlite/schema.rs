@@ -95,7 +95,7 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
         hex::encode(Sha256::digest(include_bytes!("value_quota_schema.sql")))
     );
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    anyhow::ensure!((1..=9).contains(&version),
+    anyhow::ensure!((1..=super::SCHEMA_VERSION).contains(&version),
         "unsupported Server SQLite schema {version}; use a matching Server binary/backup (never downgrade)");
     let checksum: String = connection.query_row(
         "SELECT checksum FROM schema_migrations WHERE version=1",
@@ -354,6 +354,37 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
     anyhow::ensure!(
         checksum == retention_checksum,
         "Server SQLite v9 migration checksum mismatch"
+    );
+    let grant_checksum = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(include_bytes!(
+            "grant_capability_schema.sql"
+        )))
+    );
+    if version < 10 {
+        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> anyhow::Result<()> {
+            connection.execute_batch(include_str!("grant_capability_schema.sql"))?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES(10,'share_grant_capabilities',0,?1)",
+                [&grant_checksum],
+            )?;
+            connection.execute_batch("PRAGMA user_version=10; COMMIT;")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = connection.execute_batch("ROLLBACK;");
+        }
+        result.context("migrate Server SQLite to v10 grant permissions")?;
+    }
+    let checksum: String = connection.query_row(
+        "SELECT checksum FROM schema_migrations WHERE version=10",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        checksum == grant_checksum,
+        "Server SQLite v10 migration checksum mismatch"
     );
     Ok(())
 }

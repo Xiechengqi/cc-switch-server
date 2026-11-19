@@ -95,6 +95,10 @@ pub struct ShareSettingsPatch {
     #[doc(hidden)]
     pub validated_capability_policy: Option<super::capabilities::ShareCapabilityPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_capability_edits: Option<BTreeMap<String, super::capabilities::GrantCapabilityEdit>>,
+    #[serde(skip)]
+    pub validated_grant_capabilities: Option<super::capabilities::GrantCapabilities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub support: Option<ShareSupport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_grants: Option<BTreeMap<String, ShareUserGrant>>,
@@ -491,6 +495,8 @@ pub struct ShareAnchoredUsageBucket {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShareUserGrant {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_operations: Option<Vec<super::capabilities::ShareOperation>>,
     pub email: String,
     #[serde(default)]
     pub role: String,
@@ -1376,6 +1382,39 @@ pub fn descriptor_for_share_with_accounts_and_usage(
     // so it keeps the projection fields that go with it.
     let serializes_account_reset = share.serializes_account_reset_period();
     let mut user_grants = share.user_grants.clone();
+    if let Some(permissions) = &share.grant_capabilities {
+        for (email, grant) in &mut user_grants {
+            let approved = permissions.get(email);
+            let market = grant.manager == ShareGrantManager::RouterShareMarket;
+            let effective = approved.into_iter().filter(|_| grant.active)
+                .flat_map(|p| p.operation_bindings.iter())
+                .filter(|(op, approvals)| {
+                    (!market || grant.policy.allowed_operations.as_ref().is_some_and(|ops| ops.contains(op)))
+                        && share.bindings.iter().any(|binding| {
+                            super::shares::share_app_api_enabled(share, binding.app)
+                                && (grant.policy.allowed_apps.is_empty() || grant.policy.allowed_apps.contains(&binding.app))
+                                && providers.runtime_plan(binding.app, &binding.provider_id).is_some_and(|runtime| {
+                                    runtime.configuration_state != crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
+                                        && crate::domain::providers::share_operations::implemented(&runtime, **op)
+                                        && approvals.iter().any(|approval| approval.app == binding.app.as_str()
+                                            && approval.fingerprint == super::capability_intent::grant_binding_fingerprint(share, binding.app, &runtime))
+                                        && accounts.and_then(|accounts| crate::domain::providers::share_operations::observed_account_state(
+                                            &runtime, accounts, **op, crate::infra::time::now_ms() as i64
+                                        )) != Some(crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported)
+                                })
+                        })
+                }).map(|(op,_)| *op).collect();
+            grant.effective_operations = Some(effective);
+            if !market {
+                // Fingerprints, confirmations and actor identities remain on Server.
+                grant.policy.allowed_operations = Some(
+                    approved
+                        .map(|p| p.allowed_operations.clone())
+                        .unwrap_or_default(),
+                );
+            }
+        }
+    }
     if !serializes_account_reset {
         // v7 readers deny unknown nested fields. Do not leak new projections
         // into ordinary Shares, even after the Server started collecting them.
@@ -1390,7 +1429,9 @@ pub fn descriptor_for_share_with_accounts_and_usage(
     }
     ShareDescriptor {
         termination_archive_since_ms: None,
-        contract_version: if share.capability_policy.is_some() {
+        contract_version: if share.grant_capabilities.is_some() {
+            super::capabilities::GRANT_CAPABILITY_CONTRACT_VERSION
+        } else if share.capability_policy.is_some() {
             super::capabilities::CAPABILITY_CONTRACT_VERSION
         } else if user_grants
             .values()

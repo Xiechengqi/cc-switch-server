@@ -1,3 +1,4 @@
+import { parseGrantPreview, type GrantPreviewInput, type GrantCapabilityEdit } from "../grant-capability-preview";
 import { parseCapabilityPreview } from "@/lib/share-capabilities";
 import type { ShareOperation, ShareCapabilityPolicy, CapabilityConsent } from "@/lib/share-capabilities";
 import { invokeCommand, readToken } from "@/lib/runtime";
@@ -140,6 +141,7 @@ export type ShareTotalUsageEdit = {
 
 export type ShareUserQuotaConversion = { credential: string; targetUsedPicos?: string; targetUsedTokens?: number; reason?: string };
 export type ShareUserGrant = {
+  reconfirmOperations?: ShareOperation[];
   quotaConversionId?: string;
   /** Local draft only; the save builder emits an explicit conversion input. */
   quotaUnitConversion?: ShareUserQuotaConversion;
@@ -174,6 +176,7 @@ export type ShareUserGrant = {
 export type ShareUserGrantMap = Record<string, ShareUserGrant>;
 
 export interface ShareRecord {
+  grantCapabilityPolicy?: boolean;
   id: string;
   capacityPoolId: string;
   name: string;
@@ -319,6 +322,8 @@ export interface SaveProviderShareParams {
 
 /** Bundle-scoped Share payload; enabled Surface bindings are derived by the Server. */
 export interface SaveProviderBundleShareParams {
+  grantCapabilityEdits?: Record<string, GrantCapabilityEdit>;
+  capabilityConsent?: CapabilityConsent;
   expectedAccountCycle?: AccountQuotaCycle;
   userGrantEdits?: Record<string, { expectedRevision: number; policy: ShareUserPolicy | null }>;
   bundleId: string;
@@ -335,7 +340,7 @@ export interface SaveProviderBundleShareParams {
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: number;
   previousResponseCacheEnabled: boolean;
-  grokMediaPolicy: GrokMediaPolicy;
+  grokMediaPolicy?: GrokMediaPolicy;
   userGrants?: ShareUserGrantMap;
   userUsageEdits?: ShareUserUsageEditMap;
   userValueUsageInitializations?: ShareUserValueUsageInitializationMap;
@@ -734,7 +739,43 @@ async function getClientTunnelStatus(): Promise<ShareTunnelStatus> {
   return invokeCommand<ShareTunnelStatus>("get_client_tunnel_status");
 }
 
+export interface RequestMeteringEvidence {
+  requestId: string;
+  attempt: number;
+  chargeMode: "debited" | "estimate" | "none" | "unknown";
+  model?: string | null;
+  operations: ShareOperation[];
+  meteringStatus: string;
+  settledPicos?: string | null;
+  pendingRiskPicos?: string | null;
+  pricingRevision?: string | null;
+  unpricedReason?: string | null;
+  estimated?: boolean | null;
+  dimensions: { dimension: string; quantity: number; amountPicos?: string | null; pricing: string }[];
+}
+
 export const shareApi = {
+  requestMetering: async (shareId: string, requestId: string, signal?: AbortSignal) => {
+    const token = readToken();
+    const router = readRouterAccessToken();
+    const response = await invokeCommand<{ shareId: string; requestId: string; rows: RequestMeteringEvidence[] }>(
+      "preview_share_capabilities", { shareId, requestId }, { signal, cache: "no-store" },
+    );
+    if (token !== readToken() || router !== readRouterAccessToken()) throw new DOMException("Sign-in session changed", "AbortError");
+    if (response?.shareId !== shareId || response.requestId !== requestId || !Array.isArray(response.rows)
+      || response.rows.length > 100 || response.rows.some(row => !row || row.requestId !== requestId || !Number.isInteger(row.attempt)
+        || !["debited", "estimate", "none", "unknown"].includes(row.chargeMode) || !Array.isArray(row.operations) || !Array.isArray(row.dimensions))) {
+      throw new Error("Invalid request metering response");
+    }
+    return response.rows;
+  },
+  previewGrantCapabilities: async (shareId: string, input: GrantPreviewInput, signal?: AbortSignal) => {
+    const token = readToken();
+    const router = readRouterAccessToken();
+    const result = await invokeCommand<unknown>("preview_share_capabilities", { shareId, ...input }, { signal, cache: "no-store" });
+    if (token !== readToken() || router !== readRouterAccessToken()) throw new DOMException("Sign-in session changed", "AbortError");
+    return parseGrantPreview(result, shareId, input);
+  },
   previewCapabilities: async (shareId:string, input:unknown, signal?:AbortSignal) => {
     const token=readToken(),router=readRouterAccessToken();
     const result=await invokeCommand<import("../share-capabilities").CapabilityPreview>("preview_share_capabilities",{shareId,...input as object},{signal,cache:"no-store"});

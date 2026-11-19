@@ -727,7 +727,7 @@ async fn web_invoke_dispatch(
         "preview_share_capabilities" => {
             let id=web_arg_share_id(&args)?;
             let mut input=args.clone(); input.as_object_mut().unwrap().remove("shareId");
-            state.preview_share_capabilities(&id,serde_json::from_value(input).map_err(ApiError::bad_request)?).await.map_err(ApiError::value_quota)
+            state.preview_share_permissions(&id,input).await.map_err(ApiError::value_quota)
         }
         "preview_share_value_quota" => {
             let id=web_arg_share_id(&args)?;

@@ -693,6 +693,9 @@ pub struct SharePolicy {
     pub grok_media_policy: GrokMediaPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_policy: Option<super::capabilities::ShareCapabilityPolicy>,
+    /// None can only be read from a pre-migration Share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_capabilities: Option<super::capabilities::GrantCapabilities>,
 }
 
 impl Default for SharePolicy {
@@ -708,6 +711,7 @@ impl Default for SharePolicy {
             previous_response_cache_enabled: true,
             grok_media_policy: GrokMediaPolicy::default(),
             capability_policy: None,
+            grant_capabilities: None,
         }
     }
 }
@@ -1375,9 +1379,10 @@ impl ShareStore {
                 grok_media_policy: input
                     .grok_media_policy
                     .unwrap_or(existing_policy.grok_media_policy),
-                capability_policy: existing_policy
-                    .capability_policy
-                    .or_else(|| is_new.then(super::capabilities::ShareCapabilityPolicy::default)),
+                capability_policy: existing_policy.capability_policy,
+                grant_capabilities: existing_policy
+                    .grant_capabilities
+                    .or_else(|| is_new.then(Default::default)),
             },
             tokens_used,
             requests_count,
@@ -1432,6 +1437,8 @@ impl ShareStore {
             )?;
         }
         reconcile_user_grants(&mut share);
+        normalize_grant_capability_terms(&mut share);
+        prune_grant_capabilities(&mut share);
         share.router_last_sync_error = None;
 
         self.cancel_pending_router_delete(&share.id);
@@ -2625,6 +2632,22 @@ impl ShareStore {
             .position(|item| item.id == share_id)
             .ok_or(SharePatchError::NotFound)?;
         let mut share = self.shares[index].clone();
+        if share.grant_capabilities.is_some() {
+            if patch.capability_policy.is_some() || patch.grok_media_policy.is_some() {
+                return Err(SharePatchError::Invalid(
+                    "CAPABILITY_UPGRADE_REQUIRED".into(),
+                ));
+            }
+        } else if patch.grant_capability_edits.is_some() {
+            return Err(SharePatchError::Invalid(
+                "CAPABILITY_UPGRADE_REQUIRED".into(),
+            ));
+        }
+        if patch.grant_capability_edits.is_some() && patch.validated_grant_capabilities.is_none() {
+            return Err(SharePatchError::Invalid(
+                "CAPABILITY_PREVIEW_EXPIRED".into(),
+            ));
+        }
         let managed_grant = patch.managed_grant.clone();
         let mut managed_grant_fingerprint = None;
 
@@ -2704,7 +2727,10 @@ impl ShareStore {
         if let Some(enabled) = patch.previous_response_cache_enabled {
             share.previous_response_cache_enabled = enabled;
         }
-        if patch.capability_policy.is_none() && patch.capability_consent.is_some() {
+        if share.grant_capabilities.is_none()
+            && patch.capability_policy.is_none()
+            && patch.capability_consent.is_some()
+        {
             return Err(SharePatchError::Invalid("CAPABILITY_STATE_CHANGED".into()));
         }
         if patch.capability_policy.is_some() && patch.validated_capability_policy.is_none() {
@@ -2829,6 +2855,69 @@ impl ShareStore {
         if let Some(operation) = managed_grant.as_ref() {
             apply_managed_grant_operation(&mut share, operation)?;
         }
+        if let Some(capabilities) = patch.validated_grant_capabilities {
+            for (email, policy) in &capabilities {
+                policy.validate().map_err(SharePatchError::Invalid)?;
+                if capabilities.get(email)
+                    != share
+                        .grant_capabilities
+                        .as_ref()
+                        .and_then(|map| map.get(email))
+                {
+                    if let Some(grant) = share.user_grants.get_mut(email) {
+                        let old_revision = self.shares[index]
+                            .user_grants
+                            .get(email)
+                            .map_or(0, |g| g.revision);
+                        grant.revision = grant.revision.max(old_revision.saturating_add(1));
+                        grant.updated_at_ms = now_ms();
+                    }
+                }
+            }
+            if let Some(edits) = &patch.grant_capability_edits {
+                for (email, edit) in edits {
+                    let old_revision = self.shares[index]
+                        .user_grants
+                        .get(email)
+                        .map_or(0, |g| g.revision);
+                    if edit.expected_revision != old_revision {
+                        return Err(SharePatchError::GrantRevisionConflict {
+                            email: email.clone(),
+                            expected: edit.expected_revision,
+                            current: old_revision,
+                        });
+                    }
+                    let grant = share
+                        .user_grants
+                        .get_mut(email)
+                        .filter(|g| g.active && g.manager != ShareGrantManager::RouterShareMarket)
+                        .ok_or_else(|| {
+                            SharePatchError::Invalid("CAPABILITY_STATE_CHANGED".into())
+                        })?;
+                    grant.revision = grant.revision.max(old_revision.saturating_add(1));
+                    grant.updated_at_ms = now_ms();
+                }
+            }
+            share.grant_capabilities = Some(capabilities);
+        }
+        if let Some(map) = &mut share.policy.grant_capabilities {
+            if let Some(operation) = &managed_grant {
+                // A Market operation may replace a manual grant or a different
+                // entitlement at the same address. Approval does not move.
+                map.retain(|email, _| {
+                    self.shares[index]
+                        .user_grants
+                        .get(email)
+                        .zip(share.user_grants.get(email))
+                        .is_some_and(|(previous, next)| {
+                            previous.manager == next.manager
+                                && previous.entitlement_id == next.entitlement_id
+                        })
+                        || email != &operation.email
+                });
+            }
+        }
+        normalize_grant_capability_terms(&mut share);
         let managed_grant_result = managed_grant
             .as_ref()
             .and_then(|operation| {
@@ -2855,6 +2944,9 @@ impl ShareStore {
         for grant in share.user_grants.values().filter(|g| g.active) {
             if let Some(ops) = &grant.policy.allowed_operations {
                 super::capabilities::validate_operations(ops).map_err(SharePatchError::Invalid)?;
+                if share.grant_capabilities.is_some() {
+                    continue;
+                }
                 if let Some(policy) = &share.capability_policy {
                     if !ops.iter().all(|op| policy.allowed_operations.contains(op)) {
                         return Err(SharePatchError::Invalid("SHARE_CAPABILITY_DISABLED".into()));
@@ -3435,10 +3527,27 @@ impl ShareStore {
         let mut candidate = self.clone();
         let mut imported = 0;
         for mut share in shares {
-            share.capability_policy = match candidate.get(&share.id) {
-                Some(old) => old.capability_policy.clone(),
-                None => Some(super::capabilities::ShareCapabilityPolicy::default()),
-            };
+            let existing = candidate.get(&share.id);
+            share.capability_policy = existing.and_then(|old| old.capability_policy.clone());
+            share.grant_capabilities = existing
+                .map(|old| old.grant_capabilities.clone())
+                .unwrap_or_else(|| Some(Default::default()));
+            if let Some(map) = share.policy.grant_capabilities.as_mut() {
+                map.retain(|email, _| {
+                    existing
+                        .and_then(|old| old.user_grants.get(email))
+                        .is_some_and(|grant| {
+                            grant.active
+                                && share.user_grants.get(email).is_some_and(|incoming| {
+                                    incoming.active
+                                        && incoming.manager == grant.manager
+                                        && incoming.entitlement_id == grant.entitlement_id
+                                })
+                        })
+                });
+            }
+            normalize_grant_capability_terms(&mut share);
+            prune_grant_capabilities(&mut share);
             crate::domain::sharing::invariants::validate_share_import(&share)?;
             if let Some(existing) = candidate.shares.iter().find(|item| item.id == share.id) {
                 if existing.app != share.app
@@ -4282,7 +4391,49 @@ fn disable_share_for_integrity(
     }
 }
 
+pub(crate) fn normalize_grant_quota_terms(policy: &mut ShareUserPolicy) {
+    // Ordinary v14 execution takes authority from the separate permissions map.
+    policy.allowed_operations = None;
+    if let Some(quota) = &mut policy.value_quota {
+        quota.unpriced_usage = crate::domain::usage::value_pricing::UnpricedUsage::Reject;
+    }
+}
+
+pub(crate) fn normalize_grant_capability_terms(share: &mut Share) {
+    if share.grant_capabilities.is_none() {
+        return;
+    }
+    for grant in share.user_grants.values_mut() {
+        grant.effective_operations = None;
+        if grant.manager == ShareGrantManager::RouterShareMarket {
+            continue;
+        }
+        for policy in std::iter::once(&mut grant.policy).chain(
+            grant
+                .pending_value_quota
+                .as_mut()
+                .map(|pending| &mut pending.policy),
+        ) {
+            normalize_grant_quota_terms(policy);
+        }
+    }
+}
+
+fn prune_grant_capabilities(share: &mut Share) {
+    let apps = share_enabled_apps(share);
+    let grants = &share.user_grants;
+    if let Some(permissions) = &mut share.policy.grant_capabilities {
+        permissions.retain(|email, _| grants.get(email).is_some_and(|g| g.active));
+        for policy in permissions.values_mut() {
+            for bindings in policy.operation_bindings.values_mut() {
+                bindings.retain(|binding| apps.iter().any(|app| app.as_str() == binding.app));
+            }
+        }
+    }
+}
+
 fn mark_share_config_pending(share: &mut Share) {
+    prune_grant_capabilities(share);
     share.config_revision = share.config_revision.saturating_add(1).max(1);
     share.router_last_sync_error = None;
 }
@@ -4315,7 +4466,7 @@ fn normalize_optional_email(value: Option<String>) -> Option<String> {
         .filter(|email| !email.is_empty())
 }
 
-fn normalize_verified_email(email: &str) -> Result<String, SharePatchError> {
+pub(crate) fn normalize_verified_email(email: &str) -> Result<String, SharePatchError> {
     let email = email.trim().to_ascii_lowercase();
     if email.is_empty()
         || email.len() > 254
@@ -4366,6 +4517,7 @@ fn default_user_policy(share: &Share) -> ShareUserPolicy {
 fn new_user_grant(share: &Share, email: String, role: &str) -> ShareUserGrant {
     let now = now_ms();
     ShareUserGrant {
+        effective_operations: None,
         email,
         role: role.to_string(),
         active: true,
@@ -4695,6 +4847,7 @@ fn apply_managed_grant_operation(
             share.user_grants.insert(
                 email.clone(),
                 ShareUserGrant {
+                    effective_operations: None,
                     email: email.clone(),
                     role: "shareto".to_string(),
                     active: true,
@@ -4938,6 +5091,7 @@ fn reconcile_user_grants(share: &mut Share) {
             .user_grants
             .entry(owner.clone())
             .or_insert_with(|| ShareUserGrant {
+                effective_operations: None,
                 email: owner.clone(),
                 role: "owner".to_string(),
                 active: true,

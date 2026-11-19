@@ -1,6 +1,8 @@
 //! Local, transactionally activated execution tariffs. No network calls.
 use super::*;
-use crate::domain::usage::value_pricing::{diagnostic_identity, PriceRejection};
+use crate::domain::usage::value_pricing::{
+    diagnostic_identity, price_resources, PriceRejection, ResourcePlan,
+};
 
 fn active_key(scope: &Scope) -> String {
     format!(
@@ -196,6 +198,7 @@ pub(super) fn price_rejection(
     model: &str,
     tier: &str,
     reason: &'static str,
+    plan: Option<&ResourcePlan>,
 ) -> PriceRejection {
     let pending = read_pending(conn, scope).ok().flatten();
     let pending_covers = pending.as_ref().is_some_and(|p| {
@@ -203,11 +206,30 @@ pub(super) fn price_rejection(
             .ok()
             .is_some_and(|s| {
                 s.model(model).is_ok_and(|price| {
-                    price.supports_tier(tier)
-                        || (price.rates.is_empty() && !price.resources.is_empty())
+                    (plan.is_some_and(|plan| !plan.text_tokens) || price.supports_tier(tier))
+                        && plan.is_none_or(|plan| {
+                            (!plan.requires_v2 || s.schema_version == 2)
+                                && price_resources(&price.resources, &plan.quantities).is_ok()
+                        })
                 })
             })
     });
+    let mut resource_dimensions = Vec::new();
+    if let Some(plan) = plan.filter(|_| reason == "resource_unpriced") {
+        let active =
+            cached_snapshot(conn, &scope.router_url, &scope.installation_id, revision).ok();
+        let price = active.as_ref().and_then(|s| s.model(model).ok());
+        for (key, count) in &plan.quantities {
+            let base = key.split('/').next().unwrap_or(key);
+            if *count > 0
+                && price.is_none_or(|p| {
+                    !p.resources.contains_key(key) && !p.resources.contains_key(base)
+                })
+            {
+                resource_dimensions.push(diagnostic_identity(key));
+            }
+        }
+    }
     PriceRejection {
         reason_code: if pending_covers {
             "tariff_not_effective"
@@ -216,6 +238,7 @@ pub(super) fn price_rejection(
         },
         model: diagnostic_identity(model),
         tier: diagnostic_identity(tier),
+        resource_dimensions,
         active_pricing_revision: Some(revision.into()),
         pending_pricing_revision: pending.as_ref().map(|p| p.revision.clone()),
         effective_from_ms: pending.map(|p| p.effective_from_ms),

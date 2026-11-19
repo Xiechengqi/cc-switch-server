@@ -423,6 +423,7 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
     ownerEmail: readString(record, "ownerEmail", "owner_email") ?? "",
     description: readString(record, "description") ?? null,
     freeAccess: normalizeFreeAccess(record),
+    grantCapabilityPolicy: readBool(record, "grantCapabilityPolicy") ?? false,
     bindings,
     apiKey: readString(record, "apiKey", "api_key") ?? "",
     settingsConfig:

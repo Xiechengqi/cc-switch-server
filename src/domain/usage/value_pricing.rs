@@ -24,6 +24,8 @@ pub struct PriceRejection {
     pub reason_code: &'static str,
     pub model: String,
     pub tier: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub resource_dimensions: Vec<String>,
     pub active_pricing_revision: Option<String>,
     pub pending_pricing_revision: Option<String>,
     pub effective_from_ms: Option<i64>,

@@ -948,6 +948,7 @@ mod tests {
             reason_code: "tariff_not_effective",
             model: "qiniu/conatus-free".into(),
             tier: "standard".into(),
+            resource_dimensions: vec!["image.output".into()],
             active_pricing_revision: Some("old".into()),
             pending_pricing_revision: Some("new".into()),
             effective_from_ms: Some(100),
@@ -978,6 +979,11 @@ mod tests {
                     &body["error"]["details"]
                 };
                 assert_eq!(details["reasonCode"], "tariff_not_effective");
+                if surface == InferenceSurface::Gemini {
+                    assert_eq!(details["resourceDimensions"], r#"["image.output"]"#);
+                } else {
+                    assert_eq!(details["resourceDimensions"][0], "image.output");
+                }
                 assert_eq!(details["model"], "qiniu/conatus-free");
                 assert_eq!(details["activePricingRevision"], "old");
                 assert_eq!(details["pendingPricingRevision"], "new");

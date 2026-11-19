@@ -28,6 +28,25 @@ pub fn binding_fingerprint(
         .expect("serializable runtime identity"),
     ))
 }
+/// Include the installed app binding's lineage so deleting and restoring
+/// the same Provider does not restore a previous personal approval.
+pub fn grant_binding_fingerprint(
+    share: &super::shares::Share,
+    app: crate::domain::providers::model::AppKind,
+    runtime: &crate::domain::providers::runtime::ProviderRuntimePlan,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let lineage = share
+        .binding_history
+        .iter()
+        .rev()
+        .find(|change| change.app == app);
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&(binding_fingerprint(runtime), lineage))
+            .expect("serializable grant binding"),
+    ))
+}
+
 pub fn operations(body: &Value, operation: InferenceOperation) -> Vec<Op> {
     let mut out = BTreeSet::new();
     match operation {

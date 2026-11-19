@@ -1443,6 +1443,70 @@ fn admit_with_trial_in_tx(
             "VALUE_QUOTA_TRIAL_IDENTITY_CONFLICT"
         );
     }
+    // A missing resource price must never discard the known text/model tariff.
+    // policy_epoch is deliberately not part of the identity: a retry after a
+    // policy edit is the same request in the same real window.
+    let existing: Option<(String, String, String, String, String, i64, Option<bool>, String)> = tx
+        .query_row(
+            "SELECT scope,pricing_revision,effective_model,effective_tier,window_id,started_at_ms,quota_enforced,policy_epoch
+             FROM value_quota_attempts WHERE request_id=?1 AND attempt_id=?2",
+            params![a.request_id, a.attempt_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some(old) = existing {
+        // Re-pricing replaces the stored revision but records the one the
+        // attempt was admitted with; a replay of that admission is the same
+        // request, not a conflict.
+        let admitted_revision = old.1 == a.pricing_revision
+            || read_attempt_meta(tx, a.request_id, a.attempt_id)?
+                .and_then(|meta| meta.admission_revision)
+                .is_some_and(|revision| revision == a.pricing_revision);
+        ensure!(
+            old.6
+                .or_else(|| (old.7 == "evidence").then_some(false))
+                .is_none_or(|mode| mode == a.enforce)
+                && admitted_revision
+                && (old.0, old.2, old.3, old.4, old.5)
+                    == (
+                        key,
+                        a.effective_model.into(),
+                        a.effective_tier.into(),
+                        a.window.id.clone(),
+                        a.started_at_ms
+                    ),
+            "VALUE_QUOTA_REQUEST_IDENTITY_CONFLICT"
+        );
+        if let Some(trial) = trial {
+            let marker_key = format!(
+                "{}{}",
+                trial_attempt_prefix(a.scope, trial)?,
+                serde_json::to_string(&(a.request_id, a.attempt_id))?
+            );
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+                [marker_key],
+                |r| r.get(0),
+            )?;
+            ensure!(exists, "VALUE_QUOTA_TRIAL_IDENTITY_CONFLICT");
+        }
+        return Ok(Admitted {
+            reserved_picos: read_attempt_meta(tx, a.request_id, a.attempt_id)?
+                .map(|meta| meta.reserved())
+                .unwrap_or(0),
+        });
+    }
     let snapshot = cached_snapshot(
         tx,
         &a.scope.router_url,
@@ -1461,6 +1525,7 @@ fn admit_with_trial_in_tx(
             a.effective_model,
             a.effective_tier,
             reason,
+            a.resource_plan.as_ref(),
         );
         if a.scope.entitlement_id.is_none()
             && a.quota.unpriced_usage != crate::domain::usage::value_pricing::UnpricedUsage::Reject
@@ -1523,70 +1588,14 @@ fn admit_with_trial_in_tx(
             && a.resource_plan.as_ref().is_none_or(|plan| plan.text_tokens)
             && !model.supports_tier(a.effective_tier)
             && (a.effective_tier == "ultrafast"
+                || (a.enforce
+                    && a.quota.unpriced_usage
+                        == crate::domain::usage::value_pricing::UnpricedUsage::Reject)
                 || a.scope.entitlement_id.is_some()
                 || model.supported_tiers().next().is_none())
         {
             unpriced_reason = Some(unpriced("tier_unpriced")?);
         }
-    }
-    // A missing resource price must never discard the known text/model tariff.
-    // policy_epoch is deliberately not part of the identity: a retry after a
-    // policy edit is the same request in the same real window.
-    let existing: Option<(String, String, String, String, String, i64)> = tx
-        .query_row(
-            "SELECT scope,pricing_revision,effective_model,effective_tier,window_id,started_at_ms
-             FROM value_quota_attempts WHERE request_id=?1 AND attempt_id=?2",
-            params![a.request_id, a.attempt_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            },
-        )
-        .optional()?;
-    if let Some(old) = existing {
-        // Re-pricing replaces the stored revision but records the one the
-        // attempt was admitted with; a replay of that admission is the same
-        // request, not a conflict.
-        let admitted_revision = old.1 == a.pricing_revision
-            || read_attempt_meta(tx, a.request_id, a.attempt_id)?
-                .and_then(|meta| meta.admission_revision)
-                .is_some_and(|revision| revision == a.pricing_revision);
-        ensure!(
-            admitted_revision
-                && (old.0, old.2, old.3, old.4, old.5)
-                    == (
-                        key,
-                        a.effective_model.into(),
-                        a.effective_tier.into(),
-                        a.window.id.clone(),
-                        a.started_at_ms
-                    ),
-            "VALUE_QUOTA_REQUEST_IDENTITY_CONFLICT"
-        );
-        if let Some(trial) = trial {
-            let marker_key = format!(
-                "{}{}",
-                trial_attempt_prefix(a.scope, trial)?,
-                serde_json::to_string(&(a.request_id, a.attempt_id))?
-            );
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
-                [marker_key],
-                |r| r.get(0),
-            )?;
-            ensure!(exists, "VALUE_QUOTA_TRIAL_IDENTITY_CONFLICT");
-        }
-        return Ok(Admitted {
-            reserved_picos: read_attempt_meta(tx, a.request_id, a.attempt_id)?
-                .map(|meta| meta.reserved())
-                .unwrap_or(0),
-        });
     }
     let reserved = if a.enforce {
         let current = status_in_tx(tx, a.scope, a.window)?;
@@ -1680,9 +1689,9 @@ fn admit_with_trial_in_tx(
     tx.execute(
         "INSERT INTO value_quota_attempts(request_id,attempt_id,scope,policy_epoch,window_id,started_at_ms,
          pricing_revision,effective_model,effective_tier,frozen_tariff_json,usage_revision,usage_picos,
-         pending_risk_picos,metering_status,watermark,unpriced_reason) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,'0',?11,'pending',?12,?13)",
+         pending_risk_picos,metering_status,watermark,unpriced_reason,quota_enforced) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,'0',?11,'pending',?12,?13,?14)",
         params![a.request_id,a.attempt_id,key,a.policy_epoch,a.window.id,a.started_at_ms,a.pricing_revision,
-            a.effective_model,a.effective_tier,frozen,reserved.to_string(),watermark,unpriced_reason])?;
+            a.effective_model,a.effective_tier,frozen,reserved.to_string(),watermark,unpriced_reason,a.enforce])?;
     tx.execute(
         "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![

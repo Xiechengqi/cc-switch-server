@@ -683,7 +683,8 @@ fn value_quota_v8_upgrade_preserves_evidence_and_derives_the_original_account_cl
         DROP INDEX quota_facts_account_idx;
         ALTER TABLE quota_metering_facts DROP COLUMN account_started_at_ms;
         CREATE INDEX quota_facts_account_idx ON quota_metering_facts(scope,account_key,started_at_ms,request_id,attempt_id);
-        DELETE FROM schema_migrations WHERE version=9; PRAGMA user_version=8;").unwrap();
+        ALTER TABLE value_quota_attempts DROP COLUMN quota_enforced;
+        DELETE FROM schema_migrations WHERE version>=9; PRAGMA user_version=8;").unwrap();
     super::super::schema::migrate_to_current(&conn).unwrap();
     super::super::schema::migrate_to_current(&conn).unwrap();
     let after: (String, String, i64, i64) = conn.query_row("SELECT fact_json,fact_sha256,started_at_ms,account_started_at_ms FROM quota_metering_facts WHERE request_id='v8-clock'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();

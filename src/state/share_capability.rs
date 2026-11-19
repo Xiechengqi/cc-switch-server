@@ -2,8 +2,10 @@
 use super::*;
 use crate::domain::providers::share_operations::implemented;
 use crate::domain::sharing::capabilities::*;
-use crate::domain::sharing::capability_intent::binding_fingerprint;
-use crate::domain::sharing::router_contract::{ShareSettingsPatch, ShareUserPolicy};
+use crate::domain::sharing::capability_intent::{binding_fingerprint, grant_binding_fingerprint};
+use crate::domain::sharing::router_contract::{
+    ShareGrantManager, ShareSettingsPatch, ShareUserPolicy,
+};
 use crate::domain::usage::value_pricing::{PricingSnapshot, ResourcePlan};
 use crate::infra::time::now_ms;
 use crate::repository::server_sqlite::value_quota as ledger;
@@ -11,6 +13,9 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+mod grants;
+pub(crate) use grants::migrate_grant_capabilities;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -216,6 +221,46 @@ impl ServerStateInner {
                         .is_some_and(|i| i.installation_id == *id)
             })
     }
+    pub async fn preview_share_permissions(
+        &self,
+        share_id: &str,
+        input: Value,
+    ) -> anyhow::Result<Value> {
+        if let Some(request) = input.get("requestId").and_then(Value::as_str) {
+            return self.share_request_metering(share_id, request).await;
+        }
+        if input.get("grantCapabilityEdits").is_some() || input.get("subject").is_some() {
+            self.preview_grant_capabilities(share_id, serde_json::from_value(input)?)
+                .await
+        } else {
+            self.preview_share_capabilities(share_id, serde_json::from_value(input)?)
+                .await
+        }
+    }
+
+    pub async fn share_request_metering(
+        &self,
+        share_id: &str,
+        request: &str,
+    ) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            self.shares.read().await.get(share_id).is_some(),
+            "Share not found"
+        );
+        let config = self.config_snapshot().await;
+        let identity = config
+            .registered_router_identity()
+            .context("CAPABILITY_UPGRADE_REQUIRED")?;
+        let attempts = crate::repository::server_sqlite::capability_context::request_metering(
+            &self.config_dir,
+            config.router_api_base().unwrap_or_default(),
+            &identity.installation_id,
+            share_id,
+            request,
+        )?;
+        Ok(serde_json::json!({"shareId":share_id,"requestId":request,"rows":attempts}))
+    }
+
     pub async fn preview_share_capabilities(
         &self,
         share_id: &str,
@@ -232,6 +277,10 @@ impl ServerStateInner {
             .get(share_id)
             .cloned()
             .context("Share not found")?;
+        anyhow::ensure!(
+            share.grant_capabilities.is_none(),
+            "CAPABILITY_UPGRADE_REQUIRED"
+        );
         if let Some(limit) = input.share_token_limit {
             share.token_limit = (limit >= 0).then_some(limit as u64);
         }
@@ -245,6 +294,10 @@ impl ServerStateInner {
         let committed =
             crate::repository::server_sqlite::is_committed(&self.config_dir).unwrap_or(false);
         let ready = committed && self.capability_policy_router_negotiated().await;
+        anyhow::ensure!(
+            share.grant_capabilities.is_none(),
+            "CAPABILITY_UPGRADE_REQUIRED"
+        );
         let mut legacy = ShareCapabilityPolicy::default();
         // Only the old explicit Grok permits are migration evidence. Never use
         // v2 pricing, history or a different runtime as a permission source.
@@ -562,6 +615,13 @@ impl ServerStateInner {
             .get(share_id)
             .cloned()
             .context("Share not found")?;
+        if share.grant_capabilities.is_some() {
+            return self.prepare_grant_capability_patch(&share, patch).await;
+        }
+        anyhow::ensure!(
+            patch.grant_capability_edits.is_none(),
+            "CAPABILITY_UPGRADE_REQUIRED"
+        );
         let mut changed = policies(&share, &BTreeMap::new(), false);
         if let Some(grants) = &patch.user_grants {
             changed.retain(|email,_|share.user_grants.get(email).is_some_and(|g|g.manager==crate::domain::sharing::router_contract::ShareGrantManager::RouterShareMarket || g.role=="owner"));
@@ -697,6 +757,14 @@ impl ServerStateInner {
     ) -> anyhow::Result<()> {
         for share in &candidate.shares {
             let before = previous.get(&share.id);
+            if let Some(permissions) = &share.grant_capabilities {
+                grants::validate_grant_transition(before, share, permissions, providers)?;
+                continue;
+            }
+            anyhow::ensure!(
+                before.is_none_or(|before| before.grant_capabilities.is_none()),
+                "CAPABILITY_UPGRADE_REQUIRED"
+            );
             anyhow::ensure!(
                 before.is_none_or(|s| s.capability_policy.is_none())
                     || share.capability_policy.is_some(),
@@ -806,15 +874,18 @@ impl ServerStateInner {
         model: &str,
         resource_plan: Option<&ResourcePlan>,
         providers: &ProviderStore,
+        accounts: Option<&AccountStore>,
         config: &ServerConfig,
     ) -> anyhow::Result<()> {
         let email = context.user_email.as_deref();
         let app = context.quota_app;
         let operation = context.operation;
-        let Some(policy) = &share.capability_policy else {
+        if share.grant_capabilities.is_none() && share.capability_policy.is_none() {
             return Ok(());
-        };
-        policy.validate().map_err(anyhow::Error::msg)?;
+        }
+        if let Some(policy) = &share.capability_policy {
+            policy.validate().map_err(anyhow::Error::msg)?;
+        }
         anyhow::ensure!(
             resource_plan
                 .and_then(|p| p.invalid_reason.as_ref())
@@ -845,6 +916,9 @@ impl ServerStateInner {
         }
         operations.sort();
         operations.dedup();
+        if operations.is_empty() && share.grant_capabilities.is_some() {
+            return Ok(());
+        }
         let app = app.context("CAPABILITY_STATE_CHANGED")?;
         let binding = share
             .bindings
@@ -867,6 +941,89 @@ impl ServerStateInner {
             .filter(|g| g.active);
         let scope = grant.map(|g| g.email.as_str()).unwrap_or("$default");
         let quota_unit = unit(share, grant.map(|g| &g.policy));
+        if let Some(permissions) = &share.grant_capabilities {
+            let grant = grant.context("SHARE_CAPABILITY_DISABLED")?;
+            let policy = permissions
+                .get(scope)
+                .context("SHARE_CAPABILITY_DISABLED")?;
+            let fingerprint = grant_binding_fingerprint(share, app, &runtime);
+            anyhow::ensure!(
+                crate::domain::sharing::shares::share_app_api_enabled(share, app)
+                    && (grant.policy.allowed_apps.is_empty()
+                        || grant.policy.allowed_apps.contains(&app)),
+                "SHARE_CAPABILITY_DISABLED"
+            );
+            for op in operations {
+                anyhow::ensure!(
+                    policy.allowed_operations.contains(&op)
+                        && (grant.manager != ShareGrantManager::RouterShareMarket
+                            || grant
+                                .policy
+                                .allowed_operations
+                                .as_ref()
+                                .is_some_and(|ops| ops.contains(&op))),
+                    "SHARE_CAPABILITY_DISABLED"
+                );
+                anyhow::ensure!(implemented(&runtime, op)
+                    && runtime.configuration_state != crate::domain::providers::runtime::RuntimeConfigurationState::NeedsAttention
+                    && accounts.and_then(|accounts| crate::domain::providers::share_operations::observed_account_state(
+                        &runtime, accounts, op, now_ms() as i64
+                    )) != Some(crate::domain::accounts::capability_evidence::AccountCapabilityObservationState::Unsupported),
+                    "CAPABILITY_NOT_SUPPORTED");
+                anyhow::ensure!(
+                    policy
+                        .operation_bindings
+                        .get(&op)
+                        .is_some_and(|bindings| bindings
+                            .iter()
+                            .any(|b| b.app == app_name(app) && b.fingerprint == fingerprint)),
+                    "CAPABILITY_STATE_CHANGED"
+                );
+                if quota_unit == "usdEquivalent"
+                    && !resource_plan.is_some_and(|plan| {
+                        plan.requires_v2
+                            && plan.quantities.iter().any(|(dimension, quantity)| {
+                                *quantity > 0 && dimension.split('/').next() == Some(op.resource())
+                            })
+                    })
+                {
+                    return Err(crate::domain::usage::value_pricing::PriceRejection {
+                        reason_code: "resource_unpriced",
+                        model: crate::domain::usage::value_pricing::diagnostic_identity(model),
+                        tier: "unknown".into(),
+                        resource_dimensions: vec![op.resource().into()],
+                        active_pricing_revision: None,
+                        pending_pricing_revision: None,
+                        effective_from_ms: None,
+                    }
+                    .into());
+                }
+                if quota_unit == "tokens" && grant.manager != ShareGrantManager::RouterShareMarket {
+                    let required = condition(
+                        scope,
+                        quota_unit,
+                        op,
+                        &fingerprint,
+                        "resource_not_in_token_ledger",
+                    );
+                    anyhow::ensure!(
+                        policy
+                            .coverage_acknowledgements
+                            .iter()
+                            .any(|a| a.condition == required
+                                && a.scope == scope
+                                && !a.actor.is_empty()
+                                && a.accepted_at_ms > 0),
+                        "QUOTA_COVERAGE_REQUIRED"
+                    );
+                }
+            }
+            return Ok(());
+        }
+        let policy = share
+            .capability_policy
+            .as_ref()
+            .context("CAPABILITY_STATE_CHANGED")?;
         let snapshot = if quota_unit == "usdEquivalent" {
             tariff(&self.config_dir, config, share)?
         } else {

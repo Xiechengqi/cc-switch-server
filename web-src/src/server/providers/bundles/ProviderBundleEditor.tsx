@@ -1,5 +1,5 @@
-import { capabilityQuotaContext, capabilityNeedsReview, reconcileCapabilityGrants, type CapabilityReviewHandle } from "@/lib/share-capabilities";
-import {ShareCapabilitiesEditor} from "@/components/providers/ShareCapabilitiesEditor";
+import { GrantReviewCancelled } from "@/lib/grant-capability-preview";
+import { readWebSessionToken } from "@/lib/runtime";
 import {
   Fragment,
   useEffect,
@@ -130,6 +130,7 @@ import {
   bundleShareGrantHandlers,
   saveBundleShare,
   shareForBundle,
+  type BundleShareSaveAttempt,
   type ProviderBundleShareDraft,
 } from "./bundleShare";
 import {
@@ -1117,8 +1118,6 @@ function BundleShareEditor({
   onChange,
   ownerEmail,
   shareUrl,
-  showGrokMedia,
-  capabilitiesRef,
   disabled = false,
 }: {
   draft: ProviderBundleShareDraft;
@@ -1131,8 +1130,6 @@ function BundleShareEditor({
   onChange: Dispatch<SetStateAction<ProviderBundleShareDraft>>;
   ownerEmail: string;
   shareUrl?: string | null;
-  showGrokMedia: boolean;
-  capabilitiesRef: React.Ref<CapabilityReviewHandle>;
   disabled?: boolean;
 }) {
   const { t, i18n } = useTranslation();
@@ -1275,38 +1272,6 @@ function BundleShareEditor({
               }
             />
           </div>
-          {showGrokMedia && !draft.capabilityPolicy ? (
-            <div className="space-y-2 md:col-span-2">
-              <Label>
-                {t("grokOauth.shareMediaPolicy", {
-                  defaultValue: "Share 媒体权限",
-                })}
-              </Label>
-              <fieldset disabled><GrokFeatureOptions
-                values={{
-                  grokImageGenerationEnabled:
-                    draft.grokMediaPolicy.imageGenerationEnabled,
-                  grokImageEditEnabled: draft.grokMediaPolicy.imageEditEnabled,
-                  grokVideoGenerationEnabled:
-                    draft.grokMediaPolicy.videoGenerationEnabled,
-                }}
-                onChange={(key, enabled) => {
-                  const field =
-                    key === "grokImageGenerationEnabled"
-                      ? "imageGenerationEnabled"
-                      : key === "grokImageEditEnabled"
-                        ? "imageEditEnabled"
-                        : "videoGenerationEnabled";
-                  updateDraft({
-                    grokMediaPolicy: {
-                      ...draft.grokMediaPolicy,
-                      [field]: enabled,
-                    },
-                  });
-                }}
-              /></fieldset>
-            </div>
-          ) : null}
           {/* Outside in: who may call, the Share-wide limits, then each user's own. */}
           <div className="space-y-3 border-t border-border-default/70 pt-4 md:col-span-2">
             <ShareSubheading id="bundle-share-access-title" title={t("share.freeAccess.title")} />
@@ -1470,13 +1435,7 @@ function BundleShareEditor({
             </div>
           </div>
           <div className="border-t border-border-default/70 pt-4 md:col-span-2">
-            <ShareCapabilitiesEditor shareId={draft.baseline?.shareId} revision={draft.baseline?.configRevision}
-              policy={draft.capabilityPolicy} savedPolicy={draft.baseline?.capabilityPolicy} grants={draft.userGrants}
-              tokenLimit={Number(draft.tokenLimit) || -1} disabled={disabled} reviewRef={capabilitiesRef}
-              onChange={capabilityPolicy => onChange(current => ({ ...current, capabilityPolicy, capabilityConsent: undefined,
-                userGrants: reconcileCapabilityGrants(capabilityPolicy, current.userGrants),
-              }))} />
-            <ShareUserGrantsEditor independentCapabilities={!!draft.capabilityPolicy} shareOperations={draft.capabilityPolicy?.allowedOperations}
+            <ShareUserGrantsEditor grantCapabilities={draft.baseline?.grantCapabilityPolicy} shareTokenLimit={Number(draft.tokenLimit) || -1}
               shareId={draft.baseline?.shareId}
               configRevision={draft.baseline?.configRevision}
               disabled={disabled}
@@ -1490,7 +1449,7 @@ function BundleShareEditor({
               valueUsageInitializations={draft.userValueUsageInitializations}
               onValueUsageInitializationsChange={updateValueUsageInitializations}
               onUsageEditsChange={updateUserUsageEdits}
-              onChange={userGrants => updateUserGrants(draft.capabilityPolicy ? reconcileCapabilityGrants(draft.capabilityPolicy, userGrants) : userGrants)}
+              onChange={userGrants => updateUserGrants(userGrants)}
             />
           </div>
         </div>
@@ -1535,8 +1494,6 @@ export function ProviderBundleEditor({
   );
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
-  const capabilitiesRef = useRef<CapabilityReviewHandle>(null);
-  const capabilityRuntimeReviewPending = useRef(false);
   const savedBundleRef = useRef<ProviderBundleView | undefined>(
     bundle && !duplicate ? bundle : undefined,
   );
@@ -1572,6 +1529,7 @@ export function ProviderBundleEditor({
   const [shareDraft, setShareDraft] = useState<ProviderBundleShareDraft>(() =>
     createBundleShareDraft(existingShare),
   );
+  const shareSaveAttempt = useRef<BundleShareSaveAttempt>();
   const draftBaselineRef = useRef(stableStringify(draft));
   const shareBaselineRef = useRef(stableStringify(shareDraft));
   const shareDirtyRef = useRef(false);
@@ -1987,7 +1945,7 @@ export function ProviderBundleEditor({
     }
     savingRef.current = true;
     setSaving(true);
-    const providerChanged = stableStringify(draft) !== draftBaselineRef.current;
+    const session = readWebSessionToken();
     let providerSaved = false;
     try {
       if (family.familyId === "family.custom_http") {
@@ -2014,28 +1972,17 @@ export function ProviderBundleEditor({
       setDraft(savedDraft);
       draftBaselineRef.current = stableStringify(savedDraft);
       setShareSavePending(true);
-      let reviewedShareDraft = shareDraft;
-      capabilityRuntimeReviewPending.current ||= !!shareDraft.capabilityPolicy?.allowedOperations.length && providerChanged;
-      const reviewNeeded = shareDraft.enabled && !!shareDraft.baseline && (capabilityNeedsReview(
-        shareDraft.capabilityPolicy, shareDraft.userGrants, Number(shareDraft.tokenLimit),
-        shareDraft.baseline.capabilityPolicy, shareDraft.baseline.userGrants, Number(shareDraft.baseline.tokenLimit),
-      ) || capabilityRuntimeReviewPending.current);
-      if (reviewNeeded) {
-        if (!capabilitiesRef.current) throw new Error("Capability editor is unavailable");
-        const approval = await capabilitiesRef.current.review();
-        if (!approval) return;
-        reviewedShareDraft = { ...shareDraft, capabilityPolicy: approval.policy, capabilityConsent: approval.consent,
-          capabilityConsentScope: capabilityQuotaContext(approval.policy, shareDraft.userGrants, Number(shareDraft.tokenLimit)),
-        };
-      }
-      const savedShare = await saveBundleShare(saved.id, reviewedShareDraft, existingShare);
+      const savedShare = await saveBundleShare(saved.id, shareDraft, existingShare, {
+        providerRevision: saved.revision,
+        session,
+        attempt: shareSaveAttempt,
+      });
       const savedShareDraft = savedShare
         ? createBundleShareDraft(savedShare)
         : shareDraft;
       shareBaselineRef.current = stableStringify(savedShareDraft);
       setShareDraft(savedShareDraft);
       setShareSavePending(false);
-      capabilityRuntimeReviewPending.current = false;
       await Promise.allSettled([
         queryClient.invalidateQueries({ queryKey: ["provider-bundles"] }),
         queryClient.invalidateQueries({ queryKey: shareKeys.list() }),
@@ -2064,6 +2011,7 @@ export function ProviderBundleEditor({
         queryClient.invalidateQueries({ queryKey: shareKeys.list() }),
         queryClient.invalidateQueries({ queryKey: managedAccountKeys.all }),
       ]);
+      if (error instanceof GrantReviewCancelled) return;
       const conflict = bundleCredentialConflict(error, t);
       if (conflict) {
         setValidation(conflict);
@@ -3273,8 +3221,6 @@ export function ProviderBundleEditor({
                 onChange={setShareDraft}
                 ownerEmail={ownerEmail}
                 shareUrl={shareUrl}
-                showGrokMedia={grokDriverOptions}
-                capabilitiesRef={capabilitiesRef}
                 disabled={saving}
               />
             </fieldset>

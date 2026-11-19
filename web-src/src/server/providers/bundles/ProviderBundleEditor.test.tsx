@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, useImperativeHandle } from "react";
-import type { ShareRecord } from "@/lib/api/share";
-import type { CapabilityReviewHandle } from "@/lib/share-capabilities";
+import { act } from "react";
+import type { ShareRecord, ShareUserGrantMap } from "@/lib/api/share";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ProviderBundleView, ProviderBundleWriteDraft } from "@/lib/api/providers";
@@ -13,7 +12,7 @@ import { ProviderBundleEditor } from "./ProviderBundleEditor";
 
 const mocks = vi.hoisted(() => ({
   upsertBundle: vi.fn(), getBundle: vi.fn(), shareSave: vi.fn(), toastError: vi.fn(), onSaved: vi.fn(),
-  validateBundleDraft: vi.fn(), review: vi.fn(), preflight: vi.fn(),
+  validateBundleDraft: vi.fn(), previewGrant: vi.fn(), preflight: vi.fn(),
   shares: [] as ShareRecord[],
   fetchBuddyAccountModels: vi.fn(),
   accounts: [] as ManagedAuthAccount[],
@@ -27,20 +26,20 @@ vi.mock("@/lib/api/providers", () => ({ providersApi: {
   getRequestDefaults: async () => ({ requestTimeoutSeconds: 300, streamFirstByteTimeoutSeconds: 120, streamIdleTimeoutSeconds: 300 }),
   getHealthCheckConfig: async () => ({ timeoutSeconds: 30, maxRetries: 0, degradedThresholdSeconds: 10, testModels: { claude: "test", codex: "test", gemini: "test" } }),
 } }));
-vi.mock("@/lib/api/share", () => ({ shareApi: { saveProviderBundleShare: mocks.shareSave, preflightProviderBundleShare: mocks.preflight } }));
+vi.mock("@/lib/api/share", () => ({ shareApi: { saveProviderBundleShare: mocks.shareSave, preflightProviderBundleShare: mocks.preflight, previewGrantCapabilities: mocks.previewGrant } }));
 vi.mock("@/lib/query", async (original) => ({
   ...await original<typeof import("@/lib/query")>(),
   useManagedAccountsQuery: () => ({ data: mocks.accounts }),
   useSharesQuery: () => ({ data: mocks.shares }),
   useClientTunnelQuery: () => ({ data: { config: { ownerEmail: "owner@example.com" } } }),
 }));
-vi.mock("@/components/providers/ShareUserGrantsEditor", () => ({ ShareUserGrantsEditor: () => null }));
-
-vi.mock("@/components/providers/ShareCapabilitiesEditor", () => ({
-  ShareCapabilitiesEditor: ({ reviewRef }: {reviewRef: React.Ref<CapabilityReviewHandle>}) => {
-    useImperativeHandle(reviewRef, () => ({ review: mocks.review }));
-    return null;
-  },
+vi.mock("@/components/providers/ShareUserGrantsEditor", () => ({
+  ShareUserGrantsEditor: ({ grantCapabilities, value, onChange }: {
+    grantCapabilities?: boolean; value: ShareUserGrantMap; onChange: (grants: ShareUserGrantMap) => void;
+  }) => grantCapabilities ? <button type="button" onClick={() => {
+    const alice = value["alice@example.com"];
+    onChange({ ...value, "alice@example.com": { ...alice, policy: { ...alice.policy, allowedOperations: ["tool.web_search"] } } });
+  }}>Allow search for Alice</button> : null,
 }));
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
@@ -364,35 +363,55 @@ describe("Provider Bundle editor save stages", () => {
 });
 
 
-it("retries capability review after cancellation following a saved Provider change", async () => {
+it("reviews after cancellation and replays a reviewed Share save after losing the response", async () => {
   const bundle = fixture();
-  const saved = {...bundle, name:"Renamed", revision:2};
-  const capabilityPolicy = { version:1 as const, allowedOperations:["tool.web_search" as const], operationBindings:{"tool.web_search":[{app:"codex",fingerprint:"a".repeat(64)}]} };
-  mocks.shares = [{ id:"cap-share",name:"Capability",bindings:{codex:bundle.id},ownerEmail:"owner@example.com",freeAccess:false,
-    shareSlug:"cap-share",status:"active",tokenLimit:-1,parallelLimit:-1,expiresAt:"2099-12-31T23:59:59Z",configRevision:1,
-    capabilityPolicy,userGrants:{},bankedResetExpiryLeadMinutes:60 } as ShareRecord];
+  const saved = { ...bundle, name: "Renamed", revision: 2 };
+  mocks.shares = [{ id: "cap-share", name: "Capability", bindings: { codex: bundle.id }, ownerEmail: "owner@example.com", freeAccess: false,
+    shareSlug: "cap-share", status: "active", tokenLimit: -1, parallelLimit: -1, expiresAt: "2099-12-31T23:59:59Z", configRevision: 1,
+    grantCapabilityPolicy: true, userGrants: {
+      "alice@example.com": { email: "alice@example.com", active: true, role: "shareto", revision: 7,
+        policy: { tokenPeriod: "lifetime", tokenLimit: 100_000, allowedOperations: [] } },
+    }, bankedResetExpiryLeadMinutes: 60 } as ShareRecord];
   mocks.upsertBundle.mockResolvedValue(saved);
-  const approved = { ...capabilityPolicy, operationBindings:{"tool.web_search":[{app:"codex",fingerprint:"b".repeat(64)}]} };
-  mocks.review.mockResolvedValueOnce(null).mockResolvedValueOnce({policy:approved,consent:{credential:"reviewed-ticket",acceptUncovered:[]}});
-  mocks.shareSave.mockResolvedValue(undefined);
+  mocks.previewGrant.mockResolvedValue({ ready: true, expiresAt: Date.now() + 60_000, previewCredential: "reviewed-ticket",
+    requiredAcknowledgements: [{ scope: "alice@example.com", operation: "tool.web_search", condition: "gap" }] });
+  const confirmation = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+  mocks.shareSave.mockRejectedValueOnce(new TypeError("Connection closed")).mockResolvedValue(undefined);
   const container = document.createElement("div"); document.body.appendChild(container);
-  const root = createRoot(container), client = new QueryClient({ defaultOptions:{queries:{retry:false}} });
+  const root = createRoot(container), client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   try {
-    await act(async () => root.render(<QueryClientProvider client={client}><ProviderBundleEditor bundle={bundle} onSaved={mocks.onSaved} onCancel={()=>{}} /></QueryClientProvider>));
+    await act(async () => root.render(<QueryClientProvider client={client}><ProviderBundleEditor bundle={bundle} onSaved={mocks.onSaved} onCancel={() => {}} /></QueryClientProvider>));
     await act(async () => {
       const input = container.querySelector<HTMLInputElement>("#bundle-field-name")!;
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")!.set!.call(input,"Renamed");
-      input.dispatchEvent(new Event("input",{bubbles:true}));
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "Renamed");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      [...container.querySelectorAll("button")].find(button => button.textContent === "Allow search for Alice")!.click();
     });
     await act(async () => saveButton().click());
     expect(mocks.upsertBundle).toHaveBeenCalledTimes(1);
-    expect(mocks.review).toHaveBeenCalledTimes(1);
+    expect(mocks.previewGrant).toHaveBeenCalledTimes(1);
     expect(mocks.shareSave).not.toHaveBeenCalled();
     expect(saveButton().disabled).toBe(false);
     await act(async () => saveButton().click());
     expect(mocks.upsertBundle).toHaveBeenCalledTimes(1);
-    expect(mocks.review).toHaveBeenCalledTimes(2);
-    expect(mocks.shareSave).toHaveBeenCalledWith(expect.objectContaining({capabilityPolicy:approved,capabilityConsent:{credential:"reviewed-ticket",acceptUncovered:[]}}));
+    expect(mocks.previewGrant).toHaveBeenCalledTimes(2);
+    expect(mocks.shareSave).toHaveBeenCalledWith(expect.objectContaining({
+      grantCapabilityEdits: { "alice@example.com": { operations: ["tool.web_search"], expectedRevision: 7 } },
+      capabilityConsent: { credential: "reviewed-ticket", acceptUncovered: ["gap"] },
+    }));
+    expect(mocks.onSaved).not.toHaveBeenCalled();
+    mocks.shares = [{ ...mocks.shares[0], configRevision: 2 }];
+    mocks.previewGrant.mockRejectedValue(new HttpResponseError("Share changed", 409));
+    await act(async () => saveButton().click());
+    expect(mocks.upsertBundle).toHaveBeenCalledTimes(1);
+    expect(mocks.previewGrant).toHaveBeenCalledTimes(2);
+    expect(confirmation).toHaveBeenCalledTimes(2);
+    expect(mocks.shareSave).toHaveBeenCalledTimes(2);
+    expect(mocks.shareSave.mock.calls[1][0]).toEqual(mocks.shareSave.mock.calls[0][0]);
     expect(mocks.onSaved).toHaveBeenCalledWith(saved);
-  } finally { await act(async()=>root.unmount());client.clear();container.remove(); }
+  } finally {
+    confirmation.mockRestore();
+    await act(async () => root.unmount());
+    client.clear(); container.remove();
+  }
 });

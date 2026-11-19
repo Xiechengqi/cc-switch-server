@@ -1314,10 +1314,7 @@ pub(crate) async fn control_preview_share_capabilities(
         .to_owned();
     input.as_object_mut().unwrap().remove("shareId");
     state
-        .preview_share_capabilities(
-            &share_id,
-            serde_json::from_value(input).map_err(ApiError::bad_request)?,
-        )
+        .preview_share_permissions(&share_id, input)
         .await
         .map(Json)
         .map_err(ApiError::value_quota)

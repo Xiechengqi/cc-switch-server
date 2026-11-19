@@ -1075,6 +1075,11 @@ struct SaveProviderBundleShareCommand {
     #[serde(skip)]
     validated_capability_policy:
         Option<crate::domain::sharing::capabilities::ShareCapabilityPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant_capability_edits:
+        Option<BTreeMap<String, crate::domain::sharing::capabilities::GrantCapabilityEdit>>,
+    #[serde(skip)]
+    validated_grant_capabilities: Option<crate::domain::sharing::capabilities::GrantCapabilities>,
     #[serde(default)]
     expected_account_cycle: Option<crate::domain::sharing::quota_cycle::AccountQuotaCycle>,
     bundle_id: String,
@@ -1296,6 +1301,8 @@ fn stage_provider_bundle_share(
                     capability_policy: command.capability_policy.clone(),
                     capability_consent: command.capability_consent.clone(),
                     validated_capability_policy: command.validated_capability_policy.clone(),
+                    grant_capability_edits: command.grant_capability_edits.clone(),
+                    validated_grant_capabilities: command.validated_grant_capabilities.clone(),
                     expected_account_cycle: command.expected_account_cycle.clone(),
                     description: Some(description),
                     free_access,
@@ -1441,6 +1448,8 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
         )));
     }
     let initialization_operation = if command.capability_policy.is_some()
+        || command.grant_capability_edits.is_some()
+        || command.capability_consent.is_some()
         || command.user_value_usage_initializations.is_some()
         || command.user_quota_conversions.is_some()
     {
@@ -1464,7 +1473,11 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
                     "USD usage initialization requires an operation ID",
                 )
             })?;
-        if (edits.is_empty() && conversions.is_empty() && command.capability_policy.is_none())
+        if (edits.is_empty()
+            && conversions.is_empty()
+            && command.capability_policy.is_none()
+            && command.grant_capability_edits.is_none()
+            && command.capability_consent.is_none())
             || edits.len() > 500
             || conversions.len() > 500
             || command.share_id.is_none()
@@ -1596,18 +1609,14 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
         }
     }
 
-    if command.capability_policy.is_some() {
-        let id = command.share_id.as_deref().ok_or_else(|| {
-            ApiError::bad_request(
-                "Create the Share with extensions disabled before enabling operations",
-            )
-        })?;
+    if let Some(id) = command.share_id.as_deref() {
         let patch = state
             .prepare_capability_patch(
                 id,
                 ShareSettingsPatch {
                     capability_policy: command.capability_policy.clone(),
                     capability_consent: command.capability_consent.clone(),
+                    grant_capability_edits: command.grant_capability_edits.clone(),
                     user_grants: command.user_grants.clone(),
                     user_grant_edits: command.user_grant_edits.clone(),
                     token_limit: Some(command.token_limit),
@@ -1617,9 +1626,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
                                 .value_usage_operation_id
                                 .clone()
                                 .unwrap_or_else(|| "native-capability-preview".into()),
-                            expected_config_revision: command.expected_config_revision.ok_or_else(
-                                || ApiError::bad_request("expectedConfigRevision is required"),
-                            )?,
+                            expected_config_revision: command.expected_config_revision.unwrap_or(0),
                             actor: operator.clone(),
                         },
                     ),
@@ -1629,6 +1636,14 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
             .await
             .map_err(ApiError::value_quota)?;
         command.validated_capability_policy = patch.validated_capability_policy;
+        command.validated_grant_capabilities = patch.validated_grant_capabilities;
+    } else if command.capability_policy.is_some()
+        || command.capability_consent.is_some()
+        || command.grant_capability_edits.is_some()
+    {
+        return Err(ApiError::bad_request(
+            "Create the Share before granting media and tools",
+        ));
     }
     let surfaces = providers
         .providers
@@ -2564,6 +2579,27 @@ pub(in crate::api) fn web_share_json(
     let object = value
         .as_object_mut()
         .ok_or_else(|| ApiError::internal("share did not serialize as an object"))?;
+    object.remove("grantCapabilities");
+    if let Some(permissions) = &share.grant_capabilities {
+        object.insert("grantCapabilityPolicy".into(), json!(true));
+        let mut grants = share.user_grants.clone();
+        for (email, grant) in &mut grants {
+            if grant.manager
+                != crate::domain::sharing::router_contract::ShareGrantManager::RouterShareMarket
+            {
+                grant.policy.allowed_operations = Some(
+                    permissions
+                        .get(email)
+                        .map(|policy| policy.allowed_operations.clone())
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        object.insert(
+            "userGrants".into(),
+            serde_json::to_value(grants).map_err(ApiError::internal)?,
+        );
+    }
     let Some(slug) = share.tunnel_subdomain.as_deref() else {
         return Ok(value);
     };

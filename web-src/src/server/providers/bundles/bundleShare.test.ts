@@ -9,6 +9,7 @@ const shareApiMock = vi.hoisted(() => ({
   saveProviderBundleShare: vi.fn(),
   suggestShareSlug: vi.fn(),
   preflightProviderBundleShare: vi.fn(),
+  previewGrantCapabilities: vi.fn(),
 }));
 
 vi.mock("@/lib/api/share", async (importOriginal) => {
@@ -159,6 +160,29 @@ describe("Provider Bundle sharing", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     shareApiMock.preflightProviderBundleShare.mockResolvedValue({ canShare: true });
+  });
+
+  it("persists a staged permission revocation when the Share is paused in the same save", async () => {
+    const existing = share({ codex: "bundle-1" }, 7);
+    const email = "u@example.com";
+    existing.grantCapabilityPolicy = true;
+    existing.userGrants = {
+      [email]: { email, role: "shareto", active: true, revision: 3,
+        policy: { tokenPeriod: "lifetime", allowedOperations: ["tool.web_search"] } },
+    };
+    const draft = createBundleShareDraft(existing);
+    draft.enabled = false;
+    draft.userGrants[email] = { ...draft.userGrants[email], policy: { tokenPeriod: "lifetime", allowedOperations: [] } };
+    shareApiMock.previewGrantCapabilities.mockResolvedValue({
+      ready: true, expiresAt: Date.now() + 60_000, previewCredential: "revocation-review",
+    });
+    await saveBundleShare("bundle-1", draft, existing);
+    expect(shareApiMock.preflightProviderBundleShare).not.toHaveBeenCalled();
+    expect(shareApiMock.saveProviderBundleShare).toHaveBeenCalledWith(expect.objectContaining({
+      enabled: false,
+      grantCapabilityEdits: { [email]: { operations: [], expectedRevision: 3 } },
+      capabilityConsent: { credential: "revocation-review", acceptUncovered: [] },
+    }));
   });
 
   it("checks server-owned eligibility before enabling, without writing a rejected Share", async () => {

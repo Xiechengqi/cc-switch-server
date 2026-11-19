@@ -239,30 +239,97 @@ pub(crate) fn recent(
     installation: &str,
     share: &str,
 ) -> anyhow::Result<Vec<Value>> {
+    metering_attempts(dir, router, installation, share, None)
+}
+
+pub(crate) fn request_metering(
+    dir: &Path,
+    router: &str,
+    installation: &str,
+    share: &str,
+    request: &str,
+) -> anyhow::Result<Vec<Value>> {
+    ensure!(
+        !request.is_empty()
+            && request.len() <= 192
+            && request.trim() == request
+            && !request.chars().any(char::is_control),
+        "invalid request identity"
+    );
+    metering_attempts(dir, router, installation, share, Some(request))
+}
+
+fn metering_attempts(
+    dir: &Path,
+    router: &str,
+    installation: &str,
+    share: &str,
+    request: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
     if !is_committed(dir)? {
         return Ok(vec![]);
     }
     let conn = open_database(&database_path(dir), true)?;
-    let mut query=conn.prepare("SELECT c.request_id,c.attempt,c.scope,c.plan_json,c.admitted_at_ms,a.usage_picos,a.pending_risk_picos,a.metering_status,a.pricing_revision,a.unpriced_reason,a.frozen_tariff_json,(SELECT r.observation_json FROM value_quota_revisions r WHERE r.request_id=c.request_id AND r.attempt_id=CAST(c.attempt AS TEXT) ORDER BY usage_revision DESC LIMIT 1),u.payload_json FROM share_capability_admissions c LEFT JOIN value_quota_attempts a ON a.request_id=c.request_id AND a.attempt_id=CAST(c.attempt AS TEXT) LEFT JOIN usage_records u ON u.request_id=c.request_id WHERE json_extract(c.scope,'$[0]')=?1 AND json_extract(c.scope,'$[1]')=?2 AND json_extract(c.scope,'$[2]')=?3 ORDER BY c.admitted_at_ms DESC LIMIT 20")?;
-    let rows = query.query_map(params![router, installation, share], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, u32>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, i64>(4)?,
-            r.get::<_, Option<String>>(5)?,
-            r.get::<_, Option<String>>(6)?,
-            r.get::<_, Option<String>>(7)?,
-            r.get::<_, Option<String>>(8)?,
-            r.get::<_, Option<String>>(9)?,
-            r.get::<_, Option<String>>(10)?,
-            r.get::<_, Option<String>>(11)?,
-            r.get::<_, Option<String>>(12)?,
-        ))
-    })?;
+    let mut query = conn.prepare(
+        "WITH attempts AS (
+            SELECT request_id, attempt, scope, plan_json, admitted_at_ms
+            FROM share_capability_admissions
+            WHERE json_extract(scope,'$[0]')=?1 AND json_extract(scope,'$[1]')=?2
+              AND json_extract(scope,'$[2]')=?3 AND (?4 IS NULL OR request_id=?4)
+            UNION ALL
+            SELECT a.request_id, CAST(a.attempt_id AS INTEGER),
+              json_array(?1,?2,?3,json_extract(a.scope,'$.email'),NULL), '{}', a.started_at_ms
+            FROM value_quota_attempts a
+            WHERE a.request_id=?4 AND json_extract(a.scope,'$.routerUrl')=?1
+              AND json_extract(a.scope,'$.installationId')=?2 AND json_extract(a.scope,'$.shareId')=?3
+              AND NOT EXISTS(SELECT 1 FROM share_capability_admissions c
+                WHERE c.request_id=a.request_id AND CAST(c.attempt AS TEXT)=a.attempt_id)
+        )
+        SELECT c.request_id,c.attempt,c.scope,c.plan_json,c.admitted_at_ms,
+          a.usage_picos,a.pending_risk_picos,a.metering_status,a.pricing_revision,a.unpriced_reason,a.frozen_tariff_json,
+          (SELECT r.observation_json FROM value_quota_revisions r
+            WHERE r.request_id=a.request_id AND r.attempt_id=a.attempt_id
+            ORDER BY usage_revision DESC LIMIT 1),
+          u.payload_json,a.quota_enforced,a.policy_epoch,a.effective_model
+        FROM attempts c
+        LEFT JOIN value_quota_attempts a
+          ON a.request_id=c.request_id AND a.attempt_id=CAST(c.attempt AS TEXT)
+          AND json_extract(a.scope,'$.routerUrl')=?1 AND json_extract(a.scope,'$.installationId')=?2
+          AND json_extract(a.scope,'$.shareId')=?3 AND json_extract(a.scope,'$.email')=json_extract(c.scope,'$[3]')
+        LEFT JOIN usage_records u ON u.request_id=c.request_id
+        ORDER BY CASE WHEN ?4 IS NOT NULL THEN -c.attempt ELSE c.admitted_at_ms END DESC LIMIT ?5"
+    )?;
+    let rows = query.query_map(
+        params![
+            router,
+            installation,
+            share,
+            request,
+            if request.is_some() { 100 } else { 20 }
+        ],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<String>>(10)?,
+                r.get::<_, Option<String>>(11)?,
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, Option<bool>>(13)?,
+                r.get::<_, Option<String>>(14)?,
+                r.get::<_, Option<String>>(15)?,
+            ))
+        },
+    )?;
     rows.map(|row| {
-        let (request,attempt,scope,plan,at,amount,risk,status,revision,unpriced,tariff,observation,usage_log)=row?;
+        let (request,attempt,scope,plan,at,amount,risk,status,revision,unpriced,tariff,observation,usage_log,enforced,epoch,model)=row?;
         let scope:Value=serde_json::from_str(&scope)?;
         let observation:Option<Value>=observation.as_deref().map(serde_json::from_str).transpose()?;
         let tariff:Option<Value>=tariff.as_deref().map(serde_json::from_str).transpose()?;
@@ -286,7 +353,16 @@ pub(crate) fn recent(
                 dimensions.push(serde_json::json!({"dimension":dimension,"quantity":quantity,"ratePicos":rate,"amountPicos":cost,"pricing":if tariff.is_none(){"not_in_usd_ledger"}else if rate==Some("0"){"explicit_free"}else if rate.is_some(){"priced"}else{"missing"}}));
             }
         }
-        Ok(serde_json::json!({"requestId":request,"attempt":attempt,"scope":scope[3],"policy":serde_json::from_str::<Value>(&plan)?,"admittedAtMs":at,"settledPicos":amount,"pendingRiskPicos":risk,"meteringStatus":status.unwrap_or_else(||"not_in_usd_ledger".into()),"pricingRevision":revision,"unpricedReason":unpriced,"dimensions":dimensions,"estimated":resources.and_then(|resources|resources.get("estimated")).cloned().unwrap_or(Value::Null)}))
+        let mode = match (enforced, epoch.as_deref(), status.as_deref()) {
+            (Some(true), _, _) => "debited",
+            (Some(false), _, _) | (None, Some("evidence"), _) => "estimate",
+            (_, _, None) => "none",
+            _ => "unknown",
+        };
+        let plan: Value = serde_json::from_str(&plan)?;
+        let operations = plan["operations"].as_array().cloned().unwrap_or_default();
+        Ok(serde_json::json!({"requestId":request,"attempt":attempt,"scope":scope[3],
+            "chargeMode":mode,"model":model,"operations":operations,"admittedAtMs":at,"settledPicos":amount,"pendingRiskPicos":risk,"meteringStatus":status.unwrap_or_else(||"not_in_usd_ledger".into()),"pricingRevision":revision,"unpricedReason":unpriced,"dimensions":dimensions,"estimated":resources.and_then(|resources|resources.get("estimated")).cloned().unwrap_or(Value::Null)}))
     }).collect()
 }
 

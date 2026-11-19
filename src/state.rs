@@ -1004,6 +1004,7 @@ struct NegotiatedShareCapabilities {
     quota_unit_conversion: bool,
     unpriced_fields: bool,
     share_capabilities: bool,
+    grant_capabilities: bool,
     watermark_batch: bool,
     unpriced_policy: bool,
 }
@@ -7254,12 +7255,8 @@ impl ServerStateInner {
                 "initialized user policies for historical shares"
             );
         }
-        if shares_changed {
-            if sqlite_committed {
-                crate::repository::server_sqlite::persist_shares(&config_dir, &shares)?;
-            } else {
-                shares.save(&config_dir)?;
-            }
+        if shares_changed && !sqlite_committed {
+            shares.save(&config_dir)?;
         }
         if !sqlite_committed {
             let shadow_result = crate::repository::server_sqlite::ensure_shadow(
@@ -7370,6 +7367,18 @@ impl ServerStateInner {
                         "SQLite shadow import failed; legacy stores remain authoritative"
                     );
                 }
+            }
+        }
+        if crate::repository::server_sqlite::is_committed(&config_dir)? {
+            let migrated = share_capability::migrate_grant_capabilities(&mut shares, &providers);
+            if migrated > 0 || (sqlite_committed && shares_changed) {
+                crate::repository::server_sqlite::persist_shares(&config_dir, &shares)?;
+            }
+            if migrated > 0 {
+                tracing::info!(
+                    migrated_shares = migrated,
+                    "materialized named Share permissions"
+                );
             }
         }
         let ui_settings = UiSettingsStore::load_or_default(&config_dir)?;
@@ -19769,6 +19778,11 @@ impl ServerStateInner {
                                 .capabilities
                                 .iter()
                                 .any(|c| c == "shareCapabilityPolicyV1"),
+                        grant_capabilities: capability.share_contract_version >= 14
+                            && capability
+                                .capabilities
+                                .iter()
+                                .any(|c| c == "shareGrantCapabilitiesV1"),
                         watermark_batch: capability.value_quota_watermark_batch(),
                         unpriced_policy: capability.value_quota_unpriced_policy(),
                     },
@@ -20191,6 +20205,8 @@ impl ServerStateInner {
             ));
         }
         if patch.capability_policy.is_some()
+            || patch.grant_capability_edits.is_some()
+            || patch.capability_consent.is_some()
             || patch.user_value_usage_initializations.is_some()
             || patch.user_quota_conversions.is_some()
         {
@@ -20228,7 +20244,11 @@ impl ServerStateInner {
         patch: crate::domain::sharing::router_contract::ShareSettingsPatch,
     ) -> anyhow::Result<Result<Share, crate::domain::sharing::shares::SharePatchError>> {
         use crate::domain::sharing::router_contract::ShareTokenPeriod;
-        if patch.user_quota_conversions.is_some() || patch.capability_policy.is_some() {
+        if patch.user_quota_conversions.is_some()
+            || patch.capability_policy.is_some()
+            || patch.grant_capability_edits.is_some()
+            || patch.capability_consent.is_some()
+        {
             if let Some(context) = &patch.edit_context {
                 if let Some(receipt) =
                     crate::repository::server_sqlite::value_quota::conversion::settings_receipt(
@@ -22214,8 +22234,10 @@ fn apply_value_descriptor_projection(
                 grant.pending_value_quota = None;
             }
         }
-        if descriptor.contract_version
-            >= crate::domain::sharing::router_contract::VALUE_QUOTA_CONTRACT_VERSION
+        use crate::domain::sharing::capabilities::GRANT_CAPABILITY_CONTRACT_VERSION;
+        use crate::domain::sharing::router_contract::VALUE_QUOTA_CONTRACT_VERSION;
+        if (VALUE_QUOTA_CONTRACT_VERSION..GRANT_CAPABILITY_CONTRACT_VERSION)
+            .contains(&descriptor.contract_version)
         {
             descriptor.contract_version = if !descriptor.market_entitlements.is_empty() {
                 9
@@ -35323,6 +35345,10 @@ mod tests {
                     store
                         .upsert(router_sync_share_input(id, &format!("{id}-provider")))
                         .unwrap();
+                }
+                // Exercise the v7 reader's legacy Shares, before v14 adoption.
+                for share in &mut store.shares {
+                    share.grant_capabilities = None;
                 }
                 store
                     .shares

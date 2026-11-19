@@ -15,7 +15,7 @@ const currentLogin = () => `${readToken() ?? ""}:${readRouterAccessToken() ?? ""
  * session or a Router SSO change in another tab all change it, and every hook
  * below then discards what it fetched for the previous login.
  */
-function useCurrentLogin() {
+export function useCurrentLogin() {
   const [login, setLogin] = useState(currentLogin);
   useEffect(() => {
     const update = () => setLogin(currentLogin());

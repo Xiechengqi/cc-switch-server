@@ -5,6 +5,36 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const CAPABILITY_CATALOG_VERSION: &str = "share-operations-v1";
 pub const CAPABILITY_CONTRACT_VERSION: u16 = 13;
+pub const GRANT_CAPABILITY_CONTRACT_VERSION: u16 = 14;
+
+/// Server-owned approvals keyed by the normalized identity of an active grant.
+/// Kept outside the quota policy so scheduled quota activation cannot copy
+/// older execution permissions back into effect.
+pub type GrantCapabilities = BTreeMap<String, ShareCapabilityPolicy>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GrantCapabilityEdit {
+    pub operations: Vec<ShareOperation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reconfirm: Vec<ShareOperation>,
+    pub expected_revision: u64,
+}
+
+impl GrantCapabilityEdit {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_operations(&self.operations)?;
+        validate_operations(&self.reconfirm)?;
+        if self
+            .reconfirm
+            .iter()
+            .any(|op| !self.operations.contains(op))
+        {
+            return Err("reconfirmation requires an enabled operation".into());
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ShareOperation {
     #[serde(rename = "image.generate")]

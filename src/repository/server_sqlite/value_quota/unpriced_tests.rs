@@ -810,3 +810,110 @@ fn ultrafast_without_a_dedicated_tariff_stays_unpriced_and_market_refuses() {
         "tier_unpriced"
     );
 }
+
+#[test]
+fn strict_grant_usd_rejects_missing_prices_without_reserving_and_keeps_estimates_separate() {
+    let (mut conn, scope, window, mut quota, revision) = setup();
+    quota.unpriced_usage = crate::domain::usage::value_pricing::UnpricedUsage::Reject;
+    let tx = conn.transaction().unwrap();
+    let base = unpriced_admission(&scope, &window, &quota, &revision, "strict-tier", "model");
+    for (request_id, effective_model, effective_tier, reason) in [
+        ("strict-tier", "model", "unknown", "tier_unpriced"),
+        (
+            "strict-model",
+            "missing-model",
+            "standard",
+            "model_unpriced",
+        ),
+    ] {
+        let error = admit_with_trial_in_tx(
+            &tx,
+            &Admission {
+                enforce: true,
+                request_id,
+                effective_model,
+                effective_tier,
+                ..base.clone()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::domain::usage::value_pricing::PriceRejection>()
+                .unwrap()
+                .reason_code,
+            reason
+        );
+    }
+    let mut resource_quota = quota.clone();
+    resource_quota.tariff_policy_id =
+        crate::domain::usage::value_pricing::RESOURCE_TARIFF_POLICY.into();
+    let resource = admit_with_trial_in_tx(
+        &tx,
+        &Admission {
+            enforce: true,
+            request_id: "strict-resource",
+            quota: &resource_quota,
+            resource_plan: Some(crate::domain::usage::value_pricing::ResourcePlan {
+                text_tokens: true,
+                requires_v2: true,
+                quantities: BTreeMap::from([("tool.web_search".into(), 1)]),
+                ..Default::default()
+            }),
+            ..base.clone()
+        },
+        None,
+    )
+    .unwrap_err();
+    let price = resource
+        .downcast_ref::<crate::domain::usage::value_pricing::PriceRejection>()
+        .unwrap();
+    assert_eq!(price.reason_code, "resource_unpriced");
+    assert_eq!(price.resource_dimensions, ["tool.web_search"]);
+    let count: i64 = tx
+        .query_row("SELECT count(*) FROM value_quota_attempts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    admit_with_trial_in_tx(
+        &tx,
+        &Admission {
+            enforce: false,
+            request_id: "estimate-tier",
+            effective_tier: "unknown",
+            ..base.clone()
+        },
+        None,
+    )
+    .unwrap();
+
+    let mut historical = quota.clone();
+    historical.unpriced_usage = crate::domain::usage::value_pricing::UnpricedUsage::Zero;
+    let old = Admission {
+        enforce: true,
+        request_id: "previous-admission",
+        effective_model: "missing-model",
+        quota: &historical,
+        ..base.clone()
+    };
+    admit_with_trial_in_tx(&tx, &old, None).unwrap();
+    admit_with_trial_in_tx(
+        &tx,
+        &Admission {
+            quota: &quota,
+            ..old
+        },
+        None,
+    )
+    .unwrap();
+    let enforced: bool = tx
+        .query_row(
+            "SELECT quota_enforced FROM value_quota_attempts WHERE request_id='estimate-tier'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!enforced);
+}

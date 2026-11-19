@@ -22,6 +22,8 @@ impl ValueUsageInitializationRequest {
         patch: &ShareSettingsPatch,
     ) -> anyhow::Result<Option<Self>> {
         if patch.capability_policy.is_none()
+            && patch.grant_capability_edits.is_none()
+            && patch.capability_consent.is_none()
             && patch.user_value_usage_initializations.is_none()
             && patch.user_quota_conversions.is_none()
         {

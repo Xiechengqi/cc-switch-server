@@ -638,6 +638,7 @@ fn value_quota_deterministic_policy_errors_are_client_errors_with_stable_nonretr
                 reason_code: reason,
                 model: "model".into(),
                 tier: "standard".into(),
+                resource_dimensions: Vec::new(),
                 active_pricing_revision: None,
                 pending_pricing_revision: None,
                 effective_from_ms: None,

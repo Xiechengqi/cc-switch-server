@@ -110,6 +110,63 @@ async fn fixture() -> (ServerState, Value) {
 }
 
 #[tokio::test]
+async fn native_bundle_applies_reviewed_permissions_when_pausing_a_share() {
+    let (state, mut command) = fixture().await;
+    let config = state.config_snapshot().await;
+    state
+        .record_router_quota_capability(
+            &config,
+            RouterShareCapabilities {
+                share_contract_version: 14,
+                capabilities: vec![
+                    "usdEquivalentQuotaV1".into(),
+                    "quotaUnitConversionV1".into(),
+                    "shareGrantCapabilitiesV1".into(),
+                ],
+            },
+        )
+        .await;
+    let fields = command.as_object_mut().unwrap();
+    fields.remove("userQuotaConversions");
+    fields.remove("userValueUsageInitializations");
+    let email = "new@example.test";
+    command["userGrantEdits"] = json!({(email):{"expectedRevision":0,"policy":{"tokenPeriod":"lifetime","tokenLimit":100}}});
+    command["grantCapabilityEdits"] =
+        json!({(email):{"expectedRevision":0,"operations":["tool.web_search"]}});
+    let preview = state
+        .preview_share_permissions(
+            command["shareId"].as_str().unwrap(),
+            json!({"expectedConfigRevision":command["expectedConfigRevision"],"userGrantEdits":command["userGrantEdits"],"grantCapabilityEdits":command["grantCapabilityEdits"],"shareTokenLimit":-1}),
+        )
+        .await
+        .unwrap();
+    let conditions = preview["requiredAcknowledgements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["condition"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(conditions.len(), 1);
+    command["capabilityConsent"] =
+        json!({"credential":preview["previewCredential"],"acceptUncovered":conditions});
+    let saved = web_save_provider_bundle_share(&state, &command, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!saved.enabled);
+    assert_eq!(
+        saved.grant_capabilities.as_ref().unwrap()[email].allowed_operations,
+        vec![crate::domain::sharing::capabilities::ShareOperation::WebSearch]
+    );
+    let replay = web_save_provider_bundle_share(&state, &command, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.config_revision, saved.config_revision);
+    crate::state::stop_client_tunnel(&state).await;
+}
+
+#[tokio::test]
 async fn native_bundle_opening_usd_usage_is_atomic_replayable_and_never_succeeds_for_a_deleted_share(
 ) {
     let (state, command) = fixture().await;

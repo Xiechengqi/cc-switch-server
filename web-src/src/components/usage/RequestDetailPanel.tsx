@@ -1,3 +1,4 @@
+import { RequestMeteringEvidencePanel } from "./RequestMeteringEvidencePanel";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -43,6 +44,7 @@ export function RequestDetailPanel({ requestId, onClose }: RequestDetailPanelPro
           <div className="py-16 text-center text-muted-foreground">{t("usage.requestNotFound", "请求未找到")}</div>
         ) : (
           <div className="space-y-6">
+            {request.shareId && <RequestMeteringEvidencePanel key={request.requestId} shareId={request.shareId} requestId={request.requestId} />}
             <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               <Detail label={t("usage.requestId", "请求 ID")} value={request.requestId} mono />
               <Detail label={t("usage.recordKind", "记录类型")} value={request.recordKind} mono />

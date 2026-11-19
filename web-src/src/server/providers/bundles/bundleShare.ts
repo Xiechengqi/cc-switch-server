@@ -1,6 +1,8 @@
+import { confirmGrantPreview, grantCapabilityEdits, grantQuotaTerms } from "@/lib/grant-capability-preview";
 import {capabilityIntent, capabilityQuotaContext, type ShareCapabilityPolicy, type CapabilityConsent} from "@/lib/share-capabilities";
 import {
   shareApi,
+  type SaveProviderBundleShareParams,
   type ShareRecord,
   type ShareUserGrant,
   type ShareUserGrantMap,
@@ -20,7 +22,7 @@ import {
   UNLIMITED_TOKEN_LIMIT,
 } from "@/utils/shareUtils";
 import i18n from "@/i18n";
-import { HttpResponseError } from "@/lib/runtime";
+import { HttpResponseError, readWebSessionToken } from "@/lib/runtime";
 
 export interface ProviderBundleShareDraft {
   capabilityPolicy?:ShareCapabilityPolicy;
@@ -28,6 +30,7 @@ export interface ProviderBundleShareDraft {
   capabilityConsentScope?:string;
   baseline?: {
     capabilityPolicy?:ShareCapabilityPolicy;
+    grantCapabilityPolicy?: boolean;
     shareId: string;
     configRevision: number;
     userGrants: ShareUserGrantMap;
@@ -141,6 +144,7 @@ export function createBundleShareDraft(
   return {
     baseline: share ? {
       capabilityPolicy:share.capabilityPolicy,
+      grantCapabilityPolicy:share.grantCapabilityPolicy,
       shareId: share.id,
       configRevision: share.configRevision ?? 0,
       userGrants: { ...canonicalUserGrants, ...buildShareUserGrants({
@@ -276,11 +280,52 @@ function expiresAt(draft: ProviderBundleShareDraft): string {
   return new Date(anchor + preset.seconds * 1000).toISOString();
 }
 
+export type BundleShareSaveAttempt = {
+  draft: ProviderBundleShareDraft;
+  providerRevision: number;
+  session: string | null;
+  params: SaveProviderBundleShareParams;
+};
+
 export async function saveBundleShare(
   bundleId: string,
   draft: ProviderBundleShareDraft,
   existing?: ShareRecord,
+  retry?: {
+    providerRevision: number;
+    session: string | null;
+    attempt: { current: BundleShareSaveAttempt | undefined };
+  },
 ): Promise<ShareRecord | undefined> {
+  const assertSession = () => {
+    if (retry && retry.session !== readWebSessionToken()) {
+      throw new DOMException("Sign-in session changed", "AbortError");
+    }
+  };
+  const send = async (params: SaveProviderBundleShareParams) => {
+    assertSession();
+    if (retry && params.valueUsageOperationId) {
+      retry.attempt.current = { draft, providerRevision: retry.providerRevision, session: retry.session, params };
+    }
+    try {
+      const share = await shareApi.saveProviderBundleShare(params);
+      assertSession();
+      if (retry) retry.attempt.current = undefined;
+      return share;
+    } catch (error) {
+      if (retry && error instanceof HttpResponseError && error.status < 500 && error.status !== 408) {
+        retry.attempt.current = undefined;
+      }
+      throw error;
+    }
+  };
+  const previous = retry?.attempt.current;
+  if (retry && previous?.draft === draft && previous.params.bundleId === bundleId
+    && previous.providerRevision === retry.providerRevision && previous.session === retry.session) {
+    return send(previous.params);
+  }
+  if (retry) retry.attempt.current = undefined;
+
   if ((capabilityIntent(draft.capabilityPolicy)!==capabilityIntent(draft.baseline?.capabilityPolicy) ||
       !!draft.capabilityPolicy?.allowedOperations.length && capabilityQuotaContext(draft.capabilityPolicy,draft.userGrants,Number(draft.tokenLimit))!==capabilityQuotaContext(draft.baseline?.capabilityPolicy,draft.baseline?.userGrants??{},Number(draft.baseline?.tokenLimit??-1))) && (!draft.capabilityConsent || draft.capabilityConsentScope!==capabilityQuotaContext(draft.capabilityPolicy,draft.userGrants,Number(draft.tokenLimit)))) {
     throw new Error(i18n.language.startsWith("zh")?"请先确认扩展能力与额度覆盖预览":"Confirm the capability and quota coverage preview first");
@@ -300,7 +345,7 @@ export async function saveBundleShare(
     ? draft.userGrants
     : undefined;
   const userGrantEdits = draft.baseline
-    ? changedBundleUserGrants(draft.baseline.userGrants, draft.userGrants)
+    ? changedBundleUserGrants(draft.baseline.userGrants, draft.userGrants, draft.baseline.grantCapabilityPolicy)
     : undefined;
   const allowedUsageEmails = new Set(
     Object.values(draft.userGrants)
@@ -336,6 +381,7 @@ export async function saveBundleShare(
     );
   }
   if (draft.enabled) {
+    assertSession();
     const preflight = await shareApi.preflightProviderBundleShare(bundleId);
     if (!preflight.canShare) {
       throw new HttpResponseError(i18n.t(`providerBundle.sharePreflight.${preflight.reason ?? "resolution_failed"}`, {
@@ -351,7 +397,25 @@ export async function saveBundleShare(
     delete userUsageEdits[email];
     return [[email, grant.quotaUnitConversion]];
   }));
-  return shareApi.saveProviderBundleShare({
+  const baseline = draft.baseline;
+  const grantEdits = baseline?.grantCapabilityPolicy ? grantCapabilityEdits(baseline.userGrants, draft.userGrants) : {};
+  const changesPermissions = Object.keys(grantEdits).length > 0;
+  const changesCoverage = baseline?.grantCapabilityPolicy && Object.entries(baseline.userGrants).some(([email, grant]) =>
+    grant.active !== false && grant.manager !== "routerShareMarket" && !!grant.policy.allowedOperations?.length
+      && (tokenLimit !== (Number(baseline.tokenLimit) || -1) || !!userGrantEdits?.[email]?.policy));
+  let consent = draft.capabilityConsent;
+  if (baseline && (changesPermissions || changesCoverage)) {
+    assertSession();
+    const preview = await shareApi.previewGrantCapabilities(baseline.shareId, {
+      expectedConfigRevision: baseline.configRevision,
+      grantCapabilityEdits: grantEdits,
+      userGrantEdits,
+      shareTokenLimit: tokenLimit,
+    });
+    assertSession();
+    consent = confirmGrantPreview(preview);
+  }
+  return send({
     expectedAccountCycle: Object.values(draft.userGrants).find((grant) => grant.active !== false && grant.policy.tokenPeriod === "accountReset")?.accountQuotaCycle,
     bundleId,
     shareId: draft.baseline?.shareId,
@@ -367,14 +431,17 @@ export async function saveBundleShare(
     autoConsumeBankedReset: draft.autoConsumeBankedReset,
     bankedResetExpiryLeadMinutes,
     previousResponseCacheEnabled: draft.previousResponseCacheEnabled,
-    ...(draft.capabilityConsent?{capabilityPolicy:draft.capabilityPolicy,capabilityConsent:draft.capabilityConsent}:{}),
-    grokMediaPolicy: draft.grokMediaPolicy,
+    ...(consent ? {capabilityConsent:consent} : {}),
+    ...(changesPermissions ? {grantCapabilityEdits:grantEdits} : {}),
+    ...(baseline?.grantCapabilityPolicy ? {} : {grokMediaPolicy:draft.grokMediaPolicy}),
     userGrants: draft.baseline ? undefined : userGrants,
     userGrantEdits,
     userUsageEdits,
     ...(Object.keys(initializations).length ? {userValueUsageInitializations: initializations} : {}),
     ...(Object.keys(conversions).length ? {userQuotaConversions: conversions} : {}),
-    ...(draft.capabilityConsent || Object.keys(initializations).length || Object.keys(conversions).length ? {valueUsageOperationId: draft.valueUsageOperationId} : {}),
+    ...(consent || Object.keys(initializations).length || Object.keys(conversions).length
+      ? { valueUsageOperationId: retry ? crypto.randomUUID() : draft.valueUsageOperationId }
+      : {}),
   });
 }
 
@@ -383,9 +450,9 @@ export async function saveBundleShare(
  * so when the owner stages a different policy) is a change even when the
  * enforced policy itself is untouched.
  */
-function grantPolicyKey(grant: ShareUserGrant) {
-  return JSON.stringify([sharePolicyKey(grant.policy),
-    grant.pendingValueQuota?.policy ? sharePolicyKey(grant.pendingValueQuota.policy) : null]);
+function grantPolicyKey(grant: ShareUserGrant, grantCapabilities: boolean) {
+  const key = (terms: ShareUserPolicy) => sharePolicyKey(grantCapabilities ? grantQuotaTerms(terms) : terms);
+  return JSON.stringify([key(grant.policy), grant.pendingValueQuota?.policy ? key(grant.pendingValueQuota.policy) : null]);
 }
 
 export class MalformedValueQuotaGrantError extends Error {
@@ -406,7 +473,7 @@ export class MalformedValueQuotaGrantError extends Error {
  * re-sent as a policy: that policy would be rebuilt without the unreadable
  * quota or schedule.
  */
-export function changedBundleUserGrants(baseline: ShareUserGrantMap, draft: ShareUserGrantMap) {
+export function changedBundleUserGrants(baseline: ShareUserGrantMap, draft: ShareUserGrantMap, grantCapabilities = false) {
   const changes: Record<string, { expectedRevision: number; policy: ShareUserPolicy | null }> = {};
   for (const email of new Set([...Object.keys(baseline), ...Object.keys(draft)])) {
     const previous = baseline[email];
@@ -415,11 +482,11 @@ export function changedBundleUserGrants(baseline: ShareUserGrantMap, draft: Shar
         (next?.active !== false && next?.manager === "routerShareMarket")) continue;
     const wasActive = !!previous && previous.active !== false;
     const active = !!next && next.active !== false;
-    if (wasActive === active && (!active || grantPolicyKey(previous) === grantPolicyKey(next))) continue;
+    if (wasActive === active && (!active || grantPolicyKey(previous, grantCapabilities) === grantPolicyKey(next, grantCapabilities))) continue;
     if (active && (previous?.valueQuotaMalformed || next.valueQuotaMalformed)) {
       throw new MalformedValueQuotaGrantError(next.email || email);
     }
-    changes[email] = { expectedRevision: previous?.revision ?? 0, policy: active ? next.policy : null };
+    changes[email] = { expectedRevision: previous?.revision ?? 0, policy: active ? (grantCapabilities ? grantQuotaTerms(next.policy) : next.policy) : null };
   }
   return Object.keys(changes).length ? changes : undefined;
 }
