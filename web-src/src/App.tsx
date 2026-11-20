@@ -9,6 +9,7 @@ import { LoginPanel } from "@/components/LoginPanel";
 import { isRemoteWebMode } from "@/lib/api/auth";
 import { getWebRuntimeContext, WebRuntimeContext } from "@/lib/runtime";
 import { SERVER_AUTH_EXPIRED_EVENT } from "@/lib/routerAuth";
+import { initializeEmbeddedAuth } from "@/lib/embeddedAuth";
 
 function App() {
   const { t } = useTranslation();
@@ -18,6 +19,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
 
   const refreshContext = useCallback(async () => {
+    await initializeEmbeddedAuth();
     const next = await getWebRuntimeContext();
     setContext(next);
     return next;

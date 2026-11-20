@@ -1,3 +1,5 @@
+import { clearEmbeddedSession, embeddedAuthHeaders, embeddedSessionToken, renewEmbeddedSession } from "@/lib/embeddedAuth";
+
 const AUTH_KEY = "cc_switch_router_auth_v2";
 const PROTOCOL_EPOCH = "namespace-flat-1";
 const AUTH_DEVICE_IDENTITY_LOCK_NAME =
@@ -59,6 +61,7 @@ function mergeAuthState(patch: RouterAuthState): RouterAuthState {
 }
 
 export function clearRouterSessionTokens(): void {
+  clearEmbeddedSession();
   const state = readAuthState();
   mergeAuthState({
     authDeviceId: state.authDeviceId || null,
@@ -391,6 +394,8 @@ function authBearerHeaders(): Record<string, string> {
 }
 
 export function readRouterAccessToken(): string | null {
+  const embedded = embeddedSessionToken();
+  if (embedded) return embedded;
   const state = readAuthState();
   if (state.authProvider === "apiToken") {
     return state.apiToken?.trim() || null;
@@ -398,7 +403,7 @@ export function readRouterAccessToken(): string | null {
   return state.accessToken?.trim() || state.apiToken?.trim() || null;
 }
 
-function fetchWithAuth(
+async function fetchWithAuth(
   input: RequestInfo | URL,
   init: RequestInit = {},
 ): Promise<Response> {
@@ -406,6 +411,7 @@ function fetchWithAuth(
   Object.entries(authBearerHeaders()).forEach(([key, value]) =>
     headers.set(key, value),
   );
+  Object.entries(await embeddedAuthHeaders()).forEach(([key, value]) => headers.set(key, value));
   return fetch(input, { ...init, headers });
 }
 
@@ -539,6 +545,9 @@ export async function routerAuthFetch(
   init: RequestInit = {},
 ): Promise<Response> {
   let response = await fetchWithAuth(input, init);
+  if (response.status === 401 && (await renewEmbeddedSession())) {
+    response = await fetchWithAuth(input, init);
+  }
   if (response.status === 401 && (await refreshAccessToken())) {
     response = await fetchWithAuth(input, init);
   }
