@@ -9,7 +9,7 @@
 - 现代目录的已知协议仅映射到固定路径：Chat `/inference/openai/v1/chat/completions`、Responses `/inference/openai/v1/responses`、Messages `/inference/anthropic/v1/messages`。旧目录继续使用 `/inference/v1/*` 与既有 Muse Spark/union-alpha 协议映射。未知协议、不同 origin 或未受审路径不可选；绝不直接跟随目录 URL。
 - `Bearer public`；请求规范 `opencode-1.19.5-bun-1.4.4-v1` 使用成功捕获的 CLI 1.19.5 UA、CLI/session/affinity 头，不发未经需要证明的 `x-opencode-request`。冻结的本地系统提示及环境标签提供兼容前缀，后续明确交由调用方提供实际身份、指令与工具；调用方 system/history/tool schema 保留。前缀不包含捕获时的临时目录、内置 skill 或用户对话，会占用部分输入上下文；实际计量以上游 usage 为准。
 - Session 是可解码时间戳前缀加随机尾部，6 天重铸。缓存键包含 Provider、Share、用户和下游会话；缺少会话时每次请求独立，不把全部用户折叠到 Provider ID。4096 条、哈希键、单条最旧铸造记录淘汰，不接受下游直接指定上游 session。
-- 官方 `read`、`shell` 原文指纹；冲突工具改名并恢复，Chat 名称增量支持别名分片。缓存提示不注入上游，工具 schema 中的同名属性不删除。
+- 官方 `read`、`shell` 原文指纹；冲突工具改名并恢复，Chat 名称增量支持别名分片。缓存提示不注入上游，工具 schema 中的同名属性不删除。 Zen 专用工具适配对受影响的 `spawn_agent` / `wait_agent` 函数名（包括已转换的 namespace 与冲突后缀）使用稳定、可逆且避免碰撞的出站别名，不依赖另一工具是否同时存在。声明、强制选择和已完成调用历史使用同一映射；返回时恢复原名与 Responses 工具身份。工具描述、schema、调用 ID、参数和结果正文保持，历史工具不因改名获得当前声明权限。原生 Responses 的 namespace 容器、选择器和历史仍按其原有身份处理。
 - Chat JSON 关闭 HTML 转义并保持 CLI 顶层字段顺序；缺省输出上限取 32000 与当前模型声明上限的较小值；显式超出声明的上限会在发送前拒绝。`tool_choice:none` 在出站前拒绝。
 
 入口协议与模型的上游协议独立。使用 Server 自有 transforms 与 stateful stream bridge，覆盖 Messages/Chat/Responses 三入口 × 三上游协议 × 流/非流的 18 个基础组合。请求转换保留 system/instructions、工具调用 ID、工具结果与历史，响应转换遵循入口格式，Chat 的 created 使用统一兼容边界。
@@ -31,6 +31,10 @@ Router Share 的「连接」弹窗提供新连接使用的 Codex CLI 命令。�
 请求日志分别记录客户端请求的档位和实际发出的档位，Router 可显示 `low → high`。verbosity 回退与明文推理省略在调试日志中使用固定原因和计数。
 
 当前审计过的 Codex 0.170.0 内置 `functions.exec` 声明可桥接到 Chat 目标。完整参数包含唯一的非空 `input` 字符串，源码和可选 pragma 由 CLI 在原有权限下处理。Server 在收到干净的 SSE 终态后交付完整工具调用，保留跨分片的普通工具名和 Code Mode 调用标识。遗失、冲突或无法验证的 Code Mode 参数和结果收到明确错误。
+
+2026-11-20 使用实际 Codex CLI 0.170.0，在隔离的实际 Router Share 隧道、完整 Server 与固定 US IPv4 出口的真实 Zen 之间，通过 HY4 / DeepSeek 的 8 项 CLI 场景、10 次真实生成。原有 `gpt-6.2-sol` / `gpt-6.2-astra` 别名、默认档位和 verbosity 保持，覆盖 Code Mode 工具结果回传与会话恢复。另两组签名 Share API 的真实工具往返（4 次生成）验证了别名后的工具被正确选择、恢复为原始 namespace/函数身份，并接收模拟结果继续回答；没有启动实际子代理。该验收不代表已经更新生产服务。
+
+Chat 向 Messages 或 Responses 转换时，跨增量的工具名和参数先完成有界组装与身份校验，确认干净终态后交付，避免工具名分片时提前出现占位名 `tool`。普通文本内容仍增量交付。
 
 ## Claude Code 连接与工具发现
 
@@ -68,7 +72,9 @@ Chat 必须有合法 finish_reason 与 `[DONE]`；HY4 已确认会在完整用�
 
 ## 错误与模型目录
 
-`FreeUsageLimitError`、`FreeTierError` 与地区拒绝保留受限类别，不把所有 429 解释为付费套餐额度耗尽。模型测试将合法 Retry-After 单独传给 Web；本地冷却使用独立类别，明确本次未发送上游请求。429、403、401 不自动重放，分别保留对应 HTTP 状态；其他供应商错误映射为网关错误。客户端和日志不拼接上游原始正文/HTML，只保留固定类别、原状态、受限请求 ID 及合法数字或 HTTP-date Retry-After 提示，并通过公共错误元数据向客户端透传。已识别的参数/上下文错误映射为 400；不能识别的错误仍按网关错误处理。重铸 session 不会创造新额度。
+`FreeUsageLimitError`、`FreeTierError` 与地区拒绝保留受限类别，不把所有 429 解释为付费套餐额度耗尽。已审计的结构化 `FreeUsageLimitError` 若明确提示免费模型须在 OpenCode 中使用，归为 `free_lane_gate`，其 Retry-After 只冷却实际发出的模型和请求 profile。profile 根据出站协议、工具、控制和 system/developer 指令计算摘要，不包含用户对话正文或 Share/用户身份。相同 profile 的后续请求遵守冷却，其他 profile 可继续准入。普通或未知 429 保留模型级限流，401/403 保留公开车道级保护；不会因为改名或重铸会话忽略这些限制。缓存最多 512 条；请求 profile 缓存饱和不会将其拒绝提升为全模型或全车道冷却。
+
+调试日志记录受限的原始触发请求 ID、上游请求 ID、profile 摘要及到期时间。本地冷却错误保留作用域、固定原因与不含业务词的关联摘要，避免诊断 ID 中的 `quota` 等词干扰健康分类。冷却只存于当前进程内存；修复发布后的正常进程替换会丢弃旧版本的宽作用域冷却，没有新增远程清除接口。模型测试将合法 Retry-After 单独传给 Web；本地冷却使用独立类别，明确本次未发送上游请求。429、403、401 不自动重放，分别保留对应 HTTP 状态；其他供应商错误映射为网关错误。客户端和日志不拼接上游原始正文/HTML，只保留固定类别、原状态、受限请求 ID 及合法数字或 HTTP-date Retry-After 提示，并通过公共错误元数据向客户端透传。已识别的参数/上下文错误映射为 400；不能识别的错误仍按网关错误处理。重铸 session 不会创造新额度。
 
 公开目录、管理发现与生成准入共用缓存：8 分钟 fresh，失败后旧成功目录最多保留 24 小时；冷启动无可用目录则拒绝生成，不使用写死清单。单次刷新最多 15 秒、响应 1 MiB、512 个模型、每 ID 256 字节；并发 single-flight，失败退避 30 秒。模型类型、免费分类和协议共同决定准入；decision/image/未知类型及决策模型 `jev*` 不作为 Chat 模型开放。手动刷新可绕过 fresh，但受 30 秒最短间隔、并发合并和失败退避限制。
 
@@ -82,11 +88,13 @@ Chat 必须有合法 finish_reason 与 `[DONE]`；HY4 已确认会在完整用�
 
 2026-11-18 本轮真实验收使用固定请求规范及 Bun 传输的完整 Server 二进制（SHA-256 `825386de4666283687c97007aabad4a6f8324eb62e311b46fd0eedeecc82c235`）。每个节点均通过 `hy4-flash-free` / `deepseek-v4.1-flash-free` × Claude/Codex × 流/非流的 8 项管理 HTTP 模型检测，合计 24/24；HY4 经签名 Share 入口完成 Chat/Responses/Messages 的工具调用与结果回传，每节点 3 组，合计 9/9。Share 验证使用独立临时身份和签名，不能冒称实际公网 Router 端到端验收。US 另通过显式认证 CONNECT 代理验证自动下载与推理，三节点均启用 IPv4 约束。临时服务和配置已清理，既有 Server 进程未被本轮验收重启；MY 的独立进程核对说明见根证据。本轮未替换生产二进制。该结果不扩展为 arm64/musl、其他免费模型、媒体或可选控制参数的实测证明。
 
-本轮最终整体 review 与验证完成：Rust 库 4574 通过 / 0 失败 / 5 忽略、API 契约 139/139、两个独立集成目标各 1/1；Zen 相关回归 66/66，另两项固定 Bun 进程测试显式运行 2/2 通过。完整静态检查通过，包含严格 Clippy、全部 src/include 格式、Node 审计 2205/2205 与 smoke 脚本回归 13/13、Web 类型检查及 61 文件 / 451 项测试。最终 check/build、本地 10 步 HTTP smoke、生成契约与文档索引通过；源码及传输资产摘要与真实验收版本一致。离线 readiness 的 failures=0，仍因未提供全产品真实输入及部署验收而为 `blocked_inputs`。完整命令、忽略项和验收边界见根 `PROTOCOL_EVIDENCE.md` 的 CLI request/transport rejection repair 条目。
+2026-11-18 的整体 review 与验证快照：Rust 库 4574 通过 / 0 失败 / 5 忽略、API 契约 139/139、两个独立集成目标各 1/1；Zen 相关回归 66/66，另两项固定 Bun 进程测试显式运行 2/2 通过。完整静态检查通过，包含严格 Clippy、全部 src/include 格式、Node 审计 2205/2205 与 smoke 脚本回归 13/13、Web 类型检查及 61 文件 / 451 项测试。最终 check/build、本地 10 步 HTTP smoke、生成契约与文档索引通过；源码及传输资产摘要与真实验收版本一致。离线 readiness 的 failures=0，仍因未提供全产品真实输入及部署验收而为 `blocked_inputs`。完整命令、忽略项和验收边界见根 `PROTOCOL_EVIDENCE.md` 的 CLI request/transport rejection repair 条目。
 
-整体 review 修正了无凭据 Profile 的创建与运行时准入、Responses 终态后数据校验、慢下游对空闲超时的影响、分片事件解析前的内存预留，以及续写准入失败时的 attempt 编号。SQLite loopback 同时核对一条公开日志的汇总用量与两个独立 USD attempt，防止最后一个 attempt 重复计入首段。Chat 错误帧按公共协议携带错误后以 `[DONE]` 结束；该分隔符本身不是成功证据，成功还须有效终态、干净 EOF 和完成日志。
+2026-11-18 的整体 review 修正了无凭据 Profile 的创建与运行时准入、Responses 终态后数据校验、慢下游对空闲超时的影响、分片事件解析前的内存预留，以及续写准入失败时的 attempt 编号。SQLite loopback 同时核对一条公开日志的汇总用量与两个独立 USD attempt，防止最后一个 attempt 重复计入首段。Chat 错误帧按公共协议携带错误后以 `[DONE]` 结束；该分隔符本身不是成功证据，成功还须有效终态、干净 EOF 和完成日志。
 
 2026-11-17 最终验证：Zen 相关 28/28、API 集成 138/138、Node 审计 2205/2205；严格 Clippy、check、build、完整格式检查与本地 HTTP smoke 通过。全量 Rust library 为 4479 passed / 2 failed / 3 ignored，两项为既有额度基线失败，完整套件未全绿；具体名称与最终源码摘要见 `PROTOCOL_EVIDENCE.md` 的 Zen 条目。离线 readiness 为 blocked_inputs，真实目录/推理及 Router/Share 验收继续 live_pending。
+
+2026-11-20 工具准入修复完成整体 review：Rust 库 4607/4607、API 契约 139/139、两个独立集成测试各 1/1，默认保留 5 项 opt-in 忽略；其中两项固定 Bun 测试另行显式执行 2/2 通过。严格 Clippy、全量格式与 check、Node 审计 2205/2205、smoke 脚本测试 13/13、Web 测试 448/448 和 10 步本地 HTTP smoke 全部通过。实际 Router Share 的负向回归验证同一 profile 连续 3 次 429 后，其他 profile 仍可成功，且上游拒绝仅发生一次。离线 readiness 的 failures=0，缺全产品真实输入和生产部署验收时仍为 `blocked_inputs`，不替代上述定向真实 Zen 验收。生产更新后应通过一次正式模型检测确认恢复，并核对 Router 的最新健康结果。
 
 ## Bundle 管理与固定模型
 

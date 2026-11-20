@@ -298,7 +298,8 @@ async fn forward_opencode_zen_inner(
     ))
     .map_err(|_| ProxyError::bad_request("invalid Zen conversation scope"))?;
     let session = zen::session_for_conversation(&seed);
-    let lane = match zen::acquire_lane(origin, &model, first_deadline).await {
+    let lane = match zen::acquire_lane(origin, &model, prepared.lane_profile, first_deadline).await
+    {
         Ok(lane) => lane,
         Err(error) => {
             finish_qoder_stream_failure(&mut guard, route, &error).await;
@@ -339,9 +340,16 @@ async fn forward_opencode_zen_inner(
             if response.status() == StatusCode::UNAUTHORIZED {
                 series.lock().await.auth_rejected().await;
             }
-            let error = zen_http_error(&mut response, total_deadline).await;
-            zen::observe_lane_error(origin, &model, &error);
-            return Err(error);
+            let failure = zen_http_error(&mut response, total_deadline).await;
+            zen::observe_lane_error(
+                origin,
+                &model,
+                prepared.lane_profile,
+                failure.scope,
+                &request_id,
+                &failure.error,
+            );
+            return Err(failure.error);
         }
         let content_type = response
             .headers()
@@ -405,6 +413,7 @@ async fn forward_opencode_zen_inner(
                     total_deadline,
                 ) {
                     let continuation_result = async {
+                        zen::check_lane(origin, &model, continuation.lane_profile)?;
                         series
                             .lock()
                             .await
@@ -465,9 +474,16 @@ async fn forward_opencode_zen_inner(
                             if response.status() == StatusCode::UNAUTHORIZED {
                                 series.lock().await.auth_rejected().await;
                             }
-                            let error = zen_http_error(&mut response, total_deadline).await;
-                            zen::observe_lane_error(origin, &model, &error);
-                            return Err(error);
+                            let failure = zen_http_error(&mut response, total_deadline).await;
+                            zen::observe_lane_error(
+                                origin,
+                                &model,
+                                continuation.lane_profile,
+                                failure.scope,
+                                &request_id,
+                                &failure.error,
+                            );
+                            return Err(failure.error);
                         }
                         let mut observer = StreamUsageAccumulator::new(wire.semantics());
                         let (mut continued, _memory) = zen_read_document(
@@ -1048,15 +1064,47 @@ async fn zen_observe_generation(
         .await
 }
 
+struct ZenHttpFailure {
+    error: ProxyError,
+    scope: super::opencode_zen::CooldownScope,
+}
+
 async fn zen_http_error(
     response: &mut super::opencode_zen::transport::ZenResponse,
     deadline: tokio::time::Instant,
-) -> ProxyError {
+) -> ZenHttpFailure {
+    use super::opencode_zen::CooldownScope;
     let mut error = zen_status_error(response.status(), response.headers());
+    let mut scope = if matches!(response.status().as_u16(), 401 | 403) {
+        CooldownScope::Origin
+    } else {
+        CooldownScope::Model
+    };
     if let Ok(Ok(body)) = tokio::time::timeout_at(deadline, response.read_limited(16 * 1024)).await
     {
         let lower = String::from_utf8_lossy(&body).to_ascii_lowercase();
-        let category = if lower.contains("freeusagelimiterror") {
+        let structured = serde_json::from_slice::<Value>(&body).ok();
+        // This reviewed response is also returned for incompatible tool names.
+        // Its type and day-long Retry-After alone do not establish model/IP
+        // quota exhaustion. Other 429s keep the genuine shared throttle path.
+        let request_gate = response.status() == StatusCode::TOO_MANY_REQUESTS
+            && structured.as_ref().is_some_and(|body| {
+                body.pointer("/error/type").and_then(Value::as_str) == Some("FreeUsageLimitError")
+                    && body
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .is_some_and(|message| {
+                            message.contains("Free models work in OpenCode (https://opencode.ai)")
+                        })
+            });
+        let category = if request_gate {
+            scope = CooldownScope::RequestProfile;
+            error.message =
+                error
+                    .message
+                    .replacen("upstream rate_limit:", "upstream request_gate:", 1);
+            Some("free_lane_gate")
+        } else if lower.contains("freeusagelimiterror") {
             Some("free_usage_limit")
         } else if lower.contains("freetiererror") {
             Some("free_tier_gate")
@@ -1072,7 +1120,6 @@ async fn zen_http_error(
         } else {
             None
         };
-        let structured = serde_json::from_slice::<Value>(&body).ok();
         let code = structured
             .as_ref()
             .and_then(|v| {
@@ -1099,5 +1146,5 @@ async fn zen_http_error(
             error.message.push_str(&format!("; category={category}"));
         }
     }
-    error
+    ZenHttpFailure { error, scope }
 }

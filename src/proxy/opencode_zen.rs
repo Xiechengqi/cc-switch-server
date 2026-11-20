@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 mod claude;
 mod codex;
 pub(crate) mod runtime;
+mod tool_aliases;
 pub(crate) mod transport;
 
 pub const WIRE_PROFILE: &str = "opencode-1.19.5-bun-1.4.4-v1";
@@ -385,7 +386,7 @@ pub fn apply_fingerprint_style(
     body: &mut Value,
     style: FingerprintStyle,
 ) -> BTreeMap<String, String> {
-    let mut rename = BTreeMap::new();
+    let mut rename = tool_aliases::apply(body);
     let tools = body
         .get("tools")
         .and_then(Value::as_array)
@@ -517,6 +518,9 @@ fn retarget_tool_choice(body: &mut Map<String, Value>, rename: &BTreeMap<String,
     let Some(choice) = body.get_mut("tool_choice").and_then(Value::as_object_mut) else {
         return;
     };
+    if choice.get("namespace").and_then(Value::as_str).is_some() {
+        return;
+    }
     if let Some(name) = choice
         .get("name")
         .and_then(Value::as_str)
@@ -549,7 +553,13 @@ fn alias_history_tool_calls(body: &mut Map<String, Value>, rename: &BTreeMap<Str
             let Some(map) = item.as_object_mut() else {
                 continue;
             };
-            if map.get("type").and_then(Value::as_str) != Some("function_call") {
+            if !matches!(
+                map.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            ) {
+                continue;
+            }
+            if map.get("namespace").and_then(Value::as_str).is_some() {
                 continue;
             }
             if let Some(name) = map.get("name").and_then(Value::as_str).map(str::to_string) {
@@ -563,6 +573,13 @@ fn alias_history_tool_calls(body: &mut Map<String, Value>, rename: &BTreeMap<Str
         return;
     };
     for message in messages {
+        if let Some(name) = message
+            .pointer("/function_call/name")
+            .and_then(Value::as_str)
+            .and_then(|name| alias_for(rename, name))
+        {
+            message["function_call"]["name"] = Value::String(name);
+        }
         if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
             for part in parts {
                 if part.get("type").and_then(Value::as_str) == Some("tool_use") {
@@ -735,6 +752,7 @@ pub struct PreparedUpstream {
     pub rename: BTreeMap<String, String>,
     pub stream: bool,
     pub wire: ZenWire,
+    pub(super) lane_profile: LaneProfile,
     /// Client-declared names on the sent wire, excluding injected placeholders.
     pub client_tool_names: std::collections::BTreeSet<String>,
     pub(super) response_tools: super::transforms::ResponsesToolContext,
@@ -820,12 +838,14 @@ fn prepare_upstream_at(
         })
         .collect();
     let bytes = marshal_upstream(&body).map_err(PrepareError::Encode)?;
+    let lane_profile = LaneProfile::from_body(endpoint.path(), &body);
     Ok(PreparedUpstream {
         path: endpoint.path(),
         body: bytes,
         rename,
         stream,
         wire,
+        lane_profile,
         client_tool_names,
         response_tools: Default::default(),
         codex_exec_tool: None,
@@ -1629,6 +1649,9 @@ fn restore_tool_names_inner(value: &mut Value, rename: &BTreeMap<String, String>
         }
     }
     fn item(item: &mut Value, rename: &BTreeMap<String, String>) {
+        if item.get("namespace").and_then(Value::as_str).is_some() {
+            return;
+        }
         if let Some("tool_use" | "function_call" | "custom_tool_call") =
             item.get("type").and_then(Value::as_str)
         {
@@ -1817,7 +1840,10 @@ pub(crate) use catalog::{
     store_catalog, store_catalog_payload, store_stale_catalog_payload,
 };
 pub use catalog::{refresh_model_catalog, CATALOG_PATH};
-pub(super) use lane::{acquire as acquire_lane, observe_error as observe_lane_error};
+pub(super) use lane::{
+    acquire as acquire_lane, check as check_lane, observe_error as observe_lane_error,
+    CooldownScope, LaneProfile,
+};
 pub(super) use validation::{client_tools as validate_client_tools, validate as validate_json};
 
 pub(super) fn catalog_unavailable() -> super::ProxyError {

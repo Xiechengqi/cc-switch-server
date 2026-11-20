@@ -989,7 +989,8 @@ async fn opencode_zen_typed_free_errors_preserve_retry_without_private_body() {
             &mut response,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
-        .await;
+        .await
+        .error;
         assert!(error
             .client_message()
             .contains(&format!("category={category}")));
@@ -1023,4 +1024,222 @@ fn opencode_zen_does_not_append_a_second_schema_document_to_a_truncated_answer()
         tokio::time::Instant::now() + Duration::from_secs(2)
     )
     .is_none());
+}
+
+#[tokio::test]
+async fn opencode_zen_explicit_request_gate_is_typed_and_generic_quota_stays_shared() {
+    use super::super::opencode_zen::CooldownScope;
+    for (kind,message,scope) in [
+        ("FreeUsageLimitError","Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go",CooldownScope::RequestProfile),
+        ("FreeUsageLimitError","Rate limit exceeded. Please try again later.",CooldownScope::Model),
+        ("rate_limit_error","Free models work in OpenCode (https://opencode.ai)",CooldownScope::Model),
+    ] {
+        let raw=http::Response::builder().status(429).header("retry-after","43200").header("cf-ray","reviewed-ray")
+            .body(json!({"error":{"type":kind,"message":message},"private":"do-not-leak"}).to_string()).unwrap();
+        let response:reqwest::Response=raw.into();
+        let mut response=super::super::opencode_zen::transport::ZenResponse::from_reqwest(response);
+        let failure=zen_http_error(&mut response,tokio::time::Instant::now()+Duration::from_secs(1)).await;
+        assert_eq!(failure.scope,scope);
+        assert_eq!(failure.error.status,429);
+        assert_eq!(failure.error.retry_after_seconds(),Some(43200));
+        assert!(failure.error.client_message().contains("reviewed-ray"));
+        assert!(!failure.error.message.contains("do-not-leak"));
+        assert_eq!(failure.error.client_message().contains("category=free_lane_gate"),scope==CooldownScope::RequestProfile);
+    }
+}
+
+#[tokio::test]
+async fn opencode_zen_request_gate_does_not_poison_other_profiles_or_replay_generations() {
+    use super::super::opencode_zen as zen;
+    let _lock = zen::CATALOG_TEST_LOCK.lock().await;
+    let state = forwarder_test_state("zen-request-gate-profiles");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    let router=axum::Router::new().fallback(axum::routing::post(move |body:Bytes| {
+        let observed=observed.clone();
+        async move {
+            observed.fetch_add(1,Ordering::SeqCst);
+            let body:Value=serde_json::from_slice(&body).unwrap();
+            let tool=body["tools"][0]["function"]["name"].as_str().unwrap();
+            if matches!(tool,"gate_probe"|"quota_probe") {
+                let message=if tool=="gate_probe" {"Free models work in OpenCode (https://opencode.ai)"} else {"Rate limit exceeded. Please try again later."};
+                return Response::builder().status(429).header("retry-after","43200").header("cf-ray","upstream-ray")
+                    .body(Body::from(json!({"error":{"type":"FreeUsageLimitError","message":message}}).to_string())).unwrap();
+            }
+            zen_fixture_sse(json!({"id":"chat_ok","model":"chat-free","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}),zen::ZenWire::Chat)
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    for (index, tool, expected_calls, status) in [
+        (0, "gate_probe", 1, 429),
+        (1, "gate_probe", 1, 429),
+        (2, "valid_probe", 2, 200),
+        (3, "quota_probe", 3, 429),
+        (4, "valid_probe", 3, 429),
+    ] {
+        let body = json!({"model":"chat-free","stream":false,"messages":[{"role":"user","content":format!("turn-{index}")}],"tools":[{"type":"function","function":{"name":tool,"parameters":{"type":"object"}}}]});
+        let mut options = zen_test_options(&state, body).await;
+        options.request_context.request_id = Some(format!("gate-case-{index}"));
+        options.request_context.user_email = Some(format!("user-{index}@example.test"));
+        let result = forward_opencode_zen_at(options, &origin).await;
+        match result {
+            Ok(response) => assert_eq!(response.status(), status),
+            Err(error) => {
+                assert_eq!(error.status, status);
+                if index == 1 {
+                    assert!(error.client_message().contains("scope=request_profile"));
+                    assert!(error.client_message().contains("source_request_ref="));
+                    assert!(error.client_message().contains("upstream_request_ref="));
+                }
+                if index == 4 {
+                    assert!(error.client_message().contains("scope=model"));
+                }
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn opencode_zen_multiagent_aliases_complete_tools_history_and_all_wires() {
+    use super::super::opencode_zen as zen;
+    let _lock = zen::CATALOG_TEST_LOCK.lock().await;
+    for model in ["chat-free", "muse-spark-free", "union-alpha"] {
+        for stream in [false, true] {
+            for namespaced in [false, true] {
+                if namespaced && model != "chat-free" {
+                    continue;
+                }
+                let state = forwarder_test_state("zen-multiagent-alias-roundtrip");
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let count = calls.clone();
+                let names = Arc::new(std::sync::Mutex::new(None::<String>));
+                let observed_names = names.clone();
+                let router = axum::Router::new().fallback(axum::routing::post(move |body: Bytes| {
+                    let count = count.clone();
+                    let observed_names = observed_names.clone();
+                    async move {
+                        let turn = count.fetch_add(1, Ordering::SeqCst);
+                        let sent: Value = serde_json::from_slice(&body).unwrap();
+                        let tools = sent["tools"].as_array().unwrap();
+                        let original_pair = ["collaboration__spawn_agent", "collaboration__wait_agent"];
+                        let names: Vec<_> = tools.iter().filter_map(|t| t.pointer("/function/name").or_else(|| t.get("name")).and_then(Value::as_str)).collect();
+                        if original_pair.iter().all(|name| names.contains(name)) {
+                            return Response::builder().status(429).header("retry-after","43200").body(Body::from(json!({"error":{"type":"FreeUsageLimitError","message":"Free models work in OpenCode (https://opencode.ai)"}}).to_string())).unwrap();
+                        }
+                        let aliases: Vec<_> = names.iter().filter(|name| name.starts_with("zen_fn_")).collect();
+                        assert_eq!(aliases.len(),2,"all client tools must remain declared");
+                        let selected = tools.iter().find(|tool| tool.pointer("/function/description").or_else(|| tool.get("description")).and_then(Value::as_str)==Some("Start the synthetic client agent")).unwrap();
+                        let alias = selected.pointer("/function/name").or_else(|| selected.get("name")).and_then(Value::as_str).unwrap();
+                        let schema = selected.pointer("/function/parameters").or_else(|| selected.get("parameters")).or_else(|| selected.get("input_schema")).unwrap();
+                        assert_eq!(schema["properties"]["name"]["description"],"collaboration__spawn_agent");
+                        if turn == 0 { *observed_names.lock().unwrap() = Some(alias.to_string()); }
+                        else {
+                            assert_eq!(observed_names.lock().unwrap().as_deref(),Some(alias));
+                            assert!(sent.to_string().contains("synthetic-agent-result"));
+                            assert!(sent.to_string().contains("call_agent_keep"));
+                            match zen::wire_for(model) {
+                                zen::ZenWire::Chat => {
+                                    let messages=sent["messages"].as_array().unwrap();
+                                    let call=messages.iter().find_map(|m| m.pointer("/tool_calls/0/function/name")).unwrap();
+                                    assert_eq!(call,alias);
+                                    let result=messages.iter().find(|m| m["role"]=="tool").unwrap();
+                                    assert_eq!(result["tool_call_id"],"call_agent_keep");
+                                }
+                                zen::ZenWire::Responses => {
+                                    let call=sent["input"].as_array().unwrap().iter().find(|item| item["type"]=="function_call").unwrap();
+                                    assert_eq!(call["name"],alias);
+                                }
+                                zen::ZenWire::Messages => {
+                                    let call=sent["messages"].as_array().unwrap().iter().flat_map(|m| m["content"].as_array().into_iter().flatten()).find(|part| part["type"]=="tool_use").unwrap();
+                                    assert_eq!(call["name"],alias);
+                                }
+                            }
+                        }
+                        let wire=zen::wire_for(model);
+                        let payload=match wire {
+                            zen::ZenWire::Chat => json!({"id":"chat_agent","model":model,"choices":[{"index":0,"message":if turn==0 {json!({"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_agent_keep","type":"function","function":{"name":alias,"arguments":"{\"name\":\"collaboration__spawn_agent\"}"}}]})}else{json!({"role":"assistant","content":"ZEN_MULTIAGENT_OK"})},"finish_reason":if turn==0 {"tool_calls"} else {"stop"}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}),
+                            zen::ZenWire::Responses => json!({"id":"resp_agent","object":"response","model":model,"status":"completed","output":if turn==0 {json!([{"id":"fc_agent","type":"function_call","status":"completed","call_id":"call_agent_keep","name":alias,"arguments":"{\"name\":\"collaboration__spawn_agent\"}"}])}else{json!([{"id":"msg_agent","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ZEN_MULTIAGENT_OK","annotations":[]}]}])},"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}),
+                            zen::ZenWire::Messages => json!({"id":"msg_agent","type":"message","role":"assistant","model":model,"content":if turn==0 {json!([{"type":"tool_use","id":"call_agent_keep","name":alias,"input":{"name":"collaboration__spawn_agent"}}])}else{json!([{"type":"text","text":"ZEN_MULTIAGENT_OK"}])},"stop_reason":if turn==0 {"tool_use"}else{"end_turn"},"usage":{"input_tokens":2,"output_tokens":1}}),
+                        };
+                        zen_fixture_sse(payload,wire)
+                    }
+                }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let origin = format!("http://{}", listener.local_addr().unwrap());
+                let server =
+                    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+                let spawn = if namespaced {
+                    "spawn_agent"
+                } else {
+                    "collaboration__spawn_agent"
+                };
+                let wait = if namespaced {
+                    "wait_agent"
+                } else {
+                    "collaboration__wait_agent"
+                };
+                let declarations = json!([
+                    {"type":"function","name":spawn,"description":"Start the synthetic client agent","parameters":{"type":"object","properties":{"name":{"type":"string","description":"collaboration__spawn_agent"}},"required":["name"]}},
+                    {"type":"function","name":wait,"parameters":{"type":"object","properties":{}}}
+                ]);
+                let tools = if namespaced {
+                    json!([{"type":"namespace","name":"collaboration","tools":declarations}])
+                } else {
+                    declarations
+                };
+                let mut request = json!({"model":model,"stream":stream,"input":[{"role":"user","content":"Use the declared synthetic agent tool."}],"tools":tools,"tool_choice":"auto"});
+                for turn in 0..2 {
+                    let mut options = zen_test_options(&state, request.clone()).await;
+                    options.route = ProxyRoute::CodexResponses;
+                    options.request_context.request_id = Some(format!("zen-agent-{turn}"));
+                    zen::store_catalog(vec![model.into()], current_time_ms() as i64);
+                    let response = forward_opencode_zen_at(options, &origin).await.unwrap();
+                    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap();
+                    let text = String::from_utf8(bytes.to_vec()).unwrap();
+                    assert!(!text.contains("zen_fn_"), "wire alias leaked: {text}");
+                    let document: Value = if stream {
+                        text.lines()
+                            .filter_map(|line| line.strip_prefix("data: "))
+                            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                            .find(|event| event["type"] == "response.completed")
+                            .unwrap()["response"]
+                            .clone()
+                    } else {
+                        serde_json::from_str(&text).unwrap()
+                    };
+                    if turn == 0 {
+                        let call = document["output"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|item| item["type"] == "function_call")
+                            .unwrap();
+                        assert_eq!(call["name"], spawn);
+                        assert_eq!(call["call_id"], "call_agent_keep");
+                        if namespaced {
+                            assert_eq!(call["namespace"], "collaboration");
+                        }
+                        assert_eq!(
+                            serde_json::from_str::<Value>(call["arguments"].as_str().unwrap())
+                                .unwrap(),
+                            json!({"name":"collaboration__spawn_agent"})
+                        );
+                        let mut history = call.clone();
+                        history.as_object_mut().unwrap().remove("id");
+                        request["input"].as_array_mut().unwrap().extend([history,json!({"type":"function_call_output","call_id":"call_agent_keep","output":"synthetic-agent-result"})]);
+                    } else {
+                        assert!(text.contains("ZEN_MULTIAGENT_OK"));
+                    }
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                server.abort();
+            }
+        }
+    }
 }

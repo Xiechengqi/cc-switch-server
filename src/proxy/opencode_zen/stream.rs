@@ -17,7 +17,7 @@ pub(in crate::proxy) struct ZenStream {
     anthropic: crate::proxy::anthropic_semantics::AnthropicSseInspector,
     tool_names: BTreeMap<u64, String>,
     client_tools: Option<std::collections::BTreeSet<String>>,
-    codex_tool_calls: Option<super::codex::ChatToolCalls>,
+    chat_tool_calls: Option<super::codex::ChatToolCalls>,
     finish_reason: Option<String>,
     chat_usage_tail: bool,
     done: bool,
@@ -56,7 +56,7 @@ impl ZenStream {
             anthropic: Default::default(),
             tool_names: BTreeMap::new(),
             client_tools: None,
-            codex_tool_calls: (wire == ZenWire::Chat && route == ProxyRoute::CodexResponses)
+            chat_tool_calls: (wire == ZenWire::Chat && matches!(route, ProxyRoute::CodexResponses | ProxyRoute::ClaudeMessages))
                 .then(Default::default),
             finish_reason: None,
             chat_usage_tail: false,
@@ -79,7 +79,7 @@ impl ZenStream {
     }
 
     pub(in crate::proxy) fn with_codex_exec(mut self, name: Option<String>) -> Self {
-        if let Some(calls) = &mut self.codex_tool_calls {
+        if let Some(calls) = &mut self.chat_tool_calls {
             calls.exec_name = name;
         }
         self
@@ -96,7 +96,7 @@ impl ZenStream {
             .saturating_add(self.pending.capacity())
             .saturating_add(self.held.capacity())
             .saturating_add(
-                self.codex_tool_calls
+                self.chat_tool_calls
                     .as_ref()
                     .map_or(0, |calls| calls.retained_bytes()),
             )
@@ -130,7 +130,7 @@ impl ZenStream {
             .saturating_mul(4)
             .saturating_add(self.aggregation.as_ref().map_or(0, |a| a.working_bytes()))
             .saturating_add(
-                self.codex_tool_calls
+                self.chat_tool_calls
                     .as_ref()
                     .map_or(0, |calls| calls.retained_bytes().saturating_mul(4)),
             )
@@ -371,9 +371,9 @@ impl ZenStream {
             }
         }
         if let Some(names) = &self.client_tools {
-            // Responses publishes the tool identity on item creation. Assemble
-            // split Chat names and arguments before creating that item.
-            if let Some(calls) = &mut self.codex_tool_calls {
+            // Responses and Messages publish tool identity on item/block creation.
+            // Assemble Chat names and arguments before creating either one.
+            if let Some(calls) = &mut self.chat_tool_calls {
                 calls.observe(&mut value, names, EVENT_LIMIT)?;
             }
             validate_client_tools(&value, names)?;
@@ -575,6 +575,58 @@ mod tests {
             .iter()
             .all(|call| call["item"]["name"] == "exec_command"));
         assert_eq!(calls[1]["item"]["arguments"], r#"{"cmd":"printf marker"}"#);
+    }
+
+    #[test]
+    fn zen_multiagent_alias_name_fragments_restore_on_every_downstream_route() {
+        let original = "collaboration__spawn_agent";
+        let mut request = json!({"tools":[{"type":"function","function":{"name":original,"parameters":{"type":"object"}}}]});
+        let aliases = super::super::apply_fingerprint(&mut request);
+        let alias = aliases
+            .iter()
+            .find(|(_, name)| name.as_str() == original)
+            .unwrap()
+            .0
+            .clone();
+        for route in [
+            ProxyRoute::CodexResponses,
+            ProxyRoute::CodexChatCompletions,
+            ProxyRoute::ClaudeMessages,
+        ] {
+            let context = crate::proxy::transforms::responses_tool_context(
+                &json!({"tools":[{"type":"function","name":original,"parameters":{"type":"object"}}]}),
+            );
+            let mut decoder = ZenStream::new(
+                &stored(),
+                route,
+                ZenWire::Chat,
+                aliases.clone(),
+                context,
+                true,
+                None,
+            )
+            .with_client_tools([alias.clone()].into_iter().collect());
+            let mut output = Vec::new();
+            for (index, fragment) in [&alias[..3], &alias[3..15], &alias[15..]]
+                .into_iter()
+                .enumerate()
+            {
+                let raw = frame(
+                    json!({"id":"chat_aliased","model":"chat-free","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-fragment","type":"function","function":{"name":fragment,"arguments":if index==0 {"{\"value\":1}"}else{""}}}]},"finish_reason":null}]}),
+                );
+                output.extend_from_slice(&decoder.push(raw.as_bytes()).unwrap());
+            }
+            let terminal = frame(
+                json!({"id":"chat_aliased","model":"chat-free","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+            );
+            output.extend_from_slice(&decoder.push(terminal.as_bytes()).unwrap());
+            output.extend_from_slice(&decoder.push(b"data: [DONE]\n\n").unwrap());
+            output.extend_from_slice(&decoder.finish().unwrap());
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains(original), "{route:?}: {output}");
+            assert!(!output.contains("zen_fn_"), "{route:?}: {output}");
+            assert!(output.contains("call-fragment"));
+        }
     }
 
     #[test]
