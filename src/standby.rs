@@ -309,9 +309,11 @@ fn initialize(path: &Path) -> anyhow::Result<()> {
         }
     }
     if !state_path.exists() {
-        let mut state = SendState::default();
         // A replacement sender may only start from its delegated hour.
-        state.closed_before = timestamp(&config.first_due_at)?.div_euclid(3_600_000);
+        let mut state = SendState {
+            closed_before: timestamp(&config.first_due_at)?.div_euclid(3_600_000),
+            ..Default::default()
+        };
         if restoring_existing_sender {
             state.closed_before = state
                 .closed_before
@@ -358,13 +360,9 @@ async fn run(path: &Path) -> anyhow::Result<()> {
     if state.revoked_generation == Some(config.key_generation) {
         return Ok(());
     }
-    let mut clock = if let Some(anchor) = state
-        .clock_anchor
-        .as_ref()
-        .filter(|a| {
-            !a.boot_id.is_empty() && a.boot_id == boot_id() && boot_millis() >= a.boot_millis
-        })
-    {
+    let mut clock = if let Some(anchor) = state.clock_anchor.as_ref().filter(|a| {
+        !a.boot_id.is_empty() && a.boot_id == boot_id() && boot_millis() >= a.boot_millis
+    }) {
         Some(Clock {
             utc_millis: anchor.utc_millis,
             boot_millis: anchor.boot_millis,
@@ -422,7 +420,10 @@ async fn run(path: &Path) -> anyhow::Result<()> {
             let (due, window) = if hour == first_hour {
                 (first, FIRST_SEND_WINDOW_MS)
             } else {
-                (wire::due_at(&config.host_id, hour) * 1000, REGULAR_SEND_WINDOW_MS)
+                (
+                    wire::due_at(&config.host_id, hour) * 1000,
+                    REGULAR_SEND_WINDOW_MS,
+                )
             };
             if hour >= first_hour
                 && now >= due - PREPARE_LEAD_MS
@@ -513,11 +514,12 @@ async fn run(path: &Path) -> anyhow::Result<()> {
                                         let boot = boot_millis();
                                         state.compact(corrected_hour);
                                         let id = boot_id();
-                                        state.clock_anchor = (!id.is_empty()).then(|| ClockAnchor {
-                                            boot_id: id,
-                                            utc_millis: time,
-                                            boot_millis: boot,
-                                        });
+                                        state.clock_anchor =
+                                            (!id.is_empty()).then_some(ClockAnchor {
+                                                boot_id: id,
+                                                utc_millis: time,
+                                                boot_millis: boot,
+                                            });
                                         persist(&state_path, &state);
                                         clock = Some(Clock {
                                             utc_millis: time,

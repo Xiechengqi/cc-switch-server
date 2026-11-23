@@ -313,7 +313,11 @@ pub(super) async fn snapshot(config: &Configuration, sample_cpu: bool) -> Snapsh
         }
     };
     // A confirmed boundary whose sample was skipped or had no counter is a temporary gap.
-    let mut usage = Reading::unknown(if confirmed { "unavailable" } else { "scope_unverified" });
+    let mut usage = Reading::unknown(if confirmed {
+        "unavailable"
+    } else {
+        "scope_unverified"
+    });
     if confirmed && sample_cpu {
         if let (Some(before), Some(capacity)) = (
             cpu_counter(&config.resource_paths),
