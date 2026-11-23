@@ -7,6 +7,7 @@ pub mod clients;
 pub(crate) mod codex_identity;
 pub(crate) mod cursor_client_contract;
 pub mod domain;
+pub mod host_health_protocol;
 pub(crate) mod image_store;
 pub mod infra;
 pub mod logging;
@@ -16,6 +17,7 @@ pub mod proxy;
 pub(crate) mod repository;
 pub mod self_update;
 pub mod setup;
+pub mod standby;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod test_support;

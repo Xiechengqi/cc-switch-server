@@ -6,6 +6,24 @@ use cc_switch_server::logging::{LogCapture, RING_BUFFER_CAPACITY};
 use cc_switch_server::state::ServerStateInner;
 
 fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse_args();
+    if let Command::Standby(args) = cli.effective_command() {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log_level));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("initialize standby runtime")?;
+        let result = runtime.block_on(cc_switch_server::standby::execute(args));
+        // A timed-out filesystem probe can still be blocked in the kernel.
+        // Bound shutdown as well so it cannot keep a revoked sender alive.
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        return result;
+    }
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all();
     // The unoptimized shared forwarder alone uses over 2 MiB per poll. Give
@@ -22,15 +40,15 @@ fn main() -> anyhow::Result<()> {
     runtime
         .build()
         .context("initialize async runtime")?
-        .block_on(run())
+        .block_on(run(cli))
 }
 
-async fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse_args();
+async fn run(cli: Cli) -> anyhow::Result<()> {
     let log_capture = Arc::new(LogCapture::new(RING_BUFFER_CAPACITY));
     init_tracing(&cli.log_level, log_capture.clone());
 
     match cli.effective_command() {
+        Command::Standby(args) => cc_switch_server::standby::execute(args).await,
         Command::Serve => serve(cli, log_capture).await,
         Command::Config { command } => cc_switch_server::admin::run_config_command(&cli, command),
         Command::Doctor {
