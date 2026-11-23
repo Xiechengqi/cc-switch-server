@@ -337,7 +337,9 @@ const REGULAR_SEND_WINDOW_MS: i64 = 30_000;
 const PREPARE_LEAD_MS: i64 = 1_000;
 
 async fn run(path: &Path) -> anyhow::Result<()> {
-    let client = reqwest::Client::builder()
+    // The shared transport: no environment proxies and no cross-origin redirects.
+    // Health reports must never follow a redirect or repeat a POST.
+    let client = crate::infra::http::direct_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .timeout(Duration::from_secs(30))
