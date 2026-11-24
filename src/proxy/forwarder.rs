@@ -27594,6 +27594,16 @@ fn claude_body_retry_stage_for_error_message(
     request_body: &[u8],
 ) -> Option<ClaudeBodyRetryStage> {
     let message = message.to_ascii_lowercase();
+    // Unsigned blank placeholders are removed before every official OAuth
+    // attempt. A remaining rejection must not disable thinking or rewrite all
+    // signed/redacted/tool history, even if the error also mentions signatures.
+    if message.contains("thinking block must contain") {
+        crate::metrics::record_proxy_semantic_guard(
+            "claude_thinking_history",
+            "upstream_empty_thinking",
+        );
+        return None;
+    }
     let web_search_error = message.contains("web_search")
         || message.contains("server_tool_use")
         || message.contains("web_search_tool_result");
@@ -33375,6 +33385,7 @@ mod tests {
     include!("forwarder/claude_timing_tests.rs");
     include!("forwarder/r5_timing_tests.rs");
     include!("forwarder/claude_r5_tests.rs");
+    include!("forwarder/claude_thinking_history_tests.rs");
     include!("forwarder/antigravity_timing_tests.rs");
     include!("forwarder/antigravity_r5_tests.rs");
     include!("forwarder/antigravity_native_tests.rs");
@@ -49248,6 +49259,25 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             Some(ProviderOutcome::Failure { status_code: 529 })
         );
         assert_eq!(claude_sse_error_outcome("not_interesting"), None);
+    }
+
+    #[test]
+    fn claude_unsigned_blank_thinking_rejection_never_uses_signature_downgrade() {
+        for message in [
+            "messages.93.content.0.thinking: each thinking block must contain non-whitespace thinking",
+            "messages.5.content.0.thinking: each thinking block must contain thinking; signature is empty",
+        ] {
+            for stage in [
+                None,
+                Some(ClaudeBodyRetryStage::Thinking),
+                Some(ClaudeBodyRetryStage::SignatureSensitive),
+            ] {
+                assert_eq!(
+                    claude_body_retry_stage_for_error_message(message, stage, b"{}"),
+                    None,
+                );
+            }
+        }
     }
 
     #[test]

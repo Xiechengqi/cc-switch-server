@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "providerType": "claude_oauth",
+  "liveState": "live_pending",
+  "reference": {
+    "repository": "CLIProxyAPI",
+    "commit": "85225381d89915595598ed13766cd79890c03a84",
+    "tree": "f73c19829760e4d05be86c7d91997555d2df88e4",
+    "use": "read_only_research_not_a_build_test_or_runtime_input",
+    "files": [
+      {
+        "path": "internal/runtime/executor/claude_executor.go",
+        "sha256": "90c0e8e564ae9d80b9e1077c030e7fd6ffd5b4b0cd7f0405af8875106e30afb9"
+      },
+      {
+        "path": "internal/signature/provider_compatibility.go",
+        "sha256": "b7774611f0fc70f26eb71c615566af8e0f209e85298975abc35f9164a134a0df"
+      }
+    ]
+  },
+  "policy": {
+    "target": "official_claude_oauth_only",
+    "remove": "assistant_top_level_unsigned_blank_thinking_only",
+    "emptyTurn": "reject_without_mutating_history_or_fabricating_content",
+    "signedThinking": "preserve_opaque_bytes_including_empty_text",
+    "redactedThinking": "preserve_opaque_data",
+    "businessPayload": "never_recurse_into_tool_input_or_tool_result",
+    "thinkingControls": "preserve_adaptive_display_effort_and_context_management",
+    "countTokens": "same_history_repair_with_independent_generation_and_beta_rules",
+    "cch": "sign_after_history_repair",
+    "upstreamRejection": "never_enter_destructive_signature_recovery_for_empty_thinking",
+    "accountModelFallback": false,
+    "newReplayStorage": false
+  },
+  "request": {
+    "model": "claude-opus-5-5",
+    "max_tokens": 128,
+    "thinking": { "type": "adaptive", "display": "updates" },
+    "output_config": { "effort": "high" },
+    "metadata": { "user_id": "user_test_account__session_history-repair" },
+    "messages": [
+      { "role": "user", "content": "Run the fixture tools." },
+      {
+        "role": "assistant",
+        "output_config": { "effort": "low" },
+        "content": [
+          { "type": "thinking", "thinking": " ", "signature": "" },
+          {
+            "type": "tool_use", "id": "toolu_history_read", "name": "Read",
+            "input": { "nested": { "type": "thinking", "thinking": " ", "signature": "" } }
+          },
+          { "type": "tool_use", "id": "toolu_history_bash", "name": "Bash", "input": { "command": "fixture-only" } },
+          { "type": "tool_use", "id": "toolu_history_glob", "name": "Glob", "input": { "pattern": "*.fixture" } },
+          { "type": "tool_use", "id": "toolu_history_grep", "name": "Grep", "input": { "pattern": "fixture" } }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          { "type": "tool_result", "tool_use_id": "toolu_history_read", "content": [{ "type": "text", "text": "{\"type\":\"thinking\",\"thinking\":\" \",\"signature\":\"\"}" }] },
+          { "type": "tool_result", "tool_use_id": "toolu_history_bash", "content": "fixture bash result" },
+          { "type": "tool_result", "tool_use_id": "toolu_history_glob", "content": "fixture glob result" },
+          { "type": "tool_result", "tool_use_id": "toolu_history_grep", "content": "fixture grep result", "cache_control": { "type": "ephemeral" } }
+        ]
+      }
+    ]
+  },
+  "preservedBlocks": [
+    { "type": "thinking", "thinking": "", "signature": "CAQS-synthetic-native-signature" },
+    { "type": "thinking", "thinking": " \t\n ", "signature": "opaque-future-native-signature" },
+    { "type": "redacted_thinking", "data": "synthetic-redacted-data" }
+  ],
+  "response": {
+    "id": "msg_thinking_history_fixture",
+    "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+    "content": [{ "type": "text", "text": "ok" }],
+    "stop_reason": "end_turn", "stop_sequence": null,
+    "usage": { "input_tokens": 3, "output_tokens": 2 }
+  },
+  "tests": [
+    { "path": "src/proxy/claude_compat.rs", "anchor": "unsigned_blank_thinking_repair_is_narrow_atomic_and_idempotent" },
+    { "path": "src/proxy/claude_oauth.rs", "anchor": "claude_unsigned_blank_thinking_is_cleaned_before_signing_and_counting" },
+    { "path": "src/proxy/forwarder/claude_thinking_history_tests.rs", "anchor": "claude_unsigned_blank_thinking_history_survives_parallel_tools_and_repeated_sessions" },
+    { "path": "src/proxy/forwarder/claude_thinking_history_tests.rs", "anchor": "claude_unsigned_blank_thinking_upstream_rejection_never_replays_or_downgrades" }
+  ]
+}

@@ -248,6 +248,17 @@ fn apply_forward_contract_inner(
             client_class = ClaudeClientClass::ThirdPartyAnthropic;
         }
         session_id = validated_claude_session_id(client_headers, Some(&value))?;
+        // A native client may replay history from Kimi or another Provider.
+        // Client identity is not proof that every thinking block is native.
+        // Run for Messages and CountTokens before identity/cache rewrites and CCH.
+        let removed = super::claude_compat::strip_unsigned_blank_thinking(&mut value)?;
+        if removed > 0 {
+            crate::metrics::record_claude_optional_rewrite("unsigned_blank_thinking");
+            tracing::debug!(
+                removed_blocks = removed,
+                "removed unsigned blank Claude history placeholders"
+            );
+        }
         if !client_class.is_confirmed_native() {
             session_id = session_id.or_else(|| Some(synth_session_id(identity_seed, &value)));
             if let Some(session_id) = session_id.as_deref() {
@@ -3773,6 +3784,126 @@ mod tests {
             ),
             synth_session_id("account-1", &first)
         );
+    }
+
+    #[test]
+    fn claude_unsigned_blank_thinking_is_cleaned_before_signing_and_counting() {
+        for native in [false, true] {
+            for count_tokens in [false, true] {
+                for display in [false, true] {
+                    let mut headers = HeaderMap::new();
+                    if native {
+                        for (name, value) in [
+                            ("x-app", "cli"),
+                            ("user-agent", "claude-cli/2.1.329 (external, cli)"),
+                            (
+                                "anthropic-beta",
+                                if display {
+                                    "claude-code-20250219,thinking-display-updates-2026-08-18"
+                                } else {
+                                    "claude-code-20250219,redact-thinking-2026-02-12"
+                                },
+                            ),
+                        ] {
+                            headers.insert(name, value.parse().unwrap());
+                        }
+                    }
+                    let mut input = json!({
+                        "model":"claude-opus-5-5", "max_tokens":128,
+                        "system":[{"type":"text","text":claude_billing_header_text()}],
+                        "metadata":{"user_id":"user_test_account__session_history-repair"},
+                        "thinking":{"type":"adaptive"},
+                        "messages":[
+                            {"role":"user","content":"ping"},
+                            {"role":"assistant","content":[
+                                {"type":"thinking","thinking":" \t\n\u{2003}","signature":""},
+                                {"type":"thinking","thinking":"","signature":"CAQS-opaque-native"},
+                                {"type":"redacted_thinking","data":"opaque-native-data"},
+                                {"type":"tool_use","id":"toolu_history","name":"Read","input":{
+                                    "nested":{"type":"thinking","thinking":" ","signature":""}
+                                }}
+                            ]},
+                            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_history","content":"ok","cache_control":{"type":"ephemeral"}}]}
+                        ]
+                    });
+                    if display {
+                        input["thinking"]["display"] = json!("updates");
+                    }
+                    let mut expected = input["messages"].clone();
+                    expected[1]["content"].as_array_mut().unwrap().remove(0);
+                    let mut body = Bytes::from(input.to_string());
+                    let mut url = "https://api.anthropic.com/v1/messages".to_string();
+                    if count_tokens {
+                        apply_count_tokens_forward_contract(
+                            &mut url,
+                            &mut body,
+                            &headers,
+                            "account-history",
+                            false,
+                        )
+                        .unwrap();
+                    } else {
+                        apply_forward_contract(
+                            &mut url,
+                            &mut body,
+                            &headers,
+                            "account-history",
+                            false,
+                            None,
+                        )
+                        .unwrap();
+                    }
+                    let prepared: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(prepared["messages"], expected);
+                    assert_eq!(sign_claude_oauth_messages_body(prepared.clone()), prepared);
+                    if !count_tokens {
+                        assert_eq!(prepared["thinking"]["type"], "adaptive");
+                        assert_eq!(
+                            prepared["thinking"].get("display"),
+                            input["thinking"].get("display")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn claude_unsigned_blank_thinking_cannot_erase_an_assistant_turn() {
+        let input = json!({"model":"claude-opus-5-5","messages":[
+            {"role":"user","content":"ping"},
+            {"role":"assistant","output_config":{"effort":"low"},"content":[
+                {"type":"thinking","thinking":" ","signature":""}
+            ]},
+            {"role":"user","content":"continue"}
+        ]});
+        for count_tokens in [false, true] {
+            let mut body = Bytes::from(input.to_string());
+            let original = body.clone();
+            let mut url = "https://api.anthropic.com/v1/messages".to_string();
+            let result = if count_tokens {
+                apply_count_tokens_forward_contract(
+                    &mut url,
+                    &mut body,
+                    &HeaderMap::new(),
+                    "account-history",
+                    false,
+                )
+            } else {
+                apply_forward_contract(
+                    &mut url,
+                    &mut body,
+                    &HeaderMap::new(),
+                    "account-history",
+                    false,
+                    None,
+                )
+            };
+            let error = result.err().expect("must reject an otherwise empty turn");
+            assert_eq!(error.status, http::StatusCode::BAD_REQUEST);
+            assert!(error.message.contains("messages.1.content"));
+            assert_eq!(body, original);
+        }
     }
 
     #[test]

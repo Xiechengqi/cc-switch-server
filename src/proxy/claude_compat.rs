@@ -2,6 +2,62 @@
 use super::ProxyError;
 use serde_json::{json, Value};
 
+fn is_unsigned_blank_thinking(block: &Value) -> bool {
+    block.get("type").and_then(Value::as_str) == Some("thinking")
+        && block
+            .get("thinking")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.trim().is_empty())
+        && block.get("signature").is_none_or(|signature| {
+            signature.is_null()
+                || signature
+                    .as_str()
+                    .is_some_and(|value| value.trim().is_empty())
+        })
+}
+
+/// Remove foreign, unsigned empty reasoning placeholders at the official OAuth
+/// boundary only. Native redaction can legitimately carry empty text with an
+/// opaque signature; neither those blocks nor nested business data are touched.
+/// Validate every affected turn before editing so failure is atomic and cannot
+/// silently discard per-turn controls, assistant prefill or tool boundaries.
+pub(crate) fn strip_unsigned_blank_thinking(body: &mut Value) -> Result<usize, ProxyError> {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return Ok(0);
+    };
+    let mut removed = 0;
+    for (index, message) in messages.iter().enumerate() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        let count = blocks
+            .iter()
+            .filter(|block| is_unsigned_blank_thinking(block))
+            .count();
+        if count > 0 && count == blocks.len() {
+            return Err(ProxyError::bad_request(format!(
+                "Claude OAuth messages.{index}.content would be empty after removing unsigned blank thinking; remove the empty assistant turn or rebuild the session history"
+            )));
+        }
+        removed += count;
+    }
+    if removed == 0 {
+        return Ok(0);
+    }
+    for message in body["messages"].as_array_mut().expect("validated messages") {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            blocks.retain(|block| !is_unsigned_blank_thinking(block));
+        }
+    }
+    Ok(removed)
+}
+
 pub(crate) fn apply_preserved_thinking_binding(body: &mut Value) -> bool {
     let supported = body
         .get("model")
@@ -262,6 +318,75 @@ fn validate_tool_schemas_with_policy(body: &mut Value, fallback: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsigned_blank_thinking_repair_is_narrow_atomic_and_idempotent() {
+        for text in ["", " ", "\t\r\n", "\u{a0}\u{2003}\u{3000}"] {
+            for signature in [
+                None,
+                Some(Value::Null),
+                Some(json!("")),
+                Some(json!(" \t\n")),
+            ] {
+                let mut placeholder = json!({"type":"thinking","thinking":text});
+                if let Some(signature) = signature {
+                    placeholder["signature"] = signature;
+                }
+                let retained = json!([
+                    {"type":"thinking","thinking":"","signature":"opaque-future-native"},
+                    {"type":"thinking","thinking":" \t\n","signature":"CAQS-synthetic"},
+                    {"type":"thinking","thinking":" nonblank "},
+                    {"type":"thinking","thinking":"\u{200b}","signature":""},
+                    {"type":"thinking","thinking":" ","signature":false},
+                    {"type":"redacted_thinking","data":"opaque-data"},
+                    {"type":"tool_use","id":"toolu_fixture","name":"Read","input":{"nested":placeholder}},
+                    {"type":"text","text":"visible"},
+                    {"type":"future_content","thinking":" ","signature":""}
+                ]);
+                let mut content = retained.as_array().unwrap().clone();
+                content.insert(0, placeholder.clone());
+                let mut body = json!({"thinking":{"type":"adaptive","display":"updates"},"messages":[
+                    {"role":"assistant","output_config":{"effort":"low"},"content":content},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fixture","content":[placeholder.clone()]}]},
+                    {"role":"system","content":[placeholder]}
+                ]});
+                let mut expected = body.clone();
+                expected["messages"][0]["content"] = retained;
+                assert_eq!(strip_unsigned_blank_thinking(&mut body).unwrap(), 1);
+                assert_eq!(body, expected);
+                assert_eq!(strip_unsigned_blank_thinking(&mut body).unwrap(), 0);
+                assert_eq!(body, expected);
+
+                // A later unrepairable turn must prevent earlier edits too.
+                body["messages"][0]["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(0, json!({"type":"thinking","thinking":" ","signature":""}));
+                body["messages"].as_array_mut().unwrap().push(json!({
+                    "role":"assistant","output_config":{"effort":"high"},
+                    "content":[{"type":"thinking","thinking":" ","signature":""}]
+                }));
+                let original = body.clone();
+                let error = strip_unsigned_blank_thinking(&mut body).unwrap_err();
+                assert_eq!(error.status, http::StatusCode::BAD_REQUEST);
+                assert!(error.message.contains("messages.3.content"));
+                assert_eq!(body, original);
+            }
+        }
+        for mut body in [
+            json!({}),
+            json!({"messages":null}),
+            json!({"messages":[
+                {"role":"assistant","content":"ordinary text"},
+                {"role":"assistant","content":[]}
+            ]}),
+        ] {
+            let original = body.clone();
+            assert_eq!(strip_unsigned_blank_thinking(&mut body).unwrap(), 0);
+            assert_eq!(body, original);
+        }
+    }
+
     #[test]
     fn fable52_binding_is_narrow_and_respects_explicit_policy() {
         let original = json!({"model":"claude-fable-5-2", "messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"opaque","signature":"CAQSopaque"}]}]});

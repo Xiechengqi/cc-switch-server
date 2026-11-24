@@ -22,6 +22,16 @@
 
 参考实现的 detached drain 只有 64 KiB 字节上限，无 deadline 的上下文可脱离取消，因此未迁入。本仓继续在完整 native message_delta/message_stop 后结束并释放真实上游 owner；不复制 TLS 指纹或改变 CLI 版本、连接池及刷新重试策略。所有真实 operation 仍各自 `live_pending`，样例不能证明厂商接受性或延迟收益。
 
+## 混合 Provider 会话的空白 thinking 历史
+
+Claude CLI 的会话可能先后保存 Claude、Kimi 等不同 Provider 的回复，即使后续请求仍声明同一个 Claude 模型名。其他 Provider 生成的 `{"type":"thinking","thinking":" ","signature":""}` 不能作为官方 Claude 的签名思考历史回放；`each thinking block must contain non-whitespace thinking` 是请求历史校验错误，不是网络断线或 CLI 版本门槛。
+
+官方 Claude OAuth 的 Messages 与 CountTokens 在出站前只清理 assistant 顶层 content 数组中的无签名空白 thinking（空字符串或 Unicode 空白，签名缺失、null 或空白）。原生 CLI、SDK 与第三方客户端使用同一条规则。正常签名（包括未来未知格式）、带签名空 thinking、有效 redacted thinking、工具 ID/参数/结果及逐轮控制都保留；工具业务数据中的同名字段不递归清理。清理发生在最终 CCH 之前，不添加消息存储，不改变模型、账号、权限、beta 或 thinking 模式。
+
+如果清理会让某条 assistant 消息完全变空，Server 在出站前返回带消息索引的 400，而不是删除整轮历史或伪造占位文本。客户端需要移除该空轮或重建会话历史。上游若仍返回空 thinking 校验错误，不得进入关闭 thinking、改写全部签名历史或工具的降级重试。SSE 的空起始块和分片仍按原生命周期处理，不把完整请求历史规则套在尚未完成的响应流上。
+
+合成合同在 `assets/contract/claude-thinking-history.json`，只证明本地处理边界；已有会话续聊与 Opus/Fable 真实接受性仍需受控验收，不能由 fixture 提升为真实通过。
+
 ## 能力边界
 
 - 对外入口为 Router 暴露的 Share URL 下 `POST /v1/messages` 及对应的 `count_tokens` 路径。
