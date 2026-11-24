@@ -221,9 +221,8 @@ pub(in crate::api) async fn upsert_share(
             .config
             .read()
             .await
-            .owner
-            .email
-            .clone()
+            .share_owner_email()
+            .map(str::to_owned)
             .ok_or_else(|| ApiError::conflict("client owner email is not configured"))?,
     );
     let reference_guard = state.lock_reference_mutations().await;

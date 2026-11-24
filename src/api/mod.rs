@@ -12,6 +12,7 @@ pub(crate) mod error;
 pub(in crate::api) mod events;
 pub(crate) mod invoke;
 pub(in crate::api) mod logs;
+mod market_workspace;
 pub(in crate::api) mod models;
 pub(in crate::api) mod provider_health_scheduler;
 pub(in crate::api) mod providers;
@@ -168,9 +169,12 @@ pub async fn serve(state: ServerState) -> anyhow::Result<()> {
     provider_health_scheduler::spawn_share_model_health_scheduler(state.clone());
     tracing::info!("cc-switch-server listening on {}", state.bind_addr);
     let mut shutdown = state.subscribe_shutdown();
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(state.clone()))
-        .into_future();
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(state.clone()))
+    .into_future();
     tokio::pin!(server);
 
     let completed = tokio::select! {
@@ -230,7 +234,9 @@ async fn shutdown_signal(state: ServerState) {
         let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
         match terminate {
             Ok(mut terminate) => {
+                let mut shutdown = state.subscribe_shutdown();
                 tokio::select! {
+                    _ = shutdown.wait_for(|stopping| *stopping) => {}
                     result = tokio::signal::ctrl_c() => {
                         if let Err(error) = result {
                             tracing::warn!(%error, "failed to listen for Ctrl-C");
@@ -256,6 +262,17 @@ async fn shutdown_signal(state: ServerState) {
 
 pub fn app_router(state: ServerState) -> Router {
     let mut app = Router::new()
+        .route("/_ctl/market/status", post(market_workspace::control))
+        .route("/_ctl/market/check", post(market_workspace::control))
+        .route("/_ctl/market/command", post(market_workspace::control))
+        .route("/_ctl/market/upgrade", post(market_workspace::control))
+        .route("/_ctl/market/upgrade-status", post(market_workspace::control))
+        .route("/web-api/market/chat",get(market_workspace::chat::history).post(market_workspace::chat::send))
+        .route("/web-api/market/workspace", get(market_workspace::view))
+        .route("/web-api/market/maintenance", post(market_workspace::maintenance))
+        .route("/web-api/market/token", post(market_workspace::token))
+        .route("/web-api/market/backups", get(market_workspace::backups).post(market_workspace::export))
+        .route("/web-api/market/backups/:id/restore",post(market_workspace::restore))
         .route("/health", get(health))
         .route("/ready", get(readiness))
         .route("/metrics", get(prometheus_metrics))
@@ -742,6 +759,7 @@ pub fn app_router(state: ServerState) -> Router {
             get(crate::api::logs::admin_logs_tail),
         )
         .merge(inference_router(state.clone()))
+        .layer(middleware::from_fn_with_state(state.clone(), market_workspace::authorize))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             verify_router_ingress,
@@ -890,25 +908,65 @@ fn inference_router(state: ServerState) -> Router<ServerState> {
         // 兜底内存上限：覆盖所有上面未单独放宽的推理路由（`/v1/responses`、
         // `/v1/messages` 等）。路由级 layer 更靠内，因此图片/视频档仍然生效。
         .layer(DefaultBodyLimit::max(limits.default_bytes))
-        .layer(middleware::from_fn(require_router_share_ingress))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_router_share_ingress,
+        ))
         .layer(middleware::from_fn_with_state(
             state,
             audit_inference_request,
         ))
 }
 
-async fn require_router_share_ingress(request: Request, next: Next) -> Response {
-    let Some(context) = request
+async fn require_router_share_ingress(
+    State(state): State<ServerState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if let Some(context) = request
         .extensions()
         .get::<crate::clients::router::ingress::IngressContext>()
-    else {
-        return ApiError::unauthorized("inference requires signed Router Share ingress")
-            .into_response();
-    };
-    if context.share_id.is_none() {
-        return ApiError::forbidden("inference requires a Router Share binding").into_response();
+    {
+        if context.share_id.is_none() {
+            return ApiError::forbidden("inference requires a Router Share binding")
+                .into_response();
+        }
+        return next.run(request).await;
     }
-    next.run(request).await
+    let loopback = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .is_some_and(|peer| peer.0.ip().is_loopback());
+    let (_, grant, live) = state.market_workspace.access();
+    if let Some(grant) = grant.filter(|_| {
+        loopback
+            && live
+            && session::bearer_token(request.headers())
+                .is_some_and(|v| state.market_workspace.token_matches(v))
+    }) {
+        let share = request.headers().get("x-workspace-share").cloned();
+        if let Some(share) =
+            share.filter(|h| h.to_str().is_ok_and(|v| !v.is_empty() && v.len() <= 512))
+        {
+            let known = state
+                .shares
+                .read()
+                .await
+                .get(share.to_str().unwrap_or_default())
+                .is_some();
+            if known {
+                let headers = request.headers_mut();
+                headers.remove(axum::http::header::AUTHORIZATION);
+                headers.insert("x-cc-switch-share-id", share);
+                if let Ok(email) = grant.tenant_email.parse() {
+                    headers.insert("x-cc-switch-user-email", email);
+                    return next.run(request).await;
+                }
+            }
+        }
+        return ApiError::forbidden("select a Share in this workspace").into_response();
+    }
+    ApiError::unauthorized("inference requires signed Router Share ingress").into_response()
 }
 
 async fn verify_router_ingress(
@@ -3146,6 +3204,26 @@ mod grok_catalog_provider_tests {
         signature_version: u8,
         issued_at_ms: i64,
     ) -> Request {
+        signed_catalog_request(
+            request,
+            request_id,
+            share_id,
+            signature_version,
+            issued_at_ms,
+            "share--client.router.test",
+            "owner@example.com",
+        )
+        .await
+    }
+    async fn signed_catalog_request(
+        request: Request,
+        request_id: &str,
+        share_id: Option<&str>,
+        signature_version: u8,
+        issued_at_ms: i64,
+        host: &str,
+        email: &str,
+    ) -> Request {
         let method = request.method().as_str().to_string();
         let path_and_query = request
             .uri()
@@ -3173,10 +3251,10 @@ mod grok_catalog_provider_tests {
                 .unwrap_or_else(|| format!("client:{TEST_INSTALLATION_ID}")),
             installation_id: TEST_INSTALLATION_ID.to_string(),
             target_lane_id: TEST_INSTALLATION_ID.to_string(),
-            public_host: "share--client.router.test".to_string(),
+            public_host: host.to_owned(),
             share_id: share_id.map(str::to_string),
             request_id: request_id.to_string(),
-            user_email: Some("owner@example.com".to_string()),
+            user_email: Some(email.to_owned()),
             user_role: share_id.is_none().then(|| "owner".to_string()),
             user_country: Some("JP".to_string()),
             is_health_check: false,
@@ -3210,6 +3288,236 @@ mod grok_catalog_provider_tests {
             signature.parse().unwrap(),
         );
         request
+    }
+
+    #[tokio::test]
+    async fn market_workspace_roles_and_export_use_the_live_lease() {
+        use crate::market_lease::{Command, Grant, Operation, Workspace};
+        let physical = catalog_test_state("market-roles");
+        let root = physical.config_dir.clone();
+        configure_test_router(&physical).await;
+        let owner = "owner@example.com";
+        let tenant = "tenant@example.com";
+        let alias = "rent-0123456789abcdef0123";
+        let lease = "00000000-0000-4000-8000-000000000001";
+        let mut config = physical.config_snapshot().await;
+        config.owner.email = Some(owner.into());
+        config.client.tunnel_subdomain = Some("seller-client".into());
+        physical.replace_config(config).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        physical
+            .market_workspace
+            .apply(
+                Command {
+                    sequence: 1,
+                    action: Operation::List {
+                        owner_email: owner.into(),
+                    },
+                },
+                owner,
+                now,
+                true,
+            )
+            .unwrap();
+        physical
+            .market_workspace
+            .apply(
+                Command {
+                    sequence: 2,
+                    action: Operation::Begin {
+                        grant: Grant {
+                            lease_id: lease.into(),
+                            alias: alias.into(),
+                            tenant_email: tenant.into(),
+                            expires_at: now + 3600,
+                        },
+                    },
+                },
+                owner,
+                now,
+                true,
+            )
+            .unwrap();
+        drop(physical);
+        let cli = crate::cli::Cli {
+            host: std::net::Ipv4Addr::LOCALHOST.into(),
+            port: 0,
+            config_dir: Some(root.clone()),
+            web_dist_dir: None,
+            log_level: "warn".into(),
+            command: None,
+        };
+        let state = crate::state::ServerStateInner::load(
+            cli,
+            std::sync::Arc::new(crate::logging::LogCapture::new(8)),
+        )
+        .unwrap();
+        assert_ne!(state.config_dir, root);
+        let app = app_router(state.clone());
+        for (method, path, who, label, expected) in [
+            (
+                "GET",
+                "/web-api/market/workspace",
+                tenant,
+                alias,
+                StatusCode::OK,
+            ),
+            (
+                "POST",
+                "/web-api/market/token",
+                owner,
+                "seller-client",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "GET",
+                "/web-api/market/workspace",
+                owner,
+                "seller-client",
+                StatusCode::OK,
+            ),
+            (
+                "GET",
+                "/web-api/market/workspace",
+                owner,
+                alias,
+                StatusCode::FORBIDDEN,
+            ),
+            ("GET", "/api/config", tenant, alias, StatusCode::FORBIDDEN),
+            (
+                "POST",
+                "/web-api/market/maintenance",
+                tenant,
+                alias,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "POST",
+                "/web-api/market/maintenance",
+                owner,
+                "seller-client",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "POST",
+                "/api/accounts/kiro/local/import",
+                tenant,
+                alias,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "GET",
+                "/web-api/terminal/stream",
+                tenant,
+                alias,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "POST",
+                "/web-api/invoke/list_shares",
+                owner,
+                "seller-client",
+                StatusCode::FORBIDDEN,
+            ),
+            ("GET", "/api/accounts", tenant, alias, StatusCode::OK),
+            (
+                "POST",
+                "/web-api/market/token",
+                tenant,
+                alias,
+                StatusCode::OK,
+            ),
+            (
+                "POST",
+                "/web-api/market/backups",
+                tenant,
+                alias,
+                StatusCode::OK,
+            ),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let request = signed_catalog_request(
+                request,
+                &unique_test_ingress_request_id("workspace"),
+                None,
+                crate::clients::router::ingress::SIGNATURE_VERSION_V2,
+                chrono::Utc::now().timestamp_millis(),
+                &format!("{label}.router.test"),
+                who,
+            )
+            .await;
+            let response = app.clone().oneshot(request).await.unwrap();
+            let code = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                code,
+                expected,
+                "{method} {path}: {}",
+                String::from_utf8_lossy(&body[..body.len().min(180)])
+            );
+            if path == "/web-api/market/backups" {
+                let mut archive = zip::ZipArchive::new(std::io::Cursor::new(body)).unwrap();
+                let manifest = archive
+                    .file_names()
+                    .find(|n| n.ends_with("/manifest.json"))
+                    .unwrap()
+                    .to_owned();
+                let manifest: crate::infra::backup::BackupManifest =
+                    serde_json::from_reader(archive.by_name(&manifest).unwrap()).unwrap();
+                assert!(manifest
+                    .files
+                    .iter()
+                    .all(|f| crate::market_lease::portable_name(&f.file_name)));
+                state.restore_backup_command(manifest.id).await.unwrap();
+                assert_eq!(
+                    state.config_snapshot().await.share_owner_email(),
+                    Some(tenant)
+                );
+            } else if path == "/web-api/market/workspace" && code == StatusCode::OK {
+                let payload: Value = serde_json::from_slice(&body).unwrap();
+                assert!(payload["connectivity"]["registered"].is_boolean());
+                assert_eq!(payload["maintenance"].is_object(), who == owner);
+            }
+        }
+        let policy = crate::domain::settings::config::UpgradePolicyConfig {
+            auto_upgrade_enabled: true,
+            auto_upgrade_check_interval_minutes: 27,
+            delegate_upgrade_to_router_owner: false,
+        };
+        state
+            .set_workspace_host_maintenance(false, policy)
+            .await
+            .unwrap();
+        let persisted =
+            crate::domain::settings::config::ServerConfig::load_or_default(&root).unwrap();
+        assert!(!persisted.enable_web_terminal);
+        assert_eq!(
+            persisted.upgrade_policy.auto_upgrade_check_interval_minutes,
+            27
+        );
+        assert_eq!(persisted.owner.email.as_deref(), Some(owner));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/accounts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            Workspace::open(root.clone()).unwrap().view().events.len(),
+            1
+        );
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -6081,8 +6389,15 @@ async fn web_runtime_context(
         return Ok(Json(web_runtime_auth_required_payload(&config, contract)));
     }
 
+    let leased_role = state.market_workspace.access().1.as_ref().map(|g| {
+        if session::router_web_user_email(&headers).as_deref() == Some(&g.tenant_email) {
+            "tenant"
+        } else {
+            "assistance"
+        }
+    });
     Ok(Json(json!({
-        "mode": "local-admin",
+        "mode": "local-admin","workspaceRole":leased_role,
         "appMode": "server",
         "platform": "server",
         "status": "authenticated",
@@ -6092,20 +6407,20 @@ async fn web_runtime_context(
         "auth": {
             "authenticated": true,
             "setupRequired": false,
-            "ownerEmail": config.owner.email,
+            "ownerEmail": config.share_owner_email(),
             "methods": web_runtime_auth_methods(&config)
         },
         "router": {
             "url": config.router.url,
             "domain": config.router.domain,
-            "clientSubdomain": config.client.tunnel_subdomain,
+            "clientSubdomain": config.share_client_subdomain(),
             "clientTunnelStatus": config.client.tunnel_status
         },
         "runtime": {
-            "configDir": state.config_dir.display().to_string(),
-            "webDistDir": state.web_dist_dir.as_ref().map(|path| path.display().to_string()),
+            "configDir": leased_role.is_none().then(||state.config_dir.display().to_string()),
+            "webDistDir": state.web_dist_dir.as_ref().filter(|_|leased_role.is_none()).map(|path| path.display().to_string()),
             "embeddedWebAssets": web_assets::asset_count(),
-            "enableWebTerminal": config.is_web_terminal_enabled()
+            "enableWebTerminal": leased_role!=Some("tenant") && config.is_web_terminal_enabled()
         },
         "features": {
             "retained": contract.retained_features,

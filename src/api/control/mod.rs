@@ -41,7 +41,7 @@ pub(crate) use ctl::{
     control_prepare_client_subdomain_adoption, control_prepare_quota_history,
     control_preview_account_reset, control_preview_share_capabilities, control_preview_value_quota,
     control_quota_conversion_receipt, control_refresh_share_usage,
-    control_verify_share_account_recovery,
+    control_verify_share_account_recovery, verify_control_request,
 };
 pub use ctl::{
     control_signature, control_signature_for_method, refresh_share_usage_items,

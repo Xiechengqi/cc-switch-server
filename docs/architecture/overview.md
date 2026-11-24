@@ -6,7 +6,7 @@
 
 ## 1. 系统角色
 
-托管 Host 可通过 `cc-switch-server standby` 运行独立的市场健康上报器。该命令先解析 CLI，再建立单线程 runtime，密钥、配置及发送记录与租户 `serve` 分开。它采集机器资源，按 UTC 自然小时散列择时向 Router 上报，租期内持续运行。`standby init` 从标准输入接收托管配置，`standby probe` 输出本机快照、公钥及持钥证明，两者均不发送小时报告。私钥由 Host 本机生成，小时尝试在发送前落盘，进程重启或升级保留发送记录。未知资源边界按字段说明原因，线格式以 Router 的 `PROTOCOL.md` 为准。
+在线市场通过已运行的 Client 反向隧道探测可用性。Client 在本进程读取 cgroup 和数据目录所在磁盘的容量，经签名控制接口向 Router 返回。
 
 待机时间以受信 Router UTC 和本次开机的单调时钟为基准；墙钟异常暂停发送，恢复所在小时计为已用。只有回显本次小时和本代身份的响应可校时或明确撤销。资源采集核对租户 cgroup 的可见祖先，CPU 用量优先取最深层边界；磁盘按实际租户数据路径（缺省为安装用户 `$HOME/.cc-switch-server`）确认文件系统后采样。磁盘调用设 250 毫秒等待上限，最多保留一个后台采样，待机 runtime 退出也有时限，避免不可达挂载阻塞上报或停用。托管部署支持 systemd、活动 OpenRC、约定配置目录且作为容器 PID 1 运行的 SupervisorD，nohup 降级明确提示无开机自启。
 
@@ -29,7 +29,7 @@ Token 路由交易系统由**三个角色**构成，运行时只有**两个进�
 
 Server 不参与资金计费：不保存余额、应付账单或结算。所有 Share 生成持久记录不含正文的用量事实，Token 模式缺价不阻断；Share v10 显式协商后可保存 Router 已确认的冻结价目，用于普通 Share 的纯 USD API 标价等值配额，不代表钱包消费或 Provider 成本，详见 [双口径额度](../share/value-quotas.md)。Share Market 与 Client Market 的付费发布、报价和购买均使用 Router 的平台余额；Router 的 `disabled` / `shadow` / `enabled` 财务模式只控制新的官方渠道充值，不切换到旧的 Provider 资金轨道。`shadow` 只允许 Owner 测试充值；开放或重新开放普通用户充值须通过当前渠道及账本验收门槛。关闭充值或退回影子测试不影响既有余额的消费、转账、已发起订单的核对或成熟收益的结算，也不会恢复旧资金写入口。
 
-Provider 的净收益完成七天沉淀后由 Router 自动计入其平台余额，可用于消费或按 Router 的规则流转；外部提现、提现地址和手动「收益转入余额」均已退役。对 Server 而言，Share Market 的租用、恢复和欠费暂停体现为 Router 经 pending Share edit 下发的 `managedGrant` `upsert`（授予/恢复）与 `revoke`（回收/暂停）；Server 落库为 `manager=routerShareMarket` 的授权并据此执行访问与限额。Client Market 欠费由 Router 侧暂停该 Client 的隧道，不需要 Server 配合。当前资金契约以 `cc-switch-router/docs/market-platform-wallet-implementation.md` 开头的现行说明和 `cc-switch-router/docs/market-earnings-automatic-credit.md` 为准，不能把前者保留的旧提现规划当作当前实现。
+Provider 的净收益完成七天沉淀后由 Router 自动计入其平台余额，可用于消费或按 Router 的规则流转；外部提现、提现地址和手动「收益转入余额」均已退役。对 Server 而言，Share Market 的租用、恢复和欠费暂停体现为 Router 经 pending Share edit 下发的 `managedGrant` `upsert`（授予/恢复）与 `revoke`（回收/暂停）；Server 落库为 `manager=routerShareMarket` 的授权并据此执行访问与限额。Client Market 通过租约状态、租户路由与工作区授权控制访问，installation 反向隧道继续承载状态核对与清理。当前资金契约以 `cc-switch-router/docs/market-platform-wallet-implementation.md` 开头的现行说明和 `cc-switch-router/docs/market-earnings-automatic-credit.md` 为准，不能把前者保留的旧提现规划当作当前实现。
 
 ## 2. 两条链路
 
@@ -189,3 +189,21 @@ WorkBuddy 中国站个人账号可选每日签到由账号控制面持有，默�
 DeepSeek session 与 Trae catalog 使用共享不可变 payload，索引、payload 和 64 个独立活动 single-flight 都接进程父账本。DeepSeek 保留 256条/30分钟；Trae 保留128条、32 MiB缓存、8分钟fresh/24小时stale，超本类缓存上限时可返回仍计费的当前结果而不发布。替换、淘汰、失效与缓存析构不提前释放仍被调用方持有的对象；容量错误为503，不能触发登录失效或跨scope恢复。
 
 网页 runtime 在发网前为每个配置scope预留受限 session/auth 槽（最多1024 scope，session id≤512字节）；401/403失效标记不因TTL、容量或降低父限额而消失，仅凭据/配置scope代际变化或删除收回。无生产task写入。旧八类与Kimi/Copilot既有预算不重建；Gemini持久Account投影与Antigravity短期API复制不冒称独立长期缓存。上述为逻辑估算和所有权边界，不是RSS全覆盖或性能收益；合同见 `assets/contract/r5-shared-core.json`，真实operation仍live_pending。
+
+## 在线 Client 租约的管理接口审计
+
+`market_lease::Workspace` 在 installation 目录锁内恢复操作日志，以进程重启清空上一工作区的缓存、连接和后台任务。认证层先校验 Router ingress，再按 Axum 匹配的路由模板、命令名、租约域名和本地 grant 校验角色。以下分类覆盖已上架或租期内的 Web/API 入口；新增路由需要显式进入对应清单。
+
+| 入口 | 租期内允许的身份及范围 |
+|---|---|
+| `/_ctl/market/{check,command,status}` | 仅带 installation 控制密钥 HMAC、有效时间和一次性 nonce 的 Router。命令必须满足持久化序号和租约状态。 |
+| `/_ctl/market/{upgrade,upgrade-status}` | 带 installation HMAC 且匹配上架 owner。启用委托后可触发固定来源的升级，凭 taskId 查该次状态。 |
+| `/_ctl/` 中的 Share 管理回执 | 已签名控制通道，固定的 Share 设置、配额、核验与撤权处理程序；租期结束后可完成对账。 |
+| `/web-api/market/{workspace,chat,token,backups}`、备份恢复 | 当前租户可操作当前工作区。卖家只可读 workspace 的脱敏投影。备份按文件白名单导出和校验恢复，排除 installation 身份和日志。 |
+| 账号与 Provider、Share、用量、Web invoke | `api/market_workspace.rs` 的 `tenant_path` 与 `workspace_command` 列出允许的路由模板和命令。需要租户域名和与授权一致的已验证身份。 |
+| 推理和 Share 内部观测 | 仅当前租约域名下已签名的 Share 路由。回环推理另外检查真实连接对端、租户 Bearer 令牌和 `X-Workspace-Share`。 |
+| 安装配置、Router 绑定、系统日志、终端、升级和重启 | 租户无权使用。卖家在自身域名或本机登录看协助视图；终端与固定维护操作另外验证 owner 凭据，访问事件持久化后通知租户。 |
+| `/web-api/market/maintenance` | 额外验证本机 owner 凭据，只写 installation 的终端开关与升级策略。协助页显示硬件、Router 注册状态及最近一次心跳。 |
+| 静态 Web、版本、健康与登录引导 | 可以启动页面和认证流程。其余管理请求按默认拒绝处理。 |
+
+owner 的操作系统 root 权限仍能直接读盘。租户确认页和工作区控制台均告知此边界。控制消息、报价和退租线格式见 Router 的 PROTOCOL.md。

@@ -23,6 +23,8 @@ pub const ROUTER_CONTROL_DB_FILE_NAME: &str = "router-control.sqlite";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
+    #[serde(skip)]
+    pub workspace: Option<crate::market_lease::Grant>,
     pub auth: AuthConfig,
     pub owner: OwnerConfig,
     pub router: RouterConfig,
@@ -506,6 +508,7 @@ pub struct SetupInput {
 impl ServerConfig {
     pub fn empty() -> Self {
         Self {
+            workspace: None,
             auth: AuthConfig::default(),
             owner: OwnerConfig::default(),
             router: RouterConfig::default(),
@@ -572,8 +575,33 @@ impl ServerConfig {
             .with_context(|| format!("create config dir {}", config_dir.display()))?;
 
         let config_path = config_path(config_dir);
-        crate::infra::storage::write_json_pretty(&config_path, self)
+        // The effective config borrows the installation transport and owner credentials
+        // in memory. Workspace persistence carries only workspace-owned settings.
+        let mut stored;
+        let value = if self.workspace.is_some() {
+            stored = Self::empty();
+            stored.provider_request_defaults = self.provider_request_defaults.clone();
+            stored.provider_health_check = self.provider_health_check.clone();
+            &stored
+        } else {
+            self
+        };
+        crate::infra::storage::write_json_pretty(&config_path, value)
             .with_context(|| format!("write config {}", config_path.display()))
+    }
+
+    pub fn share_owner_email(&self) -> Option<&str> {
+        self.workspace
+            .as_ref()
+            .map(|g| g.tenant_email.as_str())
+            .or(self.owner.email.as_deref())
+    }
+
+    pub fn share_client_subdomain(&self) -> Option<&str> {
+        self.workspace
+            .as_ref()
+            .map(|g| g.alias.as_str())
+            .or(self.client.tunnel_subdomain.as_deref())
     }
 
     pub fn is_local_setup_complete(&self) -> bool {
@@ -727,6 +755,7 @@ impl ServerConfig {
         };
 
         Ok(Self {
+            workspace: None,
             auth: AuthConfig {
                 password_hash: Some(hash_secret(&input.password, 8)?),
                 api_token_hash: None,

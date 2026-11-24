@@ -73,6 +73,9 @@ jobs:
           cargo test amazon_q --lib
           cargo test web_session --lib
           cargo test --locked market_termination --lib
+          cargo test --locked market_lease:: --lib
+          cargo test --locked market_workspace_roles --lib
+          cargo test --locked workspace_nonces --lib
           cargo test --locked repository::server_sqlite::schema::tests --lib
           cargo test --locked opening_usd --lib
           cargo test --locked domain::usage::value_pricing:: --lib

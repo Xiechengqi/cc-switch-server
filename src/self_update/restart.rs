@@ -980,6 +980,10 @@ fn wait_for_expected_version(
         let remaining = deadline.saturating_duration_since(Instant::now());
         std::thread::sleep(Duration::from_secs(1).min(remaining));
     }
+    // The replacement can exit during the last probe or sleep.
+    if let Some(failure) = replacement_exited(spec, child) {
+        return Err(failure);
+    }
     Err(ReplacementFailure {
         failure_code: "health_check_timeout".into(),
         stage: "health_check".into(),

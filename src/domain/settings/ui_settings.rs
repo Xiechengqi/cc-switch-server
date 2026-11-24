@@ -502,6 +502,7 @@ mod tests {
             value: json!({ "shareRouterDomain": "jptokenswitch.cc" }),
         };
         let config = ServerConfig {
+            workspace: None,
             auth: Default::default(),
             owner: Default::default(),
             router: crate::domain::settings::config::RouterConfig {

@@ -25,6 +25,19 @@ pub(crate) async fn resolve_web_admin_principal(
     headers: &HeaderMap,
 ) -> Result<Option<WebAdminPrincipal>, ApiError> {
     if let Some(user_email) = router_web_user_email(headers) {
+        let (owner, grant, live) = state.market_workspace.access();
+        if owner.as_ref().is_some_and(|owner| owner != &user_email) {
+            let label = headers
+                .get("x-cc-switch-client-tunnel-subdomain")
+                .and_then(|value| value.to_str().ok());
+            if !live
+                || !grant.as_ref().is_some_and(|g| {
+                    g.tenant_email == user_email && label == Some(g.alias.as_str())
+                })
+            {
+                return Ok(None);
+            }
+        }
         return Ok(Some(WebAdminPrincipal {
             user_email,
             role: router_web_role(headers),

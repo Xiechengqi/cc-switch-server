@@ -35,7 +35,6 @@ pub const LONG_VERSION: &str = concat!(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildInfo {
-    pub host_health_protocol_version: u32,
     pub name: &'static str,
     pub version: &'static str,
     pub version_line: &'static str,
@@ -52,7 +51,6 @@ pub struct BuildInfo {
 
 pub fn build_info() -> BuildInfo {
     BuildInfo {
-        host_health_protocol_version: crate::host_health_protocol::VERSION,
         name: env!("CARGO_PKG_NAME"),
         version: env!("CARGO_PKG_VERSION"),
         version_line: VERSION_LINE,

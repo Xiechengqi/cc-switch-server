@@ -42,6 +42,8 @@ import {
   type ServerSettingsSection,
   type ServerView,
 } from "@/lib/serverView";
+import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
+import { UsageDashboard } from "@/components/usage/UsageDashboard";
 import { cn } from "@/lib/utils";
 import { ProviderBundlesPage } from "@/server/providers/bundles/ProviderBundlesPage";
 
@@ -52,11 +54,13 @@ type View = ServerView;
 interface ServerAppProps {
   onSignOut?: (options?: { clearPasswordCache?: boolean }) => void;
   enableWebTerminal?: boolean;
+  workspaceOnly?: boolean;
 }
 
 export default function ServerApp({
   onSignOut,
   enableWebTerminal = true,
+  workspaceOnly = false,
 }: ServerAppProps = {}) {
   const { t } = useTranslation();
   useOauthQuotaRefreshBridge();
@@ -120,15 +124,18 @@ export default function ServerApp({
   }, []);
 
   const handleBack = useCallback(() => {
-    if (currentView === "settings") {
+    if (currentView === "settings" && !workspaceOnly) {
       settingsPageRef.current?.requestClose();
       return;
     }
     setCurrentView("providers");
-  }, [currentView]);
+  }, [currentView, workspaceOnly]);
 
   const content = (() => {
     if (currentView === "settings") {
+      if (workspaceOnly) return <div className={cn(PAGE_SHELL_PADDING_X,"h-full overflow-auto")}>
+        {settingsDefaultTab==="usage" ? <UsageDashboard/> : <AuthCenterPanel serverMode/>}
+      </div>;
       return (
         <SettingsPage
           ref={settingsPageRef}
@@ -144,7 +151,7 @@ export default function ServerApp({
       return (
         <SharePage
           defaultApp="claude"
-          onOpenShareSettings={() => openSettings("share")}
+          onOpenShareSettings={workspaceOnly ? undefined : () => openSettings("share")}
         />
       );
     }
@@ -174,7 +181,7 @@ export default function ServerApp({
         )}
       >
         <ProviderBundlesPage
-          onOpenShareSettings={() => openSettings("share")}
+          onOpenShareSettings={workspaceOnly ? undefined : () => openSettings("share")}
           toolbarActions={
             <div className="flex shrink-0 items-center gap-1">
               <Button
@@ -206,8 +213,8 @@ export default function ServerApp({
               <Button
                 variant="ghost"
                 size="icon"
-                onClick={() => openSettings("general")}
-                title={t("common.settings")}
+                onClick={() => openSettings(workspaceOnly ? "usage" : "general")}
+                title={t(workspaceOnly ? "usage.title" : "common.settings")}
               >
                 <Settings className="h-4 w-4" />
               </Button>

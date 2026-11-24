@@ -283,6 +283,8 @@ pub struct InstallationHeartbeatPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_ip: Option<String>,
     pub log_collection_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_lease_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1369,6 +1371,7 @@ fn build_installation_heartbeat_request(
         identity,
         "installation_heartbeat_v1",
         InstallationHeartbeatPayload {
+            market_lease_v1: Some(true),
             protocol_version: INSTALLATION_HEARTBEAT_PROTOCOL_VERSION,
             boot_id: boot_id.to_string(),
             app_version: crate::build_info::router_registration_version().to_string(),
@@ -2162,6 +2165,9 @@ pub fn canonicalize_share_descriptor(
     config: &ServerConfig,
     mut share: ShareDescriptor,
 ) -> anyhow::Result<ShareDescriptor> {
+    if let Some(grant) = config.workspace.as_ref() {
+        share.owner_email = Some(grant.tenant_email.clone());
+    }
     share.subdomain = canonicalize_share_subdomain(config, &share.subdomain)?;
     Ok(share)
 }
@@ -2171,9 +2177,7 @@ pub fn canonicalize_share_subdomain(
     configured: &str,
 ) -> anyhow::Result<String> {
     let client_subdomain = config
-        .client
-        .tunnel_subdomain
-        .as_deref()
+        .share_client_subdomain()
         .ok_or_else(|| anyhow::anyhow!("client tunnel subdomain is not configured"))
         .and_then(|value| ClientSubdomain::parse(value).map_err(Into::into))?;
     let slug = if let Some((slug, suffix)) = configured.split_once("--") {
@@ -3061,9 +3065,17 @@ fn now_ms() -> i64 {
 }
 
 fn nonce() -> String {
+    request_nonce(crate::market_lease::PROCESS_LEASE.get().map(String::as_str))
+}
+
+fn request_nonce(lease_id: Option<&str>) -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    let random: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    match lease_id {
+        Some(id) => format!("lease_{id}_{random}"),
+        None => random,
+    }
 }
 
 fn url_encode(value: &str) -> String {
@@ -3600,6 +3612,21 @@ mod tests {
     }
 
     #[test]
+    fn workspace_nonces_round_trip_through_the_router_nonce_alphabet() {
+        let lease = "f5c03c0f-a8db-4efb-b05f-be10d022cda1";
+        let nonce = request_nonce(Some(lease));
+        assert!((8..=128).contains(&nonce.len()));
+        assert!(nonce
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')));
+        let random = nonce.strip_prefix(&format!("lease_{lease}_")).unwrap();
+        assert_eq!(random.len(), 32);
+        assert!(random.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(nonce, request_nonce(Some(lease)));
+        assert_eq!(request_nonce(None).len(), 32);
+    }
+
+    #[test]
     fn signed_payload_changes_with_nonce() {
         let mut identity = generate_identity_without_installation();
         identity.installation_id = "inst-1".to_string();
@@ -4077,6 +4104,7 @@ mod tests {
             .unwrap();
 
         let payload = InstallationHeartbeatPayload {
+            market_lease_v1: None,
             protocol_version: 1,
             boot_id: "fixture-boot".into(),
             app_version: "1.2.3".into(),

@@ -7,23 +7,6 @@ use cc_switch_server::state::ServerStateInner;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_args();
-    if let Command::Standby(args) = cli.effective_command() {
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log_level));
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .init();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("initialize standby runtime")?;
-        let result = runtime.block_on(cc_switch_server::standby::execute(args));
-        // A timed-out filesystem probe can still be blocked in the kernel.
-        // Bound shutdown as well so it cannot keep a revoked sender alive.
-        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
-        return result;
-    }
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all();
     // The unoptimized shared forwarder alone uses over 2 MiB per poll. Give
@@ -48,7 +31,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     init_tracing(&cli.log_level, log_capture.clone());
 
     match cli.effective_command() {
-        Command::Standby(args) => cc_switch_server::standby::execute(args).await,
         Command::Serve => serve(cli, log_capture).await,
         Command::Config { command } => cc_switch_server::admin::run_config_command(&cli, command),
         Command::Doctor {
@@ -72,6 +54,39 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
     cc_switch_server::state::enable_fresh_install_sqlite_authority();
     let state =
         ServerStateInner::load(cli.clone(), log_capture).context("initialize server state")?;
+    if let Some(id) = &state.market_workspace.boot_lease {
+        let _ = cc_switch_server::market_lease::PROCESS_LEASE.set(id.clone());
+        let sealing = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                if let Err(error) = sealing
+                    .market_workspace
+                    .seal_expired(chrono::Utc::now().timestamp())
+                {
+                    tracing::error!(%error,"persist workspace expiry");
+                }
+                let now = chrono::Utc::now().timestamp();
+                if sealing
+                    .market_workspace
+                    .access()
+                    .1
+                    .is_some_and(|g| g.expires_at.saturating_add(300) <= now)
+                {
+                    let drained = sealing.market_workspace_drained().await;
+                    match sealing.market_workspace.reap_expired(now, drained) {
+                        Ok(true) => {
+                            sealing.begin_shutdown();
+                            break;
+                        }
+                        Err(e) => tracing::warn!(error=%e,"defer expired workspace cleanup"),
+                        _ => {}
+                    }
+                }
+            }
+        });
+    }
     state.sync_log_config_from_ui_settings().await;
     let config = state.config_snapshot().await;
     let installation_id = config
@@ -109,7 +124,9 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
     cc_switch_server::state::restore_tunnels(state.clone()).await;
     cc_switch_server::state::spawn_public_ip_discovery(state.clone());
     cc_switch_server::state::spawn_installation_heartbeat(state.clone());
-    cc_switch_server::state::spawn_audit_log_uploader(state.clone());
+    if state.market_workspace.boot_lease.is_none() {
+        cc_switch_server::state::spawn_audit_log_uploader(state.clone());
+    }
     cc_switch_server::state::spawn_router_share_log_sync_worker(state.clone());
     cc_switch_server::state::spawn_periodic_backups(state.clone());
     cc_switch_server::state::spawn_periodic_share_sync_retry(state.clone());
@@ -130,7 +147,34 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
         }
     });
     cc_switch_server::state::spawn_share_edit_event_listener(state.clone());
-    cc_switch_server::api::serve(state).await
+    cc_switch_server::api::serve(state.clone()).await?;
+    if state.market_workspace.switch_required() {
+        use std::os::unix::process::CommandExt;
+        let error = std::process::Command::new(workspace_switch_executable()?)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// An upgrade that replaced the binary in place without restarting leaves
+/// `/proc/self/exe` pointing at "<path> (deleted)". The replacement at the
+/// original path is the installed version, so the switch executes that file.
+fn workspace_switch_executable() -> anyhow::Result<std::path::PathBuf> {
+    let current = std::env::current_exe()?;
+    Ok(replaced_executable_path(&current)
+        .filter(|path| path.is_file())
+        .unwrap_or(current))
+}
+
+fn replaced_executable_path(current: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    current
+        .as_os_str()
+        .as_bytes()
+        .strip_suffix(b" (deleted)")
+        .map(|path| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path)))
 }
 
 fn init_tracing(log_level: &str, capture: Arc<LogCapture>) {
@@ -145,4 +189,23 @@ fn print_version(json: bool) -> anyhow::Result<()> {
         println!("{}", info.format_human());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn workspace_switch_follows_an_in_place_upgrade() {
+        assert_eq!(
+            super::replaced_executable_path(std::path::Path::new(
+                "/usr/local/bin/cc-switch-server (deleted)"
+            )),
+            Some("/usr/local/bin/cc-switch-server".into())
+        );
+        assert_eq!(
+            super::replaced_executable_path(std::path::Path::new(
+                "/usr/local/bin/cc-switch-server"
+            )),
+            None
+        );
+    }
 }

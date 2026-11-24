@@ -140,7 +140,7 @@ pub(in crate::api) async fn admin_restart(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_session(&state, &headers).await?;
     let schedule = map_self_update_error(restart_from_detected_service(
-        &state.config_dir,
+        &state.market_workspace.root,
         state.bind_addr,
     ))?;
     state.upgrade.clear_restart_pending().await;
@@ -158,7 +158,7 @@ pub(in crate::api) async fn admin_rollback(
     require_session(&state, &headers).await?;
     map_self_update_error(ensure_binary_writable())?;
     let script = map_self_update_error(rollback_from_backup_and_restart(
-        &state.config_dir,
+        &state.market_workspace.root,
         state.bind_addr,
     ))?;
     state.upgrade.clear_restart_pending().await;
@@ -315,12 +315,19 @@ pub(in crate::api) async fn admin_upgrade_status(
     Query(query): Query<UpgradeStatusQuery>,
 ) -> Result<Json<AdminUpgradeStatusResponse>, ApiError> {
     require_session(&state, &headers).await?;
+    upgrade_status_for_task(&state, query.task_id.as_deref()).await
+}
+
+pub(super) async fn upgrade_status_for_task(
+    state: &ServerState,
+    task_id: Option<&str>,
+) -> Result<Json<AdminUpgradeStatusResponse>, ApiError> {
     let snapshot = state
         .upgrade
         .status_snapshot()
         .await
         .ok_or_else(|| ApiError::not_found("no upgrade task running"))?;
-    if let Some(expected) = query.task_id.as_deref() {
+    if let Some(expected) = task_id {
         if expected != snapshot.task_id {
             return Err(ApiError::not_found("upgrade task id does not match"));
         }

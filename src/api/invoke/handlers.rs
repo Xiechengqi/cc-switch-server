@@ -2281,12 +2281,15 @@ pub(in crate::api) async fn web_client_tunnel_state(state: &ServerState) -> Valu
     let active_tunnel_url = runtime
         .as_ref()
         .and_then(|status| status.tunnel_url.clone());
-    let subdomain = config.client.tunnel_subdomain.clone().unwrap_or_default();
+    let subdomain = config
+        .share_client_subdomain()
+        .unwrap_or_default()
+        .to_owned();
     let expected_tunnel_url = expected_client_tunnel_url(&subdomain, &router_domain);
     let tunnel_url = active_tunnel_url
         .clone()
         .or_else(|| expected_tunnel_url.clone());
-    let owner_email = config.owner.email.clone().unwrap_or_default();
+    let owner_email = config.share_owner_email().unwrap_or_default().to_owned();
     let enabled = matches!(
         config.client.tunnel_status.as_deref(),
         Some("active") | Some("running") | Some("connected")
@@ -2390,7 +2393,10 @@ pub(in crate::api) async fn web_share_health_status(state: &ServerState) -> Valu
         ShareHealthLevel::Warning
     };
 
-    let client_subdomain = config.client.tunnel_subdomain.clone().unwrap_or_default();
+    let client_subdomain = config
+        .share_client_subdomain()
+        .unwrap_or_default()
+        .to_owned();
     let expected_tunnel_url = expected_client_tunnel_url(&client_subdomain, &router_domain);
     let active_tunnel_url = client_runtime
         .as_ref()
@@ -3965,7 +3971,7 @@ async fn configured_client_authority(state: &ServerState) -> Option<(String, Opt
         .get("shareRouterDomain")
         .and_then(Value::as_str)
         .map(str::to_string)?;
-    let client_subdomain = config.client.tunnel_subdomain.as_deref()?;
+    let client_subdomain = config.share_client_subdomain()?;
     let url = expected_client_tunnel_url(client_subdomain, &router_domain)?;
     url::Url::parse(&url)
         .ok()

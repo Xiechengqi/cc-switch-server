@@ -3,6 +3,7 @@ import { Network } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 
+import { LeaseWorkspace } from "@/components/LeaseWorkspace";
 import ServerApp from "@/ServerApp";
 import { ClientWebLoginPage } from "@/components/ClientWebLoginPage";
 import { LoginPanel } from "@/components/LoginPanel";
@@ -66,12 +67,15 @@ function App() {
     return <EmptyState title={t("common.error", { defaultValue: "Error" })} value={error} />;
   }
 
-  return (
+  if(context.workspaceRole==="assistance") return <LeaseWorkspace role="assistance"/>;
+  const app = (
     <ServerApp
       onSignOut={refreshContext}
+      workspaceOnly={context.workspaceRole === "tenant"}
       enableWebTerminal={context.runtime?.enableWebTerminal !== false}
     />
   );
+  return context.workspaceRole==="tenant"?<LeaseWorkspace role="tenant">{app}</LeaseWorkspace>:app;
 }
 
 function EmptyState({ title, value }: { title: string; value: string }) {

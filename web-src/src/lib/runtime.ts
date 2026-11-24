@@ -53,6 +53,7 @@ export interface WebRuntimeCommand {
 }
 
 export interface WebRuntimeContext {
+  workspaceRole?: "tenant" | "assistance" | null;
   mode: "local-admin" | "share" | "client-login";
   appMode?: string;
   platform?: string;

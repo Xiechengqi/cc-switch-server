@@ -45,8 +45,6 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Run the independent managed Host health reporter.
-    Standby(crate::standby::StandbyArgs),
     /// Run the HTTP server.
     Serve,
     /// Inspect and validate local configuration without starting the server.
@@ -204,30 +202,6 @@ mod tests {
     use clap::Parser;
 
     use super::*;
-
-    #[test]
-    fn standby_modes_accept_managed_configuration_without_tenant_options() {
-        for mode in ["init", "probe", "run"] {
-            let cli = Cli::try_parse_from([
-                "cc-switch-server",
-                "standby",
-                mode,
-                "--config",
-                "/tmp/managed-host.json",
-            ])
-            .unwrap();
-            let Command::Standby(args) = cli.effective_command() else {
-                panic!("standby command")
-            };
-            assert_eq!(args.config, PathBuf::from("/tmp/managed-host.json"));
-            assert!(args.command.is_some());
-        }
-        let cli = Cli::try_parse_from(["cc-switch-server", "standby"]).unwrap();
-        let Command::Standby(args) = cli.effective_command() else {
-            panic!("standby command")
-        };
-        assert!(args.command.is_none());
-    }
 
     #[test]
     fn default_host_is_loopback() {

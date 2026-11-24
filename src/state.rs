@@ -1024,6 +1024,7 @@ enum AccountShareMetadataRefresh {
 
 #[derive(Debug)]
 pub struct ServerStateInner {
+    pub market_workspace: crate::market_lease::Workspace,
     pub bind_addr: SocketAddr,
     pub config_dir: PathBuf,
     _data_directory_lock: crate::infra::storage::DataDirectoryLock,
@@ -2942,6 +2943,7 @@ pub fn backup_targets(config_dir: &Path) -> Vec<PathBuf> {
         crate::domain::sharing::legacy_token_market_migration::retirement_audit_path(config_dir),
         crate::clients::router::tunnel::tunnels_path(config_dir),
         grok_media_tasks_path(config_dir),
+        config_dir.join("workspace-chat.json"),
         crate::repository::server_sqlite::database_path(config_dir),
         crate::repository::server_sqlite::marker_path(config_dir),
     ]
@@ -6030,6 +6032,18 @@ impl ServerStateInner {
         crate::proxy::refresh_codex_model_capabilities(self, execution).await;
     }
 
+    pub async fn market_workspace_drained(&self) -> bool {
+        use crate::domain::sharing::router_contract::ShareGrantManager;
+        self.shares.read().await.shares.iter().all(|share| {
+            share.pending_market_termination_acks.is_empty()
+                && !share.user_grants.values().any(|grant| {
+                    grant.active && grant.manager == ShareGrantManager::RouterShareMarket
+                })
+                && !share.market_entitlements.values().any(|entry| entry.active)
+                && !self.share_in_flight.has_in_flight(&share.id)
+        })
+    }
+
     /// Freeze durable core-store writers in the declared lock order, refresh
     /// the SQLite shadow from those exact durable snapshots, then create one
     /// backup manifest containing both representations.
@@ -6089,7 +6103,16 @@ impl ServerStateInner {
         }
         crate::infra::backup::create_backup(
             &self.config_dir,
-            &backup_targets(&self.config_dir),
+            &backup_targets(&self.config_dir)
+                .into_iter()
+                .filter(|p| {
+                    self.market_workspace.boot_lease.is_none()
+                        || p.strip_prefix(&self.config_dir)
+                            .ok()
+                            .and_then(|p| p.to_str())
+                            .is_some_and(crate::market_lease::portable_name)
+                })
+                .collect::<Vec<_>>(),
             reason,
             backup_policy.retain_count,
         )
@@ -7060,6 +7083,8 @@ impl ServerStateInner {
         std::fs::create_dir_all(&config_dir)
             .with_context(|| format!("create config dir {}", config_dir.display()))?;
         let data_directory_lock = crate::infra::storage::acquire_data_directory_lock(&config_dir)?;
+        let market_workspace = crate::market_lease::Workspace::open(config_dir)?;
+        let config_dir = market_workspace.data_dir()?;
         crate::logging::ensure_log_dir(&config_dir)
             .with_context(|| format!("initialize log dir under {}", config_dir.display()))?;
         match prune_native_refresh_quarantine(&config_dir) {
@@ -7079,7 +7104,8 @@ impl ServerStateInner {
         }
 
         let provider_coverage = ProviderCoverage::load_embedded()?;
-        let config = ServerConfig::load_or_default(&config_dir)?;
+        market_workspace.seal_expired(chrono::Utc::now().timestamp())?;
+        let config = market_workspace.effective_config()?;
         let universal_migration =
             crate::domain::providers::migrate::inspect_remove_universal_layer(&config_dir)?;
         if universal_migration.requires_apply() {
@@ -7235,7 +7261,7 @@ impl ServerStateInner {
                 "subscription binding integrity check failed; affected Shares will remain fail-closed"
             );
         }
-        if let Some(owner_email) = config.owner.email.as_deref() {
+        if let Some(owner_email) = config.share_owner_email() {
             let migrated = shares
                 .bind_all_to_client_owner(owner_email)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -7405,9 +7431,9 @@ impl ServerStateInner {
         rand::thread_rng().fill_bytes(&mut provider_import_preview_key);
 
         let tunnels = TunnelSupervisor::load_or_default(&config_dir)?;
-        let web_auth = crate::domain::web_auth::WebAuthStore::load(config_dir.clone());
+        let web_auth = crate::domain::web_auth::WebAuthStore::load(market_workspace.root.clone());
         let upgrade = Arc::new(crate::self_update::upgrade::UpgradeRegistry::load(
-            &config_dir,
+            &market_workspace.root,
         )?);
         let image_capabilities = Arc::new(
             crate::image_store::ImageCapabilityStore::from_config_dir(&config_dir)
@@ -7433,6 +7459,7 @@ impl ServerStateInner {
             bind_addr,
             config_dir,
             _data_directory_lock: data_directory_lock,
+            market_workspace,
             web_dist_dir: cli.resolved_web_dist_dir(),
             provider_coverage,
             request_body_limits,
@@ -7701,6 +7728,25 @@ impl ServerStateInner {
         Ok(self.log_capture.read_tail(&config, &self.config_dir, lines))
     }
 
+    fn validate_market_installation_config(
+        &self,
+        current: &ServerConfig,
+        next: &ServerConfig,
+    ) -> anyhow::Result<()> {
+        if self.market_workspace.access().0.is_some() {
+            anyhow::ensure!(
+                current.owner.email == next.owner.email
+                    && current.router.url == next.router.url
+                    && current.router.api_base == next.router.api_base
+                    && current.router.domain == next.router.domain
+                    && current.client.tunnel_subdomain == next.client.tunnel_subdomain
+                    && current.router.identity == next.router.identity,
+                "unlist Client before changing installation identity or transport"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn replace_config(&self, mut config: ServerConfig) -> anyhow::Result<()> {
         let _commit = self.config_persistence.gate.lock().await;
         let current = self.config.read().await.clone();
@@ -7710,6 +7756,7 @@ impl ServerStateInner {
         preserve_client_subdomain_adoption_from_stale_snapshot(&current, &mut config);
         config.provider_request_defaults = current.provider_request_defaults.clone();
         config.provider_health_check = current.provider_health_check.clone();
+        self.validate_market_installation_config(&current, &config)?;
         let http_client = build_http_client()?;
         let web_session_http_client = build_web_session_http_client()?;
         persist_state_snapshot(&self.config_dir, config.clone()).await?;
@@ -7727,6 +7774,7 @@ impl ServerStateInner {
         let _commit = self.config_persistence.gate.lock().await;
         let mut candidate = self.config.read().await.clone();
         let result = mutate(&mut candidate)?;
+        self.validate_market_installation_config(&*self.config.read().await, &candidate)?;
         #[cfg(test)]
         self.config_persistence.apply_test_persist_delay().await;
         persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
@@ -7744,6 +7792,33 @@ impl ServerStateInner {
             Ok(())
         })
         .await
+    }
+
+    pub(crate) async fn set_workspace_host_maintenance(
+        &self,
+        terminal: bool,
+        policy: crate::domain::settings::config::UpgradePolicyConfig,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.market_workspace.boot_lease.is_some(),
+            "leased Client required"
+        );
+        let _commit = self.config_persistence.gate.lock().await;
+        let root = self.market_workspace.root.clone();
+        let policy = policy.normalize();
+        let saved_policy = policy.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut host = ServerConfig::load_or_default(&root)?;
+            host.enable_web_terminal = terminal;
+            host.upgrade_policy = saved_policy;
+            host.save(&root)
+        })
+        .await??;
+        let mut effective = self.config.write().await;
+        effective.enable_web_terminal = terminal;
+        effective.upgrade_policy = policy;
+        self.config_persistence.mark_published();
+        Ok(())
     }
 
     pub async fn set_provider_request_defaults(
@@ -8583,7 +8658,7 @@ impl ServerStateInner {
         {
             tracing::warn!("completed a pending Codex workspace rebind transaction before reload");
         }
-        let mut config = ServerConfig::load_or_default(&self.config_dir)?;
+        let mut config = self.market_workspace.effective_config()?;
         let current_config = self.config.read().await.clone();
         let http_client = build_http_client()?;
         let web_session_http_client = build_web_session_http_client()?;
@@ -8656,7 +8731,7 @@ impl ServerStateInner {
             *self.router_quota_capability.write().await = None;
             shares_changed = true;
         }
-        if let Some(owner_email) = config.owner.email.as_deref() {
+        if let Some(owner_email) = config.share_owner_email() {
             shares_changed |= !shares
                 .bind_all_to_client_owner(owner_email)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?
@@ -8738,6 +8813,12 @@ impl ServerStateInner {
         let _shares_commit = self.shares_persistence.gate.lock().await;
         let _ui_settings_commit = self.ui_settings_persistence.gate.lock().await;
         let _media_commit = self.grok_media_task_persistence.lock().await;
+        if self.market_workspace.boot_lease.is_some() {
+            anyhow::ensure!(
+                !self.market_workspace.view().managed_activity,
+                "cannot roll back third-party Share evidence"
+            );
+        }
         if apply_codex_workspace_rebind_transaction(&self.config_dir)
             .context("recover pending Codex workspace rebind transaction before restore")?
         {
@@ -8745,12 +8826,21 @@ impl ServerStateInner {
                 "completed a pending Codex workspace rebind transaction before backup restore"
             );
         }
+        let workspace_only = self.market_workspace.boot_lease.is_some();
         let config_dir = self.config_dir.clone();
         let restore_result = tokio::task::spawn_blocking(move || {
             crate::infra::backup::restore_backup_with_validator(
                 &config_dir,
                 &backup_id,
                 |stage_dir, manifest| {
+                    anyhow::ensure!(
+                        !workspace_only
+                            || manifest
+                                .files
+                                .iter()
+                                .all(|f| crate::market_lease::portable_name(&f.file_name)),
+                        "backup contains installation-owned files"
+                    );
                     validate_server_backup_restore_stage(&config_dir, stage_dir, manifest)?;
                     crate::repository::server_sqlite::value_quota::write_restore_fence(
                         &config_dir,
@@ -9326,7 +9416,8 @@ impl ServerStateInner {
         self.events.subscribe()
     }
 
-    pub(crate) fn begin_shutdown(&self) -> bool {
+    /// Start the same graceful shutdown for signals, control requests and local lease expiry.
+    pub fn begin_shutdown(&self) -> bool {
         !self.shutdown.send_replace(true)
     }
 
@@ -20211,7 +20302,11 @@ impl ServerStateInner {
             || patch.user_quota_conversions.is_some()
         {
             if let Some(context) = &mut patch.edit_context {
-                context.actor = self.config_snapshot().await.owner.email;
+                context.actor = self
+                    .config_snapshot()
+                    .await
+                    .share_owner_email()
+                    .map(str::to_owned);
             }
         }
         self.apply_router_share_settings_patch_immediate(share_id, patch)
@@ -22681,6 +22776,9 @@ async fn apply_share_edit_locally(
     Option<crate::domain::sharing::router_contract::ShareUserPolicy>,
 )> {
     let managed_grant = edit.patch.managed_grant.clone();
+    if managed_grant.is_some() {
+        state.market_workspace.mark_managed_activity()?;
+    }
     let share = if managed_grant.is_some() {
         state
             .apply_router_share_settings_patch_immediate(&edit.share_id, edit.patch.clone())

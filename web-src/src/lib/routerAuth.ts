@@ -403,11 +403,23 @@ export function readRouterAccessToken(): string | null {
   return state.accessToken?.trim() || state.apiToken?.trim() || null;
 }
 
+// A Client-issued password proof is tab-local and only sent to owner operations
+// on the current Client. It never accompanies Router requests or tenant data.
+let workspaceOwnerProof: string | null = null;
+export function setWorkspaceOwnerProof(proof: string | null) { workspaceOwnerProof = proof; }
+export function attachWorkspaceOwnerProof(headers: Headers, input: RequestInfo | URL) {
+  const url=new URL(input instanceof Request ? input.url : String(input),window.location.origin);
+  if(workspaceOwnerProof && url.origin===window.location.origin && (url.pathname.startsWith("/web-api/terminal/") ||
+    ["/web-api/market/maintenance","/web-api/invoke/restart_server_service","/web-api/invoke/start_admin_upgrade","/web-api/invoke/rollback_server_service"].includes(url.pathname))) {
+    headers.set("x-cc-switch-owner-proof",workspaceOwnerProof);
+  }
+}
 async function fetchWithAuth(
   input: RequestInfo | URL,
   init: RequestInit = {},
 ): Promise<Response> {
   const headers = new Headers(init.headers || {});
+  attachWorkspaceOwnerProof(headers,input);
   Object.entries(authBearerHeaders()).forEach(([key, value]) =>
     headers.set(key, value),
   );
