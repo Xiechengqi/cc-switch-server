@@ -53,6 +53,7 @@ pub(crate) fn product_boundary(stored: &StoredProvider) -> Result<ProductBoundar
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct CanonicalRequest {
     pub(crate) adapter: GenericForwardingAdapter,
     pub(crate) runtime_request: AdapterRequest,
@@ -75,6 +76,25 @@ pub(crate) fn prepare_canonical_request(
     request_context: &mut UsageLogContext,
 ) -> Result<CanonicalRequest, ProxyError> {
     let product = product_boundary(stored)?;
+    let (body, structured_schema) = {
+        let mut original: Value = serde_json::from_slice(&body)
+            .map_err(|error| ProxyError::bad_request(error.to_string()))?;
+        let schema = driver::structured::schema_from_request(&original)?;
+        let has_compaction = original
+            .get("input")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item["type"] == "compaction"));
+        let body = if has_compaction {
+            driver::client_features::restore_compaction(&mut original)?;
+            Bytes::from(
+                serde_json::to_vec(&original)
+                    .map_err(|error| ProxyError::bad_request(error.to_string()))?,
+            )
+        } else {
+            body
+        };
+        (body, schema)
+    };
     let adapter = adapters::adapter_for(route.app(), stored.provider_type);
     let metadata = adapters::CopilotRequestMetadata {
         has_anthropic_beta: headers.contains_key("anthropic-beta"),
@@ -88,12 +108,18 @@ pub(crate) fn prepare_canonical_request(
         &metadata,
     )?;
     execution.enforce_model_policy(&mut runtime_request)?;
-    let request_body: Value = serde_json::from_slice(&runtime_request.body).map_err(|error| {
-        ProxyError::bad_request(format!(
-            "invalid {} canonical request body: {error}",
-            product.label
-        ))
-    })?;
+    let mut request_body: Value =
+        serde_json::from_slice(&runtime_request.body).map_err(|error| {
+            ProxyError::bad_request(format!(
+                "invalid {} canonical request body: {error}",
+                product.label
+            ))
+        })?;
+    driver::structured::prepare_request(
+        &mut request_body,
+        structured_schema,
+        route.app() == crate::domain::providers::model::AppKind::Claude,
+    );
     if request_context.session_id.is_none() {
         request_context.session_id = Some(driver::request_scoped_session_id());
     }
@@ -519,7 +545,7 @@ pub(crate) async fn handle_subscription_throttle(
     true
 }
 
-fn api_base_override(stored: &StoredProvider) -> Option<String> {
+pub(crate) fn api_base_override(stored: &StoredProvider) -> Option<String> {
     #[cfg(test)]
     {
         if stored.provider_type == ProviderType::AmazonQOAuth {
@@ -644,7 +670,7 @@ mod tests {
         let body =
             Bytes::from_static(br#"{"model":"claude-sonnet-4-5","input":[],"compact":true}"#);
         let error = enforce_disabled_compaction_contract(
-            ProviderType::KiroOAuth,
+            ProviderType::AmazonQOAuth,
             ProxyRoute::CodexResponsesCompact,
             &body,
         )

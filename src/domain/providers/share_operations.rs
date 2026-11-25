@@ -20,6 +20,9 @@ pub fn driver_implements(plan: &ProviderRuntimePlan, op: ShareOperation) -> bool
     if matches!(driver, "special.antigravity" | "special.agy") {
         return op == WebSearch;
     }
+    if driver == "special.kiro" {
+        return op == WebSearch;
+    }
     match op {
         ImageGenerate | ImageEdit => {
             matches!(

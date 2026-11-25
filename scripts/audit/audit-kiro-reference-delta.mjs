@@ -1039,3 +1039,26 @@ console.log(
     checkSources ? ", external objects verified" : ", external check optional"
   })`,
 );
+
+// The earlier snapshots remain historical evidence. Current behavior is
+// independently checked by this additive single-account implementation entry.
+const enhancement = contract.singleAccountEnhancement;
+assert(enhancement?.id === "KIRO-SINGLE-ACCOUNT-2026-11-25" && enhancement.status === "fixture_verified", "Kiro single-account enhancement is missing");
+assert(enhancement.liveStatus === "live_pending" && enhancement.defaults.apiDomain === "amazonaws" && enhancement.defaults.terminalPolicy === "end-event", "Kiro live state or defaults changed");
+assert(enhancement.enabled.dedicatedSummaryCompaction === true && enhancement.enabled.rawArgumentStreaming === true && enhancement.search.maxCalls === 5 && enhancement.search.sharedForcedRefreshBudget === 1, "Kiro single-account execution bounds changed");
+assert(wire.singleAccountEnhancement?.rawToolInputRelease === "incremental_fragments_validated_before_stop" && wire.singleAccountEnhancement.amazonQCompaction === "disabled", "Kiro active wire extension is inconsistent");
+assert(digestPattern.test(enhancement.referenceFiles?.[0]?.sha256) && commitPattern.test(enhancement.referenceCommit), "Kiro enhancement reference is incomplete");
+for (const file of enhancement.referenceFiles) {
+  safeRelative(file.path, "Kiro enhancement reference");
+  assert(digestPattern.test(file.sha256), "Kiro enhancement reference digest is invalid");
+  if (checkSources) {
+    const sourceRoot = sourceRootById.get("kiro-rs-head");
+    assert(sha256(gitFile(sourceRoot, enhancement.referenceCommit, file.path, null)) === file.sha256, `Kiro enhancement reference drifted: ${file.path}`);
+  }
+}
+for (const evidence of enhancement.tests) {
+  safeRelative(evidence.path, "Kiro enhancement test");
+  const content = fs.readFileSync(path.join(repoRoot, evidence.path), "utf8");
+  for (const anchor of evidence.anchors) assert(content.includes(anchor), `Kiro enhancement acceptance is missing ${anchor}`);
+}
+console.log("Kiro single-account execution contracts ok (local fixtures; live acceptance pending)");

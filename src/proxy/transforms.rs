@@ -1022,8 +1022,16 @@ impl StreamFrame {
     }
 }
 
+pub(crate) fn openai_chat_to_kiro(input: &Value) -> Result<Value, TransformError> {
+    openai_chat_to_anthropic_with_policy(input, false, true)
+}
+
+pub(crate) fn openai_responses_to_kiro(input: &Value) -> Result<Value, TransformError> {
+    openai_responses_to_anthropic_with_policy(input, false, true)
+}
+
 pub fn openai_chat_to_anthropic(input: &Value) -> Result<Value, TransformError> {
-    openai_chat_to_anthropic_with_policy(input, false)
+    openai_chat_to_anthropic_with_policy(input, false, false)
 }
 
 #[cfg(test)]
@@ -1110,7 +1118,7 @@ mod claude_fable52_tests {
 
 pub(crate) fn openai_chat_to_claude_oauth(input: &Value) -> Result<Value, TransformError> {
     let mut output =
-        openai_chat_to_anthropic_with_policy(input, claude_oauth_system_policy(input))?;
+        openai_chat_to_anthropic_with_policy(input, claude_oauth_system_policy(input), false)?;
     preserve_claude_tool_strictness(input, &mut output);
     Ok(output)
 }
@@ -1207,6 +1215,7 @@ fn emit_pending_claude_system(messages: &mut Vec<Value>, pending: &mut Vec<Value
 fn openai_chat_to_anthropic_with_policy(
     input: &Value,
     preserve_system: bool,
+    preserve_tool_turns: bool,
 ) -> Result<Value, TransformError> {
     let messages = input
         .get("messages")
@@ -1260,7 +1269,9 @@ fn openai_chat_to_anthropic_with_policy(
 
     merge_adjacent_anthropic_messages(&mut output_messages);
     drop_empty_anthropic_messages(&mut output_messages);
-    drop_incomplete_anthropic_tool_turns(&mut output_messages);
+    if !preserve_tool_turns {
+        drop_incomplete_anthropic_tool_turns(&mut output_messages);
+    }
     drop_empty_anthropic_messages(&mut output_messages);
     merge_adjacent_anthropic_messages(&mut output_messages);
     order_anthropic_tool_results_first(&mut output_messages);
@@ -1303,12 +1314,12 @@ fn openai_chat_to_anthropic_with_policy(
 }
 
 pub fn openai_responses_to_anthropic(input: &Value) -> Result<Value, TransformError> {
-    openai_responses_to_anthropic_with_policy(input, false)
+    openai_responses_to_anthropic_with_policy(input, false, false)
 }
 
 pub(crate) fn openai_responses_to_claude_oauth(input: &Value) -> Result<Value, TransformError> {
     let mut output =
-        openai_responses_to_anthropic_with_policy(input, claude_oauth_system_policy(input))?;
+        openai_responses_to_anthropic_with_policy(input, claude_oauth_system_policy(input), false)?;
     preserve_claude_tool_strictness(input, &mut output);
     Ok(output)
 }
@@ -1316,6 +1327,7 @@ pub(crate) fn openai_responses_to_claude_oauth(input: &Value) -> Result<Value, T
 fn openai_responses_to_anthropic_with_policy(
     input: &Value,
     preserve_system: bool,
+    preserve_tool_turns: bool,
 ) -> Result<Value, TransformError> {
     validate_response_tool_type_collisions(input)?;
     validate_anthropic_tool_search_execution(input)?;
@@ -1414,7 +1426,9 @@ fn openai_responses_to_anthropic_with_policy(
     }
     merge_adjacent_anthropic_messages(&mut messages);
     drop_empty_anthropic_messages(&mut messages);
-    drop_incomplete_anthropic_tool_turns(&mut messages);
+    if !preserve_tool_turns {
+        drop_incomplete_anthropic_tool_turns(&mut messages);
+    }
     drop_empty_anthropic_messages(&mut messages);
     merge_adjacent_anthropic_messages(&mut messages);
     order_anthropic_tool_results_first(&mut messages);

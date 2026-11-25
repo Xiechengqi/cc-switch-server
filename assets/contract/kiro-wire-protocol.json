@@ -324,5 +324,22 @@
   "acceptance": {
     "localContract": "fixture_verified",
     "realAccount": "live_pending"
+  },
+  "singleAccountEnhancement": {
+    "referenceContract": "kiro-reference-delta.json#singleAccountEnhancement",
+    "activeSince": "2026-11-25",
+    "rawToolInputRelease": "incremental_fragments_validated_before_stop",
+    "builtinMappedInputRelease": "complete_validated_json",
+    "stopReasonPrecedence": [
+      "refusal",
+      "upstream_truncation",
+      "tool_use",
+      "end_turn"
+    ],
+    "thinkingDisabled": "suppress_reasoning_output_preserve_usage",
+    "readPages": "preserve_client_tool_schema_and_input",
+    "kiroCompaction": "dedicated_summary_round",
+    "amazonQCompaction": "disabled",
+    "hostedSearch": "same_account_bounded_generation_mcp_loop"
   }
 }

@@ -3,6 +3,42 @@ use serde_json::Value;
 use crate::domain::accounts::store::Account;
 
 pub(crate) const DEFAULT_REGION: &str = "us-east-1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KiroApiDomain {
+    Amazonaws,
+    Kiro,
+}
+
+impl KiroApiDomain {
+    pub(crate) fn configured() -> Result<Self, &'static str> {
+        static CONFIGURED: std::sync::OnceLock<Result<KiroApiDomain, &'static str>> =
+            std::sync::OnceLock::new();
+        *CONFIGURED.get_or_init(
+            || match std::env::var("CC_SWITCH_KIRO_API_DOMAIN").as_deref() {
+                Err(std::env::VarError::NotPresent) | Ok("") | Ok("amazonaws") => {
+                    Ok(Self::Amazonaws)
+                }
+                Ok("kiro") => Ok(Self::Kiro),
+                _ => Err("CC_SWITCH_KIRO_API_DOMAIN must be amazonaws or kiro"),
+            },
+        )
+    }
+
+    pub(crate) fn runtime_host(self, region: &str) -> String {
+        match self {
+            Self::Amazonaws => format!("q.{region}.amazonaws.com"),
+            Self::Kiro => format!("runtime.{region}.kiro.dev"),
+        }
+    }
+
+    pub(crate) fn management_host(self, region: &str) -> String {
+        match self {
+            Self::Amazonaws => format!("q.{region}.amazonaws.com"),
+            Self::Kiro => format!("management.{region}.kiro.dev"),
+        }
+    }
+}
 pub(crate) const PROFILE_REGIONS: &[&str] = &["us-east-1", "eu-central-1"];
 pub(crate) const BUILDER_ID_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";

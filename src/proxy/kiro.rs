@@ -1,8 +1,16 @@
 //! Kiro OAuth protocol bridge for Claude-compatible proxy requests.
 
+pub(crate) mod client_features;
 mod endpoint;
+mod history;
 mod image;
+use history::{
+    history_reasoning_content, normalize_messages, pair_orphaned_tool_uses,
+    preserve_resent_tool_results,
+};
 mod model;
+mod response;
+pub(crate) mod structured;
 mod tool_bridge;
 pub(crate) mod wire;
 
@@ -133,6 +141,12 @@ pub(crate) struct KiroToolNameRegistry {
     upstream_to_original: HashMap<String, String>,
     original_names: HashSet<String>,
     namespaced_children: HashMap<String, Vec<String>>,
+    schemas: HashMap<String, Value>,
+    suppress_thinking: bool,
+    tools_disabled: bool,
+    allow_clean_eof: bool,
+    incremental_tools: bool,
+    structured_schema: Option<Value>,
 }
 
 impl KiroToolNameRegistry {
@@ -178,6 +192,42 @@ impl KiroToolNameRegistry {
         }
     }
 
+    fn restore_input(&self, upstream_name: &str, input: Value) -> Value {
+        let mapped = self
+            .upstream_to_original
+            .get(upstream_name)
+            .is_some_and(|client| {
+                client != upstream_name
+                    && tool_bridge::builtin_name(client, ToolCompatibilityMode::ClaudeCode)
+                        == Some(upstream_name)
+            });
+        if mapped {
+            tool_bridge::input_from_kiro(upstream_name, input)
+        } else {
+            input
+        }
+    }
+
+    fn needs_input_rewrite(&self, upstream_name: &str) -> bool {
+        self.upstream_to_original
+            .get(upstream_name)
+            .is_some_and(|client| {
+                client != upstream_name
+                    && tool_bridge::builtin_name(client, ToolCompatibilityMode::ClaudeCode)
+                        == Some(upstream_name)
+            })
+    }
+
+    fn configure_response(&mut self, request: &Value) {
+        self.tools_disabled = request.get("tool_choice").is_some_and(|choice| {
+            choice.as_str() == Some("none")
+                || choice.get("type").and_then(Value::as_str) == Some("none")
+        });
+        self.structured_schema = request.pointer("/output_config/format/schema").cloned();
+        self.suppress_thinking = thinking_type(request) == Some("disabled");
+        self.incremental_tools = request.get("stream").and_then(Value::as_bool) == Some(true);
+    }
+
     fn retained_bytes(&self) -> usize {
         fn map_bytes(map: &HashMap<String, String>) -> usize {
             map.capacity()
@@ -192,7 +242,15 @@ impl KiroToolNameRegistry {
                 )
         }
 
-        map_bytes(&self.upstream_to_original)
+        self.structured_schema
+            .as_ref()
+            .map_or(0, retained_json_bytes)
+            .saturating_add(self.schemas.iter().fold(0_usize, |bytes, (name, schema)| {
+                bytes
+                    .saturating_add(name.capacity())
+                    .saturating_add(retained_json_bytes(schema))
+            }))
+            .saturating_add(map_bytes(&self.upstream_to_original))
             .saturating_add(
                 self.original_names
                     .capacity()
@@ -514,6 +572,73 @@ pub(crate) fn prompt_cache_request_identity(
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn apply_runtime_domain(
+    account: &KiroAccountData,
+    prepared: &mut endpoint::PreparedEndpoint,
+) -> Result<(), ProxyError> {
+    if account.product == CodeWhispererProduct::AmazonQ {
+        return Ok(());
+    }
+    let domain = crate::domain::providers::kiro::KiroApiDomain::configured()
+        .map_err(ProxyError::bad_request)?;
+    let host = domain.runtime_host(&account.api_region);
+    let mut url = url::Url::parse(&prepared.url).map_err(ProxyError::bad_gateway)?;
+    url.set_host(Some(&host)).map_err(ProxyError::bad_gateway)?;
+    prepared.url = url.to_string();
+    prepared.host = host.clone();
+    for (name, value) in &mut prepared.headers {
+        if *name == "host" {
+            *value = host.clone();
+        }
+    }
+    Ok(())
+}
+
+pub(crate) struct KiroMcpRequest {
+    pub id: String,
+    pub url: String,
+    pub headers: Vec<(&'static str, String)>,
+    pub body: Value,
+}
+
+pub(crate) fn prepare_mcp_request(
+    account: &Account,
+    query: &str,
+    version: &str,
+) -> Result<KiroMcpRequest, ProxyError> {
+    let data = KiroAccountData::from_account(account)?;
+    let mut prepared = endpoint::prepare(
+        endpoint::EndpointKind::from_account(&data),
+        &data,
+        data.access_token(account)?,
+        json!({}),
+        version,
+    );
+    apply_runtime_domain(&data, &mut prepared)?;
+    prepared.headers.retain(|(name, _)| {
+        !matches!(
+            *name,
+            "content-type"
+                | "x-amz-target"
+                | "x-amzn-codewhisperer-optout"
+                | "x-amzn-kiro-agent-mode"
+        )
+    });
+    prepared
+        .headers
+        .push(("content-type", "application/json".to_string()));
+    if let Some(profile) = endpoint::profile_arn(&data)? {
+        prepared.headers.push(("x-amzn-kiro-profile-arn", profile));
+    }
+    let id = next_uuid_like("kiro-search");
+    Ok(KiroMcpRequest {
+        id: id.clone(),
+        url: format!("https://{}/mcp", prepared.host),
+        headers: prepared.headers,
+        body: json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"web_search","arguments":{"query":query}}}),
+    })
+}
+
 pub(crate) fn prepare_kiro_request(
     account: &Account,
     body: &Value,
@@ -601,13 +726,14 @@ fn prepare_kiro_request_from_processed_images(
         reasoning_shape = ?request.resolved_model.reasoning_shape,
         "resolved Kiro model capability"
     );
-    let prepared = endpoint::prepare(
+    let mut prepared = endpoint::prepare(
         endpoint::EndpointKind::from_account(&account_data),
         &account_data,
         access_token,
         request.body,
         &context.ide_version,
     );
+    apply_runtime_domain(&account_data, &mut prepared)?;
     Ok(KiroPreparedRequest {
         url: prepared.url,
         host: prepared.host,
@@ -654,21 +780,29 @@ fn anthropic_to_kiro_request_with_catalog(
     if raw_messages.is_empty() {
         return Err(ProxyError::bad_request("messages is empty"));
     }
-    if tool_mode == ToolCompatibilityMode::ClaudeCode
-        && contains_unsupported_read_pages(raw_messages)
-    {
-        return Err(ProxyError::bad_request(
-            "Kiro Claude Code tool bridge cannot preserve Read.pages",
-        ));
-    }
 
-    let last_user_idx = raw_messages
+    let normalized_messages = normalize_messages(raw_messages);
+    let last_user_idx = normalized_messages
         .iter()
         .rposition(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
         .ok_or_else(|| ProxyError::bad_request("missing user message"))?;
-    let messages = &raw_messages[..=last_user_idx];
+    let messages = &normalized_messages[..=last_user_idx];
+    let raw_read = history_uses_read_pages(messages)
+        || body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("Read"))
+                        && tool
+                            .get("input_schema")
+                            .is_some_and(read_schema_declares_pages)
+                })
+            });
     if tool_mode == ToolCompatibilityMode::ClaudeCode
-        && contains_colliding_builtin_tool_inputs(messages)
+        && contains_colliding_builtin_tool_inputs(messages, raw_read)
     {
         return Err(ProxyError::bad_request(
             "Kiro Claude Code tool input has colliding mapped keys",
@@ -677,19 +811,44 @@ fn anthropic_to_kiro_request_with_catalog(
 
     let mut tool_name_map = HashMap::new();
     let mut tool_name_registry = KiroToolNameRegistry::default();
+    if raw_read {
+        tool_name_map.insert("Read".to_string(), "Read".to_string());
+    }
+    let no_tools = body.get("tool_choice").is_some_and(|choice| {
+        choice.as_str() == Some("none")
+            || choice.get("type").and_then(Value::as_str) == Some("none")
+    });
     let mut tools = convert_tools(
-        body.get("tools"),
+        body.get("tools").filter(|_| !no_tools),
         &mut tool_name_map,
         &mut tool_name_registry,
         tool_mode,
     )?;
-    let (content, images, tool_results) =
+    let (mut content, images, tool_results) =
         parse_user_content(messages[last_user_idx].get("content"));
     let mut history = build_history(body, messages, model_id, &mut tool_name_map, tool_mode);
-    let (validated_tool_results, orphaned_tool_use_ids) =
+    preserve_resent_tool_results(&history, &tool_results, &mut content);
+    let (mut validated_tool_results, orphaned_tool_use_ids) =
         validate_tool_pairing(&history, &tool_results);
-    remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
+    validated_tool_results.extend(pair_orphaned_tool_uses(
+        &mut history,
+        &orphaned_tool_use_ids,
+    ));
     add_missing_history_tools(&mut tools, &history);
+    tool_name_registry.configure_response(body);
+    if account.product == CodeWhispererProduct::Kiro {
+        static POLICY: OnceLock<Result<bool, &'static str>> = OnceLock::new();
+        tool_name_registry.allow_clean_eof = *POLICY
+            .get_or_init(
+                || match std::env::var("CC_SWITCH_KIRO_TERMINAL_POLICY").as_deref() {
+                    Err(std::env::VarError::NotPresent) | Ok("") | Ok("end-event") => Ok(false),
+                    Ok("clean-eof") => Ok(true),
+                    _ => Err("CC_SWITCH_KIRO_TERMINAL_POLICY must be end-event or clean-eof"),
+                },
+            )
+            .as_ref()
+            .map_err(|message| ProxyError::bad_request(*message))?;
+    }
 
     let current_message = json!({
         "userInputMessage": {
@@ -732,7 +891,7 @@ fn anthropic_to_kiro_request_with_catalog(
     })
 }
 
-fn contains_unsupported_read_pages(messages: &[Value]) -> bool {
+fn history_uses_read_pages(messages: &[Value]) -> bool {
     messages.iter().any(|message| {
         message
             .get("content")
@@ -752,7 +911,7 @@ fn contains_unsupported_read_pages(messages: &[Value]) -> bool {
     })
 }
 
-fn contains_colliding_builtin_tool_inputs(messages: &[Value]) -> bool {
+fn contains_colliding_builtin_tool_inputs(messages: &[Value], raw_read: bool) -> bool {
     messages.iter().any(|message| {
         message
             .get("content")
@@ -765,7 +924,8 @@ fn contains_colliding_builtin_tool_inputs(messages: &[Value]) -> bool {
                             .and_then(Value::as_str)
                             .zip(block.get("input"))
                             .is_some_and(|(name, input)| {
-                                tool_bridge::input_has_key_collision(name, input)
+                                !(raw_read && name.eq_ignore_ascii_case("Read"))
+                                    && tool_bridge::input_has_key_collision(name, input)
                             })
                 })
             })
@@ -915,16 +1075,17 @@ fn convert_tools(
         {
             continue;
         }
-        if tool_mode == ToolCompatibilityMode::ClaudeCode
-            && name.eq_ignore_ascii_case("Read")
-            && tool
+        let tool_mode = if name.eq_ignore_ascii_case("Read")
+            && (tool
                 .get("input_schema")
                 .is_some_and(read_schema_declares_pages)
+                || tool_name_map.get("Read").is_some_and(|name| name == "Read"))
         {
-            return Err(ProxyError::bad_request(
-                "Kiro Claude Code tool bridge cannot preserve Read.pages",
-            ));
-        }
+            tool_name_map.insert(name.to_string(), name.to_string());
+            ToolCompatibilityMode::Raw
+        } else {
+            tool_mode
+        };
         let schema = tool
             .get("input_schema")
             .cloned()
@@ -952,12 +1113,12 @@ fn convert_tools(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        match name {
-            "Write" => {
+        match (tool_mode, name) {
+            (ToolCompatibilityMode::ClaudeCode, "Write") => {
                 description.push('\n');
                 description.push_str(WRITE_TOOL_DESCRIPTION_SUFFIX);
             }
-            "Edit" => {
+            (ToolCompatibilityMode::ClaudeCode, "Edit") => {
                 description.push('\n');
                 description.push_str(EDIT_TOOL_DESCRIPTION_SUFFIX);
             }
@@ -972,11 +1133,15 @@ fn convert_tools(
         } else {
             schema
         };
+        let schema = normalize_schema(schema);
+        tool_name_registry
+            .schemas
+            .insert(mapped_name.clone(), schema.clone());
         converted.push(json!({
             "toolSpecification": {
                 "name": mapped_name,
                 "description": description,
-                "inputSchema": { "json": normalize_schema(schema) }
+                "inputSchema": { "json": schema }
             }
         }));
     }
@@ -1190,6 +1355,14 @@ fn map_tool_name(
     tool_name_map: &mut HashMap<String, String>,
     tool_mode: ToolCompatibilityMode,
 ) -> String {
+    if tool_name_map.get(name).is_some_and(|mapped| mapped == name)
+        || (name.eq_ignore_ascii_case("Read")
+            && tool_name_map
+                .get("Read")
+                .is_some_and(|mapped| mapped == "Read"))
+    {
+        return name.to_string();
+    }
     if let Some(mapped) = tool_bridge::map_name(name, tool_mode, tool_name_map) {
         return mapped;
     }
@@ -1216,10 +1389,36 @@ fn build_history(
     tool_mode: ToolCompatibilityMode,
 ) -> Vec<Value> {
     let mut history = Vec::new();
-    let prefix = thinking_prefix(body);
+    let prefix = if model::additional_request_fields(
+        body,
+        &model::resolve_catalog_authorized(model_id, None),
+    )
+    .ok()
+    .flatten()
+    .is_some()
+    {
+        None
+    } else {
+        thinking_prefix(body)
+    };
 
     if let Some(system) = system_text(body).filter(|s| !s.is_empty()) {
-        let system = format!("{system}\n{SYSTEM_CHUNKED_POLICY}");
+        let system = if tool_mode == ToolCompatibilityMode::ClaudeCode
+            && body
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| {
+                    tools.iter().any(|tool| {
+                        matches!(
+                            tool.get("name").and_then(Value::as_str),
+                            Some("Write" | "Edit")
+                        )
+                    })
+                }) {
+            format!("{system}\n{SYSTEM_CHUNKED_POLICY}")
+        } else {
+            system
+        };
         let final_system = match prefix.as_deref() {
             Some(prefix) if !has_thinking_tags(&system) => format!("{prefix}\n{system}"),
             _ => system,
@@ -1284,9 +1483,9 @@ fn build_history(
     }
     if !user_buffer.is_empty() {
         history.push(merge_user_messages(&user_buffer, model_id));
-        history.push(history_assistant_message("OK".to_string(), Vec::new()));
     }
 
+    history::retain_model_reasoning(&mut history, messages, model_id);
     history
 }
 
@@ -1387,7 +1586,11 @@ fn merge_assistant_messages(
     } else {
         content_parts.join("\n\n")
     };
-    history_assistant_message(content, tool_uses)
+    let mut message = history_assistant_message(content, tool_uses);
+    if let Some(reasoning) = history_reasoning_content(messages) {
+        message["assistantResponseMessage"]["reasoningContent"] = reasoning;
+    }
+    message
 }
 
 fn history_user_message(
@@ -1466,35 +1669,6 @@ fn validate_tool_pairing(
         }
     }
     (filtered, unpaired)
-}
-
-fn remove_orphaned_tool_uses(history: &mut [Value], orphaned_ids: &HashSet<String>) {
-    if orphaned_ids.is_empty() {
-        return;
-    }
-    for msg in history {
-        let Some(tool_uses) = msg
-            .pointer_mut("/assistantResponseMessage/toolUses")
-            .and_then(Value::as_array_mut)
-        else {
-            continue;
-        };
-        tool_uses.retain(|tool_use| {
-            tool_use
-                .get("toolUseId")
-                .and_then(Value::as_str)
-                .map(|id| !orphaned_ids.contains(id))
-                .unwrap_or(true)
-        });
-        if tool_uses.is_empty() {
-            if let Some(obj) = msg
-                .get_mut("assistantResponseMessage")
-                .and_then(Value::as_object_mut)
-            {
-                obj.remove("toolUses");
-            }
-        }
-    }
 }
 
 fn add_missing_history_tools(tools: &mut Vec<Value>, history: &[Value]) {
@@ -1616,7 +1790,6 @@ fn parse_assistant_content(
     tool_mode: ToolCompatibilityMode,
 ) -> (String, Vec<Value>) {
     let mut text = String::new();
-    let mut thinking = String::new();
     let mut tool_uses = Vec::new();
     match content {
         Some(Value::String(s)) => text.push_str(s),
@@ -1633,7 +1806,9 @@ fn parse_assistant_content(
                         let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         let mapped_name = map_tool_name(name, tool_name_map, tool_mode);
                         let mut input = item.get("input").cloned().unwrap_or_else(|| json!({}));
-                        if tool_bridge::builtin_name(name, tool_mode).is_some() {
+                        if mapped_name != name
+                            && tool_bridge::builtin_name(name, tool_mode).is_some()
+                        {
                             input = tool_bridge::input_to_kiro(name, input);
                         }
                         tool_uses.push(json!({
@@ -1642,22 +1817,22 @@ fn parse_assistant_content(
                             "input": input
                         }));
                     }
-                    Some("thinking") => {
-                        if let Some(value) = item.get("thinking").and_then(|v| v.as_str()) {
-                            thinking.push_str(value);
-                        }
-                    }
                     _ => {}
                 }
             }
         }
         _ => {}
     }
-    let content = if !thinking.is_empty() && !text.is_empty() {
-        format!("<thinking>{thinking}</thinking>\n\n{text}")
-    } else if !thinking.is_empty() {
-        format!("<thinking>{thinking}</thinking>")
-    } else if text.is_empty() && !tool_uses.is_empty() {
+    let content = if text.is_empty()
+        && (content.and_then(Value::as_array).is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                matches!(
+                    block["type"].as_str(),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+        }) || !tool_uses.is_empty())
+    {
         " ".to_string()
     } else {
         text
@@ -1695,98 +1870,135 @@ struct ToolLeakFilter {
     carry: String,
     leaked_tools: Vec<LeakedToolUse>,
     literal_tool_use: LiteralToolUseFilter,
+    schemas: HashMap<String, Value>,
+    passthrough: bool,
 }
 
 impl ToolLeakFilter {
-    fn push_text(&mut self, text: &str, flush: bool) -> Vec<String> {
-        let visible = self.literal_tool_use.push_text(text, flush);
-        self.push_invoke_text(&visible, flush)
+    fn with_registry(registry: &KiroToolNameRegistry) -> Self {
+        Self {
+            schemas: registry.schemas.clone(),
+            ..Self::default()
+        }
     }
 
-    fn push_invoke_text(&mut self, text: &str, flush: bool) -> Vec<String> {
-        self.carry.push_str(text);
-        let mut visible = Vec::new();
-
-        loop {
-            let Some(invoke_start) = self.carry.find("<invoke name=\"") else {
-                break;
-            };
-            let Some(invoke_end_rel) = self.carry[invoke_start..].find("</invoke>") else {
-                if flush {
-                    if !self.carry.is_empty() {
-                        visible.push(std::mem::take(&mut self.carry));
-                    }
-                } else {
-                    let prefix = strip_tool_prefix(&self.carry[..invoke_start]);
-                    if !prefix.is_empty() {
-                        visible.push(prefix);
-                    }
-                    self.carry = self.carry[invoke_start..].to_string();
-                }
-                return visible;
-            };
-
-            let invoke_end = invoke_start + invoke_end_rel + "</invoke>".len();
-            let prefix = strip_tool_prefix(&self.carry[..invoke_start]);
-            if !prefix.is_empty() {
-                visible.push(prefix);
-            }
-
-            if let Some(tool) = parse_leaked_invoke(&self.carry[invoke_start..invoke_end]) {
-                self.leaked_tools.push(tool);
+    fn push_text(&mut self, text: &str, flush: bool) -> Vec<String> {
+        let visible = self.literal_tool_use.push_text(text, flush);
+        if self.passthrough || self.schemas.is_empty() {
+            let visible = if self.carry.is_empty() {
+                visible
             } else {
-                visible.push(self.carry[invoke_start..invoke_end].to_string());
-            }
-
-            let mut consumed_end = invoke_end;
-            if let Some(close_len) = leading_function_calls_close_len(&self.carry[consumed_end..]) {
-                consumed_end += close_len;
-            }
-            self.carry = self.carry[consumed_end..].to_string();
+                self.carry.push_str(&visible);
+                std::mem::take(&mut self.carry)
+            };
+            return (!visible.is_empty())
+                .then_some(visible)
+                .into_iter()
+                .collect();
         }
-
-        if flush {
-            if !self.carry.is_empty() {
-                visible.push(std::mem::take(&mut self.carry));
+        self.carry.push_str(&visible);
+        let prefix = self.carry.trim_start();
+        let candidate = ["<invoke name=\"", "<function_calls>"]
+            .iter()
+            .any(|opening| opening.starts_with(prefix) || prefix.starts_with(opening));
+        if !candidate || self.carry.len() > 262_144 {
+            self.passthrough = true;
+            return vec![std::mem::take(&mut self.carry)];
+        }
+        if !flush {
+            return Vec::new();
+        }
+        match parse_declared_invokes(&self.carry, &self.schemas) {
+            Some(calls) => {
+                self.leaked_tools = calls;
+                self.carry.clear();
+                Vec::new()
             }
-            return visible;
+            None => vec![std::mem::take(&mut self.carry)],
         }
+    }
 
-        let hold = pending_tool_tail_len(&self.carry);
-        let emit_len = self.carry.len().saturating_sub(hold);
-        if emit_len > 0 {
-            visible.push(self.carry[..emit_len].to_string());
-            self.carry = self.carry[emit_len..].to_string();
-        }
-        visible
+    fn native_tool(&mut self) -> Vec<String> {
+        self.passthrough = true;
+        self.leaked_tools.clear();
+        (!self.carry.is_empty())
+            .then(|| std::mem::take(&mut self.carry))
+            .into_iter()
+            .collect()
     }
 
     fn take_deduped(&mut self, seen_signatures: &mut HashSet<String>) -> Vec<LeakedToolUse> {
-        let mut out = Vec::new();
-        for leaked in self.leaked_tools.drain(..) {
-            let sig = tool_signature(&leaked.name, &leaked.input);
-            if seen_signatures.insert(sig) {
-                out.push(leaked);
-            }
-        }
-        out
+        self.leaked_tools
+            .drain(..)
+            .filter(|tool| seen_signatures.insert(tool_signature(&tool.name, &tool.input)))
+            .collect()
     }
 
     fn retained_bytes(&self) -> usize {
         self.carry
             .capacity()
             .saturating_add(self.literal_tool_use.carry.capacity())
-            .saturating_add(
-                self.leaked_tools
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<LeakedToolUse>()),
-            )
-            .saturating_add(self.leaked_tools.iter().fold(0_usize, |bytes, leaked| {
+            .saturating_add(self.schemas.iter().fold(0_usize, |bytes, (name, schema)| {
                 bytes
-                    .saturating_add(leaked.name.capacity())
-                    .saturating_add(retained_json_bytes(&leaked.input))
+                    .saturating_add(name.capacity())
+                    .saturating_add(retained_json_bytes(schema))
+            }))
+            .saturating_add(self.leaked_tools.iter().fold(0_usize, |bytes, tool| {
+                bytes
+                    .saturating_add(tool.name.capacity())
+                    .saturating_add(retained_json_bytes(&tool.input))
             }))
     }
+}
+
+// Only a response consisting entirely of declared invocations is eligible.
+// Explanations, code examples, incomplete XML and native-tool turns stay text.
+fn parse_declared_invokes(
+    text: &str,
+    schemas: &HashMap<String, Value>,
+) -> Option<Vec<LeakedToolUse>> {
+    let mut rest = text.trim();
+    if let Some(inner) = rest.strip_prefix("<function_calls>") {
+        rest = inner.strip_suffix("</function_calls>")?.trim();
+    }
+    let mut calls = Vec::new();
+    while !rest.is_empty() {
+        let after = rest.strip_prefix("<invoke name=\"")?;
+        let (name, after) = after.split_once("\">")?;
+        let schema = schemas.get(name)?;
+        let (parameters, next) = after.split_once("</invoke>")?;
+        let mut parameters = parameters.trim();
+        let mut input = serde_json::Map::new();
+        while !parameters.is_empty() {
+            let after = parameters.strip_prefix("<parameter name=\"")?;
+            let (key, after) = after.split_once("\">")?;
+            let (raw, next) = after.split_once("</parameter>")?;
+            let value = if schema
+                .pointer(&format!(
+                    "/properties/{}/type",
+                    key.replace('~', "~0").replace('/', "~1")
+                ))
+                .and_then(Value::as_str)
+                == Some("string")
+            {
+                json!(xml_unescape(raw))
+            } else {
+                leaked_parameter_value(raw)
+            };
+            if input.insert(key.to_string(), value).is_some() {
+                return None;
+            }
+            parameters = next.trim();
+        }
+        let input = Value::Object(input);
+        crate::proxy::cursor::tool_schema::validate_tool_arguments(schema, &input).ok()?;
+        calls.push(LeakedToolUse {
+            name: name.to_string(),
+            input,
+        });
+        rest = next.trim();
+    }
+    (!calls.is_empty()).then_some(calls)
 }
 
 const LITERAL_TOOL_USE_OPEN: &str = "<tool_use";
@@ -1864,40 +2076,6 @@ fn marker_suffix_len(value: &str, marker: &str) -> usize {
     0
 }
 
-fn parse_leaked_invoke(value: &str) -> Option<LeakedToolUse> {
-    let name_start = value.find("<invoke name=\"")? + "<invoke name=\"".len();
-    let name_end = value[name_start..].find('"')? + name_start;
-    let name = value[name_start..name_end].to_string();
-    let body_start = value[name_end..].find('>')? + name_end + 1;
-    let body_end = value.rfind("</invoke>")?;
-    let body = &value[body_start..body_end];
-    let mut input = serde_json::Map::new();
-    let mut rest = body;
-
-    while let Some(param_start_rel) = rest.find("<parameter name=\"") {
-        rest = &rest[param_start_rel + "<parameter name=\"".len()..];
-        let Some(key_end) = rest.find('"') else {
-            break;
-        };
-        let key = rest[..key_end].to_string();
-        let Some(open_end) = rest[key_end..].find('>') else {
-            break;
-        };
-        rest = &rest[key_end + open_end + 1..];
-        let Some(value_end) = rest.find("</parameter>") else {
-            break;
-        };
-        let raw = &rest[..value_end];
-        input.insert(key, leaked_parameter_value(raw));
-        rest = &rest[value_end + "</parameter>".len()..];
-    }
-
-    Some(LeakedToolUse {
-        name,
-        input: Value::Object(input),
-    })
-}
-
 fn leaked_parameter_value(raw: &str) -> Value {
     let decoded = xml_unescape(raw);
     let trimmed = decoded.trim();
@@ -1927,53 +2105,6 @@ fn xml_unescape(raw: &str) -> String {
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&")
-}
-
-fn strip_tool_prefix(prefix: &str) -> String {
-    let trimmed_end = prefix.trim_end();
-    for marker in ["<function_calls>", "count"] {
-        if let Some(stripped) = trimmed_end.strip_suffix(marker) {
-            let keep_len = stripped.len();
-            return prefix[..keep_len].to_string();
-        }
-    }
-    prefix.to_string()
-}
-
-fn leading_function_calls_close_len(value: &str) -> Option<usize> {
-    let trimmed = value.trim_start();
-    let ws_len = value.len().saturating_sub(trimmed.len());
-    trimmed
-        .strip_prefix("</function_calls>")
-        .map(|_| ws_len + "</function_calls>".len())
-}
-
-fn pending_tool_tail_len(value: &str) -> usize {
-    let markers = [
-        "<function_calls>",
-        "<invoke name=\"",
-        "</invoke>",
-        "</function_calls>",
-        "<parameter name=\"",
-        "</parameter>",
-        "count",
-    ];
-    let mut hold = 0;
-    for marker in markers {
-        let max = marker.len().saturating_sub(1).min(value.len());
-        for len in (1..=max).rev() {
-            if value.ends_with(&marker[..len]) {
-                hold = hold.max(len);
-                break;
-            }
-        }
-    }
-    if let Some(pos) = value.rfind("count") {
-        if value[pos..].trim_start().starts_with("count") && value[pos..].contains('<') {
-            hold = hold.max(value.len() - pos);
-        }
-    }
-    hold
 }
 
 fn tool_signature(name: &str, input: &Value) -> String {
@@ -2021,8 +2152,11 @@ struct SseBuilder {
     tool_json: ToolJsonAccumulator,
     tool_errors: Vec<KiroToolJsonError>,
     seen_tool_signatures: HashSet<String>,
+    streamed_tools: HashSet<String>,
     tool_leak_filter: ToolLeakFilter,
-    inline_thinking: bool,
+    thinking_parser: response::ThinkingParser,
+    stop_reason: response::StopReason,
+    structured_text: String,
     output_tokens: i32,
     usage: KiroUsageAccumulator,
 }
@@ -2064,6 +2198,7 @@ impl SseBuilder {
         Self {
             message_id: next_message_id(),
             model,
+            tool_leak_filter: ToolLeakFilter::with_registry(&tool_name_registry),
             tool_name_registry,
             usage: KiroUsageAccumulator::with_context_window(context_window),
             ..Default::default()
@@ -2091,11 +2226,14 @@ impl SseBuilder {
 
     fn assistant_delta(&mut self, text: &str) -> Vec<Bytes> {
         let mut out = Vec::new();
-        for segment in split_inline_thinking(text, &mut self.inline_thinking) {
-            if segment.is_thinking {
-                out.extend(self.thinking_delta(&segment.text));
+        if self.stop_reason.is_refusal() {
+            return out;
+        }
+        for (is_thinking, text) in self.thinking_parser.push(text, false) {
+            if is_thinking {
+                out.extend(self.thinking_delta(&text));
             } else {
-                for visible in self.tool_leak_filter.push_text(&segment.text, false) {
+                for visible in self.tool_leak_filter.push_text(&text, false) {
                     out.extend(self.visible_assistant_delta(&visible));
                 }
             }
@@ -2108,6 +2246,18 @@ impl SseBuilder {
             return Vec::new();
         }
         self.output_tokens += estimate_tokens(text);
+        if self.tool_name_registry.structured_schema.is_some() {
+            self.structured_text.push_str(text);
+            if self.structured_text.len() <= structured::MAX_TEXT_BYTES {
+                return Vec::new();
+            }
+            self.tool_name_registry.structured_schema = None;
+            let held = std::mem::take(&mut self.structured_text);
+            let tokens = self.output_tokens;
+            let output = self.visible_assistant_delta(&held);
+            self.output_tokens = tokens;
+            return output;
+        }
         let mut out = Vec::new();
         out.extend(self.stop_thinking_block());
         if self.text_stopped {
@@ -2134,6 +2284,9 @@ impl SseBuilder {
     }
 
     fn reasoning_delta(&mut self, payload: &Value) -> Vec<Bytes> {
+        if self.stop_reason.is_refusal() {
+            return Vec::new();
+        }
         if let Some(signature) = reasoning_signature(payload) {
             self.pending_thinking_signature = Some(signature.to_string());
         }
@@ -2141,7 +2294,10 @@ impl SseBuilder {
     }
 
     fn redacted_thinking_block(&mut self, data: &str) -> Vec<Bytes> {
-        if data.is_empty() {
+        if data.is_empty()
+            || self.tool_name_registry.suppress_thinking
+            || self.stop_reason.is_refusal()
+        {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -2172,6 +2328,9 @@ impl SseBuilder {
             return Vec::new();
         }
         self.output_tokens += estimate_tokens(text);
+        if self.tool_name_registry.suppress_thinking || self.stop_reason.is_refusal() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         if self.text_index.is_some() && !self.text_stopped {
             self.text_stopped = true;
@@ -2212,6 +2371,18 @@ impl SseBuilder {
         input: &str,
         stop: bool,
     ) -> Result<Vec<Bytes>, KiroToolJsonError> {
+        if self.stop_reason.is_refusal() {
+            return Ok(Vec::new());
+        }
+        if self.tool_name_registry.tools_disabled {
+            return Err(kiro_wire_contract_error(
+                "Kiro returned a tool call while tools are disabled",
+            ));
+        }
+        let mut out = Vec::new();
+        for held in self.tool_leak_filter.native_tool() {
+            out.extend(self.visible_assistant_delta(&held));
+        }
         let completed = match self
             .tool_json
             .push(id, name, input, stop, &self.tool_name_registry)
@@ -2220,14 +2391,77 @@ impl SseBuilder {
             Err(error @ KiroToolJsonError::Wire { .. }) => return Err(error),
             Err(error) => {
                 self.tool_json.reject(&error);
+                if self.streamed_tools.contains(id) {
+                    return Err(error);
+                }
                 self.tool_errors.push(error);
-                return Ok(Vec::new());
+                return Ok(out);
             }
         };
-        let Some((id, kiro_name, name, parsed_input)) = completed else {
-            return Ok(Vec::new());
-        };
-        self.completed_tool_events(id, kiro_name, name, parsed_input)
+        let upstream_name = self
+            .tool_json
+            .pending
+            .get(id)
+            .map(|(name, _)| name.as_str())
+            .or_else(|| completed.as_ref().map(|(_, name, _, _)| name.as_str()))
+            .unwrap_or(name);
+        if self.tool_name_registry.incremental_tools
+            && !upstream_name.is_empty()
+            && !self.tool_name_registry.needs_input_rewrite(upstream_name)
+        {
+            let client_name = self.tool_name_registry.resolve(upstream_name)?;
+            let started = self.streamed_tools.contains(id);
+            let fragment = if started {
+                input.to_string()
+            } else if let Some((_, buffered)) = self.tool_json.pending.get(id) {
+                buffered.clone()
+            } else {
+                completed
+                    .as_ref()
+                    .map(|(_, _, _, input)| input.to_string())
+                    .unwrap_or_default()
+            };
+            if !fragment.is_empty() {
+                out.extend(self.start_tool_events(id, &client_name));
+                self.streamed_tools.insert(id.to_string());
+                let index = self.tool_indices[id];
+                out.push(self.observed_sse(
+                    "content_block_delta",
+                    json!({
+                        "type":"content_block_delta","index":index,
+                        "delta":{"type":"input_json_delta","partial_json":fragment}
+                    }),
+                ));
+            }
+        }
+        if let Some((id, upstream_name, client_name, parsed)) = completed {
+            out.extend(self.completed_tool_events(id, upstream_name, client_name, parsed)?);
+        }
+        Ok(out)
+    }
+
+    fn start_tool_events(&mut self, id: &str, name: &str) -> Vec<Bytes> {
+        if self.tool_indices.contains_key(id) {
+            return Vec::new();
+        }
+        let mut out = self.stop_thinking_block();
+        if let Some(index) = self.text_index.filter(|_| !self.text_stopped) {
+            self.text_stopped = true;
+            out.push(self.observed_sse(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":index}),
+            ));
+        }
+        let index = self.next_index;
+        self.next_index += 1;
+        self.tool_indices.insert(id.to_string(), index);
+        self.tool_names.insert(id.to_string(), name.to_string());
+        out.push(self.observed_sse(
+            "content_block_start",
+            json!({"type":"content_block_start","index":index,
+            "content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
+        ));
+        out
     }
 
     fn completed_tool_events(
@@ -2237,38 +2471,18 @@ impl SseBuilder {
         name: String,
         parsed_input: Value,
     ) -> Result<Vec<Bytes>, KiroToolJsonError> {
-        let parsed_input = tool_bridge::input_from_kiro(&kiro_name, parsed_input);
-        let mut out = Vec::new();
-        out.extend(self.stop_thinking_block());
-        if self.text_index.is_some() && !self.text_stopped {
-            self.text_stopped = true;
-            let index = self.text_index.unwrap_or(0);
-            out.push(self.observed_sse(
-                "content_block_stop",
-                json!({"type":"content_block_stop","index":index}),
-            ));
-        }
-
-        let index = if let Some(index) = self.tool_indices.get(&id).copied() {
-            index
-        } else {
-            let index = self.next_index;
-            self.next_index += 1;
-            self.tool_indices.insert(id.clone(), index);
-            self.tool_names.insert(id.clone(), name.clone());
-            out.push(self.observed_sse(
-                "content_block_start",
-                json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
-            ));
-            index
-        };
+        let parsed_input = self
+            .tool_name_registry
+            .restore_input(&kiro_name, parsed_input);
+        let mut out = self.start_tool_events(&id, &name);
+        let index = self.tool_indices[&id];
         let input =
             serde_json::to_string(&parsed_input).map_err(|error| KiroToolJsonError::Invalid {
                 tool_use_id: id.clone(),
                 name: name.clone(),
                 message: error.to_string(),
             })?;
-        if input != "{}" {
+        if input != "{}" && !self.streamed_tools.contains(&id) {
             out.push(self.observed_sse(
                 "content_block_delta",
                 json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":input}}),
@@ -2291,7 +2505,7 @@ impl SseBuilder {
             events.extend(self.completed_tool_events(id, kiro_name, name, input)?);
         }
         events.extend(self.final_events());
-        if self.next_index == 0 && !self.tool_errors.is_empty() {
+        if self.next_index == 0 && !self.tool_errors.is_empty() && !self.stop_reason.is_refusal() {
             return Err(self.tool_errors.remove(0));
         }
         Ok(events)
@@ -2299,6 +2513,15 @@ impl SseBuilder {
 
     fn final_events(&mut self) -> Vec<Bytes> {
         let mut out = Vec::new();
+        for (is_thinking, text) in self.thinking_parser.push("", true) {
+            if is_thinking {
+                out.extend(self.thinking_delta(&text));
+            } else {
+                for visible in self.tool_leak_filter.push_text(&text, false) {
+                    out.extend(self.visible_assistant_delta(&visible));
+                }
+            }
+        }
         for visible in self.tool_leak_filter.push_text("", true) {
             out.extend(self.visible_assistant_delta(&visible));
         }
@@ -2325,9 +2548,12 @@ impl SseBuilder {
             self.tool_indices.insert(id.clone(), index);
             out.push(self.observed_sse(
                 "content_block_start",
-                json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":leaked.name,"input":{}}}),
+                json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":self.tool_name_registry.resolve(&leaked.name).unwrap_or_else(|_| leaked.name.clone()),"input":{}}}),
             ));
-            let input = serde_json::to_string(&leaked.input).unwrap_or_else(|_| "{}".to_string());
+            let input = self
+                .tool_name_registry
+                .restore_input(&leaked.name, leaked.input);
+            let input = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
             if input != "{}" {
                 out.push(self.observed_sse(
                     "content_block_delta",
@@ -2339,6 +2565,17 @@ impl SseBuilder {
                 json!({"type":"content_block_stop","index":index}),
             ));
         }
+        if let Some(schema) = self.tool_name_registry.structured_schema.take() {
+            let original = std::mem::take(&mut self.structured_text);
+            let value = if self.tool_indices.is_empty() && !self.stop_reason.is_refusal() {
+                structured::extract(&original, &schema).unwrap_or(original)
+            } else {
+                original
+            };
+            let tokens = self.output_tokens;
+            out.extend(self.visible_assistant_delta(&value));
+            self.output_tokens = tokens;
+        }
         out.extend(self.stop_thinking_block());
         if self.text_index.is_some() && !self.text_stopped {
             self.text_stopped = true;
@@ -2348,11 +2585,7 @@ impl SseBuilder {
                 json!({"type":"content_block_stop","index":index}),
             ));
         }
-        let stop_reason = if self.tool_indices.is_empty() {
-            "end_turn"
-        } else {
-            "tool_use"
-        };
+        let stop_reason = self.stop_reason.finish(!self.tool_indices.is_empty());
         let usage = self.usage.final_usage(self.output_tokens);
         let mut usage_json = json!({
             "input_tokens":usage.input_tokens,
@@ -2365,7 +2598,7 @@ impl SseBuilder {
             "message_delta",
             json!({
                 "type":"message_delta",
-                "delta":{"stop_reason":stop_reason,"stop_sequence":null},
+                "delta":{"stop_reason":stop_reason,"stop_sequence":self.stop_reason.sequence()},
                 "usage":usage_json
             }),
         ));
@@ -2375,6 +2608,9 @@ impl SseBuilder {
 
     fn usage_event(&mut self, event_type: &str, payload: &Value) {
         self.usage.apply_event(event_type, payload);
+        if matches!(event_type, "metadataEvent" | "messageMetadataEvent") {
+            self.stop_reason.observe(payload);
+        }
     }
 
     fn set_prompt_cache_usage(&mut self, usage: KiroPromptCacheUsage) {
@@ -2435,8 +2671,17 @@ impl SseBuilder {
                             .sum::<usize>(),
                     ),
             )
+            .saturating_add(
+                self.streamed_tools
+                    .iter()
+                    .map(String::capacity)
+                    .sum::<usize>(),
+            )
             .saturating_add(self.tool_leak_filter.retained_bytes())
             .saturating_add(self.usage.retained_bytes())
+            .saturating_add(self.structured_text.capacity())
+            .saturating_add(self.thinking_parser.retained_bytes())
+            .saturating_add(self.stop_reason.retained_bytes())
     }
 
     fn stop_thinking_block(&mut self) -> Vec<Bytes> {
@@ -2467,12 +2712,6 @@ impl SseBuilder {
             ),
         ]
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct InlineThinkingSegment {
-    is_thinking: bool,
-    text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2759,49 +2998,6 @@ impl ToolJsonAccumulator {
     }
 }
 
-fn split_inline_thinking(text: &str, in_thinking: &mut bool) -> Vec<InlineThinkingSegment> {
-    let mut segments = Vec::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        if *in_thinking {
-            if let Some(end) = rest.find("</thinking>") {
-                let chunk = &rest[..end];
-                if !chunk.is_empty() {
-                    segments.push(InlineThinkingSegment {
-                        is_thinking: true,
-                        text: chunk.to_string(),
-                    });
-                }
-                rest = &rest[end + "</thinking>".len()..];
-                *in_thinking = false;
-            } else {
-                segments.push(InlineThinkingSegment {
-                    is_thinking: true,
-                    text: rest.to_string(),
-                });
-                break;
-            }
-        } else if let Some(start) = rest.find("<thinking>") {
-            let visible = &rest[..start];
-            if !visible.is_empty() {
-                segments.push(InlineThinkingSegment {
-                    is_thinking: false,
-                    text: visible.to_string(),
-                });
-            }
-            rest = &rest[start + "<thinking>".len()..];
-            *in_thinking = true;
-        } else {
-            segments.push(InlineThinkingSegment {
-                is_thinking: false,
-                text: rest.to_string(),
-            });
-            break;
-        }
-    }
-    segments
-}
-
 const REQUEST_MEMORY_STREAM_ERROR_PREFIX: &str = "[CC_REQUEST_MEMORY_EXHAUSTED] ";
 
 fn request_memory_stream_error(error: RequestMemoryError) -> std::io::Error {
@@ -3038,6 +3234,8 @@ pub(crate) fn kiro_event_stream_to_claude_sse_with_request_memory(
         cache_namespace,
         request_memory.as_ref(),
     );
+    let mut tool_name_registry = tool_name_registry;
+    tool_name_registry.configure_response(request_body);
     kiro_event_stream_to_anthropic_sse(
         stream,
         model,
@@ -3186,7 +3384,8 @@ fn kiro_event_stream_to_anthropic_sse(
         if let Some(memory) = stream_memory.as_ref() {
             memory.release_decoded_frames(&decoder)?;
         }
-        if !saw_end {
+        if !saw_end && !(builder.tool_name_registry.allow_clean_eof
+            && (builder.next_index > 0 || builder.output_tokens > 0 || !builder.tool_json.pending.is_empty())) {
             Err(kiro_stream_io_error(kiro_wire_contract_error(
                 "Kiro EventStream ended before endEvent",
             )))?;
@@ -3256,6 +3455,16 @@ fn process_event_to_sse(
             payload,
         } => {
             builder.usage_event(&event_type, &payload);
+            if builder.stop_reason.is_refusal() {
+                builder.tool_json.pending.clear();
+                builder.tool_leak_filter.leaked_tools.clear();
+                builder.tool_leak_filter.schemas.clear();
+                if !builder.streamed_tools.is_empty() {
+                    return Err(kiro_wire_contract_error(
+                        "Kiro refused a partially streamed tool call",
+                    ));
+                }
+            }
             Ok(Vec::new())
         }
         wire::Event::End | wire::Event::Unknown { .. } => Ok(Vec::new()),
@@ -3298,10 +3507,12 @@ pub(crate) fn kiro_event_bytes_to_claude_json_scoped_with_context_window(
     context_window: u64,
 ) -> Result<Value, KiroToolJsonError> {
     let prompt_cache_usage = compute_kiro_prompt_cache_usage(request_body, cache_namespace);
+    let mut tool_name_registry = tool_name_registry.clone();
+    tool_name_registry.configure_response(request_body);
     kiro_event_bytes_to_anthropic_json_with_context_window(
         bytes,
         model,
-        tool_name_registry,
+        &tool_name_registry,
         prompt_cache_usage,
         context_window,
     )
@@ -3335,14 +3546,15 @@ fn kiro_event_bytes_to_anthropic_json_with_context_window(
     frames.extend(decoder.finish()?);
     let mut text = String::new();
     let mut thinking = String::new();
-    let mut inline_thinking = false;
+    let mut thinking_parser = response::ThinkingParser::default();
+    let mut stop_reason = response::StopReason::default();
     let mut thinking_signature = None;
     let mut redacted_thinking = Vec::new();
     let mut tools = Vec::new();
     let mut tool_accumulator = ToolJsonAccumulator::default();
     let mut tool_errors = Vec::new();
     let mut seen_tool_signatures = HashSet::new();
-    let mut tool_leak_filter = ToolLeakFilter::default();
+    let mut tool_leak_filter = ToolLeakFilter::with_registry(tool_name_registry);
     let mut usage = KiroUsageAccumulator::with_context_window(context_window);
     usage.set_prompt_cache_usage(prompt_cache_usage);
     let mut saw_end = false;
@@ -3355,11 +3567,14 @@ fn kiro_event_bytes_to_anthropic_json_with_context_window(
         match wire::parse_event(frame)? {
             wire::Event::AssistantResponse { content: chunk }
             | wire::Event::Code { content: chunk } => {
-                for segment in split_inline_thinking(&chunk, &mut inline_thinking) {
-                    if segment.is_thinking {
-                        thinking.push_str(&segment.text);
+                if stop_reason.is_refusal() {
+                    continue;
+                }
+                for (is_thinking, text_chunk) in thinking_parser.push(&chunk, false) {
+                    if is_thinking {
+                        thinking.push_str(&text_chunk);
                     } else {
-                        for visible in tool_leak_filter.push_text(&segment.text, false) {
+                        for visible in tool_leak_filter.push_text(&text_chunk, false) {
                             text.push_str(&visible);
                         }
                     }
@@ -3381,52 +3596,96 @@ fn kiro_event_bytes_to_anthropic_json_with_context_window(
                 name,
                 input,
                 stop,
-            } => match tool_accumulator.push(&id, &name, &input, stop, tool_name_registry) {
-                Ok(Some((id, kiro_name, name, parsed_input))) => {
-                    let parsed_input = tool_bridge::input_from_kiro(&kiro_name, parsed_input);
-                    seen_tool_signatures.insert(tool_signature(&name, &parsed_input));
-                    tools.push((id, name, parsed_input));
+            } => {
+                if stop_reason.is_refusal() {
+                    continue;
                 }
-                Ok(None) => {}
-                Err(error @ KiroToolJsonError::Wire { .. }) => return Err(error),
-                Err(error) => {
-                    tool_accumulator.reject(&error);
-                    tool_errors.push(error);
+                if tool_name_registry.tools_disabled {
+                    return Err(kiro_wire_contract_error(
+                        "Kiro returned a tool call while tools are disabled",
+                    ));
                 }
-            },
+                for held in tool_leak_filter.native_tool() {
+                    text.push_str(&held);
+                }
+                match tool_accumulator.push(&id, &name, &input, stop, tool_name_registry) {
+                    Ok(Some((id, kiro_name, name, parsed_input))) => {
+                        let parsed_input =
+                            tool_name_registry.restore_input(&kiro_name, parsed_input);
+                        seen_tool_signatures.insert(tool_signature(&name, &parsed_input));
+                        tools.push((id, name, parsed_input));
+                    }
+                    Ok(None) => {}
+                    Err(error @ KiroToolJsonError::Wire { .. }) => return Err(error),
+                    Err(error) => {
+                        tool_accumulator.reject(&error);
+                        tool_errors.push(error);
+                    }
+                }
+            }
             wire::Event::Usage {
                 event_type,
                 payload,
             } => {
                 usage.apply_event(&event_type, &payload);
+                if matches!(
+                    event_type.as_str(),
+                    "metadataEvent" | "messageMetadataEvent"
+                ) {
+                    stop_reason.observe(&payload);
+                }
             }
             wire::Event::End => saw_end = true,
             wire::Event::Unknown { .. } => {}
         }
     }
-    if !saw_end {
+    if !saw_end
+        && !(tool_name_registry.allow_clean_eof
+            && (!text.is_empty()
+                || !thinking.is_empty()
+                || !tools.is_empty()
+                || !tool_accumulator.pending.is_empty()))
+    {
         return Err(kiro_wire_contract_error(
             "Kiro EventStream ended before endEvent",
         ));
     }
+    if stop_reason.is_refusal() {
+        tool_accumulator.pending.clear();
+        tools.clear();
+        tool_leak_filter.leaked_tools.clear();
+        tool_leak_filter.schemas.clear();
+    }
     for (id, kiro_name, name, input) in tool_accumulator.finish(tool_name_registry)? {
-        let input = tool_bridge::input_from_kiro(&kiro_name, input);
+        let input = tool_name_registry.restore_input(&kiro_name, input);
         seen_tool_signatures.insert(tool_signature(&name, &input));
         tools.push((id, name, input));
+    }
+    for (is_thinking, text_chunk) in thinking_parser.push("", true) {
+        if is_thinking {
+            thinking.push_str(&text_chunk);
+        } else {
+            for visible in tool_leak_filter.push_text(&text_chunk, false) {
+                text.push_str(&visible);
+            }
+        }
     }
     for visible in tool_leak_filter.push_text("", true) {
         text.push_str(&visible);
     }
 
     let mut content = Vec::new();
-    if !thinking.is_empty() {
+    if !thinking.is_empty() && !tool_name_registry.suppress_thinking && !stop_reason.is_refusal() {
         content.push(json!({
             "type":"thinking",
             "thinking":thinking,
             "signature": thinking_signature.unwrap_or_else(|| THINKING_SIGNATURE_FALLBACK.to_string())
         }));
     }
-    for data in redacted_thinking {
+    for data in redacted_thinking
+        .into_iter()
+        .filter(|_| !tool_name_registry.suppress_thinking && !stop_reason.is_refusal())
+    {
         content.push(json!({"type":"redacted_thinking","data":data}));
     }
     if !text.is_empty() {
@@ -3444,21 +3703,18 @@ fn kiro_event_bytes_to_anthropic_json_with_context_window(
         content.push(json!({
             "type":"tool_use",
             "id": format!("toolleakfix_{}_{}", unix_timestamp_secs(), content.len() + 1),
-            "name": leaked.name,
-            "input": leaked.input
+            "name": tool_name_registry.resolve(&leaked.name)?,
+            "input": tool_name_registry.restore_input(&leaked.name, leaked.input)
         }));
     }
-    if content.is_empty() && !tool_errors.is_empty() {
+    if content.is_empty() && !tool_errors.is_empty() && !stop_reason.is_refusal() {
         return Err(tool_errors.remove(0));
     }
-    let stop_reason = if content
-        .iter()
-        .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-    {
-        "tool_use"
-    } else {
-        "end_turn"
-    };
+    let stop_reason_value = stop_reason.finish(
+        content
+            .iter()
+            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("tool_use")),
+    );
     let usage = usage.final_usage(fallback_output_tokens);
     let mut usage_json = json!({
         "input_tokens": usage.input_tokens,
@@ -3467,16 +3723,22 @@ fn kiro_event_bytes_to_anthropic_json_with_context_window(
         "cache_creation_input_tokens": usage.cache_creation_tokens
     });
     usage.apply_metering_fields(&mut usage_json);
-    Ok(json!({
+    let mut message = json!({
         "id": next_message_id(),
         "type": "message",
         "role": "assistant",
         "model": model,
         "content": content,
-        "stop_reason": stop_reason,
-        "stop_sequence": null,
+        "stop_reason": stop_reason_value,
+        "stop_sequence": stop_reason.sequence(),
         "usage": usage_json
-    }))
+    });
+    if !stop_reason.is_refusal() {
+        if let Some(schema) = &tool_name_registry.structured_schema {
+            structured::rewrite_message(&mut message, schema);
+        }
+    }
+    Ok(message)
 }
 
 type KiroPromptCacheUsage = crate::proxy::kiro_prompt_cache::PromptCacheUsage;
@@ -3920,6 +4182,9 @@ pub(crate) fn enforce_disabled_compaction_contract(
     ) {
         return Ok(());
     }
+    if provider_type == ProviderType::KiroOAuth {
+        return Ok(());
+    }
     let compact_request = route == ProxyRoute::CodexResponsesCompact
         || (route == ProxyRoute::CodexResponses
             && super::forwarder::codex_responses_body_has_compaction_trigger(body));
@@ -4103,6 +4368,7 @@ pub(crate) fn is_client_validation_error(body: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("kiro/enhancement_tests.rs");
 
     const WIRE_PROTOCOL_JSON: &str = include_str!("../../assets/contract/kiro-wire-protocol.json");
 
@@ -4782,7 +5048,7 @@ mod tests {
     }
 
     #[test]
-    fn conversion_removes_orphaned_history_tool_use() {
+    fn conversion_preserves_interrupted_history_tool_use() {
         let body = json!({
             "model": "claude-sonnet-4-8",
             "messages": [
@@ -4811,7 +5077,7 @@ mod tests {
             .unwrap();
         assert!(history
             .iter()
-            .all(|msg| msg.pointer("/assistantResponseMessage/toolUses").is_none()));
+            .any(|msg| msg.pointer("/assistantResponseMessage/toolUses").is_some()));
     }
 
     #[test]
@@ -4873,7 +5139,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_tool_bridge_dedupes_mapped_names_and_rejects_read_pages() {
+    fn claude_code_tool_bridge_dedupes_mapped_names_and_preserves_read_pages() {
         let mut tool_name_map = HashMap::new();
         let mut tool_name_registry = KiroToolNameRegistry::default();
         let tools = json!([
@@ -4900,7 +5166,7 @@ mod tests {
             &mut KiroToolNameRegistry::default(),
             ToolCompatibilityMode::ClaudeCode,
         )
-        .is_err());
+        .is_ok());
     }
 
     #[test]
@@ -5151,7 +5417,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_leak_filter_rescues_cross_frame_invoke_and_hides_xml() {
+    fn tool_leak_filter_preserves_undeclared_cross_frame_examples() {
         let mut filter = ToolLeakFilter::default();
         let first = filter.push_text(
             "before <function_calls><invoke name=\"Read\"><parameter name=\"file_",
@@ -5169,11 +5435,8 @@ mod tests {
             .collect::<String>();
         let leaked = filter.take_deduped(&mut HashSet::new());
 
-        assert_eq!(visible, "before  after");
-        assert_eq!(leaked.len(), 1);
-        assert_eq!(leaked[0].name, "Read");
-        assert_eq!(leaked[0].input["file_path"], json!("Cargo.toml"));
-        assert_eq!(leaked[0].input["query"], json!("a & b <c>"));
+        assert_eq!(visible, "before <function_calls><invoke name=\"Read\"><parameter name=\"file_path\">Cargo.toml</parameter><parameter name=\"query\">a &amp; b &lt;c&gt;</parameter></invoke></function_calls> after");
+        assert!(leaked.is_empty());
     }
 
     #[test]
@@ -5228,7 +5491,7 @@ mod tests {
     }
 
     #[test]
-    fn sse_builder_injects_rescued_tool_and_dedupes_native_tool() {
+    fn sse_builder_preserves_examples_after_native_tool() {
         let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
         let native = builder
             .tool_delta(
@@ -5248,13 +5511,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        assert!(bytes.contains("\"text\":\"visible \""));
-        assert!(!bytes.contains("<invoke"));
+        assert!(bytes.contains("visible "));
+        assert!(bytes.contains("<invoke"));
         assert!(!bytes.contains("toolleakfix"));
     }
 
     #[test]
-    fn sse_builder_injects_rescued_tool_when_native_event_missing() {
+    fn sse_builder_preserves_undeclared_invocations() {
         let mut builder = SseBuilder::new("claude-sonnet-4-8".to_string(), HashMap::new());
         let bytes = builder
             .assistant_delta("run <invoke name=\"Bash\"><parameter name=\"command\">pwd</parameter><parameter name=\"timeout\">30</parameter></invoke>")
@@ -5264,12 +5527,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        assert!(!bytes.contains("<invoke"));
-        assert!(bytes.contains("toolleakfix"));
-        assert!(bytes.contains("\"name\":\"Bash\""));
-        assert!(bytes.contains("\\\"command\\\":\\\"pwd\\\""));
-        assert!(bytes.contains("\\\"timeout\\\":30"));
-        assert!(bytes.contains("\"stop_reason\":\"tool_use\""));
+        assert!(bytes.contains("<invoke"));
+        assert!(!bytes.contains("toolleakfix"));
+        assert!(bytes.contains("\"stop_reason\":\"end_turn\""));
     }
 
     #[test]
@@ -5327,7 +5587,7 @@ mod tests {
     }
 
     #[test]
-    fn non_streaming_rescues_leaked_tool_and_preserves_visible_text() {
+    fn non_streaming_preserves_tool_examples_as_text() {
         let bytes = event_stream_bytes(vec![
             (
                 "assistantResponseEvent",
@@ -5346,17 +5606,12 @@ mod tests {
             KiroPromptCacheUsage::default(),
         )
         .unwrap();
-        assert_eq!(
-            message.pointer("/content/0/text"),
-            Some(&json!("before  after"))
-        );
-        assert_eq!(message.pointer("/content/1/type"), Some(&json!("tool_use")));
-        assert_eq!(message.pointer("/content/1/name"), Some(&json!("Read")));
-        assert_eq!(
-            message.pointer("/content/1/input/file_path"),
-            Some(&json!("Cargo.toml"))
-        );
-        assert_eq!(message.get("stop_reason"), Some(&json!("tool_use")));
+        assert!(message["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<invoke"));
+        assert_eq!(message["content"].as_array().unwrap().len(), 1);
+        assert_eq!(message["stop_reason"], "end_turn");
     }
 
     #[test]
@@ -5981,7 +6236,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_read_pages_inside_single_object_variant_is_rejected() {
+    fn claude_code_read_pages_inside_single_object_variant_is_preserved() {
         let tools = json!([{
             "name": "Read",
             "input_schema": {"oneOf": [{
@@ -5989,14 +6244,18 @@ mod tests {
                 "properties": {"pages": {"type": "string"}}
             }]}
         }]);
-        let error = convert_tools(
+        let converted = convert_tools(
             Some(&tools),
             &mut HashMap::new(),
             &mut KiroToolNameRegistry::default(),
             ToolCompatibilityMode::ClaudeCode,
         )
-        .expect_err("Read.pages cannot be preserved through oneOf expansion");
-        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        .unwrap();
+        assert_eq!(converted[0]["toolSpecification"]["name"], "Read");
+        assert_eq!(
+            converted[0]["toolSpecification"]["inputSchema"]["json"]["properties"]["pages"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -6892,25 +7151,25 @@ mod tests {
     }
 
     #[test]
-    fn compact_contract_is_disabled_for_kiro_and_amazon_q_only() {
-        for provider_type in [ProviderType::KiroOAuth, ProviderType::AmazonQOAuth] {
-            let direct = enforce_disabled_compaction_contract(
-                provider_type,
-                ProxyRoute::CodexResponsesCompact,
-                &Bytes::from_static(br#"{"input":[]}"#),
-            )
-            .unwrap_err();
-            assert_eq!(direct.status, axum::http::StatusCode::BAD_REQUEST);
-            assert!(direct.message.contains("disabled pending"));
+    // Historical compact_contract_is_disabled_for_kiro_and_amazon_q_only is superseded by the dedicated Kiro summary executor.
+    fn compact_contract_keeps_amazon_q_gated() {
+        let provider_type = ProviderType::AmazonQOAuth;
+        let direct = enforce_disabled_compaction_contract(
+            provider_type,
+            ProxyRoute::CodexResponsesCompact,
+            &Bytes::from_static(br#"{"input":[]}"#),
+        )
+        .unwrap_err();
+        assert_eq!(direct.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(direct.message.contains("disabled pending"));
 
-            let marker = Bytes::from_static(br#"{"input":[{"type":"compaction_trigger"}]}"#);
-            assert!(enforce_disabled_compaction_contract(
-                provider_type,
-                ProxyRoute::CodexResponses,
-                &marker,
-            )
-            .is_err());
-        }
+        let marker = Bytes::from_static(br#"{"input":[{"type":"compaction_trigger"}]}"#);
+        assert!(enforce_disabled_compaction_contract(
+            provider_type,
+            ProxyRoute::CodexResponses,
+            &marker,
+        )
+        .is_err());
 
         assert!(enforce_disabled_compaction_contract(
             ProviderType::CodexOAuth,
@@ -6922,37 +7181,15 @@ mod tests {
 
     #[test]
     fn inline_thinking_split_preserves_state_across_chunks() {
-        let mut state = false;
-        let first = split_inline_thinking("hello <thinking>secret", &mut state);
+        let mut parser = response::ThinkingParser::default();
         assert_eq!(
-            first,
-            vec![
-                InlineThinkingSegment {
-                    is_thinking: false,
-                    text: "hello ".to_string()
-                },
-                InlineThinkingSegment {
-                    is_thinking: true,
-                    text: "secret".to_string()
-                }
-            ]
+            parser.push("hello <thinking>secret", false),
+            vec![(false, "hello ".into()), (true, "secret".into())]
         );
-        assert!(state);
-        let second = split_inline_thinking(" more</thinking> visible", &mut state);
         assert_eq!(
-            second,
-            vec![
-                InlineThinkingSegment {
-                    is_thinking: true,
-                    text: " more".to_string()
-                },
-                InlineThinkingSegment {
-                    is_thinking: false,
-                    text: " visible".to_string()
-                }
-            ]
+            parser.push(" more</thinking> visible", true),
+            vec![(true, " more".into()), (false, " visible".into())]
         );
-        assert!(!state);
     }
 
     #[test]

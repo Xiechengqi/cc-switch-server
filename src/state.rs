@@ -9027,11 +9027,34 @@ impl ServerStateInner {
         else {
             return unavailable_model_catalog("kiro_bound_account_unavailable");
         };
+        let domain = match crate::domain::providers::kiro::KiroApiDomain::configured() {
+            Ok(domain) => domain,
+            Err(_) => return unavailable_model_catalog("kiro_api_domain_invalid"),
+        };
+        let catalog_fingerprint = format!("{runtime_fingerprint}:api-domain={domain:?}");
+        let domain_endpoint = if endpoint_override.is_none()
+            && domain == crate::domain::providers::kiro::KiroApiDomain::Kiro
+        {
+            let identity =
+                match crate::domain::providers::kiro::operational_runtime_identity_from_account(
+                    &account,
+                ) {
+                    Ok(identity) => identity,
+                    Err(_) => return unavailable_model_catalog("kiro_identity_unresolved"),
+                };
+            Some(format!(
+                "https://{}/ListAvailableModels?origin=AI_EDITOR",
+                domain.management_host(&identity.runtime_region)
+            ))
+        } else {
+            None
+        };
+        let endpoint_override = endpoint_override.or(domain_endpoint.as_deref());
         let scope = KiroModelCatalogScope::derive(
             app.as_str(),
             provider_id,
             provider_revision,
-            runtime_fingerprint,
+            &catalog_fingerprint,
             account_incarnation,
         );
         let http = self.http_client().await;

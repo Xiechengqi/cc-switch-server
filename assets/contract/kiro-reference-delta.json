@@ -1622,5 +1622,108 @@
         "parent_hard_limit_remains_opt_in_no_production_capacity_or_speed_claim"
       ]
     }
-  ]
+  ],
+  "singleAccountEnhancement": {
+    "id": "KIRO-SINGLE-ACCOUNT-2026-11-25",
+    "schemaVersion": 1,
+    "referenceCommit": "c37fe5afe7ee3adba836abfcee9a97aba5ea54f9",
+    "referenceFiles": [
+      {
+        "path": "src/anthropic/converter.rs",
+        "sha256": "2ed40a5f3790de4bd31b00ec40abe1e717293ea036b65f740fad5cff7387b015"
+      },
+      {
+        "path": "src/anthropic/stream.rs",
+        "sha256": "4177659bf513691de528bc285c5e1eecde6e666f7a5d9db5c15bd79fdbcd3cef"
+      },
+      {
+        "path": "src/anthropic/structured_output.rs",
+        "sha256": "de1b876ab1d1481af8ed5d78c717130c711045657de9eb8bc5c7ce9b61d7430c"
+      },
+      {
+        "path": "src/anthropic/structured_rewrite.rs",
+        "sha256": "b29d5daf52df8e5275bb93d1d399cb09cb61480b6c819890654cc7402c79d06c"
+      },
+      {
+        "path": "src/anthropic/websearch_loop.rs",
+        "sha256": "4d92cf00c59d3d69d293e77a6f5a486498aaeb70d6fe55ca55f196382d72ab09"
+      },
+      {
+        "path": "src/anthropic/responses_compaction.rs",
+        "sha256": "17cf9b6ca35744a51a3affdc40606b3ce6763036cd6ec3953456f60ec8c640b5"
+      },
+      {
+        "path": "src/model/config.rs",
+        "sha256": "5ec0cafb70fe61c11076ad9ac2f8c593ae789343daa9b1581935f5a9e0569931"
+      },
+      {
+        "path": "src/kiro/endpoint/ide.rs",
+        "sha256": "916137401172e4935a6edd06fdbecad3ba3cf68496699fc2b1e6e53b47e5f59d"
+      },
+      {
+        "path": "src/kiro/endpoint/cli.rs",
+        "sha256": "8ad3b4ad4cd8084c559c2ff7e70b3b10128f9310fe239e956deb6daf6bec0ce7"
+      }
+    ],
+    "status": "fixture_verified",
+    "liveStatus": "live_pending",
+    "scope": "one bound Kiro account per request",
+    "defaults": {
+      "apiDomain": "amazonaws",
+      "terminalPolicy": "end-event"
+    },
+    "enabled": {
+      "requestScopedToolRestoration": true,
+      "rawArgumentStreaming": true,
+      "metadataStopReasons": true,
+      "thinkingVisibilityAndReplay": true,
+      "losslessReadPages": true,
+      "interruptedToolHistory": true,
+      "structuredOutput": true,
+      "hostedSearch": true,
+      "dedicatedSummaryCompaction": true
+    },
+    "search": {
+      "maxCalls": 5,
+      "maxRounds": 5,
+      "maxCallsPerRound": 8,
+      "maxResponseBytes": 524288,
+      "maxResultsPerCall": 16,
+      "domainFilters": true,
+      "sharedForcedRefreshBudget": 1
+    },
+    "compatibility": {
+      "rawArgumentCompletion": "validated_json_before_tool_stop",
+      "cleanEof": "explicit_process_setting_complete_nonempty_validated_stream_only",
+      "compactionItem": "server_owned_versioned_base64_summary",
+      "summaryOutputMaxBytes": 65536,
+      "amazonQCompaction": "disabled"
+    },
+    "historicalBoundariesSuperseded": [
+      "KI-N3 runtime-disabled Kiro compaction",
+      "CORE-N2-KIRO compactRuntimeEnabled=false for Kiro",
+      "default tool jsonRelease for raw incremental streaming"
+    ],
+    "tests": [
+      {
+        "path": "src/proxy/kiro/enhancement_tests.rs",
+        "anchors": [
+          "enhancement_raw_tool_inputs_preserve_every_field_on_both_outputs",
+          "enhancement_metadata_stop_reasons_agree_on_stream_and_json",
+          "enhancement_disabled_thinking_never_appears_as_answer_at_any_tag_split",
+          "enhancement_read_pages_and_consecutive_tool_results_reach_current_message",
+          "enhancement_clean_eof_requires_complete_nonempty_valid_frames"
+        ]
+      },
+      {
+        "path": "src/proxy/forwarder/kiro_feature_tests.rs",
+        "anchors": [
+          "kiro_enhancement_stop_metadata_survives_every_public_surface",
+          "kiro_enhancement_hosted_search_completes_on_bound_account_for_all_surfaces",
+          "kiro_enhancement_compaction_executes_one_summary_and_restores_next_turn",
+          "kiro_enhancement_raw_arguments_arrive_before_upstream_completion"
+        ]
+      }
+    ]
+  }
 }

@@ -2846,6 +2846,9 @@ async fn forward_with_attempt_inner(
                 started,
                 request_memory: attempt_context.request_memory().cloned(),
                 timing: attempt_context.timing.clone(),
+                auth_refresh_budget: None,
+                canonical_override: None,
+                canonical_response: false,
             })
             .await;
         }
@@ -25389,6 +25392,9 @@ struct ClaudeKiroForwardOptions {
     started: Instant,
     request_memory: Option<RequestMemoryBudget>,
     timing: TimingSlot,
+    canonical_override: Option<kiro_provider::CanonicalRequest>,
+    canonical_response: bool,
+    auth_refresh_budget: Option<Arc<AtomicBool>>,
 }
 
 struct ClaudeDeepSeekForwardOptions {
@@ -25921,12 +25927,23 @@ async fn record_kiro_memory_exhaustion(
     .await;
 }
 
+include!("forwarder/kiro_client_features.rs");
+
 async fn forward_claude_kiro(options: ClaudeKiroForwardOptions) -> Result<Response, ProxyError> {
     let state = options.state.clone();
     let stored = options.stored.clone();
     let request_context = options.request_context.clone();
     let started = options.started;
-    let result = forward_claude_kiro_inner(options).await;
+    let operation = kiro::client_features::operation(
+        options.stored.provider_type,
+        options.route,
+        &options.body,
+    )?;
+    let result = if let Some(operation) = operation {
+        forward_kiro_client_features(options, operation).await
+    } else {
+        forward_claude_kiro_inner(options).await
+    };
     if let Err(error) = &result {
         if error.is_request_memory_exhausted() {
             record_kiro_memory_exhaustion(
@@ -25969,6 +25986,9 @@ async fn forward_claude_kiro_inner_metered(
         started,
         request_memory,
         timing,
+        canonical_override,
+        canonical_response,
+        auth_refresh_budget,
     } = options;
     let product = kiro_provider::product_boundary(&stored)?;
     let expected_provider_type = product.provider_type;
@@ -25987,15 +26007,18 @@ async fn forward_claude_kiro_inner_metered(
         })
         .transpose()
         .map_err(|error| error.into_proxy_error())?;
-    let canonical = kiro_provider::prepare_canonical_request(
-        &execution,
-        &stored,
-        route,
-        gemini_path.as_deref(),
-        &headers,
-        body,
-        &mut request_context,
-    )?;
+    let canonical = match canonical_override {
+        Some(canonical) => canonical,
+        None => kiro_provider::prepare_canonical_request(
+            &execution,
+            &stored,
+            route,
+            gemini_path.as_deref(),
+            &headers,
+            body,
+            &mut request_context,
+        )?,
+    };
     if let Some(memory) = canonical_memory.as_ref() {
         memory
             .resize(
@@ -26167,9 +26190,15 @@ async fn forward_claude_kiro_inner_metered(
             upstream.status(),
             stored.provider_type,
             audit_attempt.auth_refresh_attempted(),
-            replay_allowed,
+            replay_allowed
+                && auth_refresh_budget
+                    .as_ref()
+                    .is_none_or(|budget| !budget.load(Ordering::SeqCst)),
         ) {
             Some(AuthRecoveryDecision::RefreshAndReplaySameBinding) => {
+                if let Some(budget) = &auth_refresh_budget {
+                    budget.store(true, Ordering::SeqCst);
+                }
                 let Some((provider_type, account_id, expected_generation)) =
                     execution.managed_account_identity_target()
                 else {
@@ -26456,12 +26485,16 @@ async fn forward_claude_kiro_inner_metered(
             .resize(canonical_response_bytes.len().saturating_mul(2))
             .map_err(|error| error.into_proxy_error())?;
     }
-    let response_bytes = adapter.transform_response_for_request(
-        canonical_response_bytes,
-        &stored,
-        route,
-        &runtime_request,
-    )?;
+    let response_bytes = if canonical_response {
+        canonical_response_bytes
+    } else {
+        adapter.transform_response_for_request(
+            canonical_response_bytes,
+            &stored,
+            route,
+            &runtime_request,
+        )?
+    };
     let response_bytes = if let Some(memory) = response_memory {
         memory
             .resize(response_bytes.len())
@@ -33394,6 +33427,7 @@ mod tests {
     include!("forwarder/grok_timing_tests.rs");
     include!("forwarder/kiro_timing_tests.rs");
     include!("forwarder/kiro_image_tests.rs");
+    include!("forwarder/kiro_feature_tests.rs");
     include!("forwarder/gemini_onboarding_tests.rs");
     include!("forwarder/ollama_r5_tests.rs");
     include!("forwarder/bedrock_r5_tests.rs");
@@ -44812,7 +44846,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_and_amazon_q_compact_fail_before_any_upstream_request() {
+    // Historical kiro_and_amazon_q_compact_fail_before_any_upstream_request is superseded by Kiro summary round-trip tests.
+    async fn amazon_q_compact_fails_before_any_upstream_request() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -44856,30 +44891,6 @@ mod tests {
                 ),
             ),
         ];
-
-        let kiro_state = forwarder_test_state("kiro-compact-disabled");
-        let kiro_provider = install_kiro_test_provider_for_app(
-            &kiro_state,
-            AppKind::Codex,
-            "kiro-compact-disabled",
-            endpoint.clone(),
-            format!("{endpoint}/token"),
-        )
-        .await;
-        for (route, body) in &compact_requests {
-            let kiro_error = forward_for_test_surface(
-                kiro_state.clone(),
-                *route,
-                kiro_provider.clone(),
-                None,
-                HeaderMap::new(),
-                body.clone(),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(kiro_error.status, StatusCode::BAD_REQUEST);
-            assert!(kiro_error.message.contains("disabled pending"));
-        }
 
         let amazon_q_state = forwarder_test_state("amazon-q-compact-disabled");
         let (_, amazon_q_provider, _) = install_amazon_q_test_bundle(

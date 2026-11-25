@@ -10,4 +10,4 @@ Kiro OAuth 和 Amazon Q OAuth 使用各自固定账号、产品、凭据、区�
 
 图片处理后重新核对账号实例、身份/凭据代次、产品/区域身份和 Provider revision/runtime fingerprint；绑定发生变化则拒绝使用结果。这些本地错误不授权刷新、换账号、换区域、换端点或重放生成。现有严格 EventStream CRC、终态、错误与使用量合同继续适用。
 
-推荐源码中的 `runtime.{region}.kiro.dev` 尚缺独立的产品、区域和凭据接受性证明，保持 KI-02 研究门禁；本页不启用新域名。
+`CC_SWITCH_KIRO_API_DOMAIN=kiro` 为 Kiro 生成和 MCP 选择 `runtime.{region}.kiro.dev`，为绑定账号模型目录选择 `management.{region}.kiro.dev`。默认值为 `amazonaws`，域名族固定于进程生命周期。新域名的真实账号接受性仍为 `live_pending`。

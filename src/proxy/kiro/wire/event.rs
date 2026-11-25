@@ -187,6 +187,17 @@ fn validate_token_usage_payload(payload: &Value, event_type: &str) -> Result<(),
         .get("messageMetadataEvent")
         .or_else(|| payload.get("metadataEvent"))
         .unwrap_or(payload);
+    for name in ["stopReason", "stopSequence"] {
+        if metadata
+            .get(name)
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err(WireError::InvalidEventPayload {
+                event_type: event_type.to_string(),
+                message: "stop metadata fields must be strings".to_string(),
+            });
+        }
+    }
     let Some(token_usage) = metadata.get("tokenUsage") else {
         return Ok(());
     };
