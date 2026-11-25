@@ -3,7 +3,7 @@
 use super::*;
 pub(super) mod chat;
 use crate::clients::router::ingress::IngressContext;
-use crate::market_lease::{Command, Operation};
+use crate::market_lease::{Command, Operation, ACCESS_EVENT_BATCH};
 use axum::extract::OriginalUri;
 
 pub(super) async fn control(
@@ -187,7 +187,7 @@ pub(super) async fn control(
         json!({"capability":"marketLeaseV1","ownerEmail":owner,"listedOwner":journal.owner,
         "sequence":journal.last.as_ref().map_or(0,|c|c.sequence), "grant":journal.grant,
         "runningLease":state.market_workspace.boot_lease,"switching":state.market_workspace.switch_required(),
-        "events":journal.events,"fenced":journal.fenced,"cleanupSafe":clear,"hardware":hardware,"version":env!("CARGO_PKG_VERSION")}),
+        "events":journal.events.iter().take(ACCESS_EVENT_BATCH).collect::<Vec<_>>(),"fenced":journal.fenced,"cleanupSafe":clear,"hardware":hardware,"version":env!("CARGO_PKG_VERSION")}),
     ))
 }
 
@@ -198,131 +198,10 @@ fn in_family(path: &str, base: &str) -> bool {
             .is_some_and(|tail| tail.starts_with('/'))
 }
 
-fn workspace_command(command: &str) -> bool {
-    matches!(
-        command,
-        "add_provider"
-            | "add_share_binding"
-            | "adopt_provider_profile"
-            | "apply_provider_account_binding_migration"
-            | "auth_cancel_login"
-            | "auth_checkin"
-            | "auth_get_checkin"
-            | "auth_get_status"
-            | "auth_import_buddy"
-            | "auth_list_accounts"
-            | "auth_logout"
-            | "auth_poll_for_account"
-            | "auth_remove_account"
-            | "auth_set_checkin_policy"
-            | "auth_set_default_account"
-            | "auth_set_manual_subscription_expiry"
-            | "auth_set_subscription_expiry_rule"
-            | "auth_set_workspace"
-            | "auth_start_login"
-            | "auth_submit_oauth_code"
-            | "clone_provider_as_custom"
-            | "copilot_get_auth_status"
-            | "copilot_get_models"
-            | "copilot_get_models_for_account"
-            | "copilot_get_token"
-            | "copilot_get_token_for_account"
-            | "copilot_get_usage"
-            | "copilot_get_usage_for_account"
-            | "copilot_is_authenticated"
-            | "copilot_list_accounts"
-            | "copilot_logout"
-            | "copilot_poll_for_account"
-            | "copilot_poll_for_auth"
-            | "copilot_remove_account"
-            | "copilot_set_default_account"
-            | "copilot_start_device_flow"
-            | "create_share"
-            | "deepseek_account_add"
-            | "deepseek_account_list"
-            | "deepseek_account_remove"
-            | "deepseek_account_set_default"
-            | "deepseek_account_status"
-            | "delete_provider"
-            | "delete_provider_bundle"
-            | "delete_share"
-            | "disable_share"
-            | "edit_share_value_quota_usage"
-            | "enable_share"
-            | "export_all_shares"
-            | "fetch_buddy_account_models"
-            | "fetch_opencode_zen_models"
-            | "get_account_capabilities"
-            | "get_admin_version_info"
-            | "get_antigravity_oauth_models"
-            | "get_build_info"
-            | "get_cached_oauth_quota"
-            | "get_claude_oauth_quota"
-            | "get_client_tunnel_status"
-            | "get_codex_oauth_models"
-            | "get_codex_oauth_quota"
-            | "get_coding_plan_quota"
-            | "get_grok_oauth_models"
-            | "get_provider_account_usage"
-            | "get_provider_bundle"
-            | "get_provider_bundle_delete_preview"
-            | "get_provider_bundle_share_preflight"
-            | "get_provider_bundles"
-            | "get_provider_credential"
-            | "get_provider_health"
-            | "get_provider_registry"
-            | "get_provider_request_defaults"
-            | "get_provider_resources"
-            | "get_providers"
-            | "get_proxy_status"
-            | "get_settings"
-            | "get_share_connect_info"
-            | "get_share_detail"
-            | "get_share_health_status"
-            | "get_share_quota_conversion"
-            | "get_share_value_quota_status"
-            | "get_tunnel_status"
-            | "grok_import_auth_json"
-            | "import_shares"
-            | "kiro_import_api_key"
-            | "kiro_import_credentials_json"
-            | "list_share_reuse_candidates"
-            | "list_shares"
-            | "model_test_all_providers"
-            | "model_test_provider"
-            | "pause_share"
-            | "prepare_share_quota_history"
-            | "preview_provider_account_binding_migration"
-            | "preview_share_account_reset"
-            | "preview_share_capabilities"
-            | "preview_share_value_quota"
-            | "qoder_import_pat"
-            | "rebind_custom_provider"
-            | "rebind_custom_provider_bundle"
-            | "refresh_coding_plan_quota"
-            | "refresh_oauth_quota"
-            | "refresh_provider_account_usage"
-            | "remove_share_binding"
-            | "reset_share_usage"
-            | "resume_share"
-            | "save_provider_bundle_share"
-            | "save_provider_share"
-            | "start_share_tunnel"
-            | "stop_share_tunnel"
-            | "stream_check_all_providers"
-            | "stream_check_provider"
-            | "suggest_share_slug"
-            | "update_provider"
-            | "update_provider_bundles_sort_order"
-            | "update_providers_sort_order"
-            | "update_share_description"
-            | "update_share_expiration"
-            | "update_share_parallel_limit"
-            | "update_share_subdomain"
-            | "update_share_token_limit"
-            | "upsert_provider_bundle"
-            | "validate_provider_bundle_draft"
-    )
+pub(super) fn workspace_command(command: &str) -> bool {
+    super::web_runtime::command(command).is_some_and(|c| {
+        c.workspace_access == super::web_runtime::WorkspaceAccess::Tenant && c.implemented
+    })
 }
 // Match Axum's registered route template. Newly added management endpoints
 // require an explicit workspace permission, including siblings of allowed APIs.
@@ -522,10 +401,7 @@ pub(super) async fn authorize(
     ) {
         return next.run(request).await;
     }
-    let denied = || {
-        ApiError::forbidden("this action is unavailable in the current Client workspace")
-            .into_response()
-    };
+    let denied = || workspace_error(StatusCode::FORBIDDEN, "workspace_leased").into_response();
     // Reject every alternate entry capable of changing installation identity.
     if grant.is_none() {
         if path.starts_with("/_ctl/client-subdomain-adoption")
@@ -555,7 +431,7 @@ pub(super) async fn authorize(
                 )
             })
         {
-            return denied();
+            return workspace_error(StatusCode::FORBIDDEN, "unlist_first").into_response();
         }
         if let Some(email) = session::router_web_user_email(request.headers()) {
             if email != owner {
@@ -611,19 +487,27 @@ pub(super) async fn authorize(
             denied()
         };
     }
-    if label == Some(grant.alias.as_str())
-        && live
-        && header_email.is_none()
-        && matches!(path, "/web-api/context" | "/web-api/auth/methods")
-    {
-        return next.run(request).await;
-    }
-    if label == Some(grant.alias.as_str())
-        && live
-        && header_email.as_deref() == Some(&grant.tenant_email)
-        && tenant_path(route, path)
-    {
-        return next.run(request).await;
+    if label == Some(grant.alias.as_str()) {
+        if !live {
+            return workspace_error(StatusCode::GONE, "lease_ended").into_response();
+        }
+        // These handlers consume a provider-bound OAuth state from this running workspace.
+        if matches!(
+            path,
+            "/web-api/oauth/claude-cli/callback" | "/web-api/oauth/openai-cli/callback"
+        ) && request.method() == axum::http::Method::GET
+        {
+            return next.run(request).await;
+        }
+        if header_email.is_none() {
+            return workspace_error(StatusCode::UNAUTHORIZED, "tenant_session_required")
+                .into_response();
+        }
+        return if header_email.as_deref() == Some(&grant.tenant_email) && tenant_path(route, path) {
+            next.run(request).await
+        } else {
+            denied()
+        };
     }
     let on_owner =
         ctx.is_none() || label == state.config.read().await.client.tunnel_subdomain.as_deref();
@@ -632,7 +516,12 @@ pub(super) async fn authorize(
     }
     if matches!(
         path,
-        "/web-api/auth/methods"
+        "/api/auth/login"
+            | "/api/auth/email/request-code"
+            | "/api/auth/email/verify-code"
+            | "/web-api/auth/email/request-code"
+            | "/web-api/auth/email/verify-code"
+            | "/web-api/auth/methods"
             | "/web-api/auth/password/login"
             | "/web-api/auth/password/refresh"
             | "/web-api/auth/password/logout"
@@ -646,33 +535,48 @@ pub(super) async fn authorize(
         .await
         .ok()
         .flatten();
-    if principal.as_ref().is_none_or(|p| p.user_email() != owner) {
+    let Some(principal) = principal else {
+        return if path.starts_with("/web-api/market/") || path.starts_with("/web-api/terminal/") {
+            workspace_error(StatusCode::UNAUTHORIZED, "owner_session_required").into_response()
+        } else {
+            denied()
+        };
+    };
+    let local = principal.source == session::WebPrincipalSource::LocalOwner;
+    if !local
+        && (principal.source != session::WebPrincipalSource::Router
+            || principal.user_email() != owner)
+    {
         return denied();
     }
-    let independent = request
-        .headers()
-        .get("x-cc-switch-owner-proof")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|t| state.web_auth.authenticate_access_token(t).ok().flatten())
-        .is_some_and(|p| p.user_email == owner);
-    let private_owner = header_email.is_none() || independent;
-    if path == "/web-api/market/workspace"
-        || private_owner
-            && (path.starts_with("/web-api/terminal/")
-                || matches!(
-                    path,
-                    "/web-api/market/maintenance"
-                        | "/api/admin/upgrade"
-                        | "/api/admin/rollback"
-                        | "/api/admin/restart"
-                        | "/web-api/invoke/start_admin_upgrade"
-                        | "/web-api/invoke/restart_server_service"
-                        | "/web-api/invoke/rollback_server_service"
-                ))
-    {
+    let independent = !local
+        && request
+            .headers()
+            .get("x-cc-switch-owner-proof")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|t| state.web_auth.authenticate_access_token(t).ok().flatten())
+            .is_some();
+    let maintenance = path.starts_with("/web-api/terminal/")
+        || matches!(
+            path,
+            "/web-api/market/maintenance"
+                | "/web-api/market/maintenance/status"
+                | "/web-api/market/maintenance/upgrade-status"
+                | "/api/admin/upgrade"
+                | "/api/admin/rollback"
+                | "/api/admin/restart"
+                | "/web-api/invoke/start_admin_upgrade"
+                | "/web-api/invoke/restart_server_service"
+                | "/web-api/invoke/rollback_server_service"
+        );
+    if maintenance && !(local || independent) {
+        return workspace_error(StatusCode::FORBIDDEN, "owner_proof_required").into_response();
+    }
+    if path == "/web-api/market/workspace" || maintenance {
         if let Some(kind) = match path {
             "/web-api/market/workspace" => Some("assistance"),
             "/web-api/terminal/stream" => Some("terminal"),
+            "/web-api/market/maintenance" => Some("host_settings"),
             "/api/admin/upgrade" | "/web-api/invoke/start_admin_upgrade" => Some("upgrade"),
             "/api/admin/restart" | "/web-api/invoke/restart_server_service" => Some("restart"),
             "/api/admin/rollback" | "/web-api/invoke/rollback_server_service" => Some("rollback"),
@@ -680,7 +584,14 @@ pub(super) async fn authorize(
         } {
             if state
                 .market_workspace
-                .record_event(&grant.lease_id, kind)
+                .record_visit(
+                    &grant.lease_id,
+                    kind,
+                    request
+                        .headers()
+                        .get("x-cc-switch-workspace-visit")
+                        .and_then(|v| v.to_str().ok()),
+                )
                 .is_err()
             {
                 return ApiError::internal("record owner access").into_response();
@@ -705,6 +616,25 @@ pub(super) async fn authorize(
     denied()
 }
 
+fn workspace_error(status: StatusCode, code: &'static str) -> ApiError {
+    let mut error = ApiError::new(status, code);
+    error.code = Some(code);
+    error
+}
+
+pub(super) async fn maintenance_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    session::require_local_server_owner_session(&state, &headers).await?;
+    if state.market_workspace.access().1.is_none() {
+        return Err(ApiError::conflict("leased Client required"));
+    }
+    Ok(Json(
+        json!({"authorized":true,"instanceId":state.process_instance_id}),
+    ))
+}
+
 pub(super) async fn view(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -714,11 +644,12 @@ pub(super) async fn view(
     let Some(grant) = journal.grant else {
         return Ok(Json(json!({"role":"owner"})));
     };
-    let role = if principal.user_email() == grant.tenant_email {
+    let role = if principal.source == session::WebPrincipalSource::LeaseTenant {
         "tenant"
     } else {
         "assistance"
     };
+    let waiting_on_shares = journal.fenced && !state.market_workspace_drained().await;
     // Counts and stable codes only. Raw request bodies, logs and account objects can contain secrets.
     let (shares, registered, last_heartbeat_ms) = {
         let store = state.shares.read().await;
@@ -767,7 +698,8 @@ pub(super) async fn view(
     .map_err(ApiError::internal)?;
     Ok(Json(
         json!({"role":role,"leaseId":grant.lease_id,"expiresAt":grant.expires_at,"shareCount":shares,"providers":providers,"audit":audit,
-        "version":env!("CARGO_PKG_VERSION"),"events":journal.events,"hardware":hardware,"maintenance":maintenance,
+        "fenced":journal.fenced,"cleaning":journal.purging,"localOwner":principal.source == session::WebPrincipalSource::LocalOwner,
+        "pendingEvents":journal.events.len(),"waitingOnShares":waiting_on_shares,"version":env!("CARGO_PKG_VERSION"),"events":journal.events.iter().rev().take(50).collect::<Vec<_>>(),"hardware":hardware,"maintenance":maintenance,
         "connectivity":{"registered":registered,"lastHeartbeatMs":last_heartbeat_ms}}),
     ))
 }

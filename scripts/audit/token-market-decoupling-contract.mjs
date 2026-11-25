@@ -5,7 +5,7 @@ export const retiredMarketEndpointPattern =
 
 export const retainedRouterMarketFiles = [
   "src/share_market.rs",
-  "src/client_market.rs",
+  "src/online_client_market.rs",
   "src/market_access.rs",
   "src/market_wallet.rs",
   "src/market_payments/mod.rs",

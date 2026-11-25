@@ -1,3 +1,4 @@
+import { useWorkspaceCommand } from "@/lib/workspaceCommands";
 import React from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
@@ -52,6 +53,7 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
   showLoggedInAccounts = false,
 }) => {
   const { t } = useTranslation();
+  const canImportLocal = useWorkspaceCommand("kiro_import_local_credentials");
   const [copied, setCopied] = React.useState(false);
   const [copiedCode, setCopiedCode] = React.useState(false);
   const [importMode, setImportMode] = React.useState<
@@ -461,7 +463,7 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
             <KeyRound className="mr-2 h-4 w-4" />
             {t("kiroOauth.importApiKey", { defaultValue: "API Key" })}
           </Button>
-          <Button
+          {canImportLocal && <Button
             type="button"
             variant="ghost"
             size="sm"
@@ -474,7 +476,7 @@ export const KiroOAuthSection: React.FC<KiroOAuthSectionProps> = ({
               <Upload className="mr-2 h-4 w-4" />
             )}
             {t("kiroOauth.importLocal", { defaultValue: "本机 Kiro" })}
-          </Button>
+          </Button>}
         </div>
       )}
 

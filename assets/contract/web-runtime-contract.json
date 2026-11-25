@@ -344,6 +344,7 @@
   "commands": [
     {
       "name": "add_custom_endpoint",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -351,6 +352,7 @@
     },
     {
       "name": "add_provider",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -359,6 +361,7 @@
     },
     {
       "name": "add_share_binding",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -367,6 +370,7 @@
     },
     {
       "name": "adopt_provider_profile",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -375,6 +379,7 @@
     },
     {
       "name": "rebind_custom_provider",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -383,6 +388,7 @@
     },
     {
       "name": "rebind_custom_provider_bundle",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -391,6 +397,7 @@
     },
     {
       "name": "clone_provider_as_custom",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -399,6 +406,7 @@
     },
     {
       "name": "preview_provider_account_binding_migration",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -407,6 +415,7 @@
     },
     {
       "name": "apply_provider_account_binding_migration",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -415,6 +424,7 @@
     },
     {
       "name": "apply_claude_onboarding_skip",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "claudeDesktopProfile",
@@ -422,6 +432,7 @@
     },
     {
       "name": "apply_claude_plugin_config",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "claudeDesktopProfile",
@@ -429,6 +440,7 @@
     },
     {
       "name": "auth_cancel_login",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -437,6 +449,7 @@
     },
     {
       "name": "auth_get_status",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -445,6 +458,7 @@
     },
     {
       "name": "auth_list_accounts",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -453,6 +467,7 @@
     },
     {
       "name": "auth_logout",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -461,6 +476,7 @@
     },
     {
       "name": "auth_poll_for_account",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -468,6 +484,7 @@
     },
     {
       "name": "auth_remove_account",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -476,6 +493,7 @@
     },
     {
       "name": "auth_set_default_account",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -484,6 +502,7 @@
     },
     {
       "name": "auth_set_manual_subscription_expiry",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -492,6 +511,7 @@
     },
     {
       "name": "auth_set_subscription_expiry_rule",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -500,6 +520,7 @@
     },
     {
       "name": "auth_set_workspace",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -507,6 +528,7 @@
     },
     {
       "name": "auth_get_checkin",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -515,6 +537,7 @@
     },
     {
       "name": "auth_set_checkin_policy",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -523,6 +546,7 @@
     },
     {
       "name": "auth_checkin",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -531,6 +555,7 @@
     },
     {
       "name": "auth_import_buddy",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -538,6 +563,7 @@
     },
     {
       "name": "auth_start_login",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -545,6 +571,7 @@
     },
     {
       "name": "auth_submit_oauth_code",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -553,6 +580,7 @@
     },
     {
       "name": "grok_import_auth_json",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -561,6 +589,7 @@
     },
     {
       "name": "kiro_import_credentials_json",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -569,6 +598,7 @@
     },
     {
       "name": "kiro_import_local_credentials",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -577,6 +607,7 @@
     },
     {
       "name": "kiro_import_api_key",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -585,6 +616,7 @@
     },
     {
       "name": "qoder_import_pat",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -593,6 +625,7 @@
     },
     {
       "name": "cursor_import_local_auth",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -601,6 +634,7 @@
     },
     {
       "name": "check_client_tunnel_subdomain",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "router",
@@ -608,6 +642,7 @@
     },
     {
       "name": "check_env_conflicts",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -615,6 +650,7 @@
     },
     {
       "name": "check_for_updates",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "tauriShell",
@@ -622,6 +658,7 @@
     },
     {
       "name": "check_router_reachable",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "router",
@@ -629,6 +666,7 @@
     },
     {
       "name": "claim_client_tunnel",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "router",
@@ -637,6 +675,7 @@
     },
     {
       "name": "clear_claude_onboarding_skip",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "claudeDesktopProfile",
@@ -644,6 +683,7 @@
     },
     {
       "name": "codex_banked_reset_consume",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -651,6 +691,7 @@
     },
     {
       "name": "codex_banked_reset_invite",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": false,
       "feature": "settings",
@@ -658,6 +699,7 @@
     },
     {
       "name": "codex_banked_reset_status",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -665,6 +707,7 @@
     },
     {
       "name": "get_codex_banked_reset_operation",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -672,6 +715,7 @@
     },
     {
       "name": "codex_referral_eligibility",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -679,6 +723,7 @@
     },
     {
       "name": "codex_referral_send",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -686,6 +731,7 @@
     },
     {
       "name": "codex_referral_tracking",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -693,6 +739,7 @@
     },
     {
       "name": "configure_tunnel",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "shares",
@@ -700,6 +747,7 @@
     },
     {
       "name": "copilot_get_auth_status",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -707,6 +755,7 @@
     },
     {
       "name": "copilot_get_models",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -714,6 +763,7 @@
     },
     {
       "name": "copilot_get_models_for_account",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -721,6 +771,7 @@
     },
     {
       "name": "copilot_get_token",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -728,6 +779,7 @@
     },
     {
       "name": "copilot_get_token_for_account",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -735,6 +787,7 @@
     },
     {
       "name": "copilot_get_usage",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "usage",
@@ -742,6 +795,7 @@
     },
     {
       "name": "copilot_get_usage_for_account",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "usage",
@@ -749,6 +803,7 @@
     },
     {
       "name": "copilot_is_authenticated",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -756,6 +811,7 @@
     },
     {
       "name": "copilot_list_accounts",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -763,6 +819,7 @@
     },
     {
       "name": "copilot_logout",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -770,6 +827,7 @@
     },
     {
       "name": "copilot_poll_for_account",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -777,6 +835,7 @@
     },
     {
       "name": "copilot_poll_for_auth",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -785,6 +844,7 @@
     },
     {
       "name": "copilot_remove_account",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -792,6 +852,7 @@
     },
     {
       "name": "copilot_set_default_account",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -799,6 +860,7 @@
     },
     {
       "name": "copilot_start_device_flow",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -807,6 +869,7 @@
     },
     {
       "name": "create_db_backup",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -815,6 +878,7 @@
     },
     {
       "name": "create_share",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -823,6 +887,7 @@
     },
     {
       "name": "deepseek_account_add",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -831,6 +896,7 @@
     },
     {
       "name": "deepseek_account_list",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -839,6 +905,7 @@
     },
     {
       "name": "deepseek_account_remove",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -847,6 +914,7 @@
     },
     {
       "name": "deepseek_account_set_default",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -855,6 +923,7 @@
     },
     {
       "name": "deepseek_account_status",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -863,6 +932,7 @@
     },
     {
       "name": "delete_db_backup",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -870,6 +940,7 @@
     },
     {
       "name": "delete_env_vars",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -877,6 +948,7 @@
     },
     {
       "name": "delete_provider",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -885,6 +957,7 @@
     },
     {
       "name": "delete_share",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -893,6 +966,7 @@
     },
     {
       "name": "delete_universal_provider",
+      "workspaceAccess": "excluded",
       "support": "excluded",
       "implemented": false,
       "feature": "universalProviders",
@@ -900,6 +974,7 @@
     },
     {
       "name": "disable_share",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "shares",
@@ -907,6 +982,7 @@
     },
     {
       "name": "enable_share",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "shares",
@@ -914,6 +990,7 @@
     },
     {
       "name": "email_auth_change_owner_email",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -922,6 +999,7 @@
     },
     {
       "name": "email_auth_get_status",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -930,6 +1008,7 @@
     },
     {
       "name": "email_auth_logout",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -938,6 +1017,7 @@
     },
     {
       "name": "email_auth_request_code",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -946,6 +1026,7 @@
     },
     {
       "name": "email_auth_request_owner_change_code",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -954,6 +1035,7 @@
     },
     {
       "name": "email_auth_session_me",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -962,6 +1044,7 @@
     },
     {
       "name": "email_auth_verify_code",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -970,6 +1053,7 @@
     },
     {
       "name": "ensure_claude_desktop_official_provider",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "claudeDesktopProfile",
@@ -977,6 +1061,7 @@
     },
     {
       "name": "export_all_shares",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -985,6 +1070,7 @@
     },
     {
       "name": "extract_common_config_snippet",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -992,6 +1078,7 @@
     },
     {
       "name": "fetch_opencode_zen_models",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -999,6 +1086,7 @@
     },
     {
       "name": "fetch_buddy_account_models",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -1006,6 +1094,7 @@
     },
     {
       "name": "fetch_models_for_config",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1013,6 +1102,7 @@
     },
     {
       "name": "get_account_capabilities",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -1021,6 +1111,7 @@
     },
     {
       "name": "get_antigravity_oauth_models",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -1028,6 +1119,7 @@
     },
     {
       "name": "get_app_config_dir_override",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1036,6 +1128,7 @@
     },
     {
       "name": "get_app_config_path",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1044,6 +1137,7 @@
     },
     {
       "name": "get_auto_launch_status",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1051,6 +1145,7 @@
     },
     {
       "name": "get_balance",
+      "workspaceAccess": "excluded",
       "support": "excluded",
       "implemented": false,
       "feature": "providers",
@@ -1058,6 +1153,7 @@
     },
     {
       "name": "get_admin_version_info",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1066,6 +1162,7 @@
     },
     {
       "name": "restart_server_service",
+      "workspaceAccess": "maintenance",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1074,6 +1171,7 @@
     },
     {
       "name": "get_server_store_authority",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1082,6 +1180,7 @@
     },
     {
       "name": "request_server_store_activation",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1090,6 +1189,7 @@
     },
     {
       "name": "cancel_server_store_activation",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1098,6 +1198,7 @@
     },
     {
       "name": "rollback_server_service",
+      "workspaceAccess": "maintenance",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1106,6 +1207,7 @@
     },
     {
       "name": "suggest_client_tunnel_subdomain",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "router",
@@ -1113,6 +1215,7 @@
     },
     {
       "name": "suggest_share_slug",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1120,6 +1223,7 @@
     },
     {
       "name": "start_admin_upgrade",
+      "workspaceAccess": "maintenance",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1128,6 +1232,7 @@
     },
     {
       "name": "complete_server_setup",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1136,6 +1241,7 @@
     },
     {
       "name": "login_with_api_token",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1144,6 +1250,7 @@
     },
     {
       "name": "request_admin_email_login_code",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1152,6 +1259,7 @@
     },
     {
       "name": "verify_admin_email_login_code",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1160,6 +1268,7 @@
     },
     {
       "name": "get_build_info",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1168,6 +1277,7 @@
     },
     {
       "name": "get_cached_oauth_quota",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -1176,6 +1286,7 @@
     },
     {
       "name": "get_claude_code_config_path",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1183,6 +1294,7 @@
     },
     {
       "name": "get_claude_common_config_snippet",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1190,6 +1302,7 @@
     },
     {
       "name": "get_claude_desktop_default_routes",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "claudeDesktopProfile",
@@ -1197,6 +1310,7 @@
     },
     {
       "name": "get_claude_desktop_status",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "claudeDesktopProfile",
@@ -1204,6 +1318,7 @@
     },
     {
       "name": "get_claude_oauth_quota",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -1212,6 +1327,7 @@
     },
     {
       "name": "get_client_tunnel",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "router",
@@ -1220,6 +1336,7 @@
     },
     {
       "name": "get_client_tunnel_status",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "router",
@@ -1228,6 +1345,7 @@
     },
     {
       "name": "get_codex_oauth_models",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -1235,6 +1353,7 @@
     },
     {
       "name": "get_grok_oauth_models",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "accounts",
@@ -1242,6 +1361,7 @@
     },
     {
       "name": "get_codex_oauth_quota",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -1250,6 +1370,7 @@
     },
     {
       "name": "get_coding_plan_quota",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1258,6 +1379,7 @@
     },
     {
       "name": "get_provider_account_usage",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1266,6 +1388,7 @@
     },
     {
       "name": "get_common_config_snippet",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1273,6 +1396,7 @@
     },
     {
       "name": "get_config_dir",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1281,6 +1405,7 @@
     },
     {
       "name": "get_custom_endpoints",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1288,6 +1413,7 @@
     },
     {
       "name": "get_installed_skills",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "skills",
@@ -1295,6 +1421,7 @@
     },
     {
       "name": "get_hermes_live_provider_ids",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "openclaw",
@@ -1302,6 +1429,7 @@
     },
     {
       "name": "get_log_config",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1309,6 +1437,7 @@
     },
     {
       "name": "get_api_management",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1316,6 +1445,7 @@
     },
     {
       "name": "set_api_management",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1323,6 +1453,7 @@
     },
     {
       "name": "get_upgrade_policy",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1330,6 +1461,7 @@
     },
     {
       "name": "set_upgrade_policy",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1337,6 +1469,7 @@
     },
     {
       "name": "generate_debug_token",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1344,6 +1477,7 @@
     },
     {
       "name": "revoke_debug_token",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1351,6 +1485,7 @@
     },
     {
       "name": "get_openclaw_live_provider_ids",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "openclaw",
@@ -1358,6 +1493,7 @@
     },
     {
       "name": "get_opencode_live_provider_ids",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "providers",
@@ -1365,6 +1501,7 @@
     },
     {
       "name": "get_optimizer_config",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1372,6 +1509,7 @@
     },
     {
       "name": "get_provider_health",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1380,6 +1518,7 @@
     },
     {
       "name": "get_provider_credential",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1388,6 +1527,7 @@
     },
     {
       "name": "get_provider_registry",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1396,6 +1536,7 @@
     },
     {
       "name": "get_provider_request_defaults",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1404,6 +1545,7 @@
     },
     {
       "name": "get_provider_bundles",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1412,6 +1554,7 @@
     },
     {
       "name": "get_provider_bundle",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1420,6 +1563,7 @@
     },
     {
       "name": "get_provider_bundle_delete_preview",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1428,6 +1572,7 @@
     },
     {
       "name": "upsert_provider_bundle",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1436,6 +1581,7 @@
     },
     {
       "name": "delete_provider_bundle",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1444,6 +1590,7 @@
     },
     {
       "name": "update_provider_bundles_sort_order",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1452,6 +1599,7 @@
     },
     {
       "name": "get_provider_resources",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1460,6 +1608,7 @@
     },
     {
       "name": "get_provider_store_migration",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1468,6 +1617,7 @@
     },
     {
       "name": "get_providers",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1476,6 +1626,7 @@
     },
     {
       "name": "get_proxy_status",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "proxy",
@@ -1483,6 +1634,7 @@
     },
     {
       "name": "get_proxy_takeover_status",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "proxy",
@@ -1490,6 +1642,7 @@
     },
     {
       "name": "get_rectifier_config",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1497,6 +1650,7 @@
     },
     {
       "name": "get_settings",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1505,6 +1659,7 @@
     },
     {
       "name": "get_share_connect_info",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1513,6 +1668,7 @@
     },
     {
       "name": "preview_share_account_reset",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1521,6 +1677,7 @@
     },
     {
       "name": "get_share_detail",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1529,6 +1686,7 @@
     },
     {
       "name": "preview_share_capabilities",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1537,6 +1695,7 @@
     },
     {
       "name": "preview_share_value_quota",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1545,6 +1704,7 @@
     },
     {
       "name": "get_share_value_quota_status",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1553,6 +1713,7 @@
     },
     {
       "name": "edit_share_value_quota_usage",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1561,6 +1722,7 @@
     },
     {
       "name": "get_share_health_status",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1568,6 +1730,7 @@
     },
     {
       "name": "get_provider_health_check_config",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1576,6 +1739,7 @@
     },
     {
       "name": "get_subscription_quota",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1583,6 +1747,7 @@
     },
     {
       "name": "get_tool_versions",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1590,6 +1755,7 @@
     },
     {
       "name": "get_tunnel_status",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1598,6 +1764,7 @@
     },
     {
       "name": "get_universal_provider",
+      "workspaceAccess": "excluded",
       "support": "excluded",
       "implemented": false,
       "feature": "universalProviders",
@@ -1605,6 +1772,7 @@
     },
     {
       "name": "get_universal_providers",
+      "workspaceAccess": "excluded",
       "support": "excluded",
       "implemented": false,
       "feature": "universalProviders",
@@ -1612,6 +1780,7 @@
     },
     {
       "name": "has_codex_unify_history_backup",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1619,6 +1788,7 @@
     },
     {
       "name": "import_claude_desktop_providers_from_claude",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "claudeDesktopProfile",
@@ -1626,6 +1796,7 @@
     },
     {
       "name": "import_default_config",
+      "workspaceAccess": "excluded",
       "support": "excluded",
       "implemented": false,
       "feature": "importCurrentConfig",
@@ -1633,6 +1804,7 @@
     },
     {
       "name": "import_hermes_providers_from_live",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "openclaw",
@@ -1640,6 +1812,7 @@
     },
     {
       "name": "import_openclaw_providers_from_live",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "openclaw",
@@ -1647,6 +1820,7 @@
     },
     {
       "name": "import_opencode_providers_from_live",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "providers",
@@ -1654,6 +1828,7 @@
     },
     {
       "name": "import_shares",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "shares",
@@ -1661,6 +1836,7 @@
     },
     {
       "name": "install_update_and_restart",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "tauriShell",
@@ -1668,6 +1844,7 @@
     },
     {
       "name": "is_live_takeover_active",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "proxy",
@@ -1675,6 +1852,7 @@
     },
     {
       "name": "is_portable_mode",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1682,6 +1860,7 @@
     },
     {
       "name": "is_proxy_running",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "proxy",
@@ -1689,6 +1868,7 @@
     },
     {
       "name": "list_db_backups",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1697,6 +1877,7 @@
     },
     {
       "name": "list_shares",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1705,6 +1886,7 @@
     },
     {
       "name": "list_share_reuse_candidates",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1713,6 +1895,7 @@
     },
     {
       "name": "model_test_all_providers",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "providers",
@@ -1720,6 +1903,7 @@
     },
     {
       "name": "model_test_provider",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "providers",
@@ -1727,6 +1911,7 @@
     },
     {
       "name": "open_app_config_folder",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "tauriShell",
@@ -1734,6 +1919,7 @@
     },
     {
       "name": "open_config_folder",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "tauriShell",
@@ -1741,6 +1927,7 @@
     },
     {
       "name": "open_external",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "tauriShell",
@@ -1748,6 +1935,7 @@
     },
     {
       "name": "open_file_dialog",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "tauriShell",
@@ -1755,6 +1943,7 @@
     },
     {
       "name": "open_provider_terminal",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "providers",
@@ -1762,6 +1951,7 @@
     },
     {
       "name": "pause_share",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1770,6 +1960,7 @@
     },
     {
       "name": "pick_directory",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "tauriShell",
@@ -1777,6 +1968,7 @@
     },
     {
       "name": "probe_tool_installations",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1784,6 +1976,7 @@
     },
     {
       "name": "queryProviderUsage",
+      "workspaceAccess": "excluded",
       "support": "excluded",
       "implemented": false,
       "feature": "providers",
@@ -1791,6 +1984,7 @@
     },
     {
       "name": "read_live_provider_settings",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "providers",
@@ -1798,6 +1992,7 @@
     },
     {
       "name": "refresh_oauth_quota",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "accounts",
@@ -1806,6 +2001,7 @@
     },
     {
       "name": "refresh_coding_plan_quota",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1814,6 +2010,7 @@
     },
     {
       "name": "refresh_provider_account_usage",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1822,6 +2019,7 @@
     },
     {
       "name": "remove_custom_endpoint",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1829,6 +2027,7 @@
     },
     {
       "name": "remove_share_binding",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1837,6 +2036,7 @@
     },
     {
       "name": "remove_provider_from_live_config",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "providers",
@@ -1844,6 +2044,7 @@
     },
     {
       "name": "rename_db_backup",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1851,6 +2052,7 @@
     },
     {
       "name": "reset_share_usage",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1859,6 +2061,7 @@
     },
     {
       "name": "restart_app",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "tauriShell",
@@ -1866,6 +2069,7 @@
     },
     {
       "name": "restore_codex_unified_history",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1873,6 +2077,7 @@
     },
     {
       "name": "restore_db_backup",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1881,6 +2086,7 @@
     },
     {
       "name": "restore_env_backup",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1888,6 +2094,7 @@
     },
     {
       "name": "resume_share",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1896,6 +2103,7 @@
     },
     {
       "name": "run_tool_lifecycle_action",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1903,6 +2111,7 @@
     },
     {
       "name": "s3_sync_download",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "cloudSync",
@@ -1910,6 +2119,7 @@
     },
     {
       "name": "s3_sync_fetch_remote_info",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "cloudSync",
@@ -1917,6 +2127,7 @@
     },
     {
       "name": "s3_sync_save_settings",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "cloudSync",
@@ -1924,6 +2135,7 @@
     },
     {
       "name": "s3_sync_upload",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "cloudSync",
@@ -1931,6 +2143,7 @@
     },
     {
       "name": "s3_test_connection",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "cloudSync",
@@ -1938,6 +2151,7 @@
     },
     {
       "name": "save_file_dialog",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "tauriShell",
@@ -1945,6 +2159,7 @@
     },
     {
       "name": "save_provider_request_defaults",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1953,6 +2168,7 @@
     },
     {
       "name": "save_settings",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1961,6 +2177,7 @@
     },
     {
       "name": "save_provider_health_check_config",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1969,6 +2186,7 @@
     },
     {
       "name": "set_app_config_dir_override",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -1976,6 +2194,7 @@
     },
     {
       "name": "validate_provider_bundle_draft",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -1984,6 +2203,7 @@
     },
     {
       "name": "get_provider_bundle_share_preflight",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -1992,6 +2212,7 @@
     },
     {
       "name": "save_provider_bundle_share",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -2000,6 +2221,7 @@
     },
     {
       "name": "save_provider_share",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -2008,6 +2230,7 @@
     },
     {
       "name": "set_auto_launch",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -2015,6 +2238,7 @@
     },
     {
       "name": "set_claude_common_config_snippet",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -2022,6 +2246,7 @@
     },
     {
       "name": "set_common_config_snippet",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -2029,6 +2254,7 @@
     },
     {
       "name": "set_log_config",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -2036,6 +2262,7 @@
     },
     {
       "name": "set_optimizer_config",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -2043,6 +2270,7 @@
     },
     {
       "name": "set_proxy_takeover_for_app",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "proxy",
@@ -2050,6 +2278,7 @@
     },
     {
       "name": "set_rectifier_config",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "settings",
@@ -2057,12 +2286,14 @@
     },
     {
       "name": "set_window_theme",
+      "workspaceAccess": "excluded",
       "support": "excluded",
       "implemented": false,
       "feature": "tauriShell"
     },
     {
       "name": "start_client_tunnel",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "router",
@@ -2071,6 +2302,7 @@
     },
     {
       "name": "start_proxy_server",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "proxy",
@@ -2078,6 +2310,7 @@
     },
     {
       "name": "start_share_tunnel",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -2086,6 +2319,7 @@
     },
     {
       "name": "stop_client_tunnel",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "router",
@@ -2094,6 +2328,7 @@
     },
     {
       "name": "stop_proxy_server",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "proxy",
@@ -2101,6 +2336,7 @@
     },
     {
       "name": "stop_proxy_with_restore",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "proxy",
@@ -2108,6 +2344,7 @@
     },
     {
       "name": "stop_share_tunnel",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -2116,6 +2353,7 @@
     },
     {
       "name": "stream_check_all_providers",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "providers",
@@ -2123,6 +2361,7 @@
     },
     {
       "name": "stream_check_provider",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "providers",
@@ -2130,6 +2369,7 @@
     },
     {
       "name": "sync_universal_provider",
+      "workspaceAccess": "excluded",
       "support": "excluded",
       "implemented": false,
       "feature": "universalProviders",
@@ -2137,6 +2377,7 @@
     },
     {
       "name": "test_api_endpoints",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -2144,6 +2385,7 @@
     },
     {
       "name": "testUsageScript",
+      "workspaceAccess": "excluded",
       "support": "excluded",
       "implemented": false,
       "feature": "providers",
@@ -2151,6 +2393,7 @@
     },
     {
       "name": "transfer_share_owner",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "shares",
@@ -2159,6 +2402,7 @@
     },
     {
       "name": "update_client_tunnel",
+      "workspaceAccess": "host",
       "support": "native",
       "implemented": true,
       "feature": "router",
@@ -2167,6 +2411,7 @@
     },
     {
       "name": "update_endpoint_last_used",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "tauriShell",
@@ -2174,6 +2419,7 @@
     },
     {
       "name": "update_provider",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "providers",
@@ -2182,6 +2428,7 @@
     },
     {
       "name": "update_providers_sort_order",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "providers",
@@ -2190,6 +2437,7 @@
     },
     {
       "name": "update_share_description",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "shares",
@@ -2197,6 +2445,7 @@
     },
     {
       "name": "update_share_expiration",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "shares",
@@ -2204,6 +2453,7 @@
     },
     {
       "name": "update_share_owner_email",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "shares",
@@ -2212,6 +2462,7 @@
     },
     {
       "name": "update_share_parallel_limit",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "shares",
@@ -2219,6 +2470,7 @@
     },
     {
       "name": "update_share_subdomain",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "shares",
@@ -2226,6 +2478,7 @@
     },
     {
       "name": "update_share_token_limit",
+      "workspaceAccess": "tenant",
       "support": "shim",
       "implemented": true,
       "feature": "shares",
@@ -2233,6 +2486,7 @@
     },
     {
       "name": "update_tray_menu",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "tauriShell",
@@ -2240,6 +2494,7 @@
     },
     {
       "name": "upsert_universal_provider",
+      "workspaceAccess": "excluded",
       "support": "excluded",
       "implemented": false,
       "feature": "universalProviders",
@@ -2247,6 +2502,7 @@
     },
     {
       "name": "webdav_sync_download",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "cloudSync",
@@ -2254,6 +2510,7 @@
     },
     {
       "name": "webdav_sync_fetch_remote_info",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "cloudSync",
@@ -2261,6 +2518,7 @@
     },
     {
       "name": "webdav_sync_save_settings",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "cloudSync",
@@ -2268,6 +2526,7 @@
     },
     {
       "name": "webdav_sync_upload",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "cloudSync",
@@ -2275,6 +2534,7 @@
     },
     {
       "name": "webdav_test_connection",
+      "workspaceAccess": "host",
       "support": "shim",
       "implemented": true,
       "feature": "cloudSync",
@@ -2282,6 +2542,7 @@
     },
     {
       "name": "prepare_share_quota_history",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",
@@ -2290,6 +2551,7 @@
     },
     {
       "name": "get_share_quota_conversion",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "shares",

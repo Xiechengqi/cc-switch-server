@@ -6,6 +6,10 @@ export const settingsApi = {
     return await invokeCommand("get_settings");
   },
 
+  async saveQuotaPreferences(settings: {oauthQuotaRefreshIntervalMinutes: number; oauthQuotaRefreshTimeoutSeconds: number}): Promise<boolean> {
+    return invokeCommand("save_settings", { settings });
+  },
+
   async save(settings: Settings): Promise<boolean> {
     return await invokeCommand("save_settings", { settings });
   },

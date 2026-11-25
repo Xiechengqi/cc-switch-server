@@ -55,12 +55,14 @@ interface ServerAppProps {
   onSignOut?: (options?: { clearPasswordCache?: boolean }) => void;
   enableWebTerminal?: boolean;
   workspaceOnly?: boolean;
+  fillParent?: boolean;
 }
 
 export default function ServerApp({
   onSignOut,
   enableWebTerminal = true,
   workspaceOnly = false,
+  fillParent = false,
 }: ServerAppProps = {}) {
   const { t } = useTranslation();
   useOauthQuotaRefreshBridge();
@@ -228,7 +230,8 @@ export default function ServerApp({
   return (
     <div
       className={cn(
-        "flex h-screen flex-col overflow-hidden bg-background text-foreground selection:bg-primary/30",
+        "flex flex-col overflow-hidden bg-background text-foreground selection:bg-primary/30",
+        fillParent ? "min-h-0 flex-1" : "h-screen",
         !bareTerminal && APP_VIEWPORT_PADDING_Y,
         !bareTerminal && PAGE_HEADER_CONTENT_GAP,
       )}

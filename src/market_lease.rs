@@ -5,6 +5,7 @@ use anyhow::{bail, ensure, Context};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+pub(crate) const ACCESS_EVENT_BATCH: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -43,6 +44,8 @@ pub struct Command {
 pub struct Journal {
     #[serde(default)]
     pub events: Vec<AccessEvent>,
+    #[serde(skip)]
+    recent_visits: Vec<String>,
     #[serde(default)]
     pub managed_activity: bool,
     #[serde(default)]
@@ -59,6 +62,8 @@ pub struct Journal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccessEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrences: Option<u32>,
     pub id: String,
     pub kind: String,
     pub at: i64,
@@ -217,6 +222,7 @@ impl Workspace {
             // Receipts belong to the purged lease. Without its grant the Router
             // can no longer acknowledge them, so they must not outlive cleanup.
             journal.events.clear();
+            journal.recent_visits.clear();
             journal.managed_activity = false;
             journal.token_hash = None;
             journal.sealed_until = 0;
@@ -249,6 +255,9 @@ impl Workspace {
         self.journal.read().expect("lease journal").clone()
     }
     pub fn record_event(&self, lease: &str, kind: &str) -> anyhow::Result<()> {
+        self.record_visit(lease, kind, None)
+    }
+    pub fn record_visit(&self, lease: &str, kind: &str, visit: Option<&str>) -> anyhow::Result<()> {
         let mut current = self.journal.write().expect("lease journal");
         ensure!(
             current.grant.as_ref().is_some_and(|g| g.lease_id == lease),
@@ -260,13 +269,58 @@ impl Workspace {
         if current.purging {
             return Ok(());
         }
-        ensure!(current.events.len() < 1024, "pending event queue full");
+        let visit_id = matches!(kind, "assistance" | "terminal")
+            .then_some(visit)
+            .flatten()
+            .filter(|v| v.len() == 32 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(|id| format!("{kind}:{id}"));
+        if visit_id
+            .as_ref()
+            .is_some_and(|id| current.recent_visits.contains(id))
+        {
+            return Ok(());
+        }
         let mut next = current.clone();
-        next.events.push(AccessEvent {
-            id: format!("{:032x}", rand::random::<u128>()),
+        let event_id = if let Some(id) = &visit_id {
+            use sha2::{Digest, Sha256};
+            hex::encode(&Sha256::digest(format!("{lease}:{id}").as_bytes())[..16])
+        } else {
+            format!("{:032x}", rand::random::<u128>())
+        };
+        if current.events.iter().any(|e| e.id == event_id) {
+            return Ok(());
+        }
+        if let Some(id) = visit_id {
+            if next.recent_visits.len() >= 256 {
+                next.recent_visits.remove(0);
+            }
+            next.recent_visits.push(id);
+        }
+        let overflow = next.events.len() >= ACCESS_EVENT_BATCH;
+        let event = AccessEvent {
+            // An aggregate needs its own key. One of its visits may already
+            // have been acknowledged before the in-memory dedup cache expired.
+            id: if overflow {
+                format!("{:032x}", rand::random::<u128>())
+            } else {
+                event_id
+            },
             kind: kind.into(),
             at: chrono::Utc::now().timestamp(),
-        });
+            occurrences: overflow.then_some(1),
+        };
+        // Published events are immutable until acknowledged. Compact only overflow
+        // that has never been included in a control response.
+        if let Some(summary) = next
+            .events
+            .iter_mut()
+            .skip(ACCESS_EVENT_BATCH)
+            .find(|e| e.kind == kind)
+        {
+            summary.occurrences = Some(summary.occurrences.unwrap_or(1).saturating_add(1));
+        } else {
+            next.events.push(event);
+        }
         write_json_pretty(&self.root.join("market-lease.json"), &next)?;
         *current = next;
         Ok(())
@@ -637,6 +691,63 @@ mod tests {
             .is_err());
         assert_eq!(w.view().grant.unwrap().lease_id, second);
         std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn owner_visits_deduplicate_and_overflow_survives_lost_acknowledgements() {
+        let root = std::env::temp_dir().join(format!("cc-market-events-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let workspace = Workspace::open(root.clone()).unwrap();
+        let lease = "ee983484-2e81-499a-b3d4-10708cde2747";
+        {
+            let mut journal = workspace.journal.write().unwrap();
+            journal.grant = Some(Grant {
+                lease_id: lease.into(),
+                alias: "rent-0123456789abcdef0123".into(),
+                tenant_email: "buyer@example.test".into(),
+                expires_at: i64::MAX,
+            });
+            journal.events = (0..1024)
+                .map(|n| AccessEvent {
+                    id: format!("{n:032x}"),
+                    kind: "assistance".into(),
+                    at: 1,
+                    occurrences: None,
+                })
+                .collect();
+        }
+        let visit = "f".repeat(32);
+        for _ in 0..2 {
+            workspace
+                .record_visit(lease, "terminal", Some(&visit))
+                .unwrap();
+        }
+        workspace.record_event(lease, "terminal").unwrap();
+        workspace.record_event(lease, "host_settings").unwrap();
+        let published = workspace.view();
+        assert_eq!(published.events.len(), 1026);
+        assert_eq!(published.events[1024].occurrences, Some(2));
+        let ids: Vec<_> = published.events[..1024]
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        workspace.acknowledge("stale-lease", &ids).unwrap();
+        assert_eq!(workspace.view().events.len(), 1026);
+        workspace.acknowledge(lease, &ids).unwrap();
+        workspace.acknowledge(lease, &ids).unwrap();
+        workspace
+            .record_visit(lease, "terminal", Some(&visit))
+            .unwrap();
+        workspace.record_event(lease, "terminal").unwrap();
+        let next = workspace.view();
+        assert_eq!(next.events.len(), 3);
+        assert_eq!(next.events[0].occurrences, Some(2));
+        assert_eq!(next.events[2].occurrences, None);
+        let disk = std::fs::read(root.join("market-lease.json")).unwrap();
+        let saved: Journal = serde_json::from_slice(&disk).unwrap();
+        assert!(saved.recent_visits.is_empty());
+        assert_eq!(saved.events[0].id, published.events[1024].id);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

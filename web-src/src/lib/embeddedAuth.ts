@@ -5,6 +5,49 @@ let pending: Promise<void> | null = null;
 let disabled = false;
 let listenerInstalled = false;
 
+let standalone = false;
+let enteredStandalone = false;
+/** The alias root resolves the current lease at the Router and resumes its main-origin login. */
+export function shouldResumeStandalone(): boolean {
+  return enteredStandalone && !disabled && !credential && isTenantHost() && window.parent === window;
+}
+export function isTenantHost(): boolean {
+  return /^rent-[a-f0-9]{20}\./i.test(window.location.hostname);
+}
+async function acceptCredential(response: Response): Promise<boolean> {
+  if (!response.ok || disabled) return false;
+  const data = await response.json();
+  const expiresAt = Date.parse(data.expiresAt);
+  if (disabled || typeof data.token !== "string" || !data.token || !(expiresAt > Date.now())) return false;
+  credential = { token: data.token, expiresAt };
+  return true;
+}
+async function standaloneHandshake(): Promise<void> {
+  const ticket = document.querySelector<HTMLMetaElement>('meta[name="cc-lease-ticket"]');
+  const nonce = document.querySelector<HTMLMetaElement>('meta[name="cc-lease-nonce"]');
+  if (ticket && nonce) {
+    ticket.remove();
+    nonce.remove();
+    window.history.replaceState(null, "", "/");
+    enteredStandalone = await acceptCredential(
+      await fetch("/web-api/auth/router-exchange", {
+        method: "POST",
+        cache: "no-store",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ticket: ticket.content, nonce: nonce.content }),
+      }),
+    );
+  } else if (credential) {
+    const renewed = await acceptCredential(
+      await fetch("/web-api/auth/router-renew", {
+        method: "POST",
+        cache: "no-store",
+        headers: { [HEADER]: credential.token },
+      }),
+    );
+    if (!renewed) credential = null;
+  }
+}
 function parentOrigin(): string | null {
   if (window.parent === window) return null;
   try {
@@ -30,6 +73,15 @@ export function clearEmbeddedSession(): void {
 }
 
 export async function initializeEmbeddedAuth(): Promise<void> {
+  if (window.parent === window && (standalone || document.querySelector('meta[name="cc-lease-ticket"]'))) {
+    standalone = true;
+    if (disabled || (credential && credential.expiresAt > Date.now() + 30_000)) return;
+    if (!pending)
+      pending = standaloneHandshake().finally(() => {
+        pending = null;
+      });
+    return pending;
+  }
   const origin = parentOrigin();
   if (!origin || typeof globalThis.crypto?.randomUUID !== "function" || disabled || (credential && credential.expiresAt > Date.now() + 30_000)) return;
   if (pending) return pending;
@@ -88,6 +140,14 @@ export async function embeddedAuthHeaders(): Promise<Record<string, string>> {
 
 export async function renewEmbeddedSession(): Promise<boolean> {
   if (disabled || !credential) return false;
+  if (standalone) {
+    if (!pending)
+      pending = standaloneHandshake().finally(() => {
+        pending = null;
+      });
+    await pending;
+    return embeddedSessionToken() !== null;
+  }
   credential = null;
   await initializeEmbeddedAuth();
   return embeddedSessionToken() !== null;

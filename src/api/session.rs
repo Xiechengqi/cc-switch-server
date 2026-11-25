@@ -38,7 +38,13 @@ pub(crate) async fn resolve_web_admin_principal(
                 return Ok(None);
             }
         }
+        let source = if live && grant.as_ref().is_some_and(|g| g.tenant_email == user_email) {
+            WebPrincipalSource::LeaseTenant
+        } else {
+            WebPrincipalSource::Router
+        };
         return Ok(Some(WebAdminPrincipal {
+            source,
             user_email,
             role: router_web_role(headers),
         }));
@@ -50,6 +56,7 @@ pub(crate) async fn resolve_web_admin_principal(
 
     if let Ok(Some(principal)) = state.web_auth.authenticate_access_token(token) {
         return Ok(Some(WebAdminPrincipal {
+            source: WebPrincipalSource::LocalOwner,
             user_email: principal.user_email,
             role: principal.role,
         }));
@@ -64,6 +71,7 @@ pub(crate) async fn resolve_web_admin_principal(
     {
         let config = state.config.read().await;
         return Ok(Some(WebAdminPrincipal {
+            source: WebPrincipalSource::LocalOwner,
             user_email: config
                 .owner
                 .email
@@ -76,6 +84,7 @@ pub(crate) async fn resolve_web_admin_principal(
     let config = state.config.read().await;
     if config.verify_api_token(token) {
         return Ok(Some(WebAdminPrincipal {
+            source: WebPrincipalSource::LocalOwner,
             user_email: config
                 .owner
                 .email
@@ -123,8 +132,16 @@ pub(crate) fn router_web_role(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebPrincipalSource {
+    LocalOwner,
+    Router,
+    LeaseTenant,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WebAdminPrincipal {
+    pub(crate) source: WebPrincipalSource,
     user_email: String,
     role: String,
 }

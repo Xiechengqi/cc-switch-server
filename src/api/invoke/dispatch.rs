@@ -70,11 +70,13 @@ async fn web_invoke_dispatch(
     match command {
         "get_build_info" => {
             let mut response = json!(build_info());
+            if state.market_workspace.access().1.is_some() { return Ok(response); }
             response["processId"] = json!(std::process::id());
             response["processInstanceId"] = json!(state.process_instance_id.clone());
             Ok(response)
         }
         "get_admin_version_info" => {
+            if state.market_workspace.access().1.is_some() { return Ok(json!({"build":build_info()})); }
             let check_remote = args
                 .get("checkRemote")
                 .and_then(Value::as_bool)
@@ -211,7 +213,13 @@ async fn web_invoke_dispatch(
         "get_settings" => {
             let config = state.config.read().await.clone();
             let store = state.ui_settings.read().await;
-            Ok(store.settings_for_frontend(&config))
+            let mut settings = store.settings_for_frontend(&config);
+            if config.workspace.is_some() {
+                if let Some(object) = settings.as_object_mut() {
+                    object.retain(|k,_| matches!(k.as_str(), "oauthQuotaRefreshIntervalMinutes" | "oauthQuotaRefreshTimeoutSeconds" | "language" | "shareRouterDomain"));
+                }
+            }
+            Ok(settings)
         }
         "get_rectifier_config" => {
             let store = state.ui_settings.read().await;
@@ -285,6 +293,10 @@ async fn web_invoke_dispatch(
         "save_settings" => {
             let patch =
                 ui_settings::settings_patch_from_args(&args).map_err(ApiError::bad_request)?;
+            if state.market_workspace.access().1.is_some() && !patch.as_object().is_some_and(|obj| obj.keys().all(|key|
+                matches!(key.as_str(), "oauthQuotaRefreshIntervalMinutes" | "oauthQuotaRefreshTimeoutSeconds"))) {
+                return Err(ApiError::forbidden("only workspace quota preferences can be changed"));
+            }
             let updates_log_config = patch.get("logConfig").is_some();
             state
                 .apply_ui_settings_patch_immediate(patch)
@@ -944,6 +956,9 @@ async fn web_invoke_dispatch(
             if let Ok(id) = web_arg_share_id(&args) {
                 return Ok(json!(web_share_tunnel_status(state, &id).await?));
             }
+            if state.market_workspace.access().1.is_some() {
+                return Err(ApiError::bad_request("workspace Share ID required"));
+            }
             let response = router_tunnels(State(state.clone()), headers.clone())
                 .await?
                 .0;
@@ -951,6 +966,9 @@ async fn web_invoke_dispatch(
         }
         "get_client_tunnel" => Ok(web_client_tunnel_state(state).await),
         "get_client_tunnel_status" => {
+            if state.market_workspace.access().1.is_some() {
+                return Ok(web_client_tunnel_state(state).await["status"].clone());
+            }
             let runtime = state
                 .tunnels
                 .status(&crate::clients::router::tunnel::client_tunnel_key())
@@ -1093,7 +1111,13 @@ async fn web_invoke_dispatch(
             Ok(json!(response))
         }
         "get_installed_skills" => Ok(json!([])),
-        "get_proxy_status" => Ok(json!(web_proxy_status_json(state).await)),
+        "get_proxy_status" => {
+            let mut status = web_proxy_status_json(state).await;
+            if state.market_workspace.access().1.is_some() {
+                if let Some(obj) = status.as_object_mut() { obj.remove("address"); obj.remove("port"); }
+            }
+            Ok(status)
+        }
         "get_proxy_takeover_status" => Ok(json!(web_proxy_takeover_status_json(state).await)),
         "is_proxy_running" => Ok(json!(true)),
         "is_live_takeover_active" => Ok(json!(web_is_live_takeover_active(state).await)),

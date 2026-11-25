@@ -1,6 +1,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import en from "@/i18n/server-locales/en.json";
 import { LeaseWorkspace } from "./LeaseWorkspace";
 
 const { request, proof } = vi.hoisted(() => ({
@@ -8,9 +9,9 @@ const { request, proof } = vi.hoisted(() => ({
   proof: vi.fn(),
 }));
 vi.mock("@/lib/runtime", () => ({ jsonFetch: request, apiFetch: vi.fn() }));
-vi.mock("@/lib/routerAuth", () => ({ setWorkspaceOwnerProof: proof }));
+vi.mock("@/lib/routerAuth", () => ({ setWorkspaceOwnerProof: proof, setMaintenanceVisit:vi.fn() }));
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ i18n: { language: "en" } }),
+  useTranslation: () => ({ i18n: { language: "en" }, t:(key:string)=>en.lease[key.split(".")[1] as keyof typeof en.lease] || key }),
 }));
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
@@ -79,7 +80,13 @@ it("requires owner login before changing installation maintenance settings", asy
     )!.set!.call(password, "sample-owner-password");
     password.dispatchEvent(new Event("input", { bubbles: true }));
   });
-  request.mockResolvedValueOnce({ accessToken: "sample-owner-proof" });
+  const credential = {accessToken:"sample-owner-proof",refreshToken:"refresh",expiresAt:new Date(Date.now()+600000).toISOString()};
+  request.mockResolvedValueOnce(credential).mockRejectedValueOnce(new Error("owner_proof_required"));
+  await act(async () => {password.form!.requestSubmit();});
+  expect(host.querySelector('[name="interval"]')).toBeNull();
+  expect(proof).toHaveBeenLastCalledWith(null);
+  request.mockResolvedValueOnce(credential).mockResolvedValueOnce({authorized:true,instanceId:"first"});
+  vi.spyOn(window,"confirm").mockReturnValue(true);
   await act(async () => {
     password.form!.requestSubmit();
   });

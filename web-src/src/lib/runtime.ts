@@ -1,5 +1,9 @@
+import { isTenantHost } from "@/lib/embeddedAuth";
+import i18n from "@/i18n";
 import { isRemoteWebMode } from "@/lib/api/auth";
 import {
+  attachWorkspaceOwnerProof,
+  clientRequestUrl,
   clearRouterSessionTokens,
   readRouterAccessToken,
   routerAuthFetch,
@@ -53,6 +57,11 @@ export interface WebRuntimeCommand {
 }
 
 export interface WebRuntimeContext {
+  localOwner?: boolean;
+  leaseId?: string;
+  openUrl?: string;
+  marketListed?: boolean;
+  leaseExpiresAt?: number;
   workspaceRole?: "tenant" | "assistance" | null;
   mode: "local-admin" | "share" | "client-login";
   appMode?: string;
@@ -112,26 +121,30 @@ export class HttpResponseError extends Error {
 }
 
 function httpResponseError(data: unknown, status: number): HttpResponseError {
-  const body =
-    data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+  const body = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
   const nested =
-    body.error && typeof body.error === "object"
-      ? (body.error as Record<string, unknown>)
-      : body;
-  const message = [body.error, nested.message, body.message].find(
-    (value) => typeof value === "string",
-  );
+    body.error && typeof body.error === "object" ? (body.error as Record<string, unknown>) : body;
+  const message = [body.error, nested.message, body.message].find((value) => typeof value === "string");
+  const code = typeof nested.code === "string" ? nested.code : undefined;
+  const translation = code && workspaceMessages.get(code);
   return new HttpResponseError(
-    typeof message === "string" ? message : `HTTP ${status}`,
+    translation ? i18n.t(translation) : typeof message === "string" ? message : `HTTP ${status}`,
     status,
     {
-      code: typeof nested.code === "string" ? nested.code : undefined,
+      code,
       details: nested.details,
-      retryable:
-        typeof nested.retryable === "boolean" ? nested.retryable : undefined,
+      retryable: typeof nested.retryable === "boolean" ? nested.retryable : undefined,
     },
   );
 }
+
+const workspaceMessages = new Map([
+  ["workspace_leased", "lease.locked"],
+  ["unlist_first", "lease.unlistFirst"],
+  ["owner_proof_required", "lease.ownerProof"],
+  ["tenant_session_required", "lease.routerHelp"],
+  ["lease_ended", "lease.endedHelp"],
+]);
 
 const TOKEN_KEY = "cc_switch_server_token";
 export const PROVIDER_CONTRACT_VERSION = 2;
@@ -176,15 +189,14 @@ export async function loginWithPassword(password: string): Promise<string> {
   return token;
 }
 
-async function localApiFetch(
-  input: RequestInfo | URL,
-  init: RequestInit = {},
-): Promise<Response> {
+async function localApiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  if (clientRequestUrl(input).origin !== window.location.origin) return fetch(input, init);
   const request = () => {
     const headers = new Headers(init.headers || {});
+    attachWorkspaceOwnerProof(headers, input);
     const token = readToken();
     if (token) headers.set("authorization", `Bearer ${token}`);
-    return fetch(input, { ...init, headers });
+    return fetch(input, { ...init, headers, mode: "same-origin" });
   };
 
   let response = await request();
@@ -192,14 +204,11 @@ async function localApiFetch(
     return response;
   }
 
-  writeToken(null);
+  if (!resolveRequestPath(input).startsWith("/web-api/auth/password/")) writeToken(null);
   return response;
 }
 
-export async function apiFetch(
-  input: RequestInfo | URL,
-  init: RequestInit = {},
-): Promise<Response> {
+export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   assertClientTunnelCompatiblePath(input);
   const headers = new Headers(init.headers || {});
   headers.set(PROVIDER_CONTRACT_HEADER, String(PROVIDER_CONTRACT_VERSION));
@@ -210,10 +219,7 @@ export async function apiFetch(
   return localApiFetch(input, requestInit);
 }
 
-export async function jsonFetch<T>(
-  input: RequestInfo | URL,
-  init: RequestInit = {},
-): Promise<T> {
+export async function jsonFetch<T>(input: RequestInfo | URL, init: RequestInit = {}): Promise<T> {
   const response = await apiFetch(input, {
     ...init,
     headers: {
@@ -228,9 +234,7 @@ export async function jsonFetch<T>(
   return data as T;
 }
 
-export async function getWebRuntimeContext(
-  allowAutoLogin = true,
-): Promise<WebRuntimeContext> {
+export async function getWebRuntimeContext(allowAutoLogin = true): Promise<WebRuntimeContext> {
   if (isRemoteWebMode()) {
     return getRemoteWebRuntimeContext(allowAutoLogin);
   }
@@ -259,13 +263,20 @@ export async function getWebRuntimeContext(
   return data;
 }
 
-async function getRemoteWebRuntimeContext(
-  allowAutoLogin: boolean,
-): Promise<WebRuntimeContext> {
+async function getRemoteWebRuntimeContext(allowAutoLogin: boolean): Promise<WebRuntimeContext> {
   const response = await routerAuthFetch("/web-api/context", {
     headers: { accept: "application/json" },
     cache: "no-store",
   });
+  if ([401, 403, 409, 410].includes(response.status) && isTenantHost()) {
+    const data = await response.json().catch(() => ({}));
+    return {
+      mode: "client-login",
+      workspaceRole: "tenant",
+      status: response.status === 410 ? "lease_ended" : data.code || "tenant_session_required",
+      openUrl: data.details?.openUrl,
+    };
+  }
   if (response.status === 401) {
     const retried = await tryRemoteAutoLogin(allowAutoLogin);
     if (retried.mode !== "local-admin") {

@@ -1,4 +1,5 @@
 import { invokeCommand } from "@/lib/runtime";
+import { isTenantHost } from "@/lib/embeddedAuth";
 
 export type ManagedAuthProvider =
   | "github_copilot"
@@ -266,6 +267,11 @@ const DIRECT_SERVER_PORTS = new Set(["15721", "15722"]);
  */
 export function isDirectServerWebAccess(): boolean {
   if (typeof window === "undefined") return true;
+  if (
+    isTenantHost() ||
+    (window.parent !== window && new URLSearchParams(window.location.search).has("routerOrigin"))
+  )
+    return false;
   if (isLoopbackHostname(window.location.hostname)) return true;
   const port = window.location.port;
   return DIRECT_SERVER_PORTS.has(port);

@@ -3,6 +3,8 @@ import { HttpResponseError, jsonFetch, invokeCommand } from "./runtime";
 
 vi.mock("@/lib/api/auth", () => ({ isRemoteWebMode: () => false }));
 vi.mock("@/lib/routerAuth", () => ({
+  clientRequestUrl: (path: string) => new URL(path,window.location.origin),
+  attachWorkspaceOwnerProof: vi.fn(),
   clearRouterSessionTokens: vi.fn(),
   readRouterAccessToken: () => null,
   routerAuthFetch: vi.fn(),

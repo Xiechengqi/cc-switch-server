@@ -1,4 +1,11 @@
-import { clearEmbeddedSession, embeddedAuthHeaders, embeddedSessionToken, renewEmbeddedSession } from "@/lib/embeddedAuth";
+import {
+  isTenantHost,
+  clearEmbeddedSession,
+  embeddedAuthHeaders,
+  embeddedSessionToken,
+  renewEmbeddedSession,
+  shouldResumeStandalone,
+} from "@/lib/embeddedAuth";
 
 const AUTH_KEY = "cc_switch_router_auth_v2";
 const PROTOCOL_EPOCH = "namespace-flat-1";
@@ -405,13 +412,40 @@ export function readRouterAccessToken(): string | null {
 
 // A Client-issued password proof is tab-local and only sent to owner operations
 // on the current Client. It never accompanies Router requests or tenant data.
+let maintenanceVisit: string | null = null;
+export function setMaintenanceVisit(id: string | null) {
+  maintenanceVisit = id;
+}
 let workspaceOwnerProof: string | null = null;
-export function setWorkspaceOwnerProof(proof: string | null) { workspaceOwnerProof = proof; }
+export function setWorkspaceOwnerProof(proof: string | null) {
+  workspaceOwnerProof = proof;
+}
+export function clientRequestUrl(input: RequestInfo | URL) {
+  return new URL(input instanceof Request ? input.url : String(input), window.location.origin);
+}
 export function attachWorkspaceOwnerProof(headers: Headers, input: RequestInfo | URL) {
-  const url=new URL(input instanceof Request ? input.url : String(input),window.location.origin);
-  if(workspaceOwnerProof && url.origin===window.location.origin && (url.pathname.startsWith("/web-api/terminal/") ||
-    ["/web-api/market/maintenance","/web-api/invoke/restart_server_service","/web-api/invoke/start_admin_upgrade","/web-api/invoke/rollback_server_service"].includes(url.pathname))) {
-    headers.set("x-cc-switch-owner-proof",workspaceOwnerProof);
+  const url = clientRequestUrl(input);
+  if (
+    url.origin === window.location.origin &&
+    url.pathname === "/web-api/terminal/stream" &&
+    maintenanceVisit
+  ) {
+    headers.set("x-cc-switch-workspace-visit", maintenanceVisit);
+  }
+  if (
+    workspaceOwnerProof &&
+    url.origin === window.location.origin &&
+    (url.pathname.startsWith("/web-api/terminal/") ||
+      [
+        "/web-api/market/maintenance",
+        "/web-api/market/maintenance/status",
+        "/web-api/market/maintenance/upgrade-status",
+        "/web-api/invoke/restart_server_service",
+        "/web-api/invoke/start_admin_upgrade",
+        "/web-api/invoke/rollback_server_service",
+      ].includes(url.pathname))
+  ) {
+    headers.set("x-cc-switch-owner-proof", workspaceOwnerProof);
   }
 }
 async function fetchWithAuth(
@@ -420,11 +454,11 @@ async function fetchWithAuth(
 ): Promise<Response> {
   const headers = new Headers(init.headers || {});
   attachWorkspaceOwnerProof(headers,input);
-  Object.entries(authBearerHeaders()).forEach(([key, value]) =>
-    headers.set(key, value),
-  );
-  Object.entries(await embeddedAuthHeaders()).forEach(([key, value]) => headers.set(key, value));
-  return fetch(input, { ...init, headers });
+  if (!isTenantHost()) Object.entries(authBearerHeaders()).forEach(([key, value]) => headers.set(key, value));
+  if (clientRequestUrl(input).pathname.startsWith("/web-api/")) {
+    Object.entries(await embeddedAuthHeaders()).forEach(([key, value]) => headers.set(key, value));
+  }
+  return fetch(input, { ...init, headers, mode: "same-origin" });
 }
 
 async function refreshAccessToken(): Promise<boolean> {
@@ -556,14 +590,34 @@ export async function routerAuthFetch(
   input: RequestInfo | URL,
   init: RequestInit = {},
 ): Promise<Response> {
+  const url = clientRequestUrl(input);
+  if (url.origin !== window.location.origin) return fetch(input, init);
   let response = await fetchWithAuth(input, init);
+  const path = url.pathname;
+  if (path === "/web-api/auth/password/login" || path === "/web-api/auth/password/refresh") return response;
+  if (response.status === 410 && isTenantHost()) {
+    const body = await response
+      .clone()
+      .json()
+      .catch(() => null);
+    if (body?.code === "lease_ended") {
+      clearEmbeddedSession();
+      window.dispatchEvent(new CustomEvent(SERVER_AUTH_EXPIRED_EVENT, { detail: "lease_ended" }));
+    }
+    return response;
+  }
   if (response.status === 401 && (await renewEmbeddedSession())) {
     response = await fetchWithAuth(input, init);
   }
-  if (response.status === 401 && (await refreshAccessToken())) {
+  if (response.status === 401 && !isTenantHost() && (await refreshAccessToken())) {
     response = await fetchWithAuth(input, init);
   }
   if (response.status === 401) {
+    if (shouldResumeStandalone()) {
+      clearEmbeddedSession();
+      window.location.replace("/");
+      return response;
+    }
     notifyServerAuthExpired();
   } else {
     authExpiryNotified = false;

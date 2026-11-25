@@ -2296,6 +2296,13 @@ pub(in crate::api) async fn web_client_tunnel_state(state: &ServerState) -> Valu
     ) || runtime
         .as_ref()
         .is_some_and(|status| tunnel_runtime_is_healthy(status.status.as_str()));
+    if config.workspace.is_some() {
+        return json!({"config":{"ownerEmail":owner_email,"subdomain":subdomain,"enabled":enabled,
+            "autoStart":true,"tunnelUrl":expected_tunnel_url,"expectedUrl":expected_tunnel_url},
+            "status":{"info":expected_tunnel_url.as_ref().map(|url|json!({"tunnelUrl":url,"subdomain":subdomain,
+                "remotePort":0,"healthy":enabled,"status":if enabled {"connected"} else {"offline"}})),
+                "lastError":null,"requiresOwnerLogin":false}});
+    }
     let status = web_client_tunnel_share_status(runtime);
     let mut response = json!({
         "config": {

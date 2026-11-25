@@ -1,3 +1,4 @@
+import { useWorkspaceCommand } from "@/lib/workspaceCommands";
 import React from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -52,6 +53,7 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
   showLoggedInAccounts = false,
 }) => {
   const { t } = useTranslation();
+  const canImportLocal = useWorkspaceCommand("cursor_import_local_auth");
   const [copied, setCopied] = React.useState(false);
   const {
     authStatus,
@@ -248,7 +250,7 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
                   defaultValue: "使用 Cursor 登录",
                 })}
           </Button>
-          <Button
+          {canImportLocal && <Button
             type="button"
             onClick={importCursorLocalAuth}
             className="w-full"
@@ -267,7 +269,7 @@ export const CursorOAuthSection: React.FC<CursorOAuthSectionProps> = ({
             {t("cursorOauth.importLocalServer", {
               defaultValue: "从本机 Cursor 导入",
             })}
-          </Button>
+          </Button>}
         </div>
       )}
 

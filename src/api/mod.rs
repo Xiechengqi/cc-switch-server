@@ -269,6 +269,8 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/_ctl/market/upgrade-status", post(market_workspace::control))
         .route("/web-api/market/chat",get(market_workspace::chat::history).post(market_workspace::chat::send))
         .route("/web-api/market/workspace", get(market_workspace::view))
+        .route("/web-api/market/maintenance/status", get(market_workspace::maintenance_status))
+        .route("/web-api/market/maintenance/upgrade-status", get(admin_upgrade_status))
         .route("/web-api/market/maintenance", post(market_workspace::maintenance))
         .route("/web-api/market/token", post(market_workspace::token))
         .route("/web-api/market/backups", get(market_workspace::backups).post(market_workspace::export))
@@ -3353,6 +3355,51 @@ mod grok_catalog_provider_tests {
         )
         .unwrap();
         assert_ne!(state.config_dir, root);
+        use super::session::{resolve_web_admin_principal, WebPrincipalSource};
+        let mut sources = HeaderMap::new();
+        state
+            .push_session(crate::state::Session {
+                token: "local-owner-session".into(),
+            })
+            .await;
+        sources.insert(
+            header::AUTHORIZATION,
+            "Bearer local-owner-session".parse().unwrap(),
+        );
+        assert_eq!(
+            resolve_web_admin_principal(&state, &sources)
+                .await
+                .unwrap()
+                .unwrap()
+                .source,
+            WebPrincipalSource::LocalOwner
+        );
+        sources.insert("x-cc-switch-web-user-email", owner.parse().unwrap());
+        assert_eq!(
+            resolve_web_admin_principal(&state, &sources)
+                .await
+                .unwrap()
+                .unwrap()
+                .source,
+            WebPrincipalSource::Router
+        );
+        sources.insert("x-cc-switch-web-user-email", tenant.parse().unwrap());
+        assert!(resolve_web_admin_principal(&state, &sources)
+            .await
+            .unwrap()
+            .is_none());
+        sources.insert(
+            "x-cc-switch-client-tunnel-subdomain",
+            alias.parse().unwrap(),
+        );
+        assert_eq!(
+            resolve_web_admin_principal(&state, &sources)
+                .await
+                .unwrap()
+                .unwrap()
+                .source,
+            WebPrincipalSource::LeaseTenant
+        );
         let app = app_router(state.clone());
         for (method, path, who, label, expected) in [
             (
@@ -6382,22 +6429,27 @@ async fn web_runtime_context(
         })));
     }
 
-    if resolve_web_admin_principal(&state, &headers)
-        .await?
-        .is_none()
-    {
+    let Some(principal) = resolve_web_admin_principal(&state, &headers).await? else {
         return Ok(Json(web_runtime_auth_required_payload(&config, contract)));
-    }
-
-    let leased_role = state.market_workspace.access().1.as_ref().map(|g| {
-        if session::router_web_user_email(&headers).as_deref() == Some(&g.tenant_email) {
-            "tenant"
-        } else {
-            "assistance"
-        }
-    });
+    };
+    let (listed_owner, grant, _) = state.market_workspace.access();
+    let tenant = principal.source == session::WebPrincipalSource::LeaseTenant;
+    let leased_role = grant
+        .as_ref()
+        .map(|_| if tenant { "tenant" } else { "assistance" });
+    let commands: Vec<_> = contract
+        .commands
+        .iter()
+        .filter(|cmd| match leased_role {
+            Some("tenant") => market_workspace::workspace_command(&cmd.name),
+            Some("assistance") => cmd.workspace_access == web_runtime::WorkspaceAccess::Maintenance,
+            _ => true,
+        })
+        .collect();
     Ok(Json(json!({
         "mode": "local-admin","workspaceRole":leased_role,
+        "localOwner":principal.source == session::WebPrincipalSource::LocalOwner, "leaseId":grant.as_ref().map(|g|&g.lease_id),
+        "marketListed": listed_owner.is_some(), "leaseExpiresAt":grant.as_ref().map(|g|g.expires_at),
         "appMode": "server",
         "platform": "server",
         "status": "authenticated",
@@ -6408,7 +6460,7 @@ async fn web_runtime_context(
             "authenticated": true,
             "setupRequired": false,
             "ownerEmail": config.share_owner_email(),
-            "methods": web_runtime_auth_methods(&config)
+            "methods": if tenant { vec![] } else { web_runtime_auth_methods(&config) }
         },
         "router": {
             "url": config.router.url,
@@ -6427,7 +6479,7 @@ async fn web_runtime_context(
             "hidden": contract.hidden_features,
             "excluded": contract.excluded_features
         },
-        "commands": contract.commands,
+        "commands": commands,
         "uiAutomation": {
             "allowed": contract.ui_automation_allowed
         }

@@ -401,7 +401,6 @@ if (requireDirectory(routerRoot, "Router audit root")) {
         "src/schema.rs",
         "src/store.rs",
         "src/share_market.rs",
-        "src/client_market.rs",
         "src/metrics/store.rs",
       ],
     },

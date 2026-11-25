@@ -256,8 +256,7 @@ export function AuthCenterPanel({
 
     setSavingQuotaSettings(true);
     try {
-      await settingsApi.save({
-        ...settings,
+      await settingsApi.saveQuotaPreferences({
         oauthQuotaRefreshIntervalMinutes: parsedRefreshInterval,
         oauthQuotaRefreshTimeoutSeconds: parsedRefreshTimeout,
       });

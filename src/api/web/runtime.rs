@@ -39,6 +39,7 @@ pub struct WebRuntimeFeature {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebRuntimeCommand {
+    pub workspace_access: WorkspaceAccess,
     pub name: String,
     pub support: WebRuntimeCommandSupport,
     pub implemented: bool,
@@ -59,6 +60,15 @@ pub struct WebRuntimeEndpoint {
     pub response_envelope: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceAccess {
+    Tenant,
+    Maintenance,
+    Host,
+    Excluded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

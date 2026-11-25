@@ -42,6 +42,7 @@ test("reader ceiling upgrades retain the separate reader and Market floors", () 
 });
 
 test("retained Market capability checks follow the platform-wallet architecture", () => {
+  assert.ok(retainedRouterMarketFiles.includes("src/online_client_market.rs"));
   assert.ok(retainedRouterMarketFiles.includes("src/market_wallet.rs"));
   assert.ok(retainedRouterMarketFiles.includes("src/market_payments/mod.rs"));
   assert.ok(!retainedRouterMarketFiles.includes("src/market_billing.rs"));

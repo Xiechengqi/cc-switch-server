@@ -26,7 +26,7 @@ vi.mock("@/lib/api/auth", async (original) => ({
 }));
 vi.mock("@/lib/api", async (original) => ({
   ...await original<object>(),
-  settingsApi: { get: async () => SERVER_DEFAULT_SETTINGS, save: mocks.saveSettings },
+  settingsApi: { get: async () => SERVER_DEFAULT_SETTINGS, saveQuotaPreferences: mocks.saveSettings },
   authApi: {
     authGetStatus: async (provider: string) => ({
       provider, authenticated: mocks.accounts.some((account) => account.provider === provider),

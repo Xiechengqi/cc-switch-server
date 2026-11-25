@@ -1,10 +1,14 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 import { apiFetch, jsonFetch } from "@/lib/runtime";
-const TerminalPage = lazy(() => import("@/components/terminal/TerminalPage"));
+import { setMaintenanceVisit, setWorkspaceOwnerProof } from "@/lib/routerAuth";
 import { WorkspaceChat } from "./WorkspaceChat";
-import { setWorkspaceOwnerProof } from "@/lib/routerAuth";
 
+const TerminalPage = lazy(() => import("@/components/terminal/TerminalPage"));
+const base = "/web-api/market";
 type Maintenance = {
   terminalEnabled: boolean;
   terminalAvailable: boolean;
@@ -16,265 +20,416 @@ type Maintenance = {
 };
 type View = {
   leaseId: string;
+  expiresAt: number;
+  fenced: boolean;
+  cleaning: boolean;
+  pendingEvents: number;
+  waitingOnShares?: boolean;
   shareCount: number;
   version: string;
-  hardware: {
-    arch: string;
-    cpu: number | null;
-    memoryBytes: number | null;
-    diskBytes: number | null;
-  } | null;
+  hardware: { arch: string; cpu: number | null; memoryBytes: number | null; diskBytes: number | null } | null;
   connectivity: { registered: boolean; lastHeartbeatMs: number | null };
   maintenance: Maintenance | null;
-  providers: {
-    app: string;
-    providerId: string;
-    status: string;
-    requests: number;
-    failures: number;
-  }[];
+  providers: { app: string; providerId: string; status: string; requests: number; failures: number }[];
   audit: { sequence: number; time: number; status: number | null }[];
 };
+type Proof = { accessToken: string; refreshToken: string; expiresAt: string };
+type Action = "restart" | "upgrade" | "rollback";
+const commands: Record<Action, string> = {
+  restart: "restart_server_service",
+  upgrade: "start_admin_upgrade",
+  rollback: "rollback_server_service",
+};
+function visitId(lease: string) {
+  const key = "cc-workspace-visit:" + lease;
+  const fresh = Array.from(crypto.getRandomValues(new Uint8Array(16)), (n) =>
+    n.toString(16).padStart(2, "0"),
+  ).join("");
+  try {
+    const stored = sessionStorage.getItem(key);
+    if (stored && /^[0-9a-f]{32}$/.test(stored)) return stored;
+    sessionStorage.setItem(key, fresh);
+  } catch {
+    /* Private browsing can disable tab storage. */
+  }
+  return fresh;
+}
+const post = (body: unknown) => ({
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify(body),
+});
+const needsProof = (cause: unknown) => (cause as { code?: string })?.code === "owner_proof_required";
+
 export function LeaseWorkspace({
   role,
+  leaseId = "",
+  expiresAt,
+  localOwner = false,
+  onSignOut,
   children,
 }: {
   role: "tenant" | "assistance";
+  leaseId?: string;
+  expiresAt?: number;
+  localOwner?: boolean;
+  onSignOut?: () => void;
   children?: React.ReactNode;
 }) {
-  const { i18n } = useTranslation();
-  const zh = i18n.language.startsWith("zh");
-  const label = (en: string, cn: string) => (zh ? cn : en);
+  const { t, i18n } = useTranslation();
+  const tenant = role === "tenant";
+  const [visit] = useState(() => visitId(leaseId));
   const [view, setView] = useState<View | null>(null);
-  const [error, setError] = useState("");
-  const [token, setToken] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [backups, setBackups] = useState<string[]>([]);
-  const [restorable, setRestorable] = useState(false);
-  const [restoreId, setRestoreId] = useState("");
+  const [backups, setBackups] = useState<{ backups: string[]; restorable: boolean }>({
+    backups: [],
+    restorable: false,
+  });
+  const [snapshot, setSnapshot] = useState("");
+  const [backupDone, setBackupDone] = useState(false);
+  const [chat, setChat] = useState(false);
   const [password, setPassword] = useState("");
-  const [owner, setOwner] = useState(false);
-  const [terminal, setTerminal] = useState(false);
-  const [chatOpen, setChatOpen] = useState(false);
-  const [rev, setRev] = useState(0);
+  const [authorized, setAuthorized] = useState(false);
+  const [proof, setProof] = useState<Proof | null>(null);
+  const [terminal, setTerminal] = useState(
+    () => new URLSearchParams(location.search).get("view") === "terminal",
+  );
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [revision, reload] = useState(0);
+  const [now, setNow] = useState(Date.now);
+  const [job, setJob] = useState<{ action: Action; id: string; start: number } | null>(null);
+  const instance = useRef("");
+  const alive = useRef(true);
+  const date = (ms: number) => new Date(ms).toLocaleString(i18n.language);
+  const verify = async (signal?: AbortSignal) => {
+    const result = await jsonFetch<{ authorized: boolean; instanceId: string }>(
+      base + "/maintenance/status",
+      { signal },
+    );
+    if (!result.authorized) throw new Error(t("lease.ownerProof"));
+    instance.current = result.instanceId;
+  };
+  function lock() {
+    setWorkspaceOwnerProof(null);
+    setProof(null);
+    setAuthorized(false);
+    setTerminal(false);
+    setJob(null);
+  }
   useEffect(() => {
-    const c = new AbortController();
-    if (role === "assistance") {
-      jsonFetch<View>("/web-api/market/workspace", { signal: c.signal })
-        .then((v) => {
-          if (!c.signal.aborted) setView(v);
-        })
-        .catch((e) => {
-          if (!c.signal.aborted) setError(String(e));
+    alive.current = true;
+    if (!tenant) setMaintenanceVisit(visit);
+    return () => {
+      alive.current = false;
+      setMaintenanceVisit(null);
+      setWorkspaceOwnerProof(null);
+    };
+  }, [tenant, visit]);
+  useEffect(() => {
+    const ctl = new AbortController();
+    const opts = { signal: ctl.signal, headers: { "x-cc-switch-workspace-visit": visit } };
+    let timer: ReturnType<typeof setTimeout>;
+    const read = async () => {
+      try {
+        if (tenant) {
+          const value = await jsonFetch<typeof backups>(base + "/backups", opts);
+          if (!ctl.signal.aborted) setBackups(value);
+        } else {
+          const value = await jsonFetch<View>(base + "/workspace", opts);
+          if (!ctl.signal.aborted) setView(value);
+        }
+      } catch (cause) {
+        if (!ctl.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        if (!tenant && !ctl.signal.aborted) timer = setTimeout(read, 25_000);
+      }
+    };
+    void read();
+    return () => {
+      ctl.abort();
+      clearTimeout(timer);
+    };
+  }, [role, revision, visit, tenant]);
+  useEffect(() => {
+    if (!localOwner || tenant) return;
+    const ctl = new AbortController();
+    void verify(ctl.signal)
+      .then(() => {
+        if (!ctl.signal.aborted) setAuthorized(true);
+      })
+      .catch((cause) => {
+        if (!ctl.signal.aborted) setError(String(cause));
+      });
+    return () => ctl.abort();
+  }, [localOwner, tenant]);
+  useEffect(() => {
+    if (!proof) return;
+    const ctl = new AbortController();
+    const expires = Date.parse(proof.expiresAt);
+    const refresh = async () => {
+      try {
+        const next = await jsonFetch<Proof>("/web-api/auth/password/refresh", {
+          ...post({ refreshToken: proof.refreshToken }),
+          signal: ctl.signal,
         });
-    } else {
-      jsonFetch<{ backups: string[]; restorable: boolean }>(
-        "/web-api/market/backups",
-        { signal: c.signal },
-      )
-        .then((v) => {
-          if (!c.signal.aborted) {
-            setBackups(v.backups);
-            setRestorable(v.restorable);
+        if (ctl.signal.aborted) return;
+        setWorkspaceOwnerProof(next.accessToken);
+        await verify(ctl.signal);
+        if (!ctl.signal.aborted) setProof(next);
+      } catch {
+        if (!ctl.signal.aborted) {
+          lock();
+          setError(t("lease.ownerProof"));
+        }
+      }
+    };
+    const timer = setTimeout(refresh, Math.max(0, expires - Date.now() - 30_000));
+    const deadline = setTimeout(
+      () => {
+        ctl.abort();
+        lock();
+      },
+      Math.max(0, expires - Date.now()),
+    );
+    return () => {
+      ctl.abort();
+      clearTimeout(timer);
+      clearTimeout(deadline);
+    };
+  }, [proof]);
+  useEffect(() => {
+    if (!expiresAt) return;
+    const timer = setInterval(() => setNow(Date.now()), 15_000);
+    return () => clearInterval(timer);
+  }, [expiresAt]);
+  useEffect(() => {
+    if (!job || !authorized) return;
+    const ctl = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        if (job.action === "upgrade") {
+          const v = await jsonFetch<{ status: string }>(
+            base + "/maintenance/upgrade-status?taskId=" + encodeURIComponent(job.id),
+            { signal: ctl.signal },
+          );
+          if (ctl.signal.aborted) return;
+          if (v.status === "success" || v.status === "failed") {
+            setMessage(t(v.status === "success" ? "lease.done" : "lease.failed"));
+            setJob(null);
+            return;
           }
-        })
-        .catch((e) => {
-          if (!c.signal.aborted) setError(String(e));
-        });
-    }
-    return () => c.abort();
-  }, [role, rev]);
-  useEffect(() => () => setWorkspaceOwnerProof(null), []);
+        } else {
+          await verify(ctl.signal);
+          if (ctl.signal.aborted) return;
+          if (instance.current !== job.id) {
+            setMessage(t("lease.done"));
+            setJob(null);
+            return;
+          }
+        }
+      } catch (cause) {
+        if (!ctl.signal.aborted && needsProof(cause)) {
+          lock();
+          setError(t("lease.ownerProof"));
+          return;
+        }
+      }
+      if (ctl.signal.aborted) return;
+      if (Date.now() - job.start > 300_000) {
+        setError(t("lease.jobTimeout"));
+        setJob(null);
+        return;
+      }
+      timer = setTimeout(poll, 2000);
+    };
+    timer = setTimeout(poll, 1500);
+    return () => {
+      ctl.abort();
+      clearTimeout(timer);
+    };
+  }, [job, authorized, t]);
   async function perform(fn: () => Promise<void>) {
     if (busy) return;
     setBusy(true);
     setError("");
+    setMessage("");
     try {
       await fn();
-    } catch (e) {
-      setError(String(e));
+    } catch (cause) {
+      if (needsProof(cause)) {
+        lock();
+        setError(t("lease.ownerProof"));
+      } else setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setBusy(false);
+      if (alive.current) setBusy(false);
     }
   }
-  const date = (n: number) => new Date(n).toLocaleString(i18n.language);
+  const remaining = expiresAt == null ? null : Math.max(0, expiresAt - Math.floor(now / 1000));
+  const expiry =
+    remaining == null
+      ? ""
+      : remaining > 86400
+        ? t("lease.daysLeft", { count: Math.ceil(remaining / 86400) })
+        : remaining > 3600
+          ? t("lease.hoursLeft", { count: Math.ceil(remaining / 3600) })
+          : t("lease.minutesLeft", { count: Math.ceil(remaining / 60) });
   const gib = (n: number | null) =>
-    n == null
-      ? "—"
-      : (n / 2 ** 30).toLocaleString(i18n.language, {
-          maximumFractionDigits: 1,
-        }) + " GiB";
+    n == null ? "—" : (n / 2 ** 30).toLocaleString(i18n.language, { maximumFractionDigits: 1 }) + " GiB";
   return (
-    <>
+    <main className={tenant ? "flex h-dvh min-h-0 flex-col" : "mx-auto h-dvh w-full max-w-5xl overflow-y-auto p-4"}>
       <section
-        className="panel"
-        aria-label={label("Client rental", "Client 租约")}
+        aria-label={t("lease.title")}
+        className={cn(
+          "[&_button]:min-h-11 [&_summary]:min-h-11 [&_summary]:cursor-pointer [&_summary]:py-3 [&_label]:min-h-11 [&_select]:min-h-11",
+          "[&_:is(button,input,select,summary):focus-visible]:ring-2 [&_:is(button,input,select,summary):focus-visible]:ring-ring [&_:is(button,input,select,summary):focus-visible]:ring-offset-2",
+          tenant
+            ? "max-h-[45dvh] shrink-0 overflow-auto border-b px-3 py-1.5 text-sm"
+            : "grid gap-3 rounded-lg border p-4",
+        )}
       >
-        <h2>
-          {role === "tenant"
-            ? label("Tenant workspace", "租户工作区")
-            : label("Owner assistance · read only", "所有者协助 · 只读")}
-        </h2>
-        {error && <p role="alert">{error}</p>}
-        {role === "tenant" ? (
-          <>
-            <p>
-              {label(
-                "The host owner has root access and can read data on disk. Owner assistance and maintenance are recorded.",
-                "主机所有者拥有 root 权限，可以读取磁盘数据。卖家协助及运维操作会留痕。",
-              )}
-            </p>
-            <button
-              disabled={busy}
-              onClick={() =>
-                void perform(async () => {
-                  const r = await apiFetch("/web-api/market/backups", {
-                    method: "POST",
-                  });
-                  if (!r.ok) throw new Error(await r.text());
-                  const url = URL.createObjectURL(await r.blob());
-                  const a = document.createElement("a");
-                  a.href = url;
-                  a.download =
-                    r.headers
-                      .get("content-disposition")
-                      ?.match(/filename=([a-z\d.-]+)/i)?.[1] || "workspace.zip";
-                  a.click();
-                  setTimeout(() => URL.revokeObjectURL(url), 1000);
-                  setRev((v) => v + 1);
-                })
-              }
+        <header className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <h1 className="font-semibold">{t(tenant ? "lease.tenant" : "lease.assistance")}</h1>
+          <span className="break-all font-mono text-xs">{leaseId || view?.leaseId}</span>
+          {expiresAt && (
+            <time
+              dateTime={new Date(expiresAt * 1000).toISOString()}
+              aria-live={remaining !== null && remaining <= 86400 ? "polite" : "off"}
+              className={remaining === null || remaining > 86400 ? undefined : remaining <= 3600 ? "font-semibold text-destructive" : "text-amber-700"}
             >
-              {label("Export workspace backup", "导出工作区备份")}
-            </button>
-            {restorable && backups.length > 0 && (
-              <label>
-                {label("Restore snapshot", "恢复快照")}{" "}
-                <select
-                  value={restoreId}
-                  onChange={(e) => setRestoreId(e.target.value)}
-                >
-                  <option value="">—</option>
-                  {backups.map((id) => (
-                    <option key={id}>{id}</option>
-                  ))}
-                </select>
-                <button
-                  disabled={busy || !restoreId}
+              {date(expiresAt * 1000)} · {expiry}
+            </time>
+          )}
+          {onSignOut && (
+            <Button variant="ghost" size="sm" onClick={onSignOut}>
+              {t("lease.signOut")}
+            </Button>
+          )}
+        </header>
+        {error && (
+          <p role="alert" className="text-destructive">
+            {error}
+          </p>
+        )}
+        {message && <p role="status">{message}</p>}
+        {tenant ? (
+          <>
+            <p className="text-xs text-muted-foreground">{t("lease.root")}</p>
+            <details>
+              <summary className="cursor-pointer">{t("lease.tools")}</summary>
+              <div className="flex flex-wrap items-center gap-2 py-2">
+                <Button
+                  size="sm"
+                  disabled={busy}
                   onClick={() =>
                     void perform(async () => {
-                      if (
-                        window.confirm(
-                          label(
-                            "Replace the current workspace with this snapshot?",
-                            "用所选快照替换当前工作区？",
-                          ),
-                        )
-                      ) {
-                        await jsonFetch(
-                          `/web-api/market/backups/${encodeURIComponent(restoreId)}/restore`,
-                          { method: "POST" },
-                        );
-                        location.reload();
-                      }
+                      setBackupDone(false);
+                      const r = await apiFetch(base + "/backups", { method: "POST" });
+                      if (!r.ok) throw new Error(t("lease.backupFailed"));
+                      const url = URL.createObjectURL(await r.blob());
+                      const a = document.createElement("a");
+                      a.href = url;
+                      a.download = "workspace-" + leaseId + ".zip";
+                      a.click();
+                      setTimeout(() => URL.revokeObjectURL(url), 1000);
+                      setBackupDone(true);
+                      reload((n) => n + 1);
                     })
                   }
                 >
-                  {label("Restore", "恢复")}
-                </button>
-              </label>
-            )}
-            <button
-              disabled={busy}
-              onClick={() =>
-                void perform(async () => {
-                  const r = await jsonFetch<{ token: string }>(
-                    "/web-api/market/token",
-                    { method: "POST" },
-                  );
-                  setToken(r.token);
-                })
-              }
-            >
-              {label("Rotate workspace CLI token", "轮换工作区 CLI 令牌")}
-            </button>
-            <details onToggle={(e) => setChatOpen(e.currentTarget.open)}>
-              <summary className="min-h-11 cursor-pointer py-2">
-                {label("Workspace chat", "工作区聊天")}
-              </summary>
-              {chatOpen && <WorkspaceChat zh={zh} />}
+                  {t("lease.export")}
+                </Button>
+                {backupDone && <span role="status">{t("lease.downloaded")}</span>}
+                {backups.restorable && backups.backups.length > 0 && (
+                  <>
+                    <select
+                      aria-label={t("lease.snapshot")}
+                      value={snapshot}
+                      onChange={(e) => setSnapshot(e.target.value)}
+                    >
+                      <option value="">—</option>
+                      {backups.backups.map((id) => (
+                        <option key={id}>{id}</option>
+                      ))}
+                    </select>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={!snapshot || busy}
+                      onClick={() =>
+                        void perform(async () => {
+                          if (!window.confirm(t("lease.restoreConfirm"))) return;
+                          await jsonFetch(base + "/backups/" + encodeURIComponent(snapshot) + "/restore", {
+                            method: "POST",
+                          });
+                          location.reload();
+                        })
+                      }
+                    >
+                      {t("lease.restore")}
+                    </Button>
+                  </>
+                )}
+                <Button size="sm" variant="outline" aria-expanded={chat} onClick={() => setChat(!chat)}>
+                  {t("lease.chat")}
+                </Button>
+              </div>
+              {chat && <WorkspaceChat zh={i18n.language.startsWith("zh")} />}
             </details>
-            {token && (
-              <label>
-                {label(
-                  "Use this bearer token on loopback with the X-Workspace-Share header set to your Share ID.",
-                  "通过回环地址调用时，请使用此 Bearer 令牌，并在 X-Workspace-Share 请求头中填写工作区的 Share ID。",
-                )}{" "}
-                <input
-                  readOnly
-                  value={token}
-                  onFocus={(e) => e.target.select()}
-                />
-              </label>
-            )}
           </>
         ) : (
           <>
             {view && (
               <>
                 <p>
-                  {label("Version", "版本")} {view.version} · {view.shareCount}{" "}
-                  Share
+                  {t("lease.version")} {view.version} · {view.shareCount} Share ·{" "}
+                  {t(view.cleaning ? "lease.cleaning" : view.fenced ? "lease.fenced" : "lease.active")} ·{" "}
+                  {t("lease.pending", { count: view.pendingEvents || 0 })}
                 </p>
+                {view.waitingOnShares && <p role="status">{t("lease.awaitingShares")}</p>}
                 <p>
-                  {label("Router", "Router 连接")} ·{" "}
-                  {view.connectivity.registered
-                    ? label("Registered", "已注册")
-                    : label("Unregistered", "未注册")}
+                  {t(view.connectivity.registered ? "lease.registered" : "lease.offline")}
                   {view.connectivity.lastHeartbeatMs != null && (
                     <>
                       {" "}
-                      · {label("Last heartbeat", "最近心跳")}{" "}
-                      {date(view.connectivity.lastHeartbeatMs)}
+                      · {t("lease.heartbeat")} {date(view.connectivity.lastHeartbeatMs)}
                     </>
                   )}
                 </p>
                 {view.hardware && (
                   <p>
-                    {view.hardware.arch} · {view.hardware.cpu ?? "—"} vCPU ·{" "}
-                    {label("Memory", "内存")} {gib(view.hardware.memoryBytes)} ·{" "}
-                    {label("Disk", "数据盘")} {gib(view.hardware.diskBytes)}
+                    {view.hardware.arch} · {view.hardware.cpu ?? "—"} vCPU · {t("lease.memory")}{" "}
+                    {gib(view.hardware.memoryBytes)} · {t("lease.disk")} {gib(view.hardware.diskBytes)}
                   </p>
                 )}
-                <table>
-                  <caption>
-                    {label("Provider health", "Provider 健康状况")}
-                  </caption>
-                  <thead>
-                    <tr>
-                      <th>App</th>
-                      <th>Provider</th>
-                      <th>{label("Status", "状态")}</th>
-                      <th>{label("Failed / requests", "失败 / 请求数")}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {view.providers.map((p) => (
-                      <tr key={p.app + p.providerId}>
-                        <td>{p.app}</td>
-                        <td>{p.providerId}</td>
-                        <td>{p.status}</td>
-                        <td>
-                          {p.failures} / {p.requests}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
                 <details>
-                  <summary>
-                    {label("Recent request audit", "近期请求审计")}
-                  </summary>
+                  <summary>{t("lease.health")}</summary>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>App</th>
+                        <th>Provider</th>
+                        <th>{t("lease.status")}</th>
+                        <th>{t("lease.failures")}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {view.providers.map((p) => (
+                        <tr key={p.app + p.providerId}>
+                          <td>{p.app}</td>
+                          <td>{p.providerId}</td>
+                          <td>{p.status}</td>
+                          <td>
+                            {p.failures} / {p.requests}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </details>
+                <details>
+                  <summary>{t("lease.audit")}</summary>
                   {view.audit.map((e) => (
                     <p key={e.sequence}>
                       {date(e.time)} · HTTP {e.status ?? "—"}
@@ -283,82 +438,103 @@ export function LeaseWorkspace({
                 </details>
               </>
             )}
-            {!owner ? (
+            {!authorized ? (
               <form
+                className="flex flex-wrap items-end gap-2"
                 onSubmit={(e) => {
                   e.preventDefault();
                   void perform(async () => {
-                    const r = await jsonFetch<{ accessToken: string }>(
-                      "/web-api/auth/password/login",
-                      {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ password }),
-                      },
-                    );
-                    setWorkspaceOwnerProof(r.accessToken);
+                    const next = await jsonFetch<Proof>("/web-api/auth/password/login", post({ password }));
                     setPassword("");
-                    setOwner(true);
+                    if (!alive.current) return;
+                    if (!next.accessToken || !next.refreshToken || !(Date.parse(next.expiresAt) > Date.now()))
+                      throw new Error(t("lease.ownerProof"));
+                    setWorkspaceOwnerProof(next.accessToken);
+                    try {
+                      await verify();
+                    } catch (cause) {
+                      setWorkspaceOwnerProof(null);
+                      throw cause;
+                    }
+                    if (alive.current) {
+                      setProof(next);
+                      setAuthorized(true);
+                    }
                   });
                 }}
               >
                 <label>
-                  {label(
-                    "Owner password for maintenance",
-                    "运维需要所有者密码",
-                  )}{" "}
-                  <input
+                  {t("lease.ownerPassword")}{" "}
+                  <Input
+                    className="h-12"
                     type="password"
                     autoComplete="current-password"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                   />
                 </label>
-                <button disabled={busy || !password}>
-                  {label("Unlock maintenance", "解锁运维")}
-                </button>
+                <Button disabled={!password || busy}>{t("lease.unlock")}</Button>
               </form>
             ) : (
-              <div>
-                <button
-                  disabled={!view?.maintenance?.terminalAvailable}
-                  onClick={() => setTerminal(!terminal)}
-                >
-                  {label("Owner terminal", "所有者终端")}
-                </button>
+              <>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    variant="outline"
+                    disabled={!view?.maintenance?.terminalAvailable}
+                    aria-expanded={terminal}
+                    onClick={() => setTerminal(!terminal)}
+                  >
+                    {t("lease.terminal")}
+                  </Button>
+                  {(["restart", "upgrade", "rollback"] as const).map((action) => (
+                    <Button
+                      key={action}
+                      variant="outline"
+                      disabled={busy || !!job}
+                      onClick={() =>
+                        void perform(async () => {
+                          if (!window.confirm(t("lease.confirm_" + action))) return;
+                          const v = await jsonFetch<{ taskId?: string }>(
+                            "/web-api/invoke/" + commands[action],
+                            post({}),
+                          );
+                          setJob({
+                            action,
+                            id: action === "upgrade" ? v.taskId || "" : instance.current,
+                            start: Date.now(),
+                          });
+                          setMessage(t("lease.running", { action: t("lease." + action) }));
+                        })
+                      }
+                    >
+                      {t("lease." + action)}
+                    </Button>
+                  ))}
+                </div>
                 {view?.maintenance && (
                   <details>
-                    <summary className="min-h-11 cursor-pointer py-2">
-                      {label("Host settings", "主机设置")}
-                    </summary>
+                    <summary>{t("lease.settings")}</summary>
                     <form
+                      className="grid gap-2 py-2"
                       onSubmit={(e) => {
                         e.preventDefault();
                         const data = new FormData(e.currentTarget);
                         void perform(async () => {
+                          if (!window.confirm(t("lease.confirm_settings"))) return;
                           const saved = await jsonFetch<Maintenance>(
-                            "/web-api/market/maintenance",
-                            {
-                              method: "POST",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({
-                                terminalEnabled: data.has("terminal"),
-                                upgradePolicy: {
-                                  autoUpgradeEnabled: data.has("automatic"),
-                                  delegateUpgradeToRouterOwner:
-                                    data.has("delegate"),
-                                  autoUpgradeCheckIntervalMinutes: Number(
-                                    data.get("interval"),
-                                  ),
-                                },
-                              }),
-                            },
+                            base + "/maintenance",
+                            post({
+                              terminalEnabled: data.has("terminal"),
+                              upgradePolicy: {
+                                autoUpgradeEnabled: data.has("automatic"),
+                                delegateUpgradeToRouterOwner: data.has("delegate"),
+                                autoUpgradeCheckIntervalMinutes: Number(data.get("interval")),
+                              },
+                            }),
                           );
-                          setView(
-                            (previous) =>
-                              previous && { ...previous, maintenance: saved },
-                          );
+                          setView((v) => v && { ...v, maintenance: saved });
                           if (!saved.terminalAvailable) setTerminal(false);
+                          setMessage(t("lease.done"));
                         });
                       }}
                     >
@@ -368,113 +544,58 @@ export function LeaseWorkspace({
                           type="checkbox"
                           defaultChecked={view.maintenance.terminalEnabled}
                         />{" "}
-                        {label("Enable owner terminal", "启用所有者终端")}
+                        {t("lease.enableTerminal")}
                       </label>
-                      {view.maintenance.terminalEnabled !==
-                        view.maintenance.terminalAvailable && (
-                        <p>
-                          {label(
-                            "The service environment overrides the terminal setting.",
-                            "服务环境变量已覆盖终端设置。",
-                          )}
-                        </p>
+                      {view.maintenance.terminalAvailable !== view.maintenance.terminalEnabled && (
+                        <p>{t("lease.terminalOverride")}</p>
                       )}
                       <label>
                         <input
                           name="automatic"
                           type="checkbox"
-                          defaultChecked={
-                            view.maintenance.upgradePolicy.autoUpgradeEnabled
-                          }
+                          defaultChecked={view.maintenance.upgradePolicy.autoUpgradeEnabled}
                         />{" "}
-                        {label("Enable automatic upgrades", "启用自动升级")}
+                        {t("lease.automatic")}
                       </label>
                       <label>
                         <input
                           name="delegate"
                           type="checkbox"
-                          defaultChecked={
-                            view.maintenance.upgradePolicy
-                              .delegateUpgradeToRouterOwner
-                          }
+                          defaultChecked={view.maintenance.upgradePolicy.delegateUpgradeToRouterOwner}
                         />{" "}
-                        {label(
-                          "Allow Router owner to trigger upgrades",
-                          "允许 Router 所有者触发升级",
-                        )}
+                        {t("lease.delegate")}
                       </label>
                       <label>
-                        {label(
-                          "Upgrade check interval (minutes)",
-                          "升级检查间隔（分钟）",
-                        )}{" "}
-                        <input
-                          name="interval"
+                        {t("lease.interval")}{" "}
+                        <Input
                           className="h-12"
+                          name="interval"
                           type="number"
                           required
                           min={5}
                           max={1440}
-                          defaultValue={
-                            view.maintenance.upgradePolicy
-                              .autoUpgradeCheckIntervalMinutes
-                          }
+                          defaultValue={view.maintenance.upgradePolicy.autoUpgradeCheckIntervalMinutes}
                         />
                       </label>
-                      <button disabled={busy}>
-                        {label("Save host settings", "保存主机设置")}
-                      </button>
+                      <Button className="justify-self-start" disabled={busy}>
+                        {t("lease.save")}
+                      </Button>
                     </form>
                   </details>
                 )}
-                {(
-                  [
-                    "restart_server_service",
-                    "start_admin_upgrade",
-                    "rollback_server_service",
-                  ] as const
-                ).map((cmd, i) => (
-                  <button
-                    key={cmd}
-                    disabled={busy}
-                    onClick={() =>
-                      void perform(async () => {
-                        if (
-                          window.confirm(
-                            label(
-                              "Run this maintenance action and notify the tenant?",
-                              "执行此运维操作并通知租户？",
-                            ),
-                          )
-                        )
-                          await jsonFetch(`/web-api/invoke/${cmd}`, {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: "{}",
-                          });
-                      })
-                    }
-                  >
-                    {
-                      [
-                        label("Restart", "重启"),
-                        label("Upgrade", "升级"),
-                        label("Rollback", "回滚"),
-                      ][i]
-                    }
-                  </button>
-                ))}
-              </div>
-            )}
-            {terminal && owner && (
-              <Suspense>
-                <TerminalPage bare />
-              </Suspense>
+                {terminal && view?.maintenance?.terminalAvailable && (
+                  <div className="h-[65dvh] min-h-72 overflow-hidden" aria-label={t("lease.terminal")}>
+                    <Suspense fallback={t("common.loading")}>
+                      <TerminalPage bare />
+                    </Suspense>
+                  </div>
+                )}
+              </>
             )}
           </>
         )}
       </section>
-      {role === "tenant" && children}
-    </>
+      {tenant && children}
+    </main>
   );
 }

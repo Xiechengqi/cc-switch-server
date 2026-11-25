@@ -13,7 +13,7 @@
   "currentSourceEvidence": [
     {
       "path": "src/api/mod.rs",
-      "sha256": "e5c833c5a93c1440adc3cdd75e7e7f48482793218fb640d82cb2af46991f62bb"
+      "sha256": "a682c4304f46c814f6a5896af4e9da62629c78d972a76a0d14b04ab0e9259578"
     },
     {
       "path": "src/api/providers.rs",
