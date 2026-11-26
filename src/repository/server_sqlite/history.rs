@@ -1,19 +1,26 @@
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::domain::usage::history::{UsageHistory, UsageSelection};
+use crate::domain::usage::history::{ProviderUsageStatistics, UsageHistory, UsageSelection};
 use rusqlite::{params_from_iter, types::Value as SqlValue, OptionalExtension};
 
 #[derive(Debug)]
 struct SqliteUsageHistory {
     config_dir: PathBuf,
     connection: Option<Arc<Mutex<Connection>>>,
+    retention_cutoff_ms: u128,
+    statistics: Mutex<
+        BTreeMap<(crate::domain::providers::model::AppKind, String), ProviderUsageStatistics>,
+    >,
 }
 
 pub(super) fn attach(config_dir: &Path, store: &mut UsageStore) -> anyhow::Result<()> {
     store.history = Some(Arc::new(SqliteUsageHistory {
         config_dir: config_dir.into(),
         connection: None,
+        retention_cutoff_ms: crate::infra::time::now_ms()
+            .saturating_sub(crate::domain::usage::store::USAGE_DETAIL_RETENTION_MS),
+        statistics: Mutex::new(BTreeMap::new()),
     }));
     let selection = UsageSelection {
         limit: Some(2048),
@@ -66,6 +73,9 @@ impl UsageHistory for SqliteUsageHistory {
         Ok(Arc::new(Self {
             config_dir: self.config_dir.clone(),
             connection: Some(Arc::new(Mutex::new(connection))),
+            retention_cutoff_ms: crate::infra::time::now_ms()
+                .saturating_sub(crate::domain::usage::store::USAGE_DETAIL_RETENTION_MS),
+            statistics: Mutex::new(BTreeMap::new()),
         }))
     }
     fn visit(
@@ -74,6 +84,10 @@ impl UsageHistory for SqliteUsageHistory {
         visitor: &mut dyn FnMut(&UsageLog) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         self.with_connection(|connection| {
+        let export_page = selection.after_export_sequence.is_some()
+            && selection.share_id.is_some()
+            && selection.is_health_check == Some(false)
+            && selection.data_source.as_deref() == Some("router_share");
         let mut conditions = Vec::new();
         let mut parameters = Vec::<SqlValue>::new();
         let mut add = |sql: &str, value: SqlValue| {
@@ -81,8 +95,9 @@ impl UsageHistory for SqliteUsageHistory {
             parameters.push(value);
         };
         if !selection.include_expired && !selection.pending_router_sync {
-            let cutoff = crate::infra::time::now_ms()
-                .saturating_sub(crate::domain::usage::store::USAGE_DETAIL_RETENTION_MS);
+            let cutoff = if self.connection.is_some() { self.retention_cutoff_ms } else {
+                crate::infra::time::now_ms().saturating_sub(crate::domain::usage::store::USAGE_DETAIL_RETENTION_MS)
+            };
             add(
                 "created_at_ms >= ?",
                 SqlValue::Integer(i64::try_from(cutoff)?),
@@ -99,7 +114,7 @@ impl UsageHistory for SqliteUsageHistory {
         }
         if let Some(app) = selection.app {
             add(
-                "json_extract(payload_json,'$.app') = ?",
+                "app = ?",
                 SqlValue::Text(app.as_str().into()),
             );
         }
@@ -117,31 +132,31 @@ impl UsageHistory for SqliteUsageHistory {
         }
         if let Some(health) = selection.is_health_check {
             add(
-                "coalesce(json_extract(payload_json,'$.isHealthCheck'),0) = ?",
+                "is_health_check = ?",
                 SqlValue::Integer(i64::from(health)),
             );
         }
         if let Some(source) = &selection.data_source {
             add(
-                "json_extract(payload_json,'$.dataSource') = ?",
+                "data_source = ?",
                 SqlValue::Text(source.clone()),
             );
         }
         if let Some(fingerprint) = &selection.health_fingerprint {
             add(
-                "json_extract(payload_json,'$.providerHealthFingerprint') = ?",
+                "health_fingerprint = ?",
                 SqlValue::Text(fingerprint.clone()),
             );
         }
         if let Some(model) = &selection.requested_model {
             add(
-                "json_extract(payload_json,'$.requestedModel') = ?",
+                "requested_model = ?",
                 SqlValue::Text(model.clone()),
             );
         }
         if let Some(prefix) = &selection.data_source_prefix {
             add(
-                "substr(json_extract(payload_json,'$.dataSource'),1,length(?)) = ?",
+                "substr(data_source,1,length(?)) = ?",
                 SqlValue::Text(prefix.clone()),
             );
             parameters.push(SqlValue::Text(prefix.clone()));
@@ -150,15 +165,15 @@ impl UsageHistory for SqliteUsageHistory {
             for (column, value) in [
                 ("share_id", &selection.share_id),
                 (
-                    "json_extract(payload_json,'$.dataSource')",
+                    "data_source",
                     &selection.data_source,
                 ),
                 (
-                    "json_extract(payload_json,'$.providerHealthFingerprint')",
+                    "health_fingerprint",
                     &selection.health_fingerprint,
                 ),
                 (
-                    "json_extract(payload_json,'$.requestedModel')",
+                    "requested_model",
                     &selection.requested_model,
                 ),
             ] {
@@ -168,13 +183,22 @@ impl UsageHistory for SqliteUsageHistory {
             }
         }
         if selection.pending_router_sync {
-            conditions.push("json_extract(payload_json,'$.routerLastSyncedAtMs') IS NULL AND share_id IS NOT NULL AND coalesce(json_extract(payload_json,'$.isHealthCheck'),0)=0 AND coalesce(json_extract(payload_json,'$.recordKind'),'user_inference')='user_inference' AND json_extract(payload_json,'$.dataSource')='router_share' AND ((length(request_id) BETWEEN 8 AND 80 AND substr(request_id,1,4)='req_' AND request_id NOT GLOB '*[^A-Za-z0-9_-]*') OR (length(request_id)=36 AND substr(request_id,9,1)='-' AND substr(request_id,14,1)='-' AND substr(request_id,19,1)='-' AND substr(request_id,24,1)='-' AND length(replace(request_id,'-',''))=32 AND request_id NOT GLOB '*[^0-9a-fA-F-]*'))".into());
+            conditions.push("router_last_synced_at_ms IS NULL AND share_id IS NOT NULL AND is_health_check=0 AND record_kind='user_inference' AND data_source='router_share' AND ((length(request_id) BETWEEN 8 AND 80 AND substr(request_id,1,4)='req_' AND request_id NOT GLOB '*[^A-Za-z0-9_-]*') OR (length(request_id)=36 AND substr(request_id,9,1)='-' AND substr(request_id,14,1)='-' AND substr(request_id,19,1)='-' AND substr(request_id,24,1)='-' AND length(replace(request_id,'-',''))=32 AND request_id NOT GLOB '*[^0-9a-fA-F-]*'))".into());
         }
         if let Some(now) = selection.retry_before_ms {
             conditions.push(
-                "coalesce(json_extract(payload_json,'$.routerNextSyncAttemptAtMs'),0) <= ?".into(),
+                "router_next_sync_attempt_at_ms <= ?".into(),
             );
             parameters.push(SqlValue::Integer(i64::try_from(now)?));
+        }
+        if let Some(after) = selection.after_export_sequence {
+            conditions.push("router_export_sequence > ? AND record_kind='user_inference'".into());
+            parameters.push(SqlValue::Integer(i64::try_from(after)?));
+        }
+        if export_page {
+            // Literal predicates prove the partial-index contract at prepare
+            // time, regardless of SQLite's parameter-sensitive planning.
+            conditions.push("data_source='router_share' AND is_health_check=0".into());
         }
         let predicate = if conditions.is_empty() {
             String::new()
@@ -186,13 +210,20 @@ impl UsageHistory for SqliteUsageHistory {
         } else {
             "ASC"
         };
-        let ordering = if selection.pending_router_sync {
-            "coalesce(json_extract(payload_json,'$.routerExportSequence'),0),created_at_ms,request_id".to_owned()
+        let ordering = if selection.pending_router_sync || selection.after_export_sequence.is_some() {
+            "router_export_sequence,created_at_ms,request_id".to_owned()
         } else {
             format!("created_at_ms {order},request_id {order}")
         };
+        let table = if export_page {
+            "usage_records INDEXED BY usage_share_export_idx"
+        } else if selection.pending_router_sync {
+            "usage_records INDEXED BY usage_pending_export_idx"
+        } else {
+            "usage_records"
+        };
         let mut sql = format!(
-            "SELECT payload_json,payload_sha256 FROM usage_records{predicate} ORDER BY {ordering}"
+            "SELECT payload_json,payload_sha256 FROM {table}{predicate} ORDER BY {ordering}"
         );
         if let Some(limit) = selection.limit {
             sql.push_str(" LIMIT ?");
@@ -206,6 +237,45 @@ impl UsageHistory for SqliteUsageHistory {
         }
         Ok(())
         })
+    }
+
+    fn provider_statistics(
+        &self,
+        app: crate::domain::providers::model::AppKind,
+        provider_id: &str,
+    ) -> anyhow::Result<ProviderUsageStatistics> {
+        let key = (app, provider_id.to_string());
+        if let Some(stats) = self
+            .statistics
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Usage statistics cache poisoned"))?
+            .get(&key)
+        {
+            return Ok(stats.clone());
+        }
+        let stats = self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT created_at_ms,status_code,duration_ms_text FROM usage_records INDEXED BY usage_provider_statistics_idx
+                 WHERE provider_id=?1 AND app=?2 AND is_health_check=0 AND created_at_ms>=?3")?;
+            let mut rows = statement.query(params![provider_id,app.as_str(),i64::try_from(self.retention_cutoff_ms)?])?;
+            let mut stats = ProviderUsageStatistics::default();
+            while let Some(row) = rows.next()? {
+                let created = u128::try_from(row.get::<_, i64>(0)?)?;
+                let status = u16::try_from(row.get::<_, i64>(1)?)?;
+                let latency = row.get_ref(2)?.as_str()?.parse::<u128>().context("decode Usage latency projection")?;
+                stats.observe(created, status, latency);
+            }
+            Ok(stats)
+        })?;
+        // Only transactional read views cache statistics. A live history reader
+        // can observe newer revisions and must not keep a stale aggregate.
+        if self.connection.is_some() {
+            self.statistics
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Usage statistics cache poisoned"))?
+                .insert(key, stats.clone());
+        }
+        Ok(stats)
     }
 
     fn request(&self, id: &str) -> anyhow::Result<Option<UsageLog>> {
@@ -237,7 +307,7 @@ pub(super) fn recover_interrupted(config_dir: &Path) -> anyhow::Result<()> {
         let batch = {
             let mut statement = transaction.prepare(
                 "SELECT request_id,payload_json,payload_sha256 FROM usage_records
-                 WHERE request_id>?1 AND coalesce(json_extract(payload_json,'$.recordKind'),'user_inference')='user_inference'
+                 WHERE request_id>?1 AND record_kind='user_inference'
                  AND (json_extract(payload_json,'$.usageState')='pending' OR json_extract(payload_json,'$.outcome')='pending')
                  ORDER BY request_id LIMIT 256")?;
             let rows = statement.query_map([&after], |row| {
@@ -290,7 +360,13 @@ pub(super) fn recover_interrupted(config_dir: &Path) -> anyhow::Result<()> {
 
 pub(super) fn next_export_sequence(connection: &Connection) -> anyhow::Result<u64> {
     let next: i64 = connection.query_row(
-        "SELECT coalesce(max(coalesce(json_extract(payload_json,'$.routerExportSequence'),0)),0)+1 FROM usage_records",
-        [], |row| row.get(0))?;
+        "SELECT coalesce(max(coalesce(router_export_sequence,0)),0)+1 FROM usage_records",
+        [],
+        |row| row.get(0),
+    )?;
     Ok(u64::try_from(next)?)
 }
+
+#[cfg(test)]
+#[path = "history_tests.rs"]
+mod tests;

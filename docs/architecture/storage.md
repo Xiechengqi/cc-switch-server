@@ -136,7 +136,7 @@ config → providers → accounts → usage → shares → ui_settings → sessi
 - `providers` 主键为 `(app, provider_id)`，保留 revision、credential generation 和原始 S2 密文 record；
 - `accounts` 主键为 `(provider_type, account_id)`，保留 auth identity/token refresh generation 和原始字段级密文；
 - `provider_accounts`、`shares`、`share_bindings` 使用 foreign key 校验 Provider/Account/Share 图；
-- `usage_records` 以 request id 为主键，按创建时间和 Share 建索引，payload 保留未知扩展字段；
+- `usage_records` 以 request id 为主键，按创建时间和 Share 建索引，payload 保留未知扩展字段；可兼容的 `usage_query_schema_v1` 扩展增加派生查询列及 Provider/探测身份/导出序列索引，独立 checksum 与索引在同一事务安装，基础 schema 仍为 v10，旧 v10 writer 可继续维护这些派生索引；
 - `quota_usage_entries` 按request/revision保存精简账项、唯一watermark、来源/用户/开始毫秒索引与payload SHA256；metadata digest及完整水位连续性另校验，详情replace不删除精简账；
 - v3 `value_quota_*` 保存 USD 等值额度的执行价目快照、请求预占及尝试结算；这是使用限额账本，不是平台资金；
 - v4 `market_settlement_requests/market_settlement_receipts` 保存原市场 entitlement 的完整 admission／最终消费证据和不可变撤权回执，独立于展示日志保留；`market_settlement_ack_outbox` 在网络确认与 Share 标记持久化之间提供崩溃重试。真实归档起点及升级／ACK 规则见 [Share 市场退租](../share/market-termination.md)；

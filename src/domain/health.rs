@@ -258,6 +258,7 @@ impl ProviderHealthStore {
 pub struct ProviderHealth {
     pub provider_id: String,
     pub app: AppKind,
+    pub statistics_available: bool,
     pub requests: u64,
     pub successes: u64,
     pub failures: u64,
@@ -321,6 +322,27 @@ pub fn provider_health_for_plan(
     )
 }
 
+/// Scheduling and transport recovery need committed probe evidence, not a
+/// request-history report. This path must remain free of database reads.
+pub fn provider_health_snapshot_for_plan(
+    provider: &StoredProvider,
+    usage: &UsageStore,
+    plan: Option<&ProviderRuntimePlan>,
+) -> ProviderHealth {
+    let probe_support = plan
+        .map(provider_probe_support)
+        .unwrap_or(ProviderProbeSupport::Supported);
+    let fingerprint = plan.map(ProviderRuntimePlan::health_fingerprint);
+    health_from_logs(
+        provider,
+        std::iter::empty(),
+        &usage.provider_health,
+        probe_support,
+        fingerprint.as_deref(),
+        now_ms(),
+    )
+}
+
 fn provider_health_with_runtime(
     provider: &StoredProvider,
     usage: &UsageStore,
@@ -335,42 +357,24 @@ fn provider_health_with_runtime(
         runtime_fingerprint,
         now_ms(),
     );
-    let mut latency_total = 0_u128;
-    let result = usage.visit_logs(
-        &crate::domain::usage::history::UsageSelection {
-            app: Some(provider.app),
-            provider_id: Some(provider.provider.id.clone()),
-            is_health_check: Some(false),
-            ..Default::default()
-        },
-        |log| {
-            health.requests = health.requests.saturating_add(1);
-            latency_total = latency_total.saturating_add(log.duration_ms);
-            if (200..400).contains(&log.status_code) {
-                health.successes = health.successes.saturating_add(1);
-            } else {
-                health.failures = health.failures.saturating_add(1);
-            }
-            health.last_request_at_ms = Some(
-                health
-                    .last_request_at_ms
-                    .unwrap_or_default()
-                    .max(log.created_at_ms),
-            );
-            Ok(())
-        },
-    );
-    if let Err(error) = result {
-        tracing::error!(%error,"read Provider usage history failed");
-        health.status = ProviderHealthStatus::Unknown;
-        health.available = false;
-        health.healthy = false;
-        health.reason = Some("provider usage history is unavailable".into());
+    match usage.provider_statistics(provider.app, &provider.provider.id) {
+        Ok(stats) => {
+            health.statistics_available = true;
+            health.requests = stats.requests;
+            health.successes = stats.successes;
+            health.failures = stats.failures;
+            health.last_request_at_ms = stats.last_request_at_ms;
+            health.success_rate =
+                (stats.requests > 0).then(|| stats.successes as f64 / stats.requests as f64);
+            health.avg_latency_ms =
+                (stats.requests > 0).then(|| stats.latency_total_ms as f64 / stats.requests as f64);
+        }
+        Err(error) => {
+            // Historical presentation failure cannot overwrite committed probe
+            // evidence. Quota admission has its own fail-closed durable reads.
+            tracing::error!(%error, "read Provider usage statistics failed");
+        }
     }
-    health.success_rate =
-        (health.requests > 0).then(|| health.successes as f64 / health.requests as f64);
-    health.avg_latency_ms =
-        (health.requests > 0).then(|| latency_total as f64 / health.requests as f64);
     health
 }
 
@@ -438,6 +442,7 @@ fn health_from_logs<'a>(
     ProviderHealth {
         provider_id: provider.provider.id.clone(),
         app: provider.app,
+        statistics_available: false,
         requests,
         successes,
         failures,

@@ -704,7 +704,25 @@ async fn run_tunnel_actor(
     let mut retry_cap = INITIAL_RECONNECT_BACKOFF;
     let mut rotation_id = new_rotation_id();
     let mut consecutive_lease_failures: u32 = 0;
+    let mut last_attempt_error = None;
     loop {
+        // Queue heavy Share preparation outside the network timeout. Client
+        // web recovery bypasses this queue and can reconnect immediately.
+        static SHARE_LEASE_SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let share_permit = if kind == "share-http" {
+            match SHARE_LEASE_SLOTS
+                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+                .clone()
+                .acquire_owned()
+                .await
+            {
+                Ok(permit) => Some(permit),
+                Err(_) => return,
+            }
+        } else {
+            None
+        };
         if actor_generation_is_stale(&statuses, &key, generation).await {
             tracing::debug!(
                 tunnel_key = %key,
@@ -721,6 +739,7 @@ async fn run_tunnel_actor(
                 key: key.clone(),
                 kind: kind.clone(),
                 status: "leasing".to_string(),
+                last_error: last_attempt_error.clone(),
                 generation,
                 desired_generation: generation,
                 router_generation,
@@ -748,6 +767,7 @@ async fn run_tunnel_actor(
             }
             Ok(Err(error)) => {
                 let error_message = error.to_string();
+                last_attempt_error = Some(error_message.clone());
                 recover_lease_issue_state_after_error(
                     &error_message,
                     &mut router_generation,
@@ -784,6 +804,7 @@ async fn run_tunnel_actor(
                     Some(&error),
                     None,
                 );
+                drop(share_permit);
                 sleep_with_full_jitter(retry_cap).await;
                 retry_cap = next_backoff(retry_cap);
                 continue;
@@ -793,6 +814,7 @@ async fn run_tunnel_actor(
                     "router tunnel lease request timed out after {}s",
                     LEASE_ISSUE_TIMEOUT.as_secs()
                 );
+                last_attempt_error = Some(error.clone());
                 set_status_for_generation(
                     &statuses,
                     &store_path,
@@ -803,6 +825,8 @@ async fn run_tunnel_actor(
                         last_error: Some(error.clone()),
                         generation,
                         desired_generation: generation,
+                        router_generation,
+                        router_active_generation,
                         transport_state: Some(TransportState::Candidate.as_str().to_string()),
                         start_reason: Some(reason.clone()),
                         spec_id: Some(spec_id.clone()),
@@ -821,12 +845,15 @@ async fn run_tunnel_actor(
                     None,
                     Some(LEASE_ISSUE_TIMEOUT.as_secs()),
                 );
+                drop(share_permit);
                 sleep_with_full_jitter(retry_cap).await;
                 retry_cap = next_backoff(retry_cap);
                 continue;
             }
         };
 
+        drop(share_permit);
+        last_attempt_error = None;
         set_status_for_generation(
             &statuses,
             &store_path,
@@ -947,6 +974,7 @@ async fn run_tunnel_actor(
                 break;
             }
             Err(error) => {
+                last_attempt_error = Some(error.to_string());
                 set_status_for_generation(
                     &statuses,
                     &store_path,
@@ -1560,6 +1588,7 @@ fn log_lease_issue_retry(
 
 fn lease_issue_message_requires_new_rotation(message: &str) -> bool {
     message.contains("rotationId belongs to an expired or retired lease")
+        || message.contains("lease expired before SSH connection")
         || message.contains("rotationId is already bound to different lease semantics")
         || message.contains("rotationId has already been used")
         || message.contains("generation must be newer than persisted generation")
@@ -2474,6 +2503,7 @@ mod tests {
         for message in [
             "router namespace tunnel lease failed: 409 Conflict: {\"message\":\"rotationId is already bound to different lease semantics\"}",
             "router namespace tunnel lease failed: 409 Conflict: {\"message\":\"rotationId has already been used\"}",
+            "router namespace lease expired before SSH connection",
         ] {
             let mut router_generation = 4;
             let mut router_active_generation = 3;

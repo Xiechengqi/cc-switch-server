@@ -33,4 +33,6 @@ Restart requests are executed by the detached self-update helper. The helper per
 
 If the replacement cannot start, the operation file, `<config-dir>/log/server.log`, and `<config-dir>/log/restart-helper.log` retain the helper failure. Router also retains its normal tunnel `last_seen_at`/offline lifecycle, which distinguishes a replacement that never reconnected from an HTTP stream interruption.
 
+Local readiness and Router connectivity are independent. The authenticated `GET /api/router/status` and `GET /api/router/diagnostics` responses include `connectivity`: local readiness, registration, current-process heartbeat and Client tunnel activation, recovery phase, and the last tunnel failure. A successful heartbeat with `clientTunnelOnline=false` means the Client route is still unavailable. `claimed_remote` records domain ownership; only the tunnel actor's active state confirms forwarding. These admin endpoints retain their existing session authorization and do not bypass Router login.
+
 Log API output is line-limited, masks the host log path, and redacts common credential assignments. It should still be treated as operationally sensitive.

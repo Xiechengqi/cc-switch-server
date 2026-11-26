@@ -23,6 +23,9 @@ pub(crate) struct UsageSelection {
     pub pending_router_sync: bool,
     pub retry_before_ms: Option<u128>,
     pub exact_probe_identity: bool,
+    /// Router export order is independent of request creation time. Apply this
+    /// cursor before LIMIT, including revised requests with an old timestamp.
+    pub after_export_sequence: Option<u64>,
 }
 
 impl UsageSelection {
@@ -80,6 +83,31 @@ impl UsageSelection {
                     && log.data_source == self.data_source
                     && log.provider_health_fingerprint == self.health_fingerprint
                     && log.requested_model == self.requested_model))
+            && self
+                .after_export_sequence
+                .is_none_or(|after| log.is_user_inference() && log.router_export_sequence > after)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProviderUsageStatistics {
+    pub requests: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub latency_total_ms: u128,
+    pub last_request_at_ms: Option<u128>,
+}
+
+impl ProviderUsageStatistics {
+    pub(crate) fn observe(&mut self, created_at: u128, status: u16, latency: u128) {
+        self.requests = self.requests.saturating_add(1);
+        if (200..400).contains(&status) {
+            self.successes = self.successes.saturating_add(1);
+        } else {
+            self.failures = self.failures.saturating_add(1);
+        }
+        self.latency_total_ms = self.latency_total_ms.saturating_add(latency);
+        self.last_request_at_ms = Some(self.last_request_at_ms.unwrap_or_default().max(created_at));
     }
 }
 
@@ -92,4 +120,10 @@ pub(crate) trait UsageHistory: std::fmt::Debug + Send + Sync {
     ) -> Result<()>;
 
     fn request(&self, request_id: &str) -> Result<Option<UsageLog>>;
+
+    fn provider_statistics(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+    ) -> Result<ProviderUsageStatistics>;
 }

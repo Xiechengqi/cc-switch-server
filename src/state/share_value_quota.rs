@@ -898,12 +898,22 @@ impl ServerStateInner {
         }
         let providers = self.providers.read().await.clone();
         let config = self.config_snapshot().await;
+        let router_negotiated = self.value_quota_router_negotiated().await;
+        let conversion_negotiated = self.quota_conversion_router_negotiated().await;
+        let resource_negotiated = self.resource_value_router_negotiated().await;
+        let prepared_state = self
+            .self_weak
+            .upgrade()
+            .context("Server state is no longer available")?;
+        let owned_id = share_id.to_string();
+        self.query_usage(move |usage| {
+            let share_id = owned_id.as_str();
         let now = now_ms_i64();
         let tariff = scope(&config, share_id, "preview@local.invalid").and_then(|identity| {
-            ledger::active_revision(&self.config_dir, &identity)?
+            ledger::active_revision(&prepared_state.config_dir, &identity)?
                 .context("VALUE_QUOTA_SNAPSHOT_UNAVAILABLE")
         });
-        let authority = server_sqlite::read_marker(&self.config_dir)
+        let authority = server_sqlite::read_marker(&prepared_state.config_dir)
             .ok()
             .flatten()
             .map(|marker| marker.authority);
@@ -929,8 +939,6 @@ impl ServerStateInner {
                 "driverId":plan.as_ref().map(|p|p.driver_id.as_str())})
             })
             .collect::<Vec<_>>();
-        let router_negotiated = self.value_quota_router_negotiated().await;
-        let conversion_negotiated = self.quota_conversion_router_negotiated().await;
         let mut tariff_check =
             serde_json::json!({"code":"acknowledged_tariff", "ready":tariff.is_ok()});
         // Pricing sync needs both a committed ledger and a negotiated Router,
@@ -945,14 +953,14 @@ impl ServerStateInner {
         let mut checks = vec![
             serde_json::json!({"code":"router_protocol", "ready":router_negotiated}),
             serde_json::json!({"code":"sqlite_authority", "ready":storage == "committed", "state":storage}),
-            serde_json::json!({"code":"metering_storage", "ready":!self.quota_usage_degraded.load(std::sync::atomic::Ordering::Acquire)}),
+            serde_json::json!({"code":"metering_storage", "ready":!prepared_state.quota_usage_degraded.load(std::sync::atomic::Ordering::Acquire)}),
             tariff_check,
         ];
         if surfaces.is_empty() {
             checks.push(serde_json::json!({"code":"text_surface", "ready":false}));
         }
         checks.extend(surfaces);
-        checks.extend(self.value_model_coverage(&share, &providers, &config, now)?);
+        checks.extend(prepared_state.value_model_coverage(&share, &providers, &config, now)?);
         // Build capability, not readiness: this Server can meter Router
         // Share Market seats sold with a USD-equivalent quota. Always ready,
         // so it never changes `capabilityReady`; a Router treats its absence
@@ -963,9 +971,9 @@ impl ServerStateInner {
         checks.push(serde_json::json!({"code":MARKET_TRIAL_VALUE_CHECK, "ready":true}));
         checks.push(serde_json::json!({"code":"value_usage_initialization", "ready":true}));
         checks.push(serde_json::json!({"code":"quota_unit_conversion", "ready":true}));
-        let resource_ready = self.resource_value_router_negotiated().await
+        let resource_ready = resource_negotiated
             && scope(&config, share_id, "preview@local.invalid")
-                .and_then(|identity| ledger::resource_tariff_ready(&self.config_dir, &identity))
+                .and_then(|identity| ledger::resource_tariff_ready(&prepared_state.config_dir, &identity))
                 .unwrap_or(false);
         let requests_resources = policies.values().any(|policy| {
             policy.value_quota.as_ref().is_some_and(|quota| {
@@ -1029,7 +1037,6 @@ impl ServerStateInner {
             BTreeMap<String, Option<i64>>,
             BTreeMap<String, bool>,
         ) = {
-            let usage = self.usage.read().await;
             let empty_windows = policies
                 .iter()
                 .filter(|(_, policy)| policy.value_quota.is_some())
@@ -1037,7 +1044,7 @@ impl ServerStateInner {
                     let email = email.trim().to_ascii_lowercase();
                     let new_grant = !share.user_grants.contains_key(&email);
                     let start = proven_empty_window_start(
-                        Some(&usage),
+                        Some(usage),
                         share_id,
                         &email,
                         new_grant,
@@ -1064,7 +1071,7 @@ impl ServerStateInner {
                 .collect();
             (empty_windows, no_prior_usage)
         };
-        let conversion_usage = self.usage.read().await.clone();
+        let conversion_usage = usage;
         let mut rows = Vec::new();
         let mut first_blocker: Option<&'static str> = None;
         for (email, policy) in &policies {
@@ -1088,12 +1095,12 @@ impl ServerStateInner {
                 continue;
             }
             if conversion::needed(previous, policy) {
-                let row = self.conversion_preview_row(
+                let row = prepared_state.conversion_preview_row(
                     &config,
                     &share,
                     &email,
                     policy,
-                    &conversion_usage,
+                    conversion_usage,
                     now,
                     conversion_negotiated,
                 )?;
@@ -1157,7 +1164,7 @@ impl ServerStateInner {
                 ),
             };
             let status = matches!(activation, Activation::Immediate { .. })
-                .then(|| ledger::status(&self.config_dir, &identity, &w));
+                .then(|| ledger::status(&prepared_state.config_dir, &identity, &w));
             if status
                 .as_ref()
                 .and_then(|s| s.as_ref().ok())
@@ -1173,7 +1180,7 @@ impl ServerStateInner {
             let can_initialize = previous.is_none()
                 && no_prior_usage.get(&email) == Some(&true)
                 && matches!(activation, Activation::Immediate { .. })
-                && ledger::can_initialize_usage(&self.config_dir, &identity).unwrap_or(false);
+                && ledger::can_initialize_usage(&prepared_state.config_dir, &identity).unwrap_or(false);
             rows.push(serde_json::json!({"email":email,"windowId":w.id,"windowStartsAtMs":w.starts_at_ms,"resetsAtMs":w.ends_at_ms,
                 "canInitializeUsage":can_initialize,
                 "meteredFromMs":metered_from,"effectiveFromMs":effective_from,"usedPicos":used.map(|s|s.used_picos.clone()),
@@ -1201,6 +1208,7 @@ impl ServerStateInner {
             "activePricingRevision":tariff.as_ref().ok(),"meteredFromConfirmationRequired":true,
             "softLimit":true,"maximumParallel":4,"rows":rows}),
         )
+        }).await
     }
     pub async fn router_supports_value_quotas(&self) -> bool {
         if !server_sqlite::is_committed(&self.config_dir).unwrap_or(false) {

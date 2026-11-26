@@ -1811,6 +1811,12 @@ pub async fn issue_namespace_lease(
         .await
         .context("parse router namespace tunnel lease response")?;
     validate_namespace_lease_response(&payload, &lease)?;
+    let expires_at = chrono::DateTime::parse_from_rfc3339(&lease.expires_at)
+        .context("parse namespace lease expiry")?;
+    if expires_at.timestamp_millis() <= chrono::Utc::now().timestamp_millis().saturating_add(1_000)
+    {
+        bail!("router namespace lease expired before SSH connection");
+    }
     normalize_namespace_lease_url_scheme(config, &mut lease);
     Ok(lease)
 }

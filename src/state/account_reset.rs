@@ -312,13 +312,14 @@ impl ServerStateInner {
             observation.bucket_id
         );
         let _commit = self.usage_persistence.gate.lock().await;
-        let usage = self.usage.read().await;
-        self.try_mutate_shares_in_workspace_transaction(|shares| {
+        let fence = fence.clone();
+        let observation = observation.clone();
+        self.try_mutate_shares_with_usage_in_workspace(None, move |shares, usage| {
             let Some(source) = shares
                 .quota_cycle_ledger
                 .sources
                 .get(&source_identity)
-                .filter(|source| &source.fence == fence)
+                .filter(|source| source.fence == fence)
                 .cloned()
             else {
                 return Ok::<_, &'static str>(false);
@@ -326,7 +327,7 @@ impl ServerStateInner {
             let changed =
                 shares
                     .quota_cycle_ledger
-                    .observe(&source.source_ref, fence, observation)?;
+                    .observe(&source.source_ref, &fence, &observation)?;
             if changed {
                 let ids: Vec<_> = shares
                     .quota_cycle_sources
@@ -339,7 +340,7 @@ impl ServerStateInner {
                         .project_account_reset(
                             &id,
                             &source.source_ref,
-                            &usage,
+                            usage,
                             observation.observed_at_ms,
                         )
                         .map_err(|_| "quota_projection_failed")?;
@@ -361,12 +362,13 @@ impl ServerStateInner {
         let negotiated = self.router_supports_account_reset().await;
         let _quota = self.share_quota_mutations.lock().await;
         let _commit = self.usage_persistence.gate.lock().await;
-        let usage = self.usage.read().await;
-        let shares = self.shares.read().await;
-        let share = shares.get(share_id).context("share not found")?;
+        let shares = self.shares.read().await.clone();
+        let share_id = share_id.to_string();
+        self.query_usage(move |usage| {
+        let share = shares.get(&share_id).context("share not found")?;
         let source = shares
             .quota_cycle_sources
-            .get(share_id)
+            .get(&share_id)
             .and_then(|source| shares.quota_cycle_ledger.source(source));
         let cycle = source.and_then(|source| source.cycle.as_ref());
         if share.config_revision != expected_revision {
@@ -435,11 +437,11 @@ impl ServerStateInner {
         let rows: Vec<_> = policies.into_iter().map(|(email, policy)| {
             let email = email.trim().to_ascii_lowercase();
             let current = share.user_grants.get(&email);
-            let observed = cycle.filter(|_| complete).and_then(|cycle| usage.quota_ledger.query(cycle, share_id, &email, usage.quota_ledger.watermark).ok()).map(|value| value.0);
+            let observed = cycle.filter(|_| complete).and_then(|cycle| usage.quota_ledger.query(cycle, &share_id, &email, usage.quota_ledger.watermark).ok()).map(|value| value.0);
             let baseline = current.and_then(|grant| grant.account_usage_baseline.as_ref()).filter(|baseline|
                 cycle.is_some_and(|cycle| baseline.source_ref == cycle.source_ref && baseline.cycle_id == cycle.cycle_id));
             let effective = observed.map(|observed| baseline.and_then(|baseline| cycle.and_then(|cycle|
-                usage.quota_ledger.query(cycle, share_id, &email, baseline.usage_watermark).ok())
+                usage.quota_ledger.query(cycle, &share_id, &email, baseline.usage_watermark).ok())
                 .map(|at_edit| crate::domain::usage::quota_ledger::QuotaUsageLedger::effective_with_baseline(observed, baseline.target_tokens, at_edit.0))).unwrap_or(observed));
             let locked = current.is_some_and(|grant| grant.manager == crate::domain::sharing::router_contract::ShareGrantManager::RouterShareMarket);
             json!({ "email": email, "currentTokens": current.and_then(|grant| grant.usage_quota.as_ref()).map(|quota| quota.effective_tokens_used),
@@ -456,6 +458,7 @@ impl ServerStateInner {
                 "retentionPolicy":crate::domain::usage::quota_ledger::QUOTA_USAGE_RETENTION_POLICY},
             "defaultTokenPeriod":if reason.is_none(){"accountReset"}else{"lifetime"}}),
         )
+        }).await
     }
 
     /// The caller owns both existing account consume locks. Persisting intent
@@ -613,11 +616,13 @@ impl ServerStateInner {
     ) -> anyhow::Result<()> {
         let result_json = result.map(serde_json::to_string).transpose()?;
         let now = now_ms_i64();
-        self.try_mutate_share_quota_immediate(|shares, usage, _| {
+        let operation_id = operation_id.to_string();
+        let result = result.cloned();
+        self.try_mutate_share_quota_immediate(move |shares, usage, _| {
             let ledger = &mut shares.quota_cycle_ledger;
             let operation = ledger
                 .operations
-                .get(operation_id)
+                .get(&operation_id)
                 .cloned()
                 .ok_or("reset_operation_missing")?;
             if matches!(
@@ -626,7 +631,9 @@ impl ServerStateInner {
             ) {
                 return Ok::<_, &'static str>(());
             }
-            let confirmed = result.is_some_and(|receipt| receipt.shared_weekly_confirmed);
+            let confirmed = result
+                .as_ref()
+                .is_some_and(|receipt| receipt.shared_weekly_confirmed);
             if confirmed {
                 ledger.apply_reset(
                     &operation.source_ref,
@@ -639,11 +646,12 @@ impl ServerStateInner {
             }
             let operation = ledger
                 .operations
-                .get_mut(operation_id)
+                .get_mut(&operation_id)
                 .expect("checked above");
             operation.status = if confirmed {
                 ResetCreditStatus::Confirmed
             } else if result
+                .as_ref()
                 .and_then(|receipt| receipt.code.as_deref())
                 .is_some_and(|code| {
                     matches!(
@@ -720,7 +728,7 @@ impl ServerStateInner {
             .clone();
         if status_cursor.retry_at_ms.is_none_or(|due| due <= now) {
             let fetched = public_resets::status(&http, status_cursor.etag.as_deref()).await;
-            self.try_mutate_share_quota_immediate(|shares, _, _| {
+            self.try_mutate_share_quota_immediate(move |shares, _, _| {
                 apply_public_status_result(&mut shares.quota_cycle_ledger, &fetched, now);
                 Ok::<_, &'static str>(())
             })
@@ -758,17 +766,19 @@ impl ServerStateInner {
                 .flatten();
             let fetched =
                 public_resets::history(&http, from, cursor.next_cursor.as_deref(), etag).await;
+            let fetched = Arc::new(fetched);
+            let prepared_fetch = fetched.clone();
             // A page and its cursor share one durable commit. Failure leaves
             // that exact query replayable, including after process restart.
             let result = self
-                .try_mutate_share_quota_immediate(|shares, usage, _| {
+                .try_mutate_share_quota_immediate(move |shares, usage, _| {
                     let ledger = &mut shares.quota_cycle_ledger;
                     if ledger.public_cursor.next_cursor != cursor.next_cursor
                         || ledger.public_cursor.from_at_ms != cursor.from_at_ms
                     {
                         return Err("public_cursor_conflict");
                     }
-                    match &fetched {
+                    match prepared_fetch.as_ref() {
                         Ok(Fetch::Page {
                             page,
                             etag,
@@ -875,7 +885,7 @@ impl ServerStateInner {
                 })
                 .await?;
             if let Err(reason) = result {
-                self.try_mutate_share_quota_immediate(|shares, _, _| {
+                self.try_mutate_share_quota_immediate(move |shares, _, _| {
                     let cursor = &mut shares.quota_cycle_ledger.public_cursor;
                     cursor.last_error = Some(reason.into());
                     cursor.failures = cursor.failures.saturating_add(1);
@@ -887,6 +897,9 @@ impl ServerStateInner {
                 .map_err(anyhow::Error::msg)?;
                 anyhow::bail!("{reason}");
             }
+            let fetched = Arc::try_unwrap(fetched).map_err(|_| {
+                anyhow::anyhow!("public quota history preparation is still running")
+            })?;
             match fetched {
                 Ok(Fetch::Page { page, .. }) if page.pagination.has_more => continue,
                 Err(error) => return Err(error),
@@ -1255,7 +1268,7 @@ mod tests {
                 panic!("expected page");
             };
             let result = state
-                .try_mutate_share_quota_immediate(|shares, _, _| {
+                .try_mutate_share_quota_immediate(move |shares, _, _| {
                     ingest_public_quota_page(
                         &mut shares.quota_cycle_ledger,
                         &page,

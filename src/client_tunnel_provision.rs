@@ -396,11 +396,18 @@ pub(crate) async fn claim_client_tunnel_config(
             config.client.tunnel_status.as_deref(),
             Some("claimed_remote" | "connected" | "active" | "running")
         )
-        && reconcile_remote_client_tunnel(state, &config, &intent)
-            .await
-            .unwrap_or(false)
     {
-        return Ok(config);
+        match reconcile_remote_client_tunnel(state, &config, &intent).await {
+            Ok(true) => return Ok(config),
+            Ok(false) => {}
+            Err(error) => {
+                // Unknown is not absent. Preserve the confirmed claim instead
+                // of writing another intent after a transient read failure.
+                return Err(ApiError::bad_gateway(format!(
+                    "router client tunnel reconciliation remains uncertain: {error}"
+                )));
+            }
+        }
     }
     config = state
         .begin_client_tunnel_claim(&intent)
@@ -626,7 +633,8 @@ async fn complete_client_tunnel_claim(
         .await
         .context("persist router control-plane state after client tunnel claim")
         .map_err(ApiError::internal)?;
-    state.deliver_setup_completion_after_claim().await;
+    // The control-plane worker delivers the setup notification independently
+    // of lease issuance, after the committed claim is visible.
     Ok(state.config_snapshot().await)
 }
 
@@ -658,46 +666,6 @@ pub(crate) fn subdomain_conflict_error(subdomain: &str, reason: Option<&str>) ->
             "client_tunnel_subdomain_conflict: subdomain '{subdomain}' is unavailable ({detail})"
         ),
     )
-}
-
-pub(crate) async fn reconcile_pending_client_tunnel_claim(
-    state: &ServerState,
-) -> anyhow::Result<bool> {
-    let _claim = state.lock_client_tunnel_claim().await;
-    let config = state.config_snapshot().await;
-    let Some(intent) = config.client.claim_pending.clone() else {
-        return Ok(false);
-    };
-    if !intent.matches_config(&config) {
-        anyhow::bail!("pending client tunnel claim no longer matches current configuration");
-    }
-    match reconcile_remote_client_tunnel(state, &config, &intent).await {
-        Ok(true) => {
-            state.commit_client_tunnel_claim_success(&intent).await?;
-            state
-                .complete_router_registration_control_plane("client_tunnel_claim_reconcile")
-                .await?;
-            state.deliver_setup_completion_after_claim().await;
-            Ok(true)
-        }
-        Ok(false) => {
-            commit_claim_failure(
-                state,
-                &intent,
-                false,
-                "pending client tunnel claim was not found on the router".to_string(),
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!(error.message))?;
-            Ok(false)
-        }
-        Err(error) => {
-            state
-                .retain_client_tunnel_claim_pending(&intent, error.to_string())
-                .await?;
-            Err(error)
-        }
-    }
 }
 
 pub(crate) fn derive_client_tunnel_claim_status(
@@ -953,6 +921,101 @@ mod tests {
         server.abort();
         drop(state);
         std::fs::remove_dir_all(config_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirmed_claim_survives_uncertain_remote_status_without_reclaim() {
+        let claims = Arc::new(AtomicUsize::new(0));
+        let counted = claims.clone();
+        let app = Router::new()
+            .route(
+                "/v1/installations/client-tunnel",
+                get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable") }),
+            )
+            .route(
+                "/v1/installations/client-tunnel/claim",
+                post(move || {
+                    let claims = counted.clone();
+                    async move {
+                        claims.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"ok":true}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state("uncertain-confirmed-claim");
+        let dir = state.config_dir.clone();
+        let intent = configure_claim_state(
+            &state,
+            format!("http://{addr}"),
+            "inst-uncertain",
+            "confirmed",
+        )
+        .await;
+        state.begin_client_tunnel_claim(&intent).await.unwrap();
+        state
+            .commit_client_tunnel_claim_success(&intent)
+            .await
+            .unwrap();
+        assert!(claim_client_tunnel_config(&state).await.is_err());
+        let config = state.config_snapshot().await;
+        assert_eq!(
+            config.client.tunnel_status.as_deref(),
+            Some("claimed_remote")
+        );
+        assert!(config.client.claim_pending.is_none());
+        assert_eq!(claims.load(Ordering::SeqCst), 0);
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn registration_completion_and_lease_commit_do_not_claim_connectivity() {
+        let state = test_state("registration-without-share-network");
+        let dir = state.config_dir.clone();
+        let intent = configure_claim_state(
+            &state,
+            "http://127.0.0.1:1".into(),
+            "inst-local-registration",
+            "localclaim",
+        )
+        .await;
+        state.begin_client_tunnel_claim(&intent).await.unwrap();
+        state
+            .commit_client_tunnel_claim_success(&intent)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            state.complete_router_registration_control_plane("test"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        state
+            .commit_client_tunnel_lease(&intent, "127.0.0.1:2222".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .config_snapshot()
+                .await
+                .client
+                .tunnel_status
+                .as_deref(),
+            Some("claimed_remote")
+        );
+        assert!(state
+            .tunnels
+            .status(&crate::clients::router::tunnel::client_tunnel_key())
+            .await
+            .is_none());
+        assert!(ShareStore::load_or_default(&dir).unwrap().router_registered);
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -1260,9 +1323,7 @@ mod tests {
         )
         .await;
         explicit.begin_client_tunnel_claim(&intent).await.unwrap();
-        assert!(reconcile_pending_client_tunnel_claim(&explicit)
-            .await
-            .unwrap());
+        claim_client_tunnel_config(&explicit).await.unwrap();
         assert!(explicit
             .config_snapshot()
             .await
@@ -1281,6 +1342,9 @@ mod tests {
             "pending-reconcile",
         )
         .await;
+        let mut configured = before_restart.config_snapshot().await;
+        configured.auth.password_hash = Some("configured".into());
+        before_restart.replace_config(configured).await.unwrap();
         before_restart
             .begin_client_tunnel_claim(&intent)
             .await
@@ -1289,6 +1353,23 @@ mod tests {
 
         let restarted = test_state_at(restart_dir.clone());
         crate::state::restore_tunnels(restarted.clone()).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if restarted
+                    .config_snapshot()
+                    .await
+                    .client
+                    .claim_pending
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        crate::state::stop_client_tunnel(&restarted).await;
         let config = restarted.config_snapshot().await;
         assert!(config.client.claim_pending.is_none());
         assert_eq!(

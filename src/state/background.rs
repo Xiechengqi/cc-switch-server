@@ -682,6 +682,7 @@ fn audit_upload_recovered(audit: &SharedAuditLog, last_failure: &mut Option<Stri
 
 pub fn spawn_installation_heartbeat(state: ServerState) {
     tokio::spawn(async move {
+        refresh_router_installation_registration(&state).await;
         let mut consecutive_failures = 0_u32;
         let mut last_failure_warning = None;
         let mut unregistered_retry_secs = ROUTER_HEARTBEAT_UNREGISTERED_RETRY_SECS;
@@ -1051,6 +1052,20 @@ pub fn spawn_value_quota_sweeper(state: ServerState) {
 pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
     let config = state.config_snapshot().await;
     if !config.has_registered_router_identity() {
+        return;
+    }
+    if state
+        .router_registration_reconcile_pending
+        .swap(false, std::sync::atomic::Ordering::AcqRel)
+    {
+        if let Err(error) = reconcile_all_shares_to_router(state.clone()).await {
+            state
+                .router_registration_reconcile_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+            tracing::warn!(%error, "background Router registration reconciliation remains pending");
+        }
+        retry_pending_router_share_deletes(state.clone()).await;
+        state.retry_pending_setup_completion_notification().await;
         return;
     }
     // Startup/reader capability upgrades must backfill already-acknowledged Shares too.

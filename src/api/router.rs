@@ -236,13 +236,14 @@ pub(in crate::api) async fn router_status(
     headers: HeaderMap,
 ) -> Result<Json<RouterStatusResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let shares = state.shares.read().await;
+    let shares = state.shares.read().await.clone();
     Ok(Json(RouterStatusResponse {
         ok: true,
         registered: shares.router_registered,
         last_error: shares.last_router_error.clone(),
         last_heartbeat_ms: shares.last_router_heartbeat_ms,
         pending_request_log_sync: crate::state::pending_router_log_count(&state).await,
+        connectivity: router_connectivity(&state).await,
     }))
 }
 
@@ -252,7 +253,7 @@ pub(in crate::api) async fn router_diagnostics(
 ) -> Result<Json<RouterDiagnosticsResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let config = state.config.read().await.clone();
-    let shares = state.shares.read().await;
+    let shares = state.shares.read().await.clone();
     let share_sync = shares
         .shares
         .iter()
@@ -278,6 +279,7 @@ pub(in crate::api) async fn router_diagnostics(
         pending_request_log_sync: crate::state::pending_router_log_count(&state).await,
         tunnels: state.tunnels.statuses().await,
         share_sync,
+        connectivity: router_connectivity(&state).await,
     }))
 }
 
@@ -391,6 +393,54 @@ pub(in crate::api) async fn sync_share_upsert(
 
 pub(in crate::api) fn spawn_share_delete_sync(state: ServerState, tombstone: ShareDeleteTombstone) {
     crate::state::spawn_router_share_delete_retry(state, tombstone);
+}
+
+async fn router_connectivity(state: &ServerState) -> RouterConnectivityView {
+    let config = state.config_snapshot().await;
+    let started_at_ms = now_ms().saturating_sub(state.started_at.elapsed().as_millis());
+    let heartbeat = state.shares.read().await.last_router_heartbeat_ms;
+    let heartbeat_online =
+        heartbeat.is_some_and(|at| at >= started_at_ms && now_ms().saturating_sub(at) <= 150_000);
+    let runtime = state
+        .tunnels
+        .status(&crate::clients::router::tunnel::client_tunnel_key())
+        .await;
+    let current = runtime
+        .as_ref()
+        .filter(|status| status.updated_at_ms >= started_at_ms);
+    let tunnel_online = current.is_some_and(|status| {
+        status.status == "connected" && status.transport_state.as_deref() == Some("active")
+    });
+    let registered = config.has_registered_router_identity();
+    let stopped = config.client.tunnel_status.as_deref() == Some("stopped")
+        || runtime
+            .as_ref()
+            .is_some_and(|status| status.status == "stopped");
+    let phase = if !config.is_local_setup_complete() {
+        "setup_required"
+    } else if stopped {
+        "stopped"
+    } else if !registered {
+        "registering"
+    } else if !tunnel_online {
+        "reconnecting"
+    } else if !heartbeat_online {
+        "heartbeat_delayed"
+    } else {
+        "online"
+    };
+    RouterConnectivityView {
+        local_ready: !state.is_shutting_down()
+            && !state.credential_persistence_degraded()
+            && !state.quota_usage_is_degraded(),
+        registered,
+        heartbeat_online,
+        client_tunnel_online: tunnel_online,
+        phase: phase.into(),
+        tunnel_status: current.map(|status| status.status.clone()),
+        tunnel_updated_at_ms: current.map(|status| status.updated_at_ms),
+        last_tunnel_error: current.and_then(|status| status.last_error.clone()),
+    }
 }
 
 async fn client_tunnel_response(

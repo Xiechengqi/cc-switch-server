@@ -127,6 +127,34 @@ assert(
   history.includes("BEGIN DEFERRED") && state.includes("acquire_owned"),
   "bounded Usage caching, query snapshot, or cancellation-safe concurrency is missing",
 );
+const querySchema = read("src/repository/server_sqlite/usage_query_schema.sql");
+for (const index of ["usage_provider_statistics_idx", "usage_probe_identity_idx", "usage_share_export_idx", "usage_pending_export_idx"]) {
+  assert(querySchema.includes(`CREATE INDEX ${index}`), `missing bounded query index: ${index}`);
+}
+assert(
+  schema.includes("usage_query_schema_v1") && schema.includes("Usage query extension checksum mismatch") &&
+  !querySchema.includes("PRAGMA user_version") && !querySchema.includes("DROP TABLE"),
+  "query projections must install atomically without changing the v10 authority format",
+);
+assert(
+  history.includes("router_export_sequence > ?") && history.includes("selection.after_export_sequence") &&
+  history.includes("LIMIT ?") && history.includes("INDEXED BY usage_provider_statistics_idx") &&
+  history.includes("INDEXED BY usage_share_export_idx") && history.includes("INDEXED BY usage_pending_export_idx"),
+  "export cursors must precede LIMIT and Provider statistics must use the covering projection",
+);
+const health = read("src/domain/health.rs");
+const snapshotStart = health.indexOf("pub fn provider_health_snapshot_for_plan(");
+const snapshotEnd = health.indexOf("fn provider_health_with_runtime(", snapshotStart);
+assert(snapshotStart >= 0 && !/visit_logs|select_logs|provider_statistics/.test(health.slice(snapshotStart, snapshotEnd)),
+  "transport/scheduling health must not read request history");
+const registrationStart = state.indexOf("pub async fn complete_router_registration_control_plane(");
+const registrationEnd = state.indexOf("async fn register_router_installation_locked(", registrationStart);
+assert(!/reconcile_all_shares_to_router\(|retry_pending_router_share_deletes\(/.test(state.slice(registrationStart, registrationEnd)),
+  "Client registration completion must not wait for full Share reconciliation");
+assert(usageStore.includes("pub(crate) fn read_snapshot(") &&
+  usageStore.includes("provider_health: self.provider_health.clone()") &&
+  usageStore.includes("quota_ledger: self.quota_ledger.clone()"),
+  "durable read views must preserve health and quota metadata");
 const quotaLedger = read("src/domain/usage/quota_ledger.rs");
 const validateLogStart = quotaLedger.indexOf("pub fn validate_log(");
 const validateLogEnd = quotaLedger.indexOf("pub fn record(", validateLogStart);

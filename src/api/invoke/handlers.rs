@@ -8,8 +8,8 @@ use crate::domain::providers::runtime::authoritative_managed_account;
 use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK_REDIRECT_URI};
 use crate::domain::sharing::retired_fields::find_retired_share_field;
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, GrokMediaPolicy, ShareSettingsPatch,
-    ShareTotalUsageEdit, ShareUserGrant, ShareUserUsageEdit, ShareUserUsageEditAction,
+    GrokMediaPolicy, ShareSettingsPatch, ShareTotalUsageEdit, ShareUserGrant, ShareUserUsageEdit,
+    ShareUserUsageEditAction,
 };
 
 #[cfg(test)]
@@ -29,7 +29,8 @@ pub(in crate::api) async fn web_provider_health_json(
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
     let plan = providers.runtime_plan(app, provider_id);
     let usage = state.usage.read().await;
-    let health = crate::domain::health::provider_health_for_plan(provider, &usage, plan.as_deref());
+    let health =
+        crate::domain::health::provider_health_snapshot_for_plan(provider, &usage, plan.as_deref());
     Ok(web_provider_health_value(&health))
 }
 
@@ -46,7 +47,7 @@ pub(in crate::api) async fn web_provider_health_list_json(
             .filter(|provider| provider.app == app)
             .map(|provider| {
                 let plan = providers.runtime_plan(app, &provider.provider.id);
-                let health = crate::domain::health::provider_health_for_plan(
+                let health = crate::domain::health::provider_health_snapshot_for_plan(
                     provider,
                     &usage,
                     plan.as_deref(),
@@ -99,6 +100,7 @@ mod provider_health_response_tests {
         ProviderHealth {
             provider_id: "p1".to_string(),
             app: AppKind::Codex,
+            statistics_available: false,
             requests: 0,
             successes: 0,
             failures: 0,
@@ -1808,12 +1810,10 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
 
     let mut remote_subdomain_claimed = false;
     if subdomain_changed && previous.is_some() && config.has_registered_router_identity() {
-        let mut descriptor = descriptor_for_share_with_accounts_and_usage(
-            &staged_share,
-            &providers,
-            Some(&accounts),
-            Some(&usage),
-        );
+        let mut descriptor = state
+            .describe_share(&staged_share, &providers, &accounts)
+            .await
+            .map_err(ApiError::internal)?;
         state
             .project_router_provider_identity(&mut descriptor)
             .await;
@@ -1859,11 +1859,12 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
         }
     });
     let has_value_initializations = value_initializations.is_some();
+    let staged_share_id = staged_share.id.clone();
     let saved = match state
-        .try_mutate_share_quota_with_value_initializations(value_initializations, |store, current_usage, applied_at_ms| {
+        .try_mutate_share_quota_with_value_initializations(value_initializations, move |store, current_usage, applied_at_ms| {
             if let Some((operation_id, fingerprint)) = &initialization_operation {
                 if let Some(receipt) = store.applied_settings_operations.get(operation_id) {
-                    return fingerprint.replay(&receipt.patch_fingerprint, store.get(&staged_share.id), command.grok_media_policy);
+                    return fingerprint.replay(&receipt.patch_fingerprint, store.get(&staged_share_id), command.grok_media_policy);
                 }
             }
             let current = store.clone();
@@ -2117,13 +2118,10 @@ pub(in crate::api) async fn web_save_provider_share(
         if config.has_registered_router_identity() {
             let providers = state.providers.read().await.clone();
             let accounts = state.accounts.read().await.clone();
-            let usage = state.usage.read().await.clone();
-            let mut descriptor = descriptor_for_share_with_accounts_and_usage(
-                &candidate,
-                &providers,
-                Some(&accounts),
-                Some(&usage),
-            );
+            let mut descriptor = state
+                .describe_share(&candidate, &providers, &accounts)
+                .await
+                .map_err(ApiError::internal)?;
             state
                 .project_router_provider_identity(&mut descriptor)
                 .await;
@@ -2150,8 +2148,10 @@ pub(in crate::api) async fn web_save_provider_share(
         }
     }
 
+    let mutation_share_id = share_id.clone();
     let saved = match state
-        .try_mutate_share_quota_immediate(|store, usage, applied_at_ms| {
+        .try_mutate_share_quota_immediate(move |store, usage, applied_at_ms| {
+            let share_id = mutation_share_id;
             let current = store
                 .get(&share_id)
                 .ok_or_else(|| ApiError::not_found("share not found"))?;

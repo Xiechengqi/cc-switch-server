@@ -1,6 +1,5 @@
 use super::*;
 
-use crate::domain::sharing::router_contract::descriptor_for_share_with_accounts_and_usage;
 use std::collections::BTreeMap;
 
 #[derive(Deserialize)]
@@ -117,7 +116,7 @@ pub(in crate::api) async fn import_shares(
         .len();
     input.shares = imported_store.shares;
     let imported = state
-        .try_mutate_share_quota_immediate(|store, usage, now| {
+        .try_mutate_share_quota_immediate(move |store, usage, now| {
             let mut candidate = store.clone();
             let mut expected = BTreeMap::new();
             for share in &mut input.shares {
@@ -280,7 +279,7 @@ pub(in crate::api) async fn upsert_share(
         _ => {}
     }
     let share = state
-        .try_mutate_share_quota_immediate(|store, usage, now| {
+        .try_mutate_share_quota_immediate(move |store, usage, now| {
             let current = input
                 .id
                 .as_deref()
@@ -661,10 +660,9 @@ pub(in crate::api) async fn update_share_binding(
 ) -> Result<Json<UpsertShareResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let reference_guard = state.lock_reference_mutations().await;
-    let (providers, accounts, usage, app, current_bindings) = {
+    let (providers, accounts, app, current_bindings) = {
         let providers = state.providers.read().await;
         let accounts = state.accounts.read().await;
-        let usage = state.usage.read().await;
         let shares = state.shares.read().await;
         let share = shares
             .get(&id)
@@ -678,7 +676,6 @@ pub(in crate::api) async fn update_share_binding(
         (
             providers.clone(),
             accounts.clone(),
-            usage.clone(),
             share.app,
             share.bindings.clone(),
         )
@@ -710,7 +707,7 @@ pub(in crate::api) async fn update_share_binding(
         .await
         .ok_or_else(share_in_flight_error)?;
     let share = state
-        .try_mutate_shares_immediate(|store| {
+        .try_mutate_shares_with_usage(move |store, usage| {
             let current = store
                 .get(&id)
                 .ok_or_else(|| ApiError::not_found("share not found"))?;
@@ -759,7 +756,7 @@ pub(in crate::api) async fn update_share_binding(
                 &provider_keys,
                 &providers,
                 Some(&accounts),
-                &usage,
+                usage,
             );
             crate::domain::sharing::subscription_identity::validate_subscription_reference_graph_transition(
                 &providers,
@@ -816,7 +813,6 @@ pub(in crate::api) async fn update_share_subdomain(
     let config = state.config.read().await.clone();
     let providers = state.providers.read().await.clone();
     let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
     let current = state
         .shares
         .read()
@@ -840,12 +836,10 @@ pub(in crate::api) async fn update_share_subdomain(
     let expected_config_revision = current.config_revision;
     let mut candidate = current.clone();
     candidate.tunnel_subdomain = Some(subdomain.clone());
-    let mut descriptor = descriptor_for_share_with_accounts_and_usage(
-        &candidate,
-        &providers,
-        Some(&accounts),
-        Some(&usage),
-    );
+    let mut descriptor = state
+        .describe_share(&candidate, &providers, &accounts)
+        .await
+        .map_err(ApiError::internal)?;
     let mut remote_claimed = false;
     state
         .project_router_provider_identity(&mut descriptor)
@@ -1107,12 +1101,12 @@ pub(in crate::api) async fn refresh_share_snapshots(
     require_session(&state, &headers).await?;
     let providers = state.providers.read().await.clone();
     let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
     let shares = state
-        .mutate_shares_debounced(|store| {
-            store.refresh_runtime_snapshots(&providers, Some(&accounts), &usage)
+        .mutate_shares_with_usage(move |store, usage| {
+            store.refresh_runtime_snapshots(&providers, Some(&accounts), usage)
         })
-        .await;
+        .await
+        .map_err(ApiError::internal)?;
     state.emit_event(ServerEvent::new("share.changed", "share").message("runtime_snapshot"));
     Ok(Json(ListSharesResponse { ok: true, shares }))
 }

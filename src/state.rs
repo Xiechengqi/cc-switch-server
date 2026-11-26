@@ -526,9 +526,16 @@ struct PreparedProviderIdentityChange {
     stored: StoredProvider,
 }
 
+struct ShareCommitContext {
+    value_config: ServerConfig,
+    value_capable: bool,
+    value_providers: ProviderStore,
+    account_reset_capable: bool,
+}
+
 #[derive(Debug, Default)]
 struct StorePersistenceCoordinator {
-    gate: AsyncMutex<()>,
+    gate: Arc<AsyncMutex<()>>,
     revision: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     delay_next_persist_ms: std::sync::atomic::AtomicU64,
@@ -1038,6 +1045,7 @@ enum AccountShareMetadataRefresh {
 
 #[derive(Debug)]
 pub struct ServerStateInner {
+    self_weak: Weak<ServerStateInner>,
     pub market_workspace: crate::market_lease::Workspace,
     pub bind_addr: SocketAddr,
     pub config_dir: PathBuf,
@@ -1162,6 +1170,7 @@ pub struct ServerStateInner {
     periodic_backup_wakeup: Notify,
     setup_completion_notification_flight: AsyncMutex<()>,
     router_share_prune_retry_pending: std::sync::atomic::AtomicBool,
+    router_registration_reconcile_pending: std::sync::atomic::AtomicBool,
     // Low bit marks degraded persistence; upper bits form a monotonic failure generation.
     credential_persistence_state: std::sync::atomic::AtomicU64,
     credential_persistence_retry_scheduled: std::sync::atomic::AtomicBool,
@@ -7492,7 +7501,10 @@ impl ServerStateInner {
         );
 
         share_value_quota::remove_legacy_degraded_marker(&config_dir);
-        Ok(Arc::new(Self {
+        let web_session_http_client =
+            build_web_session_http_client().context("build Web Session HTTP client")?;
+        Ok(Arc::new_cyclic(|weak| Self {
+            self_weak: weak.clone(),
             bind_addr,
             config_dir,
             _data_directory_lock: data_directory_lock,
@@ -7579,9 +7591,7 @@ impl ServerStateInner {
             web_session_runtime: RwLock::new(
                 crate::proxy::web_session_runtime::WebSessionRuntime::default(),
             ),
-            web_session_http_client: RwLock::new(
-                build_web_session_http_client().context("build Web Session HTTP client")?,
-            ),
+            web_session_http_client: RwLock::new(web_session_http_client),
             cursor_api_key_verifier,
             managed_account_refreshes: ManagedAccountRefreshCoordinator::default(),
             account_refresh_locks: AccountRefreshLocks::default(),
@@ -7616,6 +7626,7 @@ impl ServerStateInner {
             periodic_backup_wakeup: Notify::new(),
             setup_completion_notification_flight: AsyncMutex::new(()),
             router_share_prune_retry_pending: std::sync::atomic::AtomicBool::new(false),
+            router_registration_reconcile_pending: std::sync::atomic::AtomicBool::new(false),
             credential_persistence_state: std::sync::atomic::AtomicU64::new(0),
             credential_persistence_retry_scheduled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -7908,14 +7919,14 @@ impl ServerStateInner {
 
         let providers = self.providers.read().await.clone();
         let accounts = self.accounts.read().await.clone();
-        let usage = self.usage.read().await.clone();
+        let projection_keys = provider_keys.clone();
         let refreshed_share_ids = self
-            .mutate_shares_immediate(|shares| {
+            .mutate_shares_with_usage(move |shares, usage| {
                 shares.reconcile_runtime_snapshots_for_providers(
-                    &provider_keys,
+                    &projection_keys,
                     &providers,
                     Some(&accounts),
-                    &usage,
+                    usage,
                 )
             })
             .await?;
@@ -8210,7 +8221,9 @@ impl ServerStateInner {
             if !intent.matches_config(config) {
                 anyhow::bail!("client tunnel configuration changed before lease commit");
             }
-            config.client.tunnel_status = Some("connected".to_string());
+            // A lease is permission to connect; the actor reports actual
+            // connectivity only after SSH forwarding and Router activation.
+            config.client.tunnel_status = Some("claimed_remote".to_string());
             config.router.ssh_host = Some(ssh_host);
             Ok(config.clone())
         })
@@ -8244,15 +8257,6 @@ impl ServerStateInner {
 
     pub(crate) async fn lock_setup(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.setup_flight.lock().await
-    }
-
-    pub(crate) async fn deliver_setup_completion_after_claim(&self) {
-        if let Err(error) = self.deliver_setup_completion_notification(true).await {
-            tracing::warn!(
-                error = %error,
-                "persist setup-completed notification state after client claim failed"
-            );
-        }
     }
 
     pub(crate) async fn retry_pending_setup_completion_notification(&self) {
@@ -8496,15 +8500,21 @@ impl ServerStateInner {
         self: &Arc<Self>,
         source: &'static str,
     ) -> anyhow::Result<()> {
-        self.mutate_shares_immediate(|shares| {
+        {
+            // Registration changes runtime metadata only. Persist it without
+            // evaluating quota-policy transitions or historical projections.
+            let _commit = self.shares_persistence.gate.lock().await;
+            let mut shares = self.shares.read().await.clone();
             shares.router_registered = true;
             shares.last_router_error = None;
-        })
-        .await?;
-        if let Err(error) = reconcile_all_shares_to_router(self.clone()).await {
-            tracing::warn!(%error, source, "router share reconcile after registration failed");
+            persist_state_snapshot(&self.config_dir, shares.clone()).await?;
+            *self.shares.write().await = shares;
+            self.shares_persistence.mark_published();
         }
-        retry_pending_router_share_deletes(self.clone()).await;
+        self.router_registration_reconcile_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.router_share_sync_wakeup.notify_one();
+        tracing::debug!(source, "queued Router Share reconciliation");
         Ok(())
     }
 
@@ -9760,7 +9770,7 @@ impl ServerStateInner {
         ollama_cloud_share_projection(account.as_ref(), usage.as_ref())
     }
 
-    fn apply_ollama_cloud_share_projections(
+    pub(crate) fn apply_ollama_cloud_share_projections(
         &self,
         descriptor: &mut ShareDescriptor,
         share: &Share,
@@ -9806,26 +9816,6 @@ impl ServerStateInner {
                 }
             }
         }
-    }
-
-    /// Builds the descriptor fields returned by the Router's periodic runtime refresh.
-    /// The Router replaces its stored app runtimes/providers with this response, so
-    /// memory-only display projections must be applied on every refresh.
-    pub(crate) fn share_router_runtime_descriptor(
-        &self,
-        share: &Share,
-        providers: &ProviderStore,
-        accounts: &AccountStore,
-        usage: &UsageStore,
-    ) -> ShareDescriptor {
-        let mut descriptor = descriptor_for_share_with_accounts_and_usage(
-            share,
-            providers,
-            Some(accounts),
-            Some(usage),
-        );
-        self.apply_ollama_cloud_share_projections(&mut descriptor, share, providers);
-        descriptor
     }
 
     async fn ollama_cloud_share_ids_for_cache_key(
@@ -11810,12 +11800,21 @@ impl ServerStateInner {
         let _commit = self.shares_persistence.gate.lock().await;
         let mut candidate = self.shares.read().await.clone();
         let capacity_ids = candidate.apply_capacity_pool_ids(capacity_pool_updates);
-        let runtime_ids = candidate.reconcile_runtime_snapshots_for_providers(
-            runtime_provider_keys,
-            providers,
-            Some(accounts),
-            usage,
-        );
+        let runtime_provider_keys = runtime_provider_keys.clone();
+        let providers = providers.clone();
+        let accounts = accounts.clone();
+        let (candidate_next, runtime_ids) =
+            Self::query_usage_snapshot(usage.read_snapshot(), move |usage| {
+                let runtime_ids = candidate.reconcile_runtime_snapshots_for_providers(
+                    &runtime_provider_keys,
+                    &providers,
+                    Some(&accounts),
+                    usage,
+                );
+                Ok((candidate, runtime_ids))
+            })
+            .await?;
+        let candidate = candidate_next;
         if capacity_ids.is_empty() && runtime_ids.is_empty() {
             return Ok((capacity_ids, runtime_ids));
         }
@@ -13302,12 +13301,19 @@ impl ServerStateInner {
             current_share.clone()
         };
         if !provider_keys.is_empty() {
-            candidate_shares.refresh_runtime_snapshots_for_providers(
-                &provider_keys,
-                &candidate_providers,
-                Some(&candidate_accounts),
-                &usage,
-            );
+            let keys = provider_keys.clone();
+            let projection_providers = candidate_providers.clone();
+            let projection_accounts = candidate_accounts.clone();
+            candidate_shares = Self::query_usage_snapshot(usage.read_snapshot(), move |usage| {
+                candidate_shares.refresh_runtime_snapshots_for_providers(
+                    &keys,
+                    &projection_providers,
+                    Some(&projection_accounts),
+                    usage,
+                );
+                Ok(candidate_shares)
+            })
+            .await?;
         }
         if let Err(error) = validate_subscription_reference_graph_transition(
             &providers,
@@ -13617,29 +13623,28 @@ impl ServerStateInner {
 
         let providers = self.providers.read().await.clone();
         let accounts = self.accounts.read().await.clone();
-        let usage = self.usage.read().await.clone();
         let share_ids = self
-            .mutate_shares_immediate(|shares| match mode {
+            .mutate_shares_with_usage(move |shares, usage| match mode {
                 AccountShareMetadataRefresh::SubscriptionExpiry => shares
                     .refresh_subscription_expiry_snapshots_for_providers(
                         &provider_keys,
                         &providers,
                         Some(&accounts),
-                        &usage,
+                        usage,
                     ),
                 AccountShareMetadataRefresh::Runtime => shares
                     .refresh_runtime_snapshots_for_providers(
                         &provider_keys,
                         &providers,
                         Some(&accounts),
-                        &usage,
+                        usage,
                     ),
                 AccountShareMetadataRefresh::QuotaPresentation => shares
                     .refresh_quota_presentation_snapshots_for_providers(
                         &provider_keys,
                         &providers,
                         Some(&accounts),
-                        &usage,
+                        usage,
                     ),
             })
             .await?;
@@ -13746,34 +13751,63 @@ impl ServerStateInner {
     }
 
     pub(crate) async fn query_usage<T: Send + 'static>(
-        self: &Arc<Self>,
+        &self,
+        query: impl FnOnce(&UsageStore) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let snapshot = self.usage.read().await.read_snapshot();
+        Self::query_usage_snapshot(snapshot, query).await
+    }
+
+    pub(crate) async fn query_usage_snapshot<T: Send + 'static>(
+        mut snapshot: UsageStore,
         query: impl FnOnce(&UsageStore) -> anyhow::Result<T> + Send + 'static,
     ) -> anyhow::Result<T> {
         static QUERY_SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
             std::sync::OnceLock::new();
+        let queued = Instant::now();
         let permit = QUERY_SLOTS
             .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
             .clone()
             .acquire_owned()
             .await
             .context("Usage query slots closed")?;
-        let history = self.usage.read().await.history.clone();
-        let state = self.clone();
+        let queue_ms = queued.elapsed().as_millis();
         tokio::task::spawn_blocking(move || {
+            // Cancellation must not release capacity while SQLite is running.
             let _permit = permit;
-            if let Some(history) = history {
-                let snapshot = UsageStore {
-                    history: Some(history.snapshot()?),
-                    ..Default::default()
-                };
-                query(&snapshot)
-            } else {
-                let usage = state.usage.blocking_read();
-                query(&usage)
+            let started = Instant::now();
+            if let Some(history) = &snapshot.history {
+                snapshot.history = Some(history.snapshot()?);
             }
+            let result = query(&snapshot);
+            let elapsed_ms = started.elapsed().as_millis();
+            if queue_ms > 1_000 || elapsed_ms > 1_000 {
+                tracing::warn!(queue_ms, elapsed_ms, "slow durable Usage query");
+            }
+            result
         })
         .await
         .context("Usage query task panicked")?
+    }
+
+    pub(crate) async fn describe_share(
+        &self,
+        share: &Share,
+        providers: &ProviderStore,
+        accounts: &AccountStore,
+    ) -> anyhow::Result<ShareDescriptor> {
+        let share = share.clone();
+        let providers = providers.clone();
+        let accounts = accounts.clone();
+        self.query_usage(move |usage| {
+            Ok(descriptor_for_share_with_accounts_and_usage(
+                &share,
+                &providers,
+                Some(&accounts),
+                Some(usage),
+            ))
+        })
+        .await
     }
 
     pub async fn usage_snapshot(&self) -> UsageStore {
@@ -13895,7 +13929,9 @@ impl ServerStateInner {
         let _commit = self.usage_persistence.gate.lock().await;
         #[cfg(test)]
         self.usage_persistence.apply_test_persist_delay().await;
-        let append = self.usage.read().await.prepare_append(log)?;
+        let append = self
+            .query_usage(move |usage| usage.prepare_append(log))
+            .await?;
         self.commit_usage_append(append).await?;
         Ok(())
     }
@@ -14060,36 +14096,41 @@ impl ServerStateInner {
         let _workspace = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Health Usage commit")?;
         let _commit = self.usage_persistence.gate.lock().await;
-        let append = {
-            let usage = self.usage.read().await;
-            let latest = usage
-                .select_logs(&crate::domain::usage::history::UsageSelection {
-                    app: Some(log.app),
-                    provider_id: Some(log.provider_id.clone()),
-                    share_id: log.share_id.clone(),
-                    is_health_check: Some(true),
-                    data_source: log.data_source.clone(),
-                    health_fingerprint: log.provider_health_fingerprint.clone(),
-                    requested_model: log.requested_model.clone(),
-                    exact_probe_identity: true,
-                    limit: Some(1),
-                    ..Default::default()
-                })?
-                .into_iter()
-                .find(|existing| {
-                    existing.share_id == log.share_id
-                        && existing.data_source == log.data_source
-                        && existing.provider_health_fingerprint == log.provider_health_fingerprint
-                        && existing.requested_model == log.requested_model
-                });
-            if let Some(existing) = latest {
-                if log.created_at_ms.saturating_sub(existing.created_at_ms) < min_interval_ms {
-                    return Ok(existing);
+        let prepared = self
+            .query_usage(move |usage| {
+                let latest = usage
+                    .select_logs(&crate::domain::usage::history::UsageSelection {
+                        app: Some(log.app),
+                        provider_id: Some(log.provider_id.clone()),
+                        share_id: log.share_id.clone(),
+                        is_health_check: Some(true),
+                        data_source: log.data_source.clone(),
+                        health_fingerprint: log.provider_health_fingerprint.clone(),
+                        requested_model: log.requested_model.clone(),
+                        exact_probe_identity: true,
+                        limit: Some(1),
+                        ..Default::default()
+                    })?
+                    .into_iter()
+                    .find(|existing| {
+                        existing.share_id == log.share_id
+                            && existing.data_source == log.data_source
+                            && existing.provider_health_fingerprint
+                                == log.provider_health_fingerprint
+                            && existing.requested_model == log.requested_model
+                    });
+                if let Some(existing) = latest {
+                    if log.created_at_ms.saturating_sub(existing.created_at_ms) < min_interval_ms {
+                        return Ok(Err(existing));
+                    }
                 }
-            }
-            usage.prepare_append(log)?
-        };
-        self.commit_usage_append(append).await
+                Ok(Ok(usage.prepare_append(log)?))
+            })
+            .await?;
+        match prepared {
+            Ok(append) => self.commit_usage_append(append).await,
+            Err(existing) => Ok(existing),
+        }
     }
 
     pub async fn update_usage_log(
@@ -14100,14 +14141,17 @@ impl ServerStateInner {
         let _workspace = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Usage update")?;
         let _commit = self.usage_persistence.gate.lock().await;
-        let append = {
-            let usage = self.usage.read().await;
-            let Some(mut updated) = usage.find_request(request_id)? else {
-                return Ok(None);
-            };
-            update(&mut updated);
-            usage.prepare_append(updated)?
+        let id = request_id.to_string();
+        let Some(mut updated) = self
+            .query_usage(move |usage| usage.find_request(&id))
+            .await?
+        else {
+            return Ok(None);
         };
+        update(&mut updated);
+        let append = self
+            .query_usage(move |usage| usage.prepare_append(updated))
+            .await?;
         self.commit_usage_append(append).await.map(Some)
     }
 
@@ -14119,16 +14163,19 @@ impl ServerStateInner {
         let _workspace = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Usage conditional update")?;
         let _commit = self.usage_persistence.gate.lock().await;
-        let append = {
-            let usage = self.usage.read().await;
-            let Some(mut updated) = usage.find_request(request_id)? else {
-                return Ok(false);
-            };
-            if !update(&mut updated) {
-                return Ok(false);
-            }
-            usage.prepare_append(updated)?
+        let id = request_id.to_string();
+        let Some(mut updated) = self
+            .query_usage(move |usage| usage.find_request(&id))
+            .await?
+        else {
+            return Ok(false);
         };
+        if !update(&mut updated) {
+            return Ok(false);
+        }
+        let append = self
+            .query_usage(move |usage| usage.prepare_append(updated))
+            .await?;
         self.commit_usage_append(append).await?;
         Ok(true)
     }
@@ -19786,16 +19833,55 @@ impl ServerStateInner {
         initializations: Option<share_value_quota::ValueUsageInitializationRequest>,
         usage_context: Option<&UsageStore>,
     ) -> anyhow::Result<Result<R, E>> {
-        let value_usage_changed = initializations.is_some();
-        let value_config = self.config_snapshot().await;
-        let value_capable = self.router_supports_value_quotas().await;
-        let value_providers = self.providers.read().await.clone();
-        let account_reset_capable = self.router_supports_account_reset().await;
-        let _commit = self.shares_persistence.gate.lock().await;
+        let context = self.share_commit_context().await;
+        let commit = Arc::new(self.shares_persistence.gate.clone().lock_owned().await);
         let mut candidate = self.shares.read().await.clone();
-        let value_previous = candidate.clone();
-        let previous_quota_revision = candidate.quota_cycle_ledger.revision;
-        let previous_account_policies: BTreeMap<_, _> = candidate
+        let previous = candidate.clone();
+        let result = match mutate(&mut candidate) {
+            Ok(result) => result,
+            Err(error) => return Ok(Err(error)),
+        };
+        self.commit_share_candidate(
+            candidate,
+            previous,
+            context,
+            initializations,
+            usage_context,
+            commit,
+        )
+        .await?;
+        Ok(Ok(result))
+    }
+
+    async fn share_commit_context(&self) -> ShareCommitContext {
+        ShareCommitContext {
+            value_config: self.config_snapshot().await,
+            value_capable: self.router_supports_value_quotas().await,
+            value_providers: self.providers.read().await.clone(),
+            account_reset_capable: self.router_supports_account_reset().await,
+        }
+    }
+
+    /// The caller holds the Share commit gate. Validation and persistence stay
+    /// identical for ordinary writers and prepared history-dependent writers.
+    async fn commit_share_candidate(
+        &self,
+        mut candidate: ShareStore,
+        value_previous: ShareStore,
+        context: ShareCommitContext,
+        initializations: Option<share_value_quota::ValueUsageInitializationRequest>,
+        usage_context: Option<&UsageStore>,
+        commit: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> anyhow::Result<()> {
+        let ShareCommitContext {
+            value_config,
+            value_capable,
+            value_providers,
+            account_reset_capable,
+        } = context;
+        let value_usage_changed = initializations.is_some();
+        let previous_quota_revision = value_previous.quota_cycle_ledger.revision;
+        let previous_account_policies: BTreeMap<_, _> = value_previous
             .shares
             .iter()
             .flat_map(|share| {
@@ -19806,10 +19892,6 @@ impl ServerStateInner {
                     .map(|(email, grant)| ((share.id.clone(), email.clone()), grant.policy.clone()))
             })
             .collect();
-        let result = match mutate(&mut candidate) {
-            Ok(result) => result,
-            Err(error) => return Ok(Err(error)),
-        };
         self.validate_capability_transition(
             &value_previous,
             &candidate,
@@ -19841,47 +19923,68 @@ impl ServerStateInner {
             None
         };
         let value_usage = usage_context.or(value_usage_guard.as_deref());
-        let prepared_conversions = initializations
-            .as_ref()
-            .map(|request| {
-                self.prepare_unit_conversions(
-                    request,
-                    &value_previous,
-                    &mut candidate,
-                    &value_config,
-                    value_usage,
-                    now_ms_i64(),
-                )
-            })
-            .transpose()?
+        let usage_available = value_usage.is_some();
+        let snapshot = value_usage
+            .map(UsageStore::read_snapshot)
             .unwrap_or_default();
-        let converted = prepared_conversions
-            .iter()
-            .map(|c| (c.scope.share_id.clone(), c.scope.email.clone()))
-            .collect();
-        self.prepare_value_bindings_with_context(
-            &mut candidate,
-            &value_previous,
-            now_ms_i64(),
-            &value_config,
-            value_capable,
-            &value_providers,
-            value_usage,
-            &converted,
-        )?;
-        let prepared_initializations = initializations
-            .as_ref()
-            .map(|request| {
-                request.prepare(
-                    &value_previous,
-                    &candidate,
-                    &value_config,
-                    value_usage,
-                    now_ms_i64(),
-                )
-            })
-            .transpose()?;
         drop(value_usage_guard);
+        let state = self
+            .self_weak
+            .upgrade()
+            .context("Server state is no longer available")?;
+        let prepared_config = value_config.clone();
+        let prepared_providers = value_providers;
+        let initialization_request = initializations.clone();
+        let preparation_commit = commit.clone();
+        let (candidate_next, prepared_conversions, prepared_initializations) =
+            Self::query_usage_snapshot(snapshot, move |usage| {
+                let _commit = preparation_commit;
+                let value_usage = usage_available.then_some(usage);
+                let initializations = initialization_request;
+                let prepared_conversions = initializations
+                    .as_ref()
+                    .map(|request| {
+                        state.prepare_unit_conversions(
+                            request,
+                            &value_previous,
+                            &mut candidate,
+                            &prepared_config,
+                            value_usage,
+                            now_ms_i64(),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let converted = prepared_conversions
+                    .iter()
+                    .map(|c| (c.scope.share_id.clone(), c.scope.email.clone()))
+                    .collect();
+                state.prepare_value_bindings_with_context(
+                    &mut candidate,
+                    &value_previous,
+                    now_ms_i64(),
+                    &prepared_config,
+                    value_capable,
+                    &prepared_providers,
+                    value_usage,
+                    &converted,
+                )?;
+                let prepared_initializations = initializations
+                    .as_ref()
+                    .map(|request| {
+                        request.prepare(
+                            &value_previous,
+                            &candidate,
+                            &prepared_config,
+                            value_usage,
+                            now_ms_i64(),
+                        )
+                    })
+                    .transpose()?;
+                Ok((candidate, prepared_conversions, prepared_initializations))
+            })
+            .await?;
+        candidate = candidate_next;
         #[cfg(test)]
         self.shares_persistence.apply_test_persist_delay().await;
         if let Some(request) = initializations {
@@ -19920,7 +20023,59 @@ impl ServerStateInner {
         if quota_changed || value_usage_changed {
             self.router_share_sync_wakeup.notify_one();
         }
+        Ok(())
+    }
+
+    pub(crate) async fn try_mutate_shares_with_usage<R: Send + 'static, E: Send + 'static>(
+        &self,
+        mutate: impl FnOnce(&mut ShareStore, &UsageStore) -> Result<R, E> + Send + 'static,
+    ) -> anyhow::Result<Result<R, E>> {
+        let _workspace = self.codex_workspace_rebind_transactions.lock().await;
+        self.recover_pending_codex_workspace_rebind_transaction("Shares history commit")?;
+        self.try_mutate_shares_with_usage_in_workspace(None, mutate)
+            .await
+    }
+
+    async fn try_mutate_shares_with_usage_in_workspace<R: Send + 'static, E: Send + 'static>(
+        &self,
+        initializations: Option<ValueUsageInitializationRequest>,
+        mutate: impl FnOnce(&mut ShareStore, &UsageStore) -> Result<R, E> + Send + 'static,
+    ) -> anyhow::Result<Result<R, E>> {
+        let context = self.share_commit_context().await;
+        let usage = self.usage.read().await.read_snapshot();
+        let commit = Arc::new(self.shares_persistence.gate.clone().lock_owned().await);
+        let mut candidate = self.shares.read().await.clone();
+        let previous = candidate.clone();
+        let (candidate, result) = Self::query_usage_snapshot(usage.read_snapshot(), move |usage| {
+            let result = mutate(&mut candidate, usage);
+            Ok((candidate, result))
+        })
+        .await?;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => return Ok(Err(error)),
+        };
+        self.commit_share_candidate(
+            candidate,
+            previous,
+            context,
+            initializations,
+            Some(&usage),
+            commit,
+        )
+        .await?;
         Ok(Ok(result))
+    }
+
+    pub(crate) async fn mutate_shares_with_usage<R: Send + 'static>(
+        &self,
+        mutate: impl FnOnce(&mut ShareStore, &UsageStore) -> R + Send + 'static,
+    ) -> anyhow::Result<R> {
+        self.try_mutate_shares_with_usage(move |shares, usage| {
+            Ok::<_, std::convert::Infallible>(mutate(shares, usage))
+        })
+        .await?
+        .map_err(|never| match never {})
     }
 
     pub(crate) fn quota_usage_is_degraded(&self) -> bool {
@@ -20093,8 +20248,8 @@ impl ServerStateInner {
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Quota refresh")?;
         let _quota = self.share_quota_mutations.lock().await;
-        let providers = self.providers.read().await;
-        let accounts = self.accounts.read().await;
+        let providers = self.providers.read().await.clone();
+        let accounts = self.accounts.read().await.clone();
         let _usage_commit = self.usage_persistence.gate.lock().await;
         let share = self.shares.read().await.get(share_id).cloned();
         let Some(share) = share else {
@@ -20189,19 +20344,18 @@ impl ServerStateInner {
             .coverage_from_ms
             .contains_key(&source_ref)
         {
-            let _usage_commit = self.usage_persistence.gate.lock().await;
             let mut usage = self.usage.read().await.clone();
             usage.quota_ledger.begin_collection(&source_ref, now);
             persist_state_snapshot(&self.config_dir, usage.clone()).await?;
             *self.usage.write().await = usage;
             self.usage_persistence.mark_published();
         }
-        let usage = self.usage.read().await;
         let durable_change = ledger.revision != before
             || previous_source.as_deref() != Some(&source_ref)
             || previous_fence.as_ref() != Some(&resolved.fence);
+        let share_id = share_id.to_string();
         if durable_change {
-            self.try_mutate_shares_in_workspace_transaction(|shares| {
+            self.try_mutate_shares_with_usage_in_workspace(None, move |shares, usage| {
                 shares.quota_cycle_ledger = ledger;
                 shares
                     .quota_cycle_sources
@@ -20212,16 +20366,22 @@ impl ServerStateInner {
                         share.config_revision = share.config_revision.saturating_add(1);
                     }
                 }
-                shares.project_account_reset(share_id, &source_ref, &usage, now)
+                shares.project_account_reset(&share_id, &source_ref, usage, now)
             })
             .await?
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         } else {
-            self.mutate_shares(|shares| {
-                shares.project_account_reset(share_id, &source_ref, &usage, now)
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let _commit = self.shares_persistence.gate.lock().await;
+            let mut candidate = self.shares.read().await.clone();
+            let candidate = self
+                .query_usage(move |usage| {
+                    candidate
+                        .project_account_reset(&share_id, &source_ref, usage, now)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    Ok(candidate)
+                })
+                .await?;
+            *self.shares.write().await = candidate;
         }
         Ok(())
     }
@@ -20336,45 +20496,48 @@ impl ServerStateInner {
             })
             .clone();
         let _commit = self.usage_persistence.gate.lock().await;
-        let append = {
-            let usage = self.usage.read().await;
-            if let Some(existing) = usage.find_request(&request_id)? {
-                anyhow::ensure!(
-                    existing.share_id == context.share_id
-                        && existing.user_email.as_deref().is_some_and(|email| context
-                            .user_email
-                            .as_deref()
-                            .is_some_and(|candidate| email.eq_ignore_ascii_case(candidate))),
-                    "quota_request_identity_changed"
-                );
-                context
-                    .quota_attribution
-                    .clone_from(&existing.quota_attribution);
-                context.started_at_ms = Some(existing.started_at_ms);
-                return Ok(());
-            }
-            let provider_type = match app {
-                AppKind::Claude => ProviderType::Claude,
-                AppKind::Codex => ProviderType::Codex,
-                AppKind::Gemini => ProviderType::Gemini,
-            };
-            let mut pending = UsageLog::new(
-                app,
-                "pending-route".into(),
-                "Pending route".into(),
-                provider_type,
-                0,
-                0,
-                UsageModelMetadata::default(),
-                TokenUsage::default(),
+        let lookup_id = request_id.clone();
+        if let Some(existing) = self
+            .query_usage(move |usage| usage.find_request(&lookup_id))
+            .await?
+        {
+            anyhow::ensure!(
+                existing.share_id == context.share_id
+                    && existing.user_email.as_deref().is_some_and(|email| context
+                        .user_email
+                        .as_deref()
+                        .is_some_and(|candidate| email.eq_ignore_ascii_case(candidate))),
+                "quota_request_identity_changed"
             );
-            let mut pending_context = context.clone();
-            pending_context.usage_state = Some(UsageState::Pending);
-            pending_context.outcome = Some(UsageOutcome::Pending);
-            pending_context.failure_kind = Some("quota_admission".into());
-            pending.apply_context(pending_context);
-            usage.prepare_append(pending)?
+            context
+                .quota_attribution
+                .clone_from(&existing.quota_attribution);
+            context.started_at_ms = Some(existing.started_at_ms);
+            return Ok(());
+        }
+        let provider_type = match app {
+            AppKind::Claude => ProviderType::Claude,
+            AppKind::Codex => ProviderType::Codex,
+            AppKind::Gemini => ProviderType::Gemini,
         };
+        let mut pending = UsageLog::new(
+            app,
+            "pending-route".into(),
+            "Pending route".into(),
+            provider_type,
+            0,
+            0,
+            UsageModelMetadata::default(),
+            TokenUsage::default(),
+        );
+        let mut pending_context = context.clone();
+        pending_context.usage_state = Some(UsageState::Pending);
+        pending_context.outcome = Some(UsageOutcome::Pending);
+        pending_context.failure_kind = Some("quota_admission".into());
+        pending.apply_context(pending_context);
+        let append = self
+            .query_usage(move |usage| usage.prepare_append(pending))
+            .await?;
         if let Err(error) = self.commit_usage_append(append).await {
             self.mark_quota_usage_degraded();
             return Err(error);
@@ -20530,12 +20693,13 @@ impl ServerStateInner {
         }
         let patch = self.prepare_capability_patch(share_id, patch).await?;
         let Some(support) = patch.support.clone() else {
+            let owned_share_id = share_id.to_string();
             return self
                 .try_mutate_share_quota_with_value_initializations(
                     value_initializations,
-                    |shares, usage, applied_at_ms| {
+                    move |shares, usage, applied_at_ms| {
                         shares.apply_settings_patch_with_usage(
-                            share_id,
+                            &owned_share_id,
                             patch,
                             usage,
                             applied_at_ms,
@@ -20551,12 +20715,13 @@ impl ServerStateInner {
         };
         let providers = self.providers.read().await.clone();
         let Some(bundle_id) = share_bundle_id(&providers, &share) else {
+            let owned_share_id = share_id.to_string();
             return self
                 .try_mutate_share_quota_with_value_initializations(
                     value_initializations,
-                    |shares, usage, applied_at_ms| {
+                    move |shares, usage, applied_at_ms| {
                         shares.apply_settings_patch_with_usage(
-                            share_id,
+                            &owned_share_id,
                             patch,
                             usage,
                             applied_at_ms,
@@ -20579,12 +20744,13 @@ impl ServerStateInner {
             .cloned()
             .collect::<Vec<_>>();
         if family_surfaces.is_empty() {
+            let owned_share_id = share_id.to_string();
             return self
                 .try_mutate_share_quota_with_value_initializations(
                     value_initializations,
-                    |shares, usage, applied_at_ms| {
+                    move |shares, usage, applied_at_ms| {
                         shares.apply_settings_patch_with_usage(
-                            share_id,
+                            &owned_share_id,
                             patch,
                             usage,
                             applied_at_ms,
@@ -20629,11 +20795,12 @@ impl ServerStateInner {
             }
         };
 
+        let owned_share_id = share_id.to_string();
         self.try_mutate_share_quota_with_value_initializations(
             value_initializations,
             move |shares, usage, applied_at_ms| {
                 shares.apply_settings_patch_with_bindings_and_usage(
-                    share_id,
+                    &owned_share_id,
                     patch,
                     &missing_bindings,
                     usage,
@@ -20644,30 +20811,30 @@ impl ServerStateInner {
         .await
     }
 
-    pub async fn try_mutate_share_quota_immediate<R, E>(
+    pub async fn try_mutate_share_quota_immediate<R: Send + 'static, E: Send + 'static>(
         &self,
-        mutate: impl FnOnce(&mut ShareStore, &UsageStore, i64) -> Result<R, E>,
+        mutate: impl FnOnce(&mut ShareStore, &UsageStore, i64) -> Result<R, E> + Send + 'static,
     ) -> anyhow::Result<Result<R, E>> {
         self.try_mutate_share_quota_with_value_initializations(None, mutate)
             .await
     }
 
-    pub(crate) async fn try_mutate_share_quota_with_value_initializations<R, E>(
+    pub(crate) async fn try_mutate_share_quota_with_value_initializations<
+        R: Send + 'static,
+        E: Send + 'static,
+    >(
         &self,
         initializations: Option<ValueUsageInitializationRequest>,
-        mutate: impl FnOnce(&mut ShareStore, &UsageStore, i64) -> Result<R, E>,
+        mutate: impl FnOnce(&mut ShareStore, &UsageStore, i64) -> Result<R, E> + Send + 'static,
     ) -> anyhow::Result<Result<R, E>> {
         let _workspace_transaction = self.codex_workspace_rebind_transactions.lock().await;
         self.recover_pending_codex_workspace_rebind_transaction("Quota commit")?;
         let _quota_mutation = self.share_quota_mutations.lock().await;
         let _usage_commit = self.usage_persistence.gate.lock().await;
-        let usage = self.usage.read().await;
         let applied_at_ms = crate::infra::time::now_ms() as i64;
-        self.try_mutate_shares_with_value_initializations(
-            |shares| mutate(shares, &usage, applied_at_ms),
-            initializations,
-            Some(&usage),
-        )
+        self.try_mutate_shares_with_usage_in_workspace(initializations, move |shares, usage| {
+            mutate(shares, usage, applied_at_ms)
+        })
         .await
     }
 
@@ -20678,16 +20845,29 @@ impl ServerStateInner {
         tokens: u64,
         recorded_at_ms: i64,
     ) {
+        let _workspace = self.codex_workspace_rebind_transactions.lock().await;
         let _quota_mutation = self.share_quota_mutations.lock().await;
-        let usage = self.usage.read().await;
-        self.mutate_shares_debounced(|shares| {
-            shares.record_user_invocation_result(share_id, user_email, tokens, recorded_at_ms);
-            if let Err(error) = shares.rebuild_user_anchored_usage(share_id, &usage, recorded_at_ms)
-            {
-                tracing::error!(%error, share_id, "rebuild anchored Share quota usage failed");
-            }
-        })
-        .await;
+        let share_id = share_id.to_string();
+        let user_email = user_email.map(str::to_string);
+        let result = self
+            .try_mutate_shares_with_usage_in_workspace(None, move |shares, usage| {
+                shares.record_user_invocation_result(
+                    &share_id,
+                    user_email.as_deref(),
+                    tokens,
+                    recorded_at_ms,
+                );
+                if let Err(error) =
+                    shares.rebuild_user_anchored_usage(&share_id, usage, recorded_at_ms)
+                {
+                    tracing::error!(%error, share_id, "rebuild anchored Share quota usage failed");
+                }
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .await;
+        if let Err(error) = result {
+            tracing::error!(%error, "persist Share invocation result failed");
+        }
         self.router_share_sync_wakeup.notify_one();
     }
 
@@ -20701,16 +20881,29 @@ impl ServerStateInner {
         if tokens == 0 {
             return;
         }
+        let _workspace = self.codex_workspace_rebind_transactions.lock().await;
         let _quota_mutation = self.share_quota_mutations.lock().await;
-        let usage = self.usage.read().await;
-        self.mutate_shares_debounced(|shares| {
-            shares.record_user_supplemental_usage(share_id, user_email, tokens, recorded_at_ms);
-            if let Err(error) = shares.rebuild_user_anchored_usage(share_id, &usage, recorded_at_ms)
-            {
-                tracing::error!(%error, share_id, "rebuild anchored Share quota usage failed");
-            }
-        })
-        .await;
+        let share_id = share_id.to_string();
+        let user_email = user_email.map(str::to_string);
+        let result = self
+            .try_mutate_shares_with_usage_in_workspace(None, move |shares, usage| {
+                shares.record_user_supplemental_usage(
+                    &share_id,
+                    user_email.as_deref(),
+                    tokens,
+                    recorded_at_ms,
+                );
+                if let Err(error) =
+                    shares.rebuild_user_anchored_usage(&share_id, usage, recorded_at_ms)
+                {
+                    tracing::error!(%error, share_id, "rebuild anchored Share quota usage failed");
+                }
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .await;
+        if let Err(error) = result {
+            tracing::error!(%error, "persist supplemental Share usage failed");
+        }
         self.router_share_sync_wakeup.notify_one();
     }
 
@@ -21408,43 +21601,30 @@ pub fn enable_fresh_install_sqlite_authority() {
 
 pub async fn restore_tunnels(state: ServerState) {
     if let Err(error) = resume_client_subdomain_adoption(state.clone()).await {
-        tracing::error!(error = %error, "resume Client subdomain adoption failed");
+        tracing::error!(%error, "resume Client subdomain adoption failed");
     }
-    let registration_completed = refresh_router_installation_registration(&state).await;
-
-    if state.config.read().await.client.claim_pending.is_some() {
-        if let Err(error) =
-            crate::client_tunnel_provision::reconcile_pending_client_tunnel_claim(&state).await
-        {
-            tracing::warn!(error = %error, "startup client tunnel claim reconciliation remains pending");
-        }
-    }
-
-    let restore_config = state.config_snapshot().await;
+    let config = state.config_snapshot().await;
     if should_restore_client_tunnel(
-        &restore_config,
+        &config,
         state
             .tunnels
             .status(&tunnel::client_tunnel_key())
             .await
             .as_ref(),
     ) {
+        // The actor reconciles registration/claim itself. Neither full Share
+        // sync nor setup notifications belong before Client connectivity.
         ensure_client_tunnel_running(state.clone(), "startup_restore").await;
     }
-
+    state.installation_heartbeat_wakeup.notify_one();
     let auto_start_share_ids = share_tunnel_restore_ids(&state.shares.read().await.shares);
     for share_id in auto_start_share_ids {
         ensure_share_tunnel_running_for(state.clone(), &share_id, "startup_restore").await;
     }
-
-    state.retry_pending_setup_completion_notification().await;
-
-    if !registration_completed {
-        if let Err(error) = reconcile_all_shares_to_router(state.clone()).await {
-            tracing::warn!(error = %error, "fallback router share reconcile failed");
-        }
-    }
-    retry_pending_router_share_deletes(state).await;
+    state
+        .router_registration_reconcile_pending
+        .store(true, std::sync::atomic::Ordering::Release);
+    state.router_share_sync_wakeup.notify_one();
 }
 
 async fn resume_client_subdomain_adoption(state: ServerState) -> anyhow::Result<()> {
@@ -22286,7 +22466,6 @@ pub(crate) async fn authoritative_share_descriptor(
         let config = state.config_snapshot().await;
         let providers = state.providers.read().await.clone();
         let accounts = state.accounts.read().await.clone();
-        let usage = state.usage.read().await.clone();
         let share = state
             .shares
             .read()
@@ -22295,12 +22474,7 @@ pub(crate) async fn authoritative_share_descriptor(
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("share not found"))?;
         let expected_config_revision = share.config_revision;
-        let descriptor = descriptor_for_share_with_accounts_and_usage(
-            &share,
-            &providers,
-            Some(&accounts),
-            Some(&usage),
-        );
+        let descriptor = state.describe_share(&share, &providers, &accounts).await?;
         let mut descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
         descriptor.termination_archive_since_ms = if state.router_supports_share_termination().await
         {
@@ -23616,7 +23790,6 @@ fn build_router_share_upsert_ops_with_policy<'a>(
         }
         let providers = state.providers.read().await.clone();
         let accounts = state.accounts.read().await.clone();
-        let usage = state.usage.read().await.clone();
         let config = state.config_snapshot().await;
         let account_reset_supported = state.router_supports_account_reset().await;
         let market_trial_supported = state.router_supports_market_trials().await;
@@ -23700,46 +23873,64 @@ fn build_router_share_upsert_ops_with_policy<'a>(
                 })
                 .await?;
         }
-        let prepared = shares
-            .iter()
-            .filter(|share| !unsupported.contains_key(&share.id))
-            .map(|share| {
-                let descriptor = descriptor_for_share_with_accounts_and_usage(
-                    share,
-                    &providers,
-                    Some(&accounts),
-                    Some(&usage),
-                );
-                let mut descriptor = client::canonicalize_share_descriptor(&config, descriptor)?;
-                // Publish the durable archive on normal sync too, not only
-                // on explicit authoritative reads. Omit it for old Routers.
-                descriptor.termination_archive_since_ms = termination_archive_since_ms;
-                project_provider_identity_capability(&mut descriptor, provider_identity_supported);
-                project_buddy_quota_capability(&mut descriptor, buddy_quota_supported);
-                let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
-                // v8 read-only capabilities also describe ordinary users, so
-                // a ready source can offer an explicit migration. These
-                // dynamic fields do not enter the static fingerprint.
-                apply_account_reset_descriptor_projection(
-                    &mut descriptor,
-                    share,
-                    account_reset_supported,
-                );
-                if market_trial_supported {
-                    descriptor.contract_version = descriptor.contract_version.max(
+        let selected = shares.clone();
+        let descriptor_state = state.clone();
+        let descriptor_config = config.clone();
+        let prepared = state
+            .query_usage(move |usage| {
+                let shares = selected;
+                let state = descriptor_state;
+                let config = descriptor_config;
+                shares
+                    .iter()
+                    .filter(|share| !unsupported.contains_key(&share.id))
+                    .map(|share| {
+                        let descriptor = descriptor_for_share_with_accounts_and_usage(
+                            share,
+                            &providers,
+                            Some(&accounts),
+                            Some(usage),
+                        );
+                        let mut descriptor =
+                            client::canonicalize_share_descriptor(&config, descriptor)?;
+                        // Publish the durable archive on normal sync too, not only
+                        // on explicit authoritative reads. Omit it for old Routers.
+                        descriptor.termination_archive_since_ms = termination_archive_since_ms;
+                        project_provider_identity_capability(
+                            &mut descriptor,
+                            provider_identity_supported,
+                        );
+                        project_buddy_quota_capability(&mut descriptor, buddy_quota_supported);
+                        let fingerprint = static_descriptor_fingerprint(&descriptor, &providers)?;
+                        // v8 read-only capabilities also describe ordinary users, so
+                        // a ready source can offer an explicit migration. These
+                        // dynamic fields do not enter the static fingerprint.
+                        apply_account_reset_descriptor_projection(
+                            &mut descriptor,
+                            share,
+                            account_reset_supported,
+                        );
+                        if market_trial_supported {
+                            descriptor.contract_version = descriptor.contract_version.max(
                         crate::domain::sharing::router_contract::MARKET_TRIAL_CONTRACT_VERSION,
                     );
-                }
-                apply_value_descriptor_projection(
-                    &mut descriptor,
-                    value_supported,
-                    resources_supported,
-                    unpriced_policy_supported,
-                )?;
-                state.apply_ollama_cloud_share_projections(&mut descriptor, share, &providers);
-                Ok((share.id.clone(), descriptor, fingerprint))
+                        }
+                        apply_value_descriptor_projection(
+                            &mut descriptor,
+                            value_supported,
+                            resources_supported,
+                            unpriced_policy_supported,
+                        )?;
+                        state.apply_ollama_cloud_share_projections(
+                            &mut descriptor,
+                            share,
+                            &providers,
+                        );
+                        Ok((share.id.clone(), descriptor, fingerprint))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .await?;
 
         let needs_prepare = prepared.iter().any(|(share_id, _, fingerprint)| {
             shares
@@ -24479,7 +24670,6 @@ async fn issue_share_tunnel_lease(
     }
     let providers = state.providers.read().await.clone();
     let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
     let share = state
         .shares
         .read()
@@ -24492,12 +24682,7 @@ async fn issue_share_tunnel_lease(
     if !share.enabled || share.status != "active" {
         anyhow::bail!("share is not active");
     }
-    let descriptor = descriptor_for_share_with_accounts_and_usage(
-        &share,
-        &providers,
-        Some(&accounts),
-        Some(&usage),
-    );
+    let descriptor = state.describe_share(&share, &providers, &accounts).await?;
     let mut descriptor = descriptor;
     state
         .project_router_provider_identity(&mut descriptor)
@@ -29191,7 +29376,6 @@ mod tests {
 
         let providers = state.providers.read().await.clone();
         let accounts = state.accounts.read().await.clone();
-        let usage = state.usage.read().await.clone();
         let mut share = share("ollama-share", false, true, "active");
         share.provider_id = "legacy-provider-id".to_string();
         share.provider_type = ProviderType::OllamaCloud;
@@ -29238,8 +29422,11 @@ mod tests {
             Some("owner@example.com")
         );
 
-        let descriptor =
-            state.share_router_runtime_descriptor(&share, &providers, &accounts, &usage);
+        let mut descriptor = state
+            .describe_share(&share, &providers, &accounts)
+            .await
+            .unwrap();
+        state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
 
         let runtime = descriptor.app_runtimes.codex.as_ref().unwrap();
         let quota = runtime.quota.as_ref().unwrap();

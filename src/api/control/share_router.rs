@@ -41,37 +41,19 @@ pub(crate) async fn share_router_request_logs(
     let selected_share = share_id.clone();
     let (matching, has_more) = state
         .query_usage(move |usage| {
-            let mut selected = std::collections::BTreeMap::new();
-            usage.visit_logs(
-                &crate::domain::usage::history::UsageSelection {
+            let mut selected =
+                usage.select_logs(&crate::domain::usage::history::UsageSelection {
                     share_id: Some(selected_share),
                     is_health_check: Some(false),
                     data_source: Some("router_share".into()),
                     include_expired: true,
+                    after_export_sequence: Some(after_sequence),
+                    limit: Some(limit.saturating_add(1)),
                     ..Default::default()
-                },
-                |log| {
-                    if log.is_user_inference() && log.router_export_sequence > after_sequence {
-                        let key = (log.router_export_sequence, log.request_id.clone());
-                        if selected.len() <= limit
-                            || selected
-                                .last_key_value()
-                                .is_some_and(|(last, _)| &key < last)
-                        {
-                            selected.insert(key, log.clone());
-                            if selected.len() > limit.saturating_add(1) {
-                                selected.pop_last();
-                            }
-                        }
-                    }
-                    Ok(())
-                },
-            )?;
+                })?;
             let has_more = selected.len() > limit;
-            Ok((
-                selected.into_values().take(limit).collect::<Vec<_>>(),
-                has_more,
-            ))
+            selected.truncate(limit);
+            Ok((selected, has_more))
         })
         .await
         .map_err(ApiError::internal)?;
@@ -102,18 +84,26 @@ pub(crate) async fn share_router_runtime(
     require_share_router_request(&state, "GET", &uri, &headers, &[]).await?;
     let providers = state.providers.read().await.clone();
     let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
     let share = resolve_share_for_internal_request(&state, query.share_id.as_deref()).await?;
-    let mut descriptor =
-        state.share_router_runtime_descriptor(&share, &providers, &accounts, &usage);
+    let mut descriptor = state
+        .describe_share(&share, &providers, &accounts)
+        .await
+        .map_err(ApiError::internal)?;
+    state.apply_ollama_cloud_share_projections(&mut descriptor, &share, &providers);
     state
         .project_router_provider_identity(&mut descriptor)
         .await;
     let mut response = runtime_response_from_descriptor(descriptor);
-    response.manual_model_health =
-        crate::domain::sharing::model_health::manual_observations_for_share(
-            &share, &providers, &usage,
-        );
+    response.manual_model_health = state
+        .query_usage(move |usage| {
+            Ok(
+                crate::domain::sharing::model_health::manual_observations_for_share(
+                    &share, &providers, usage,
+                ),
+            )
+        })
+        .await
+        .map_err(ApiError::internal)?;
     response.model_health_degraded_threshold_ms = Some(
         web_provider_health_check_config(&state)
             .await

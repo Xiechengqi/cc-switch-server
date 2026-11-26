@@ -391,10 +391,9 @@ pub(crate) async fn control_refresh_share_usage(
     let refreshed =
         refresh_share_usage_items(&state, &share, input.app.as_deref(), &providers).await;
     let accounts = state.accounts.read().await.clone();
-    let usage = state.usage.read().await.clone();
     state
-        .mutate_shares_immediate(|shares| {
-            shares.refresh_runtime_snapshots(&providers, Some(&accounts), &usage);
+        .mutate_shares_with_usage(move |shares, usage| {
+            shares.refresh_runtime_snapshots(&providers, Some(&accounts), usage);
         })
         .await
         .map_err(ApiError::internal)?;

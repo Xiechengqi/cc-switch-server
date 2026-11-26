@@ -362,30 +362,39 @@ async fn recent_router_cycle_covers_provider(
 ) -> bool {
     let providers = state.providers_snapshot().await;
     let plan = providers.runtime_plan(provider.app, &provider.provider.id);
-    let usage = state.usage.read().await;
-    let health = crate::domain::health::provider_health_for_plan(provider, &usage, plan.as_deref());
-    let recent_snapshot = health
-        .source
-        .as_deref()
-        .is_some_and(|source| source.starts_with("cc-switch-router-cycle:"))
-        && health.checked_at_ms.is_some_and(|checked_at| {
-            now_ms().saturating_sub(checked_at) < ROUTER_PROBE_FALLBACK_AFTER_MS
-        });
-    recent_snapshot
-        || plan.as_ref().is_some_and(|plan| {
-            usage
-                .select_logs(&crate::domain::usage::history::UsageSelection {
-                    app: Some(provider.app),
-                    provider_id: Some(provider.provider.id.clone()),
-                    is_health_check: Some(true),
-                    health_fingerprint: Some(plan.health_fingerprint()),
-                    data_source_prefix: Some("cc-switch-router-cycle:".into()),
-                    from_ms: Some(now_ms().saturating_sub(ROUTER_PROBE_FALLBACK_AFTER_MS)),
-                    limit: Some(1),
-                    ..Default::default()
-                })
-                .is_ok_and(|logs| !logs.is_empty())
+    let provider = provider.clone();
+    state
+        .query_usage(move |usage| {
+            let health = crate::domain::health::provider_health_snapshot_for_plan(
+                &provider,
+                usage,
+                plan.as_deref(),
+            );
+            let recent_snapshot = health
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("cc-switch-router-cycle:"))
+                && health.checked_at_ms.is_some_and(|checked_at| {
+                    now_ms().saturating_sub(checked_at) < ROUTER_PROBE_FALLBACK_AFTER_MS
+                });
+            Ok(recent_snapshot
+                || plan.as_ref().is_some_and(|plan| {
+                    usage
+                        .select_logs(&crate::domain::usage::history::UsageSelection {
+                            app: Some(provider.app),
+                            provider_id: Some(provider.provider.id.clone()),
+                            is_health_check: Some(true),
+                            health_fingerprint: Some(plan.health_fingerprint()),
+                            data_source_prefix: Some("cc-switch-router-cycle:".into()),
+                            from_ms: Some(now_ms().saturating_sub(ROUTER_PROBE_FALLBACK_AFTER_MS)),
+                            limit: Some(1),
+                            ..Default::default()
+                        })
+                        .is_ok_and(|logs| !logs.is_empty())
+                }))
         })
+        .await
+        .unwrap_or(false)
 }
 
 async fn confirm_health_target(
@@ -413,8 +422,12 @@ async fn confirm_health_target(
         .await;
     let still_pending = {
         let usage = state.usage.read().await;
-        crate::domain::health::provider_health_for_plan(&current, &usage, runtime_plan.as_deref())
-            .confirmation_pending
+        crate::domain::health::provider_health_snapshot_for_plan(
+            &current,
+            &usage,
+            runtime_plan.as_deref(),
+        )
+        .confirmation_pending
     };
     if !still_pending {
         return Ok(());
@@ -961,10 +974,20 @@ async fn existing_cycle_result(
     source: &str,
     expected_health_fingerprint: &str,
 ) -> Option<StreamCheckResult> {
-    let usage = state.usage.read().await;
-    existing_cycle_result_from_usage(&usage, provider, source, expected_health_fingerprint).or_else(
-        || local_result_for_router_cycle(&usage, provider, source, expected_health_fingerprint),
-    )
+    let provider = provider.clone();
+    let source = source.to_string();
+    let fingerprint = expected_health_fingerprint.to_string();
+    state
+        .query_usage(move |usage| {
+            Ok(
+                existing_cycle_result_from_usage(usage, &provider, &source, &fingerprint).or_else(
+                    || local_result_for_router_cycle(usage, &provider, &source, &fingerprint),
+                ),
+            )
+        })
+        .await
+        .ok()
+        .flatten()
 }
 
 fn router_cycle_source(at_ms: u128) -> String {
@@ -1179,8 +1202,20 @@ async fn existing_cycle_share_ids(
     source: &str,
     expected_health_fingerprint: &str,
 ) -> HashSet<String> {
-    let usage = state.usage.read().await;
-    existing_cycle_share_ids_from_usage(&usage, provider, source, expected_health_fingerprint)
+    let provider = provider.clone();
+    let source = source.to_string();
+    let fingerprint = expected_health_fingerprint.to_string();
+    state
+        .query_usage(move |usage| {
+            Ok(existing_cycle_share_ids_from_usage(
+                usage,
+                &provider,
+                &source,
+                &fingerprint,
+            ))
+        })
+        .await
+        .unwrap_or_default()
 }
 
 fn existing_cycle_share_ids_from_usage(

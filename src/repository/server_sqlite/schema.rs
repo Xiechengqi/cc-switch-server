@@ -1,5 +1,5 @@
 use anyhow::Context;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 pub(super) fn initialize_schema(connection: &Connection) -> anyhow::Result<()> {
     connection
@@ -386,6 +386,41 @@ pub(super) fn migrate_to_current(connection: &Connection) -> anyhow::Result<()> 
         checksum == grant_checksum,
         "Server SQLite v10 migration checksum mismatch"
     );
+    // This derived read extension is compatible with v10 readers/writers:
+    // payloads, base columns and accounting tables keep their existing format.
+    // Keep its own checksum so binary rollback does not require DB downgrade.
+    let query_checksum = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(include_bytes!("usage_query_schema.sql")))
+    );
+    let installed = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key='usage_query_schema_v1'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(checksum) = installed {
+        anyhow::ensure!(
+            checksum == query_checksum,
+            "Usage query extension checksum mismatch"
+        );
+    } else {
+        connection.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> anyhow::Result<()> {
+            connection.execute_batch(include_str!("usage_query_schema.sql"))?;
+            connection.execute(
+                "INSERT INTO meta(key,value) VALUES('usage_query_schema_v1',?1)",
+                [&query_checksum],
+            )?;
+            connection.execute_batch("COMMIT;")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = connection.execute_batch("ROLLBACK;");
+        }
+        result.context("install compatible indexed Usage query extension")?;
+    }
     Ok(())
 }
 
@@ -397,7 +432,7 @@ mod tests {
     fn quota_v1_migration_is_idempotent_and_preserves_original_checksum() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
-        connection.execute_batch("DROP TABLE quota_metering_facts; DROP TABLE quota_history_preparations; DROP TABLE quota_conversion_receipts; DROP TABLE quota_adjustment_mappings; DROP TABLE quota_shadow_intervals; DROP INDEX usage_records_quota_backfill_idx; DROP TABLE market_settlement_ack_outbox; DROP TABLE market_settlement_receipts; DROP TABLE market_settlement_requests; DELETE FROM meta WHERE key='market_settlement_since_ms';
+        connection.execute_batch("DELETE FROM meta WHERE key='usage_query_schema_v1'; DROP INDEX usage_provider_statistics_idx; DROP INDEX usage_probe_identity_idx; DROP INDEX usage_provider_recent_idx; DROP INDEX usage_share_export_idx; DROP INDEX usage_pending_export_idx; ALTER TABLE usage_records DROP COLUMN app; ALTER TABLE usage_records DROP COLUMN is_health_check; ALTER TABLE usage_records DROP COLUMN record_kind; ALTER TABLE usage_records DROP COLUMN data_source; ALTER TABLE usage_records DROP COLUMN health_fingerprint; ALTER TABLE usage_records DROP COLUMN requested_model; ALTER TABLE usage_records DROP COLUMN status_code; ALTER TABLE usage_records DROP COLUMN duration_ms_text; ALTER TABLE usage_records DROP COLUMN router_export_sequence; ALTER TABLE usage_records DROP COLUMN router_last_synced_at_ms; ALTER TABLE usage_records DROP COLUMN router_next_sync_attempt_at_ms; DROP TABLE quota_metering_facts; DROP TABLE quota_history_preparations; DROP TABLE quota_conversion_receipts; DROP TABLE quota_adjustment_mappings; DROP TABLE quota_shadow_intervals; DROP INDEX usage_records_quota_backfill_idx; DROP TABLE market_settlement_ack_outbox; DROP TABLE market_settlement_receipts; DROP TABLE market_settlement_requests; DELETE FROM meta WHERE key='market_settlement_since_ms';
             DROP TABLE value_async_tasks;
             DROP TABLE value_quota_revisions; DROP TABLE value_quota_attempts;
             DROP TABLE value_quota_checkpoints;

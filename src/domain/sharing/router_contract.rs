@@ -1829,7 +1829,8 @@ fn provider_availability(
     usage: Option<&UsageStore>,
     runtime_plan: Option<&ProviderRuntimePlan>,
 ) -> ShareProviderAvailability {
-    let health = usage.map(|usage| health::provider_health_for_plan(provider, usage, runtime_plan));
+    let health =
+        usage.map(|usage| health::provider_health_snapshot_for_plan(provider, usage, runtime_plan));
     let account = accounts.and_then(|accounts| account_for_provider(accounts, provider));
     let usage_block = account.and_then(|account| current_account_usage_block(account, share));
     let quota_blocked = account.map(|_| usage_block.is_some());

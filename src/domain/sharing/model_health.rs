@@ -276,7 +276,8 @@ fn provider_snapshot_result(
     usage: &UsageStore,
     runtime_plan: Option<&ProviderRuntimePlan>,
 ) -> Option<ShareModelHealthResult> {
-    let health = crate::domain::health::provider_health_for_plan(provider, usage, runtime_plan);
+    let health =
+        crate::domain::health::provider_health_snapshot_for_plan(provider, usage, runtime_plan);
     if health.status == ProviderHealthStatus::Unknown {
         return None;
     }

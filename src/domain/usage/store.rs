@@ -913,6 +913,41 @@ impl UsageStore {
         Ok(())
     }
 
+    /// Copy control metadata without duplicating the bounded detail cache.
+    /// The durable read transaction is opened later on a blocking worker.
+    pub(crate) fn read_snapshot(&self) -> Self {
+        if self.history.is_none() {
+            return self.clone();
+        }
+        Self {
+            schema_version: self.schema_version,
+            quota_ledger: self.quota_ledger.clone(),
+            journal_checkpoint: self.journal_checkpoint.clone(),
+            provider_health: self.provider_health.clone(),
+            history: self.history.clone(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn provider_statistics(
+        &self,
+        app: AppKind,
+        provider_id: &str,
+    ) -> anyhow::Result<super::history::ProviderUsageStatistics> {
+        if let Some(history) = &self.history {
+            return history.provider_statistics(app, provider_id);
+        }
+        let mut stats = super::history::ProviderUsageStatistics::default();
+        for log in self
+            .logs
+            .iter()
+            .filter(|log| !log.is_health_check && log.app == app && log.provider_id == provider_id)
+        {
+            stats.observe(log.created_at_ms, log.status_code, log.duration_ms);
+        }
+        Ok(stats)
+    }
+
     pub(crate) fn select_logs(
         &self,
         selection: &super::history::UsageSelection,
@@ -931,11 +966,20 @@ impl UsageStore {
             .filter(|log| selection.matches(log))
             .cloned()
             .collect();
-        logs.sort_by(|a, b| {
-            b.created_at_ms
-                .cmp(&a.created_at_ms)
-                .then(b.request_id.cmp(&a.request_id))
-        });
+        if selection.after_export_sequence.is_some() || selection.pending_router_sync {
+            logs.sort_by(|a, b| {
+                a.router_export_sequence
+                    .cmp(&b.router_export_sequence)
+                    .then(a.created_at_ms.cmp(&b.created_at_ms))
+                    .then(a.request_id.cmp(&b.request_id))
+            });
+        } else {
+            logs.sort_by(|a, b| {
+                b.created_at_ms
+                    .cmp(&a.created_at_ms)
+                    .then(b.request_id.cmp(&a.request_id))
+            });
+        }
         if let Some(limit) = selection.limit {
             logs.truncate(limit);
         }

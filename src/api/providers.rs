@@ -736,18 +736,27 @@ pub(in crate::api) async fn provider_health(
     Query(query): Query<ListProvidersQuery>,
 ) -> Result<Json<ProviderHealthResponse>, ApiError> {
     require_session(&state, &headers).await?;
-    let provider_store = state.providers.read().await;
-    let providers = provider_store.list(query.app);
-    let usage = state.usage.read().await;
+    let provider_store = state.providers.read().await.clone();
+    let providers = state
+        .query_usage(move |usage| {
+            Ok(provider_store
+                .list(query.app)
+                .iter()
+                .map(|provider| {
+                    let plan = provider_store.runtime_plan(provider.app, &provider.provider.id);
+                    crate::domain::health::provider_health_for_plan(
+                        provider,
+                        usage,
+                        plan.as_deref(),
+                    )
+                })
+                .collect())
+        })
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(ProviderHealthResponse {
         ok: true,
-        providers: providers
-            .iter()
-            .map(|provider| {
-                let plan = provider_store.runtime_plan(provider.app, &provider.provider.id);
-                crate::domain::health::provider_health_for_plan(provider, &usage, plan.as_deref())
-            })
-            .collect(),
+        providers,
     }))
 }
 
