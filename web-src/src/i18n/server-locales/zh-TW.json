@@ -1162,6 +1162,8 @@
   },
   "share": {
     "grantMedia": {
+      "byUserHint": "分享建立後，編輯目標使用者的「媒體生成與工具」，再儲存供應商。",
+      "saveMismatch": "伺服器傳回的媒體與工具權限與本次修改不一致。請重新載入分享設定並核對權限。",
       "selectedCount": "媒體與工具已開啟 {{count}} 項",
       "expired": "授權預覽已失效，請重試儲存。",
       "confirmTokenGap": "以下操作的資源用量不受 Token 限額控制。要允許並儲存嗎？",

@@ -2217,7 +2217,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/save_provider_bundle_share",
-      "notes": "Atomically reconciles every enabled Provider Bundle Surface binding, canonical freeAccess (omitted on update keeps the current access; a new Share defaults to private), userGrants-derived ACL projection, limits, URL settings, and optional Server-owned userUsageEdits (consumed-token rebase) in one Share commit."
+      "notes": "Atomically reconciles enabled Provider Bundle Surface bindings, freeAccess (omission preserves current access, new Shares are private), userGrants-derived ACL, limits, URL settings and optional userUsageEdits. Omit grokMediaPolicy to preserve it. Only pre-v13 Shares accept global media changes. New Shares allow an all-off legacy default and start with empty named permissions. v14 edits use reviewed grantCapabilityEdits per user."
     },
     {
       "name": "save_provider_share",
@@ -2226,7 +2226,7 @@
       "implemented": true,
       "feature": "shares",
       "endpoint": "POST /web-api/invoke/save_provider_share",
-      "notes": "Atomically persists canonical freeAccess (omitted keeps the current access) and userGrants-derived ShareTo configuration plus optional Server-owned userUsageEdits (target tokens and period anchor), while preserving Router Share Market-managed grants and keeping Share Owner derived from Client Owner."
+      "notes": "Atomically persists canonical freeAccess (omission preserves current access), userGrants-derived ShareTo configuration and optional userUsageEdits (target tokens and period anchor). Preserves Router Share Market-managed grants and the Client Owner. Accepts grokMediaPolicy edits on pre-v13 Shares. Use the reviewed Bundle or Share permissions flow for capability policies and named grants."
     },
     {
       "name": "set_auto_launch",

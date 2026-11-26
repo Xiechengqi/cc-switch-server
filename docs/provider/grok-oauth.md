@@ -138,15 +138,15 @@ GR-05 的 remote compaction 保持运行时禁用。只有固定 OAuth rail 的�
 
 ## 媒体能力
 
-图片生成、图片编辑和视频生成分别对应 `image_generation`、`image_edit`、`video_generation` capability。三个入口各自执行三层 fail-closed 门禁，顺序固定为：
+图片生成、图片编辑和视频生成分别对应 `image_generation`、`image_edit`、`video_generation`。每个入口都须满足以下条件。
 
 1. Grok Provider Bundle 的 `grokImageGenerationEnabled`、`grokImageEditEnabled`、`grokVideoGenerationEnabled` 必须分别开启；旧配置和缺字段配置均按关闭处理。
-2. Share 的 `grokMediaPolicy.imageGenerationEnabled`、`imageEditEnabled`、`videoGenerationEnabled` 必须分别授权；Share Contract v5 缺字段时同样默认关闭。
+2. 新建和已迁移的 v14 Share 按用户授权。在远程分享中编辑目标用户的「媒体生成与工具」，选择操作后保存外层供应商表单。owner 自用也要单独授权。v13 Share 按其 `capabilityPolicy` 执行。只有尚未采用这两种策略的旧 Grok Share 使用「Share 媒体权限」的三个全局开关，缺省为关闭。[Share 权限与保存](../share/extended-capabilities.md)
 3. 当前绑定账号必须具有对应 capability evidence；`CC_SWITCH_GROK_OAUTH_CAPABILITIES` 只可 bootstrap 待验证 evidence，不能绕过 Provider 或 Share 策略。
 
 Provider 管理页可对已经开启的单项能力发起真实媒体测试；测试使用 `POST /api/providers/:id/inference-test`、当前 Provider 唯一绑定账号和隔离的 `test-share:<provider-id>` scope，尊重 Provider 开关但不伪造 Share 授权。Router Share 连接测试支持 `text`、`image_generation`、`image_edit`、`video_generation`；媒体测试只允许 Codex binding，并同时尊重 Share 和 Server 的 Provider 门禁。两种测试都使用固定安全 payload，不选择其他账号或 Provider。
 
-成功的真实上游响应会把 `supported` evidence 持久化到绑定账号。媒体策略检查发生在 credential refresh 和上游访问之前，关闭时分别返回 `403 grok_media_disabled_by_provider` 或 `403 grok_media_disabled_by_share`，不会消耗上游请求。
+成功的真实上游响应会把 `supported` evidence 持久化到绑定账号。媒体策略检查发生在 credential refresh 和上游访问之前。Provider 关闭时返回 `403 grok_media_disabled_by_provider`，旧 Share 全局开关关闭时返回 `403 grok_media_disabled_by_share`，v14 用户缺少操作权限时返回 `403 SHARE_CAPABILITY_DISABLED`。
 
 媒体首次 401 同样只允许原账号强刷一次。视频创建成功后，request id 的 durable binding 写入 `grok-media-tasks.json`，固定创建请求 id、Provider、账号、`authIdentityGeneration`、Share、runtime、用户命名空间、TTL 和 `upstreamPlane`；它不是账号调度机制。schema v1/v2 兼容迁移到当前 schema v3，历史任务缺少创建请求 id 时保持 `None`；历史任务只有一个 direct-XAI endpoint，因此精确迁移为 `xai` plane。未知 schema/plane fail closed。状态查询只读取创建时的 binding，Provider 重绑、身份代际、runtime 或 plane 变化均返回 `409`，重启后不会丢失有效绑定；新任务的状态记录通过 `parentRequestId` 关联创建记录。
 

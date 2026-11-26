@@ -2,6 +2,7 @@ import { confirmGrantPreview, grantCapabilityEdits, grantQuotaTerms } from "@/li
 import {capabilityIntent, capabilityQuotaContext, type ShareCapabilityPolicy, type CapabilityConsent} from "@/lib/share-capabilities";
 import {
   shareApi,
+  type GrokMediaPolicy,
   type SaveProviderBundleShareParams,
   type ShareRecord,
   type ShareUserGrant,
@@ -31,6 +32,7 @@ export interface ProviderBundleShareDraft {
   baseline?: {
     capabilityPolicy?:ShareCapabilityPolicy;
     grantCapabilityPolicy?: boolean;
+    legacyGrokMediaPolicy?: GrokMediaPolicy;
     shareId: string;
     configRevision: number;
     userGrants: ShareUserGrantMap;
@@ -56,11 +58,32 @@ export interface ProviderBundleShareDraft {
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: string;
   previousResponseCacheEnabled: boolean;
-  grokMediaPolicy: {
-    imageGenerationEnabled: boolean;
-    imageEditEnabled: boolean;
-    videoGenerationEnabled: boolean;
-  };
+  grokMediaPolicy: GrokMediaPolicy;
+}
+
+export const GROK_MEDIA_OPERATIONS = [
+  ["imageGenerationEnabled", "image.generate"],
+  ["imageEditEnabled", "image.edit"],
+  ["videoGenerationEnabled", "video.generate"],
+] as const;
+
+function sameGrokMediaPolicy(current: GrokMediaPolicy | undefined, requested: GrokMediaPolicy) {
+  return !!current && GROK_MEDIA_OPERATIONS.every(([key]) => current[key] === requested[key]);
+}
+
+function mediaPermissionsMatch(params: SaveProviderBundleShareParams, share?: ShareRecord): boolean {
+  if (!params.grokMediaPolicy && !params.grantCapabilityEdits) return true;
+  if (!share || share.id !== params.shareId) return false;
+  if (params.grokMediaPolicy) {
+    return !share.grantCapabilityPolicy && !share.capabilityPolicy
+      && sameGrokMediaPolicy(share.grokMediaPolicy, params.grokMediaPolicy);
+  }
+  return !!share.grantCapabilityPolicy && Object.entries(params.grantCapabilityEdits ?? {}).every(([email, edit]) => {
+    const grant = share.userGrants?.[email];
+    const operations = grant?.policy.allowedOperations;
+    return !!grant && grant.active !== false && grant.manager !== "routerShareMarket" && !grant.valueQuotaMalformed
+      && !!operations && operations.length === edit.operations.length && edit.operations.every(op => operations.includes(op));
+  });
 }
 
 export const BUNDLE_SHARE_EXPIRY_PRESETS = [
@@ -145,6 +168,7 @@ export function createBundleShareDraft(
     baseline: share ? {
       capabilityPolicy:share.capabilityPolicy,
       grantCapabilityPolicy:share.grantCapabilityPolicy,
+      legacyGrokMediaPolicy: share.grantCapabilityPolicy || share.capabilityPolicy ? undefined : share.grokMediaPolicy,
       shareId: share.id,
       configRevision: share.configRevision ?? 0,
       userGrants: { ...canonicalUserGrants, ...buildShareUserGrants({
@@ -185,7 +209,7 @@ export function createBundleShareDraft(
       ? Boolean(share.previousResponseCacheEnabled)
       : true,
     capabilityPolicy: share?.capabilityPolicy,
-    grokMediaPolicy: share?.grokMediaPolicy ?? {
+    grokMediaPolicy: share?.grokMediaPolicy ? { ...share.grokMediaPolicy } : {
       imageGenerationEnabled: false,
       imageEditEnabled: false,
       videoGenerationEnabled: false,
@@ -310,6 +334,7 @@ export async function saveBundleShare(
     try {
       const share = await shareApi.saveProviderBundleShare(params);
       assertSession();
+      if (!mediaPermissionsMatch(params, share)) throw new Error(i18n.t("share.grantMedia.saveMismatch"));
       if (retry) retry.attempt.current = undefined;
       return share;
     } catch (error) {
@@ -433,7 +458,8 @@ export async function saveBundleShare(
     previousResponseCacheEnabled: draft.previousResponseCacheEnabled,
     ...(consent ? {capabilityConsent:consent} : {}),
     ...(changesPermissions ? {grantCapabilityEdits:grantEdits} : {}),
-    ...(baseline?.grantCapabilityPolicy ? {} : {grokMediaPolicy:draft.grokMediaPolicy}),
+    ...(baseline?.legacyGrokMediaPolicy && !sameGrokMediaPolicy(baseline.legacyGrokMediaPolicy, draft.grokMediaPolicy)
+      ? { grokMediaPolicy: draft.grokMediaPolicy } : {}),
     userGrants: draft.baseline ? undefined : userGrants,
     userGrantEdits,
     userUsageEdits,

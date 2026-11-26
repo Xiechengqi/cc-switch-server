@@ -312,8 +312,6 @@ export interface SaveProviderShareParams {
   autoConsumeBankedReset: boolean;
   bankedResetExpiryLeadMinutes: number;
   previousResponseCacheEnabled: boolean;
-  capabilityPolicy?: ShareCapabilityPolicy;
-  capabilityConsent?: CapabilityConsent;
   grokMediaPolicy?: GrokMediaPolicy;
   userGrants: ShareUserGrantMap;
   userUsageEdits?: ShareUserUsageEditMap;

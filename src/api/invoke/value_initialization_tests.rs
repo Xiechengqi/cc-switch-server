@@ -25,6 +25,7 @@ async fn fixture() -> (ServerState, Value) {
     .unwrap();
     let mut config = state.config_snapshot().await;
     config.owner.email = Some("owner@example.test".into());
+    config.client.tunnel_subdomain = Some("opening-client".into());
     state.replace_config(config).await.unwrap();
     state
         .configure_value_quota_router_for_test("opening-bundle-install")
@@ -132,7 +133,7 @@ async fn native_bundle_applies_reviewed_permissions_when_pausing_a_share() {
     let email = "new@example.test";
     command["userGrantEdits"] = json!({(email):{"expectedRevision":0,"policy":{"tokenPeriod":"lifetime","tokenLimit":100}}});
     command["grantCapabilityEdits"] =
-        json!({(email):{"expectedRevision":0,"operations":["tool.web_search"]}});
+        json!({(email):{"expectedRevision":0,"operations":["image.generate","tool.web_search"]}});
     let preview = state
         .preview_share_permissions(
             command["shareId"].as_str().unwrap(),
@@ -146,7 +147,7 @@ async fn native_bundle_applies_reviewed_permissions_when_pausing_a_share() {
         .iter()
         .map(|item| item["condition"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(conditions.len(), 1);
+    assert_eq!(conditions.len(), 2);
     command["capabilityConsent"] =
         json!({"credential":preview["previewCredential"],"acceptUncovered":conditions});
     let saved = web_save_provider_bundle_share(&state, &command, None)
@@ -154,9 +155,20 @@ async fn native_bundle_applies_reviewed_permissions_when_pausing_a_share() {
         .unwrap()
         .unwrap();
     assert!(!saved.enabled);
+    let projected = web_share_json(&config, &saved).unwrap();
+    assert_eq!(projected["grantCapabilityPolicy"], true);
     assert_eq!(
-        saved.grant_capabilities.as_ref().unwrap()[email].allowed_operations,
-        vec![crate::domain::sharing::capabilities::ShareOperation::WebSearch]
+        projected["userGrants"][email]["policy"]["allowedOperations"],
+        json!(["image.generate", "tool.web_search"])
+    );
+    assert_eq!(
+        projected["userGrants"]["owner@example.test"]["policy"]["allowedOperations"],
+        json!([])
+    );
+    let reloaded = server_sqlite::load_authoritative(&state.config_dir).unwrap();
+    assert_eq!(
+        reloaded.shares.get(&saved.id).unwrap().grant_capabilities,
+        saved.grant_capabilities
     );
     let replay = web_save_provider_bundle_share(&state, &command, None)
         .await
@@ -196,6 +208,37 @@ async fn native_bundle_opening_usd_usage_is_atomic_replayable_and_never_succeeds
         .unwrap()
         .unwrap();
     assert_eq!(again.config_revision, saved.config_revision);
+    let mut explicit_off = command.clone();
+    explicit_off["grokMediaPolicy"] = json!(GrokMediaPolicy::default());
+    let error = web_save_provider_bundle_share(&state, &explicit_off, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Some("quota_revision_conflict"));
+
+    // Historical receipts serialized even omitted media as three false flags.
+    use sha2::{Digest, Sha256};
+    let typed: SaveProviderBundleShareCommand = serde_json::from_value(command.clone()).unwrap();
+    let mut old_payload = serde_json::to_value(&typed).unwrap();
+    old_payload["grokMediaPolicy"] = json!(GrokMediaPolicy::default());
+    old_payload.sort_all_objects();
+    let old_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&old_payload).unwrap())
+    );
+    let fingerprints = BundleShareFingerprints::new(&typed).unwrap();
+    assert_eq!(
+        fingerprints
+            .replay(&old_hash, Some(&saved), None)
+            .unwrap()
+            .config_revision,
+        saved.config_revision
+    );
+    let explicit: SaveProviderBundleShareCommand = serde_json::from_value(explicit_off).unwrap();
+    let error = BundleShareFingerprints::new(&explicit)
+        .unwrap()
+        .replay(&old_hash, Some(&saved), explicit.grok_media_policy)
+        .unwrap_err();
+    assert_eq!(error.code, Some("CAPABILITY_UPGRADE_REQUIRED"));
     let db = rusqlite::Connection::open(server_sqlite::database_path(&state.config_dir)).unwrap();
     assert_eq!(
         db.query_row("SELECT count(*) FROM value_quota_adjustments", [], |row| {
@@ -213,6 +256,13 @@ async fn native_bundle_opening_usd_usage_is_atomic_replayable_and_never_succeeds
         result["settingsReceipt"]["configRevision"],
         saved.config_revision
     );
+    let digest = result["settingsReceipt"]["patchFingerprint"]
+        .as_str()
+        .unwrap();
+    assert_eq!(digest.len(), 64);
+    assert!(digest
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
     assert_eq!(result["quotaConversions"].as_array().unwrap().len(), 1);
     assert_eq!(
         result["quotaConversions"][0]["status"]["usedPicos"],

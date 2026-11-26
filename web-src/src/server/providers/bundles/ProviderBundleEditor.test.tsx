@@ -8,6 +8,7 @@ import type { ManagedAuthAccount } from "@/lib/api/auth";
 import { familyById } from "@/server/providerRegistry";
 import i18n from "@/i18n";
 import { HttpResponseError } from "@/lib/runtime";
+import { normalizeShareRecord } from "@/utils/shareRecordNormalize";
 import { ProviderBundleEditor } from "./ProviderBundleEditor";
 
 const mocks = vi.hoisted(() => ({
@@ -26,7 +27,10 @@ vi.mock("@/lib/api/providers", () => ({ providersApi: {
   getRequestDefaults: async () => ({ requestTimeoutSeconds: 300, streamFirstByteTimeoutSeconds: 120, streamIdleTimeoutSeconds: 300 }),
   getHealthCheckConfig: async () => ({ timeoutSeconds: 30, maxRetries: 0, degradedThresholdSeconds: 10, testModels: { claude: "test", codex: "test", gemini: "test" } }),
 } }));
-vi.mock("@/lib/api/share", () => ({ shareApi: { saveProviderBundleShare: mocks.shareSave, preflightProviderBundleShare: mocks.preflight, previewGrantCapabilities: mocks.previewGrant } }));
+vi.mock("@/lib/api/share", async (original) => ({
+  ...await original<typeof import("@/lib/api/share")>(),
+  shareApi: { saveProviderBundleShare: mocks.shareSave, preflightProviderBundleShare: mocks.preflight, previewGrantCapabilities: mocks.previewGrant },
+}));
 vi.mock("@/lib/query", async (original) => ({
   ...await original<typeof import("@/lib/query")>(),
   useManagedAccountsQuery: () => ({ data: mocks.accounts }),
@@ -85,6 +89,52 @@ beforeEach(() => {
 });
 
 describe("Provider Bundle editor save stages", () => {
+  it("saves and reopens the Grok switches on legacy Shares and locates permissions by user on v14", async () => {
+    const family = familyById("family.grok_oauth")!;
+    const bundle = fixture();
+    bundle.familyId = family.familyId;
+    bundle.surfaces = Object.fromEntries(family.surfaces.map(({ app, profileId }) => [app, {
+      ...bundle.surfaces[app]!, profileId, providerType: "grok_oauth", providerTypeId: "grok_oauth",
+      provider: { id: bundle.id, name: "Grok", settingsConfig: { modelMapping: { mode: "single", upstreamModel: "grok-4.6" } },
+        meta: { authBinding: { source: "managed_account", authProvider: "grok_oauth", accountId: "grok-account", authIdentityGeneration: 1 } } },
+    }]));
+    const before = { imageGenerationEnabled: true, imageEditEnabled: false, videoGenerationEnabled: false };
+    const legacy = normalizeShareRecord({ id: "grok-share", bindings: { codex: bundle.id }, ownerEmail: "owner@example.com",
+      status: "active", shareSlug: "grok-share", expiresAt: "2099-01-01T00:00:00Z", configRevision: 1, grokMediaPolicy: before })!;
+    const after = { ...before, videoGenerationEnabled: true };
+    const saved = { ...legacy, configRevision: 2, grokMediaPolicy: after };
+    mocks.shareSave.mockResolvedValue(saved);
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    async function open(share: ShareRecord) {
+      mocks.shares = [share];
+      await act(async () => root.render(<QueryClientProvider client={client}>
+        <ProviderBundleEditor key={share.configRevision} bundle={bundle} onSaved={mocks.onSaved} onCancel={() => {}} />
+      </QueryClientProvider>));
+    }
+    const toggle = (key: keyof typeof before) => container.querySelector<HTMLButtonElement>(`#bundle-share-${key}`);
+    try {
+      await open(legacy);
+      expect(toggle("imageGenerationEnabled")?.getAttribute("aria-checked")).toBe("true");
+      expect(toggle("imageEditEnabled")?.getAttribute("aria-checked")).toBe("false");
+      expect(toggle("videoGenerationEnabled")?.getAttribute("aria-checked")).toBe("false");
+      await act(async () => toggle("videoGenerationEnabled")!.click());
+      await act(async () => saveButton().click());
+      expect(mocks.shareSave).toHaveBeenCalledWith(expect.objectContaining({ shareId: legacy.id, grokMediaPolicy: after }));
+      expect(mocks.onSaved).toHaveBeenCalledTimes(1);
+      await open(saved);
+      expect(toggle("videoGenerationEnabled")?.getAttribute("aria-checked")).toBe("true");
+      await open({ ...saved, configRevision: 3, grantCapabilityPolicy: true });
+      expect(toggle("videoGenerationEnabled")).toBeNull();
+      expect(container.textContent).toContain(i18n.t("share.grantMedia.byUserHint"));
+    } finally {
+      await act(async () => root.unmount());
+      client.clear(); container.remove();
+    }
+  });
+
   it("starts Custom creation with neutral identity and no connection preset", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);
@@ -376,7 +426,10 @@ it("reviews after cancellation and replays a reviewed Share save after losing th
   mocks.previewGrant.mockResolvedValue({ ready: true, expiresAt: Date.now() + 60_000, previewCredential: "reviewed-ticket",
     requiredAcknowledgements: [{ scope: "alice@example.com", operation: "tool.web_search", condition: "gap" }] });
   const confirmation = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
-  mocks.shareSave.mockRejectedValueOnce(new TypeError("Connection closed")).mockResolvedValue(undefined);
+  const alice = mocks.shares[0].userGrants!["alice@example.com"];
+  mocks.shareSave.mockRejectedValueOnce(new TypeError("Connection closed")).mockResolvedValue({
+    ...mocks.shares[0], userGrants: { "alice@example.com": { ...alice, policy: { ...alice.policy, allowedOperations: ["tool.web_search"] } } },
+  });
   const container = document.createElement("div"); document.body.appendChild(container);
   const root = createRoot(container), client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   try {

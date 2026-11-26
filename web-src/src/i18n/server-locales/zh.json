@@ -1162,6 +1162,8 @@
   },
   "share": {
     "grantMedia": {
+      "byUserHint": "分享创建后，编辑目标用户的「媒体生成与工具」，再保存供应商。",
+      "saveMismatch": "服务器返回的媒体与工具权限与本次修改不一致。请重新加载分享设置并核对权限。",
       "selectedCount": "媒体与工具已开启 {{count}} 项",
       "expired": "授权预览已失效，请重试保存。",
       "confirmTokenGap": "以下操作的资源用量不受 Token 限额控制。允许并保存？",

@@ -716,6 +716,34 @@ impl Default for SharePolicy {
     }
 }
 
+/// Old Web clients include an all-off policy when creating any Bundle Share.
+/// New Shares start with empty per-user grants. Only a pre-v13 Share actually
+/// enforces subsequent writes to the Share-wide Grok switches.
+pub(crate) fn validate_grok_media_write(
+    requested: Option<GrokMediaPolicy>,
+    existing: Option<&SharePolicy>,
+    adopting_capability_policy: bool,
+) -> Result<(), SharePatchError> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let supported = match existing {
+        None => requested == GrokMediaPolicy::default(),
+        Some(policy) => {
+            policy.grant_capabilities.is_none()
+                && policy.capability_policy.is_none()
+                && !adopting_capability_policy
+        }
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(SharePatchError::Invalid(
+            "CAPABILITY_UPGRADE_REQUIRED".into(),
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Share {
@@ -1293,6 +1321,11 @@ impl ShareStore {
         let is_new = existing_id
             .as_deref()
             .is_none_or(|id| self.get(id).is_none());
+        validate_grok_media_write(
+            input.grok_media_policy,
+            (!is_new).then_some(&existing_policy),
+            false,
+        )?;
         let share_id = existing_id.unwrap_or_else(generate_share_id);
         let (
             tokens_used,
@@ -2632,8 +2665,13 @@ impl ShareStore {
             .position(|item| item.id == share_id)
             .ok_or(SharePatchError::NotFound)?;
         let mut share = self.shares[index].clone();
+        validate_grok_media_write(
+            patch.grok_media_policy,
+            Some(&share.policy),
+            patch.capability_policy.is_some(),
+        )?;
         if share.grant_capabilities.is_some() {
-            if patch.capability_policy.is_some() || patch.grok_media_policy.is_some() {
+            if patch.capability_policy.is_some() {
                 return Err(SharePatchError::Invalid(
                     "CAPABILITY_UPGRADE_REQUIRED".into(),
                 ));

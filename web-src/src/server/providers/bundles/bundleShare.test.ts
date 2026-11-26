@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ShareRecord } from "@/lib/api/share";
 import { PERMANENT_EXPIRES_AT } from "@/utils/shareUtils";
+import { normalizeShareRecord } from "@/utils/shareRecordNormalize";
+import i18n from "@/i18n";
 
 const shareApiMock = vi.hoisted(() => ({
   delete: vi.fn(),
@@ -176,6 +178,7 @@ describe("Provider Bundle sharing", () => {
     shareApiMock.previewGrantCapabilities.mockResolvedValue({
       ready: true, expiresAt: Date.now() + 60_000, previewCredential: "revocation-review",
     });
+    shareApiMock.saveProviderBundleShare.mockResolvedValue({ ...existing, userGrants: draft.userGrants });
     await saveBundleShare("bundle-1", draft, existing);
     expect(shareApiMock.preflightProviderBundleShare).not.toHaveBeenCalled();
     expect(shareApiMock.saveProviderBundleShare).toHaveBeenCalledWith(expect.objectContaining({
@@ -183,6 +186,78 @@ describe("Provider Bundle sharing", () => {
       grantCapabilityEdits: { [email]: { operations: [], expectedRevision: 3 } },
       capabilityConsent: { credential: "revocation-review", acceptUncovered: [] },
     }));
+  });
+
+  it("saves and reopens only changed legacy Grok media flags", async () => {
+    const raw = share({ codex: "bundle-1" });
+    const original = { imageGenerationEnabled: true, imageEditEnabled: false, videoGenerationEnabled: true };
+    const existing = normalizeShareRecord({ ...raw, grok_media_policy: {
+      image_generation_enabled: true, image_edit_enabled: false, video_generation_enabled: true,
+    } })!;
+    const draft = createBundleShareDraft(existing);
+    expect(draft.grokMediaPolicy).toEqual(original);
+    expect(normalizeShareRecord({ ...raw, grokMediaPolicy: { imageEditEnabled: true } })?.grokMediaPolicy)
+      .toEqual({ imageGenerationEnabled: false, imageEditEnabled: true, videoGenerationEnabled: false });
+    await saveBundleShare("bundle-1", { ...draft, description: "renamed" }, existing);
+    expect(shareApiMock.saveProviderBundleShare.mock.lastCall?.[0]).not.toHaveProperty("grokMediaPolicy");
+    const changed = { imageGenerationEnabled: false, imageEditEnabled: true, videoGenerationEnabled: false };
+    draft.grokMediaPolicy = changed;
+    for (const response of [existing, undefined, normalizeShareRecord({
+      ...raw, grokMediaPolicy: { ...changed, imageGenerationEnabled: "false" },
+    })]) {
+      shareApiMock.saveProviderBundleShare.mockResolvedValueOnce(response);
+      await expect(saveBundleShare("bundle-1", draft, existing)).rejects.toThrow(i18n.t("share.grantMedia.saveMismatch"));
+    }
+    const response = normalizeShareRecord({ ...raw, grokMediaPolicy: changed });
+    shareApiMock.saveProviderBundleShare.mockResolvedValueOnce(response);
+    expect(createBundleShareDraft(await saveBundleShare("bundle-1", draft, existing)).grokMediaPolicy).toEqual(changed);
+    expect(shareApiMock.saveProviderBundleShare.mock.lastCall?.[0].grokMediaPolicy).toEqual(changed);
+    expect(original).toEqual(existing.grokMediaPolicy);
+  });
+
+  it("confirms v14 media operations from the intended user's saved grant", async () => {
+    const email = "friend@example.com";
+    const existing = share({ codex: "bundle-1" });
+    existing.grantCapabilityPolicy = true;
+    existing.userGrants = {
+      [email]: { email, active: true, role: "shareto", revision: 2, policy: { tokenPeriod: "day", allowedOperations: [] } },
+    };
+    const draft = createBundleShareDraft(existing);
+    const grant = { ...draft.userGrants[email], policy: { ...draft.userGrants[email].policy, allowedOperations: ["image.edit" as const] } };
+    draft.userGrants[email] = grant;
+    shareApiMock.previewGrantCapabilities.mockResolvedValue({
+      ready: true, expiresAt: Date.now() + 60_000, previewCredential: "media-review",
+    });
+    const saved = { ...existing, userGrants: { [email]: grant } };
+    for (const response of [
+      existing,
+      { ...saved, id: "other-share" },
+      { ...saved, userGrants: { "other@example.com": { ...grant, email: "other@example.com" } } },
+      { ...saved, userGrants: { [email]: { ...grant, manager: "routerShareMarket" } } },
+    ]) {
+      shareApiMock.saveProviderBundleShare.mockResolvedValueOnce(response);
+      await expect(saveBundleShare("bundle-1", draft, existing)).rejects.toThrow(i18n.t("share.grantMedia.saveMismatch"));
+    }
+    shareApiMock.saveProviderBundleShare.mockResolvedValueOnce(normalizeShareRecord(saved));
+    const reopened = createBundleShareDraft(await saveBundleShare("bundle-1", draft, existing));
+    expect(reopened.userGrants[email].policy.allowedOperations).toEqual(["image.edit"]);
+    const sent = shareApiMock.saveProviderBundleShare.mock.lastCall?.[0];
+    expect(sent.grantCapabilityEdits).toEqual({ [email]: { expectedRevision: 2, operations: ["image.edit"] } });
+    expect(sent).not.toHaveProperty("grokMediaPolicy");
+  });
+
+  it("omits the global policy on create and for both generations of capability policies", async () => {
+    const raw = share({ codex: "bundle-1" });
+    const grokMediaPolicy = { imageGenerationEnabled: true, imageEditEnabled: true, videoGenerationEnabled: true };
+    for (const existing of [undefined,
+      normalizeShareRecord({ ...raw, grokMediaPolicy, grantCapabilityPolicy: true })!,
+      normalizeShareRecord({ ...raw, grokMediaPolicy, capabilityPolicy: { version: 1, allowedOperations: [], operationBindings: {} } })!]) {
+      const draft = createBundleShareDraft(existing);
+      draft.enabled = true;
+      expect(draft.baseline?.legacyGrokMediaPolicy).toBeUndefined();
+      await saveBundleShare("bundle-1", draft, existing);
+      expect(shareApiMock.saveProviderBundleShare.mock.lastCall?.[0]).not.toHaveProperty("grokMediaPolicy");
+    }
   });
 
   it("checks server-owned eligibility before enabling, without writing a rejected Share", async () => {

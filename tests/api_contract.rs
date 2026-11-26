@@ -4,6 +4,7 @@
 include!("api_contract/buddy_login_site.rs");
 include!("api_contract/workbuddy_checkin.rs");
 include!("api_contract/opencode_zen.rs");
+include!("api_contract/grok_media_policy.rs");
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -6225,6 +6226,12 @@ async fn provider_share_settings_are_saved_atomically() {
     assert_eq!(saved["ownerEmail"].as_str(), Some("owner@example.com"));
     assert_eq!(saved["tunnelSubdomain"].as_str(), Some("after-save"));
     assert_eq!(saved["description"].as_str(), Some("Provider-scoped share"));
+    assert_eq!(saved["grantCapabilityPolicy"], true);
+    assert!(saved.get("grantCapabilities").is_none());
+    assert_eq!(
+        saved["userGrants"]["friend@example.com"]["policy"]["allowedOperations"],
+        json!([])
+    );
     assert!(saved.get("forSale").is_none());
     assert_eq!(saved["freeAccess"].as_bool(), Some(false));
     assert_eq!(saved["tokenLimit"].as_u64(), Some(123));
@@ -12326,21 +12333,7 @@ fn test_state_with_store_authority(host: IpAddr, committed: bool) -> ServerState
         )
         .unwrap();
     }
-    let log_capture = Arc::new(cc_switch_server::logging::LogCapture::new(
-        cc_switch_server::logging::RING_BUFFER_CAPACITY,
-    ));
-    let state = ServerStateInner::load(
-        Cli {
-            host,
-            port: 0,
-            config_dir: Some(config_dir),
-            web_dist_dir: None,
-            log_level: "warn".to_string(),
-            command: None,
-        },
-        log_capture,
-    )
-    .unwrap();
+    let state = load_test_state(host, config_dir);
     if committed {
         let marker: Value = serde_json::from_slice(
             &std::fs::read(state.config_dir.join("server-store-migration.json")).unwrap(),
@@ -12349,6 +12342,23 @@ fn test_state_with_store_authority(host: IpAddr, committed: bool) -> ServerState
         assert_eq!(marker["authority"], "committed");
     }
     state
+}
+
+fn load_test_state(host: IpAddr, config_dir: std::path::PathBuf) -> ServerState {
+    ServerStateInner::load(
+        Cli {
+            host,
+            port: 0,
+            config_dir: Some(config_dir),
+            web_dist_dir: None,
+            log_level: "warn".to_string(),
+            command: None,
+        },
+        Arc::new(cc_switch_server::logging::LogCapture::new(
+            cc_switch_server::logging::RING_BUFFER_CAPACITY,
+        )),
+    )
+    .unwrap()
 }
 
 fn test_state_with_external_web_dist() -> ServerState {
@@ -12392,6 +12402,10 @@ async fn setup_and_login(app: &Router) -> String {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
+    login_test_admin(app).await
+}
+
+async fn login_test_admin(app: &Router) -> String {
     let response = app
         .clone()
         .oneshot(json_request(

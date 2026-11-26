@@ -11,7 +11,7 @@ import type {
   ShareUserQuotaView,
   ShareUserUsageRebase,
 } from "@/lib/api";
-import { SHARE_APP_TYPES } from "@/lib/api/share";
+import { SHARE_APP_TYPES, type GrokMediaPolicy } from "@/lib/api/share";
 import {
   normalizeShareLimitValue,
   UNLIMITED_TOKEN_LIMIT,
@@ -380,6 +380,22 @@ function normalizeFreeAccess(raw: RawRecord): boolean {
   return readBool(raw, "freeAccess", "free_access") ?? false;
 }
 
+function normalizeGrokMediaPolicy(value: unknown): GrokMediaPolicy | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as RawRecord;
+  const flag = (camel: string, snake: string) => {
+    if (camel in raw) return raw[camel];
+    if (snake in raw) return raw[snake];
+    return false;
+  };
+  const imageGenerationEnabled = flag("imageGenerationEnabled", "image_generation_enabled");
+  const imageEditEnabled = flag("imageEditEnabled", "image_edit_enabled");
+  const videoGenerationEnabled = flag("videoGenerationEnabled", "video_generation_enabled");
+  if (typeof imageGenerationEnabled !== "boolean" || typeof imageEditEnabled !== "boolean"
+    || typeof videoGenerationEnabled !== "boolean") return undefined;
+  return { imageGenerationEnabled, imageEditEnabled, videoGenerationEnabled };
+}
+
 function normalizeExpiresAt(raw: RawRecord): string {
   const iso = readString(raw, "expiresAt", "expires_at");
   if (iso) return iso;
@@ -416,14 +432,15 @@ export function normalizeShareRecord(raw: unknown): ShareRecord | null {
 
   return {
     id,
-    capabilityPolicy: record.capabilityPolicy as ShareCapabilityPolicy | undefined,
+    capabilityPolicy: (record.capabilityPolicy ?? record.capability_policy) as ShareCapabilityPolicy | undefined,
     capacityPoolId:
       readString(record, "capacityPoolId", "capacity_pool_id") ?? id,
     name: readString(record, "name", "displayName", "display_name") ?? id,
     ownerEmail: readString(record, "ownerEmail", "owner_email") ?? "",
     description: readString(record, "description") ?? null,
     freeAccess: normalizeFreeAccess(record),
-    grantCapabilityPolicy: readBool(record, "grantCapabilityPolicy") ?? false,
+    grantCapabilityPolicy: readBool(record, "grantCapabilityPolicy", "grant_capability_policy") ?? false,
+    grokMediaPolicy: normalizeGrokMediaPolicy(record.grokMediaPolicy ?? record.grok_media_policy),
     bindings,
     apiKey: readString(record, "apiKey", "api_key") ?? "",
     settingsConfig:

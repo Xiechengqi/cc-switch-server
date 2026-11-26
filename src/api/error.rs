@@ -752,6 +752,10 @@ pub(crate) fn map_share_patch_error(
         }
         crate::domain::sharing::shares::SharePatchError::Invalid(message) => {
             match message.as_str() {
+                "CAPABILITY_UPGRADE_REQUIRED" => ApiError::conflict_code(
+                    "CAPABILITY_UPGRADE_REQUIRED",
+                    "Reload the Share editor to use its supported media permissions. For a new Share, save it first, then edit media and tools for the intended user.",
+                ),
                 "QUOTA_CYCLE_CONFLICT" | "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED" => {
                     let code = if message == "QUOTA_CYCLE_CONFLICT" { "QUOTA_CYCLE_CONFLICT" } else { "ACCOUNT_RESET_ROUTER_UPGRADE_REQUIRED" };
                     ApiError::conflict_code(code, message).with_retryable(true)

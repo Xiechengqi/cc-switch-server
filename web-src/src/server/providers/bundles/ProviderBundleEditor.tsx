@@ -1,4 +1,4 @@
-import { GrantReviewCancelled } from "@/lib/grant-capability-preview";
+import { grantMediaOperationLabel, GrantReviewCancelled } from "@/lib/grant-capability-preview";
 import { readWebSessionToken } from "@/lib/runtime";
 import {
   Fragment,
@@ -123,6 +123,7 @@ import {
 import { DEFAULT_PARALLEL_LIMIT, formatShareTokens } from "@/utils/shareUtils";
 import {
   BUNDLE_SHARE_EXPIRY_PRESETS,
+  GROK_MEDIA_OPERATIONS,
   createBundleShareDraft,
   shareLimitInput,
   shareLimitState,
@@ -1115,12 +1116,14 @@ function ShareAccessModeField({ value, onChange, disabled }: {
 
 function BundleShareEditor({
   draft,
+  grokMedia,
   onChange,
   ownerEmail,
   shareUrl,
   disabled = false,
 }: {
   draft: ProviderBundleShareDraft;
+  grokMedia: boolean;
   /**
    * A state setter, not a plain callback: ShareUserGrantsEditor reports a
    * grant change and its usage-edit change through two callbacks in the same
@@ -1272,6 +1275,20 @@ function BundleShareEditor({
               }
             />
           </div>
+          {grokMedia && draft.baseline?.legacyGrokMediaPolicy && (
+            <fieldset className="space-y-2 md:col-span-2">
+              <legend className="text-sm font-medium">{t("grokOauth.shareMediaPolicy")}</legend>
+              {GROK_MEDIA_OPERATIONS.map(([key, operation]) => (
+                <div key={key} className="flex items-center justify-between gap-3">
+                  <Label htmlFor={`bundle-share-${key}`}>{grantMediaOperationLabel(operation)}</Label>
+                  <Switch id={`bundle-share-${key}`} checked={draft.grokMediaPolicy[key]}
+                    onCheckedChange={enabled => onChange(current => ({
+                      ...current, grokMediaPolicy: { ...current.grokMediaPolicy, [key]: enabled },
+                    }))} />
+                </div>
+              ))}
+            </fieldset>
+          )}
           {/* Outside in: who may call, the Share-wide limits, then each user's own. */}
           <div className="space-y-3 border-t border-border-default/70 pt-4 md:col-span-2">
             <ShareSubheading id="bundle-share-access-title" title={t("share.freeAccess.title")} />
@@ -1435,6 +1452,9 @@ function BundleShareEditor({
             </div>
           </div>
           <div className="border-t border-border-default/70 pt-4 md:col-span-2">
+            {grokMedia && (!draft.baseline || draft.baseline.grantCapabilityPolicy) && (
+              <p className="mb-2 text-xs text-muted-foreground">{t("share.grantMedia.byUserHint")}</p>
+            )}
             <ShareUserGrantsEditor grantCapabilities={draft.baseline?.grantCapabilityPolicy} shareTokenLimit={Number(draft.tokenLimit) || -1}
               shareId={draft.baseline?.shareId}
               configRevision={draft.baseline?.configRevision}
@@ -3224,6 +3244,7 @@ export function ProviderBundleEditor({
             <fieldset disabled={saving} className="min-w-0">
               <BundleShareEditor
                 draft={shareDraft}
+                grokMedia={grokDriverOptions}
                 onChange={setShareDraft}
                 ownerEmail={ownerEmail}
                 shareUrl={shareUrl}

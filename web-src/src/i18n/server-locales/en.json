@@ -1162,6 +1162,8 @@
   },
   "share": {
     "grantMedia": {
+      "byUserHint": "After creating the Share, edit “Media generation and tools” for the intended user, then save the provider.",
+      "saveMismatch": "The server returned different media and tool permissions. Reload the Share settings and check the permissions.",
       "selectedCount": "Media and tools · {{count}}",
       "expired": "The permission review expired. Retry saving.",
       "confirmTokenGap": "Token limits do not cover these operations’ resource usage. Allow and save?",

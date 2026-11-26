@@ -907,7 +907,7 @@ async fn web_invoke_dispatch(
         "save_provider_share" => {
             let operator = share_usage_operator(state, headers).await;
             let share = Box::pin(web_save_provider_share(state, &args, operator)).await?;
-            Ok(json!(share))
+            web_share_with_grant_permissions(&share)
         }
         "validate_provider_bundle_draft" => {
             require_provider_write_contract(state, headers)?;

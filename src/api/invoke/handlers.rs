@@ -8,8 +8,8 @@ use crate::domain::providers::runtime::authoritative_managed_account;
 use crate::domain::accounts::oauth::{CLAUDE_WEB_PASTE_REDIRECT_URI, XAI_LOOPBACK_REDIRECT_URI};
 use crate::domain::sharing::retired_fields::find_retired_share_field;
 use crate::domain::sharing::router_contract::{
-    descriptor_for_share_with_accounts_and_usage, ShareSettingsPatch, ShareTotalUsageEdit,
-    ShareUserGrant, ShareUserUsageEdit, ShareUserUsageEditAction,
+    descriptor_for_share_with_accounts_and_usage, GrokMediaPolicy, ShareSettingsPatch,
+    ShareTotalUsageEdit, ShareUserGrant, ShareUserUsageEdit, ShareUserUsageEditAction,
 };
 
 #[cfg(test)]
@@ -1126,7 +1126,68 @@ struct SaveProviderBundleShareCommand {
     #[serde(default = "default_provider_bundle_previous_response_cache_enabled")]
     previous_response_cache_enabled: bool,
     #[serde(default)]
-    grok_media_policy: crate::domain::sharing::router_contract::GrokMediaPolicy,
+    grok_media_policy: Option<GrokMediaPolicy>,
+}
+
+struct BundleShareFingerprints {
+    current: String,
+    legacy: String,
+}
+
+impl BundleShareFingerprints {
+    fn new(command: &SaveProviderBundleShareCommand) -> Result<Self, ApiError> {
+        use sha2::{Digest, Sha256};
+        fn digest(payload: &Value) -> Result<String, ApiError> {
+            Ok(format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(payload).map_err(ApiError::internal)?)
+            ))
+        }
+        let mut payload = serde_json::to_value(command).map_err(ApiError::internal)?;
+        payload.sort_all_objects();
+        // The receipt exposes a SHA-256 hex digest scoped to [shareId, command].
+        let current = digest(&json!([command.share_id, &payload]))?;
+        // Historical receipts hashed a bare command with omitted media serialized as all-off.
+        payload["grokMediaPolicy"] = json!(command.grok_media_policy.unwrap_or_default());
+        payload.sort_all_objects();
+        Ok(Self {
+            current,
+            legacy: digest(&payload)?,
+        })
+    }
+
+    fn replay(
+        &self,
+        stored: &str,
+        share: Option<&Share>,
+        requested_media: Option<GrokMediaPolicy>,
+    ) -> Result<Share, ApiError> {
+        if stored != self.current && stored != self.legacy {
+            return Err(ApiError::conflict_code(
+                "quota_revision_conflict",
+                "The initialization operation has a different payload",
+            ));
+        }
+        let share = share.ok_or_else(|| ApiError::not_found("Share not found"))?;
+        // Before this fix even a matching receipt could describe media flags
+        // that were ignored. Never reapply its financial edits on a retry.
+        if stored == self.legacy {
+            if let Some(requested) = requested_media {
+                crate::domain::sharing::shares::validate_grok_media_write(
+                    Some(requested),
+                    Some(&share.policy),
+                    false,
+                )
+                .map_err(map_share_patch_error)?;
+                if requested != share.grok_media_policy {
+                    return Err(provider_bundle_share_conflict(
+                        "The earlier save did not apply these media permissions. Reload the Share and save the media change separately.",
+                    ));
+                }
+            }
+        }
+        Ok(share.clone())
+    }
 }
 
 fn default_provider_bundle_banked_reset_expiry_lead_minutes() -> u32 {
@@ -1315,6 +1376,7 @@ fn stage_provider_bundle_share(
                         command.banked_reset_expiry_lead_minutes,
                     ),
                     previous_response_cache_enabled: Some(command.previous_response_cache_enabled),
+                    grok_media_policy: command.grok_media_policy,
                     support: Some(crate::domain::sharing::shares::support_from_enabled_apps(
                         enabled_apps,
                     )),
@@ -1375,7 +1437,7 @@ fn stage_provider_bundle_share(
                 auto_consume_banked_reset: Some(command.auto_consume_banked_reset),
                 banked_reset_expiry_lead_minutes: Some(command.banked_reset_expiry_lead_minutes),
                 previous_response_cache_enabled: Some(command.previous_response_cache_enabled),
-                grok_media_policy: Some(command.grok_media_policy),
+                grok_media_policy: command.grok_media_policy,
                 auto_start: Some(true),
                 description,
                 enabled_apps: {
@@ -1503,15 +1565,9 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
                 "Do not mix Token and USD usage edits for the same user",
             ));
         }
-        use sha2::{Digest, Sha256};
-        let mut payload = serde_json::to_value(&command).map_err(ApiError::internal)?;
-        payload.sort_all_objects();
         Some((
             format!("bundle-value:{id}"),
-            format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_vec(&payload).map_err(ApiError::internal)?)
-            ),
+            BundleShareFingerprints::new(&command)?,
         ))
     } else {
         None
@@ -1595,20 +1651,26 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
             .get(operation_id)
             .or(permanent.as_ref())
         {
-            if &receipt.patch_fingerprint != fingerprint {
-                return Err(ApiError::conflict_code(
-                    "quota_revision_conflict",
-                    "The initialization operation has a different payload",
-                ));
-            }
-            return shares
-                .get(command.share_id.as_deref().unwrap_or_default())
-                .cloned()
-                .map(Some)
-                .ok_or_else(|| ApiError::not_found("Share not found"));
+            return fingerprint
+                .replay(
+                    &receipt.patch_fingerprint,
+                    shares.get(command.share_id.as_deref().unwrap_or_default()),
+                    command.grok_media_policy,
+                )
+                .map(Some);
         }
     }
 
+    crate::domain::sharing::shares::validate_grok_media_write(
+        command.grok_media_policy,
+        command
+            .share_id
+            .as_deref()
+            .and_then(|id| shares.get(id))
+            .map(|share| &share.policy),
+        command.capability_policy.is_some(),
+    )
+    .map_err(map_share_patch_error)?;
     if let Some(id) = command.share_id.as_deref() {
         let patch = state
             .prepare_capability_patch(
@@ -1616,6 +1678,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
                 ShareSettingsPatch {
                     capability_policy: command.capability_policy.clone(),
                     capability_consent: command.capability_consent.clone(),
+                    grok_media_policy: command.grok_media_policy,
                     grant_capability_edits: command.grant_capability_edits.clone(),
                     user_grants: command.user_grants.clone(),
                     user_grant_edits: command.user_grant_edits.clone(),
@@ -1800,10 +1863,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
         .try_mutate_share_quota_with_value_initializations(value_initializations, |store, current_usage, applied_at_ms| {
             if let Some((operation_id, fingerprint)) = &initialization_operation {
                 if let Some(receipt) = store.applied_settings_operations.get(operation_id) {
-                    if &receipt.patch_fingerprint != fingerprint {
-                        return Err(ApiError::conflict_code("quota_revision_conflict", "The initialization operation has a different payload"));
-                    }
-                    return store.get(&staged_share.id).cloned().ok_or_else(|| ApiError::not_found("Share not found"));
+                    return fingerprint.replay(&receipt.patch_fingerprint, store.get(&staged_share.id), command.grok_media_policy);
                 }
             }
             let current = store.clone();
@@ -1840,7 +1900,7 @@ pub(in crate::api) async fn web_save_provider_bundle_share(
                     if let Some(id) = store.applied_settings_operations.keys().next().cloned() { store.applied_settings_operations.remove(&id); }
                 }
                 store.applied_settings_operations.insert(operation_id.clone(), crate::domain::sharing::router_contract::ShareSettingsReceipt {
-                    operation_id: operation_id.clone(), patch_fingerprint: fingerprint.clone(), config_revision: saved.config_revision,
+                    operation_id: operation_id.clone(), patch_fingerprint: fingerprint.current.clone(), config_revision: saved.config_revision,
                 });
             }
             Ok(saved)
@@ -1930,6 +1990,20 @@ pub(in crate::api) async fn web_save_provider_share(
 ) -> Result<Share, ApiError> {
     let value = web_payload(args, &["params", "input"]);
     reject_retired_share_input_fields(value)?;
+    if [
+        "capabilityPolicy",
+        "capabilityConsent",
+        "grantCapabilityEdits",
+    ]
+    .iter()
+    .any(|key| value.get(*key).is_some_and(|v| !v.is_null()))
+    {
+        return Err(ApiError::conflict_code(
+            "CAPABILITY_UPGRADE_REQUIRED",
+            "Use the Share permissions editor to preview and save media and tool permissions.",
+        ));
+    }
+    let grok_media_policy = web_optional_deserialize(value, "grokMediaPolicy")?;
     let share_id = web_arg_string_any(value, &["shareId", "share_id", "id"])?;
     state
         .refresh_share_account_quota(&share_id)
@@ -2003,6 +2077,7 @@ pub(in crate::api) async fn web_save_provider_share(
                 parallel_limit: Some(parallel_limit),
                 expires_at: Some(expires_at),
                 user_grants: Some(user_grants),
+                grok_media_policy,
                 ..ShareSettingsPatch::default()
             },
             &usage_for_quota,
@@ -2584,10 +2659,7 @@ pub(in crate::api) fn web_arg_share_id(args: &Value) -> Result<String, ApiError>
     web_arg_string_any(value, &["shareId", "share_id", "id"])
 }
 
-pub(in crate::api) fn web_share_json(
-    config: &ServerConfig,
-    share: &Share,
-) -> Result<Value, ApiError> {
+pub(in crate::api) fn web_share_with_grant_permissions(share: &Share) -> Result<Value, ApiError> {
     let mut value = serde_json::to_value(share).map_err(ApiError::internal)?;
     let object = value
         .as_object_mut()
@@ -2613,6 +2685,14 @@ pub(in crate::api) fn web_share_json(
             serde_json::to_value(grants).map_err(ApiError::internal)?,
         );
     }
+    Ok(value)
+}
+
+pub(in crate::api) fn web_share_json(
+    config: &ServerConfig,
+    share: &Share,
+) -> Result<Value, ApiError> {
+    let mut value = web_share_with_grant_permissions(share)?;
     let Some(slug) = share.tunnel_subdomain.as_deref() else {
         return Ok(value);
     };
@@ -2628,13 +2708,10 @@ pub(in crate::api) fn web_share_json(
                 .map_err(|error| ApiError::conflict(error.to_string()))
         })?;
     let label = format!("{slug}--{client}");
-    object.insert("shareSlug".into(), json!(slug.as_str()));
-    object.insert("subdomain".into(), json!(label));
+    value["shareSlug"] = json!(slug.as_str());
+    value["subdomain"] = json!(label);
     if let Some(domain) = config.router.domain.as_deref() {
-        object.insert(
-            "tunnelUrl".into(),
-            json!(format!("https://{label}.{}", domain.trim())),
-        );
+        value["tunnelUrl"] = json!(format!("https://{label}.{}", domain.trim()));
     }
     Ok(value)
 }
