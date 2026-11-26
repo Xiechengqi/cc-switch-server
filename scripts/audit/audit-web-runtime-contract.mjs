@@ -60,7 +60,7 @@ const commands = contract.commands || [];
 uniqueBy(commands, "name", "command");
 const commandByName = new Map(commands.map((command) => [command.name, command]));
 for (const command of commands) {
-  if (!["tenant", "maintenance", "host", "excluded"].includes(command.workspaceAccess) ||
+  if (!["tenant", "host", "excluded"].includes(command.workspaceAccess) ||
       (command.workspaceAccess === "excluded") !== (command.support === "excluded")) {
     fail(`command ${command.name} requires an explicit workspace permission`);
   }

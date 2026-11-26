@@ -35,6 +35,7 @@ pub const LONG_VERSION: &str = concat!(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildInfo {
+    pub exclusive_management: bool,
     pub name: &'static str,
     pub version: &'static str,
     pub version_line: &'static str,
@@ -51,6 +52,7 @@ pub struct BuildInfo {
 
 pub fn build_info() -> BuildInfo {
     BuildInfo {
+        exclusive_management: true,
         name: env!("CARGO_PKG_NAME"),
         version: env!("CARGO_PKG_VERSION"),
         version_line: VERSION_LINE,

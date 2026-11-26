@@ -46,7 +46,7 @@ impl OpsTerminalManager {
         };
         if let Some(session) = session {
             session.cancel_idle_timer();
-            session.kill();
+            session.close().await;
             info!(owner = %session.owner, "web terminal session ended");
         }
     }

@@ -2,7 +2,6 @@ import { isTenantHost } from "@/lib/embeddedAuth";
 import i18n from "@/i18n";
 import { isRemoteWebMode } from "@/lib/api/auth";
 import {
-  attachWorkspaceOwnerProof,
   clientRequestUrl,
   clearRouterSessionTokens,
   readRouterAccessToken,
@@ -62,7 +61,7 @@ export interface WebRuntimeContext {
   openUrl?: string;
   marketListed?: boolean;
   leaseExpiresAt?: number;
-  workspaceRole?: "tenant" | "assistance" | null;
+  workspaceRole?: "tenant" | null;
   mode: "local-admin" | "share" | "client-login";
   appMode?: string;
   platform?: string;
@@ -141,7 +140,6 @@ function httpResponseError(data: unknown, status: number): HttpResponseError {
 const workspaceMessages = new Map([
   ["workspace_leased", "lease.locked"],
   ["unlist_first", "lease.unlistFirst"],
-  ["owner_proof_required", "lease.ownerProof"],
   ["tenant_session_required", "lease.routerHelp"],
   ["lease_ended", "lease.endedHelp"],
 ]);
@@ -193,7 +191,6 @@ async function localApiFetch(input: RequestInfo | URL, init: RequestInit = {}): 
   if (clientRequestUrl(input).origin !== window.location.origin) return fetch(input, init);
   const request = () => {
     const headers = new Headers(init.headers || {});
-    attachWorkspaceOwnerProof(headers, input);
     const token = readToken();
     if (token) headers.set("authorization", `Bearer ${token}`);
     return fetch(input, { ...init, headers, mode: "same-origin" });
@@ -246,6 +243,11 @@ export async function getWebRuntimeContext(allowAutoLogin = true): Promise<WebRu
     return tryAutoLoginFromCache(allowAutoLogin);
   }
   if (response.status === 403) {
+    const error = await response.json().catch(() => null);
+    if (error?.code === "workspace_leased") {
+      writeToken(null);
+      return {mode:"client-login",status:"workspace_leased"};
+    }
     return tryAutoLoginFromCache(allowAutoLogin);
   }
   const data = (await response.json().catch(() => ({}))) as WebRuntimeContext;
@@ -268,6 +270,13 @@ async function getRemoteWebRuntimeContext(allowAutoLogin: boolean): Promise<WebR
     headers: { accept: "application/json" },
     cache: "no-store",
   });
+  if (response.status === 403 && !isTenantHost()) {
+    const error = await response.clone().json().catch(() => null);
+    if (error?.code === "workspace_leased") {
+      clearRouterSessionTokens();
+      return {mode:"client-login",status:"workspace_leased"};
+    }
+  }
   if ([401, 403, 409, 410].includes(response.status) && isTenantHost()) {
     const data = await response.json().catch(() => ({}));
     return {

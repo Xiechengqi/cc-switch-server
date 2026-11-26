@@ -13,7 +13,7 @@ use crate::build_info::{build_info, BuildInfo};
 use crate::self_update::restart::{
     restart_from_detected_service, rollback_from_backup_and_restart,
 };
-use crate::self_update::upgrade::{UpgradeLogEntry, UpgradeStatus};
+use crate::self_update::upgrade::{UpgradeFailureDiagnostic, UpgradeLogEntry, UpgradeStatus};
 use crate::self_update::version::{
     ensure_binary_writable, fetch_latest_release_meta, rollback_available, BINARY_INSTALL_PATH,
     BINARY_ROLLBACK_PATH,
@@ -82,6 +82,8 @@ pub(in crate::api) struct AdminUpgradeStatusResponse {
     pub restart_pending: bool,
     pub target_commit_id: Option<String>,
     pub logs: Vec<UpgradeLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<UpgradeFailureDiagnostic>,
     pub restart_after: bool,
     pub updated_at: String,
 }
@@ -138,12 +140,28 @@ pub(in crate::api) async fn admin_restart(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let _command = state.market_workspace.commands.lock().await;
     require_session(&state, &headers).await?;
+    if state.market_workspace.management_locked() {
+        super::market_workspace::tenant(&state, &headers).await?;
+        if state.client_update_in_progress().await {
+            return Err(ApiError::conflict("Client update in progress"));
+        }
+    }
     let schedule = map_self_update_error(restart_from_detected_service(
         &state.market_workspace.root,
         state.bind_addr,
     ))?;
     state.upgrade.clear_restart_pending().await;
+    if let Some(g) = state.market_workspace.access().1 {
+        state
+            .market_workspace
+            .record_event(&g.lease_id, "tenant_restart")
+            .map_err(ApiError::internal)?;
+        return Ok(Json(
+            serde_json::json!({"ok":true,"operationId":schedule.operation_id}),
+        ));
+    }
     Ok(Json(serde_json::json!({
         "ok": true,
         "script": schedule.command,
@@ -155,13 +173,35 @@ pub(in crate::api) async fn admin_rollback(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let _command = state.market_workspace.commands.lock().await;
     require_session(&state, &headers).await?;
+    if state.market_workspace.management_locked() {
+        super::market_workspace::tenant(&state, &headers).await?;
+        if state.client_update_in_progress().await {
+            return Err(ApiError::conflict("Client update in progress"));
+        }
+        map_self_update_error(
+            crate::self_update::upgrade::sanity_exec(
+                std::path::Path::new(BINARY_ROLLBACK_PATH),
+                &state.market_workspace.root,
+            )
+            .await,
+        )?;
+        super::market_workspace::tenant(&state, &headers).await?;
+    }
     map_self_update_error(ensure_binary_writable())?;
     let script = map_self_update_error(rollback_from_backup_and_restart(
         &state.market_workspace.root,
         state.bind_addr,
     ))?;
     state.upgrade.clear_restart_pending().await;
+    if let Some(g) = state.market_workspace.access().1 {
+        state
+            .market_workspace
+            .record_event(&g.lease_id, "tenant_rollback")
+            .map_err(ApiError::internal)?;
+        return Ok(Json(serde_json::json!({"ok":true})));
+    }
     Ok(Json(serde_json::json!({
         "ok": true,
         "script": script,
@@ -174,6 +214,17 @@ pub(in crate::api) async fn admin_upgrade_start(
     Json(input): Json<StartUpgradeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_session(&state, &headers).await?;
+    if state.market_workspace.management_locked() {
+        let _command = state.market_workspace.commands.lock().await;
+        let grant = super::market_workspace::tenant(&state, &headers).await?;
+        let task = format!("lease-{}-{:032x}", grant.lease_id, rand::random::<u128>());
+        let id = start_authorized_upgrade(&state, true, "tenant", false, Some(task), None).await?;
+        state
+            .market_workspace
+            .record_event(&grant.lease_id, "tenant_upgrade")
+            .map_err(ApiError::internal)?;
+        return Ok(Json(serde_json::json!({"ok":true,"taskId":id})));
+    }
     ensure_upgrade_actor_allowed(&state, &headers).await?;
     let actor = if router_web_user_email(&headers).is_some() {
         "router-owner"
@@ -222,24 +273,68 @@ pub(crate) async fn start_upgrade_for_actor(
     actor: &str,
     force: bool,
 ) -> Result<String, ApiError> {
+    let _command = state.market_workspace.commands.lock().await;
+    if state.market_workspace.management_locked() {
+        return Err(ApiError::forbidden("current rental required"));
+    }
+    start_authorized_upgrade(state, restart_after, actor, force, None, None).await
+}
+
+pub(super) async fn start_authorized_upgrade(
+    state: &ServerState,
+    restart_after: bool,
+    actor: &str,
+    force: bool,
+    task_id: Option<String>,
+    expected_commit: Option<String>,
+) -> Result<String, ApiError> {
+    if crate::self_update::restart::restart_in_progress(&state.market_workspace.root) {
+        return Err(ApiError::conflict("Client restart in progress"));
+    }
     map_self_update_error(ensure_binary_writable())?;
     let client = crate::infra::http::self_update_client_builder()
         .user_agent("cc-switch-server/0.1 upgrade")
         .build()
         .map_err(|err| ApiError::internal(format!("upgrade client failed: {err}")))?;
-    let handle = map_self_update_error(
-        state
-            .upgrade
-            .start(
-                client,
-                Some(actor.to_string()),
-                restart_after,
-                force,
-                state.bind_addr,
-            )
-            .await,
-    )?;
+    let result = match task_id {
+        Some(id) => {
+            state
+                .upgrade
+                .start_task(
+                    client,
+                    Some(actor.to_owned()),
+                    restart_after,
+                    force,
+                    state.bind_addr,
+                    id,
+                    expected_commit,
+                )
+                .await
+        }
+        None => {
+            state
+                .upgrade
+                .start(
+                    client,
+                    Some(actor.to_owned()),
+                    restart_after,
+                    force,
+                    state.bind_addr,
+                )
+                .await
+        }
+    };
+    let handle = map_self_update_error(result)?;
     Ok(handle.task_id)
+}
+
+pub(super) fn workspace_can_view_upgrade(state: &ServerState, task_id: &str) -> bool {
+    let (_, grant, live) = state.market_workspace.access();
+    if let Some(grant) = grant {
+        live && task_id.starts_with(&format!("lease-{}-", grant.lease_id))
+    } else {
+        !state.market_workspace.management_locked() && !task_id.starts_with("lease-")
+    }
 }
 
 pub(in crate::api) async fn admin_upgrade_stream(
@@ -253,6 +348,7 @@ pub(in crate::api) async fn admin_upgrade_stream(
         .upgrade
         .current()
         .await
+        .filter(|handle| workspace_can_view_upgrade(&state, &handle.task_id))
         .ok_or_else(|| ApiError::not_found("no upgrade task running"))?;
     if let Some(expected) = query.task_id.as_deref() {
         if expected != handle.task_id {
@@ -270,6 +366,7 @@ pub(in crate::api) async fn admin_upgrade_stream(
     let mut shutdown = state.subscribe_shutdown();
     let stream = async_stream::stream! {
         for entry in history {
+            if !workspace_can_view_upgrade(&state, &handle.task_id) { return; }
             yield Ok(sse_event_from_entry(&entry));
         }
         if let Some(event) = emit_done_if_finished(&status, &restart_pending).await {
@@ -285,6 +382,7 @@ pub(in crate::api) async fn admin_upgrade_stream(
                 }
                 received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()) => received,
             };
+            if !workspace_can_view_upgrade(&state, &handle.task_id) { break; }
             match received {
                 Ok(Ok(entry)) => yield Ok(sse_event_from_entry(&entry)),
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
@@ -326,6 +424,7 @@ pub(super) async fn upgrade_status_for_task(
         .upgrade
         .status_snapshot()
         .await
+        .filter(|snapshot| workspace_can_view_upgrade(state, &snapshot.task_id))
         .ok_or_else(|| ApiError::not_found("no upgrade task running"))?;
     if let Some(expected) = task_id {
         if expected != snapshot.task_id {
@@ -338,6 +437,7 @@ pub(super) async fn upgrade_status_for_task(
         restart_pending: snapshot.restart_pending,
         target_commit_id: snapshot.target_commit_id,
         logs: snapshot.logs,
+        failure: snapshot.failure,
         restart_after: snapshot.restart_after,
         updated_at: snapshot.updated_at,
     }))

@@ -197,13 +197,13 @@ DeepSeek session 与 Trae catalog 使用共享不可变 payload，索引、paylo
 | 入口 | 租期内允许的身份及范围 |
 |---|---|
 | `/_ctl/market/{check,command,status}` | 仅带 installation 控制密钥 HMAC、有效时间和一次性 nonce 的 Router。命令必须满足持久化序号和租约状态。 |
-| `/_ctl/market/{upgrade,upgrade-status}` | 带 installation HMAC 且匹配上架 owner。启用委托后可触发固定来源的升级，凭 taskId 查该次状态。 |
+| `/_ctl/market/{upgrade,upgrade-status}` | 带 installation HMAC。租期内按有效 grant、租约 ID 和买家身份授权，只能查询同一租约的任务。空闲时仍按 owner 委托校验。 |
 | `/_ctl/` 中的 Share 管理回执 | 已签名控制通道，固定的 Share 设置、配额、核验与撤权处理程序；租期结束后可完成对账。 |
-| `/web-api/market/{workspace,chat,token,backups}`、备份恢复 | 当前租户可操作当前工作区。卖家只可读 workspace 的脱敏投影。备份按文件白名单导出和校验恢复，排除 installation 身份和日志。 |
+| `/web-api/market/{workspace,chat,token,backups}`、备份恢复 | 当前租户可操作当前工作区。通过租户域名和 Router 买家账号验证身份。备份按文件白名单导出和校验恢复，排除 installation 身份和日志。 |
 | 账号与 Provider、Share、用量、Web invoke | `api/market_workspace.rs` 的 `tenant_path` 与 `workspace_command` 列出允许的路由模板和命令。需要租户域名和与授权一致的已验证身份。 |
 | 推理和 Share 内部观测 | 仅当前租约域名下已签名的 Share 路由。回环推理另外检查真实连接对端、租户 Bearer 令牌和 `X-Workspace-Share`。 |
-| 安装配置、Router 绑定、系统日志、终端、升级和重启 | 租户无权使用。卖家在自身域名或本机登录看协助视图；终端与固定维护操作另外验证 owner 凭据，访问事件持久化后通知租户。 |
-| `/web-api/market/maintenance` | 额外验证本机 owner 凭据，只写 installation 的终端开关与升级策略。协助页显示硬件、Router 注册状态及最近一次心跳。 |
+| 安装身份、Router 绑定、Web Terminal | 租期内关闭物理控制台与本机管理。开租结束已有 PTY，租户也无法使用 Web Terminal。 |
+| `/web-api/market/upgrade-policy` 与受控运维命令 | 租户在本租约目录保存自动升级策略，可重启、升级和回滚至支持独占管理的版本。操作回执按租约保存。 |
 | 静态 Web、版本、健康与登录引导 | 可以启动页面和认证流程。其余管理请求按默认拒绝处理。 |
 
-owner 的操作系统 root 权限仍能直接读盘。租户确认页和工作区控制台均告知此边界。控制消息、报价和退租线格式见 Router 的 PROTOCOL.md。
+owner 的操作系统 root 权限仍能直接读盘。买家在结账时确认该边界。控制台密码只保存在 installation 中。Router 确认交还后 owner 使用原密码重新认证。控制消息、报价和退租线格式见 Router 的 PROTOCOL.md。

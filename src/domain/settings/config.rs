@@ -575,8 +575,8 @@ impl ServerConfig {
             .with_context(|| format!("create config dir {}", config_dir.display()))?;
 
         let config_path = config_path(config_dir);
-        // The effective config borrows the installation transport and owner credentials
-        // in memory. Workspace persistence carries only workspace-owned settings.
+        // The effective config borrows the installation transport and verified owner
+        // identity in memory. Workspace persistence carries only workspace-owned settings.
         let mut stored;
         let value = if self.workspace.is_some() {
             stored = Self::empty();
@@ -605,7 +605,7 @@ impl ServerConfig {
     }
 
     pub fn is_local_setup_complete(&self) -> bool {
-        self.auth.password_hash.is_some()
+        (self.workspace.is_some() || self.auth.password_hash.is_some())
             && self
                 .owner
                 .email

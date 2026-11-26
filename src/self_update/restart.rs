@@ -123,6 +123,18 @@ pub fn read_restart_operation(config_dir: &Path) -> Option<RestartOperationSnaps
     serde_json::from_slice(&std::fs::read(config_dir.join(RESTART_OPERATION_FILENAME)).ok()?).ok()
 }
 
+pub(crate) fn restart_in_progress(config_dir: &Path) -> bool {
+    read_restart_operation(config_dir).is_some_and(|op| {
+        op.status == "running"
+            && chrono::DateTime::parse_from_rfc3339(&op.updated_at).is_ok_and(|at| {
+                chrono::Utc::now()
+                    .timestamp()
+                    .saturating_sub(at.timestamp())
+                    < 120
+            })
+    })
+}
+
 fn update_restart_operation(
     config_dir: &Path,
     operation_id: &str,

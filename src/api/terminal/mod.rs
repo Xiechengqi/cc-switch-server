@@ -44,6 +44,7 @@ pub(crate) async fn terminal_stream(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let admission = state.market_workspace.commands.lock().await;
     ensure_enabled(&state).await?;
     let principal = require_web_admin_session(&state, &headers).await?;
     let session = state
@@ -52,6 +53,7 @@ pub(crate) async fn terminal_stream(
         .await
         .map_err(map_attach_error)?;
 
+    drop(admission);
     let client_id = next_client_id();
     let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(32);
     let (replay_tx, replay_rx) = oneshot::channel();
@@ -70,8 +72,10 @@ pub(crate) async fn terminal_stream(
 
     let stream = async_stream::stream! {
         let _attachment = attachment;
+        if *shutdown.borrow() || state.market_workspace.management_locked() { return; }
         yield Ok(terminal_event(ServerMessage::ReplayBegin));
         for chunk in replay {
+            if *shutdown.borrow() || state.market_workspace.management_locked() { return; }
             yield Ok(terminal_event(ServerMessage::output_bytes(&chunk)));
         }
         yield Ok(terminal_event(ServerMessage::ReplayEnd));
@@ -82,8 +86,10 @@ pub(crate) async fn terminal_stream(
                     if changed.is_err() || *shutdown.borrow() { break; }
                 }
                 chunk = output_rx.recv() => match chunk {
-                    Some(chunk) => yield Ok(terminal_event(ServerMessage::output_bytes(&chunk))),
-                    None => break,
+                    Some(chunk) if !state.market_workspace.management_locked() => {
+                        yield Ok(terminal_event(ServerMessage::output_bytes(&chunk)));
+                    }
+                    _ => break,
                 }
             }
         }
@@ -102,6 +108,7 @@ pub(crate) async fn terminal_input(
     headers: HeaderMap,
     Json(payload): Json<TerminalInputPayload>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let _admission = state.market_workspace.commands.lock().await;
     ensure_enabled(&state).await?;
     let principal = require_web_admin_session(&state, &headers).await?;
     let bytes = decode_input_payload(&payload.d).map_err(ApiError::bad_request)?;
@@ -114,6 +121,7 @@ pub(crate) async fn terminal_resize(
     headers: HeaderMap,
     Json(payload): Json<TerminalResizePayload>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let _admission = state.market_workspace.commands.lock().await;
     ensure_enabled(&state).await?;
     let principal = require_web_admin_session(&state, &headers).await?;
     request_for_principal(
@@ -132,6 +140,7 @@ pub(crate) async fn terminal_session_end(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let _admission = state.market_workspace.commands.lock().await;
     ensure_enabled(&state).await?;
     let principal = require_web_admin_session(&state, &headers).await?;
     if let Some(owner) = state.terminal.current_owner().await {
@@ -148,6 +157,9 @@ pub(crate) async fn terminal_session_end(
 
 async fn ensure_enabled(state: &ServerState) -> Result<(), ApiError> {
     let config = state.config.read().await;
+    if state.market_workspace.management_locked() {
+        return Err(ApiError::forbidden("Web Terminal is closed during rental"));
+    }
     if !config.is_web_terminal_enabled() {
         return Err(ApiError::feature_disabled(
             "web terminal is disabled; set enableWebTerminal=true or unset CC_SWITCH_ENABLE_WEB_TERMINAL=0",

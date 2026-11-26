@@ -410,50 +410,14 @@ export function readRouterAccessToken(): string | null {
   return state.accessToken?.trim() || state.apiToken?.trim() || null;
 }
 
-// A Client-issued password proof is tab-local and only sent to owner operations
-// on the current Client. It never accompanies Router requests or tenant data.
-let maintenanceVisit: string | null = null;
-export function setMaintenanceVisit(id: string | null) {
-  maintenanceVisit = id;
-}
-let workspaceOwnerProof: string | null = null;
-export function setWorkspaceOwnerProof(proof: string | null) {
-  workspaceOwnerProof = proof;
-}
 export function clientRequestUrl(input: RequestInfo | URL) {
   return new URL(input instanceof Request ? input.url : String(input), window.location.origin);
-}
-export function attachWorkspaceOwnerProof(headers: Headers, input: RequestInfo | URL) {
-  const url = clientRequestUrl(input);
-  if (
-    url.origin === window.location.origin &&
-    url.pathname === "/web-api/terminal/stream" &&
-    maintenanceVisit
-  ) {
-    headers.set("x-cc-switch-workspace-visit", maintenanceVisit);
-  }
-  if (
-    workspaceOwnerProof &&
-    url.origin === window.location.origin &&
-    (url.pathname.startsWith("/web-api/terminal/") ||
-      [
-        "/web-api/market/maintenance",
-        "/web-api/market/maintenance/status",
-        "/web-api/market/maintenance/upgrade-status",
-        "/web-api/invoke/restart_server_service",
-        "/web-api/invoke/start_admin_upgrade",
-        "/web-api/invoke/rollback_server_service",
-      ].includes(url.pathname))
-  ) {
-    headers.set("x-cc-switch-owner-proof", workspaceOwnerProof);
-  }
 }
 async function fetchWithAuth(
   input: RequestInfo | URL,
   init: RequestInit = {},
 ): Promise<Response> {
   const headers = new Headers(init.headers || {});
-  attachWorkspaceOwnerProof(headers,input);
   if (!isTenantHost()) Object.entries(authBearerHeaders()).forEach(([key, value]) => headers.set(key, value));
   if (clientRequestUrl(input).pathname.startsWith("/web-api/")) {
     Object.entries(await embeddedAuthHeaders()).forEach(([key, value]) => headers.set(key, value));

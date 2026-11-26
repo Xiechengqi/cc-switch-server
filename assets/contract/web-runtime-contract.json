@@ -1162,7 +1162,7 @@
     },
     {
       "name": "restart_server_service",
-      "workspaceAccess": "maintenance",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1198,7 +1198,7 @@
     },
     {
       "name": "rollback_server_service",
-      "workspaceAccess": "maintenance",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -1223,7 +1223,7 @@
     },
     {
       "name": "start_admin_upgrade",
-      "workspaceAccess": "maintenance",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -2159,7 +2159,7 @@
     },
     {
       "name": "save_provider_request_defaults",
-      "workspaceAccess": "host",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "settings",
@@ -2177,7 +2177,7 @@
     },
     {
       "name": "save_provider_health_check_config",
-      "workspaceAccess": "host",
+      "workspaceAccess": "tenant",
       "support": "native",
       "implemented": true,
       "feature": "settings",

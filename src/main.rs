@@ -74,8 +74,7 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
                     .1
                     .is_some_and(|g| g.expires_at.saturating_add(300) <= now)
                 {
-                    let drained = sealing.market_workspace_drained().await;
-                    match sealing.market_workspace.reap_expired(now, drained) {
+                    match sealing.reap_expired_workspace(now).await {
                         Ok(true) => {
                             sealing.begin_shutdown();
                             break;

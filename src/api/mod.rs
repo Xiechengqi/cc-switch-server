@@ -269,9 +269,7 @@ pub fn app_router(state: ServerState) -> Router {
         .route("/_ctl/market/upgrade-status", post(market_workspace::control))
         .route("/web-api/market/chat",get(market_workspace::chat::history).post(market_workspace::chat::send))
         .route("/web-api/market/workspace", get(market_workspace::view))
-        .route("/web-api/market/maintenance/status", get(market_workspace::maintenance_status))
-        .route("/web-api/market/maintenance/upgrade-status", get(admin_upgrade_status))
-        .route("/web-api/market/maintenance", post(market_workspace::maintenance))
+        .route("/web-api/market/upgrade-policy", post(market_workspace::upgrade_policy))
         .route("/web-api/market/token", post(market_workspace::token))
         .route("/web-api/market/backups", get(market_workspace::backups).post(market_workspace::export))
         .route("/web-api/market/backups/:id/restore",post(market_workspace::restore))
@@ -3328,6 +3326,7 @@ mod grok_catalog_provider_tests {
                     sequence: 2,
                     action: Operation::Begin {
                         grant: Grant {
+                            buyer_id: None,
                             lease_id: lease.into(),
                             alias: alias.into(),
                             tenant_email: tenant.into(),
@@ -3366,23 +3365,15 @@ mod grok_catalog_provider_tests {
             header::AUTHORIZATION,
             "Bearer local-owner-session".parse().unwrap(),
         );
-        assert_eq!(
-            resolve_web_admin_principal(&state, &sources)
-                .await
-                .unwrap()
-                .unwrap()
-                .source,
-            WebPrincipalSource::LocalOwner
-        );
+        assert!(resolve_web_admin_principal(&state, &sources)
+            .await
+            .unwrap()
+            .is_none());
         sources.insert("x-cc-switch-web-user-email", owner.parse().unwrap());
-        assert_eq!(
-            resolve_web_admin_principal(&state, &sources)
-                .await
-                .unwrap()
-                .unwrap()
-                .source,
-            WebPrincipalSource::Router
-        );
+        assert!(resolve_web_admin_principal(&state, &sources)
+            .await
+            .unwrap()
+            .is_none());
         sources.insert("x-cc-switch-web-user-email", tenant.parse().unwrap());
         assert!(resolve_web_admin_principal(&state, &sources)
             .await
@@ -3421,7 +3412,7 @@ mod grok_catalog_provider_tests {
                 "/web-api/market/workspace",
                 owner,
                 "seller-client",
-                StatusCode::OK,
+                StatusCode::FORBIDDEN,
             ),
             (
                 "GET",
@@ -3432,15 +3423,15 @@ mod grok_catalog_provider_tests {
             ),
             ("GET", "/api/config", tenant, alias, StatusCode::FORBIDDEN),
             (
-                "POST",
-                "/web-api/market/maintenance",
-                tenant,
-                alias,
+                "GET",
+                "/web-api/terminal/stream",
+                owner,
+                "seller-client",
                 StatusCode::FORBIDDEN,
             ),
             (
                 "POST",
-                "/web-api/market/maintenance",
+                "/web-api/auth/password/login",
                 owner,
                 "seller-client",
                 StatusCode::FORBIDDEN,
@@ -3528,8 +3519,9 @@ mod grok_catalog_provider_tests {
                 );
             } else if path == "/web-api/market/workspace" && code == StatusCode::OK {
                 let payload: Value = serde_json::from_slice(&body).unwrap();
-                assert!(payload["connectivity"]["registered"].is_boolean());
-                assert_eq!(payload["maintenance"].is_object(), who == owner);
+                assert_eq!(payload["role"], "tenant");
+                assert_eq!(payload["leaseId"], lease);
+                assert!(payload.get("maintenance").is_none());
             }
         }
         let policy = crate::domain::settings::config::UpgradePolicyConfig {
@@ -3537,16 +3529,15 @@ mod grok_catalog_provider_tests {
             auto_upgrade_check_interval_minutes: 27,
             delegate_upgrade_to_router_owner: false,
         };
-        state
-            .set_workspace_host_maintenance(false, policy)
-            .await
-            .unwrap();
+        let original =
+            crate::domain::settings::config::ServerConfig::load_or_default(&root).unwrap();
+        state.set_tenant_upgrade_policy(policy).await.unwrap();
         let persisted =
             crate::domain::settings::config::ServerConfig::load_or_default(&root).unwrap();
-        assert!(!persisted.enable_web_terminal);
+        assert_eq!(persisted.enable_web_terminal, original.enable_web_terminal);
         assert_eq!(
             persisted.upgrade_policy.auto_upgrade_check_interval_minutes,
-            27
+            original.upgrade_policy.auto_upgrade_check_interval_minutes
         );
         assert_eq!(persisted.owner.email.as_deref(), Some(owner));
         let response = app
@@ -3561,7 +3552,7 @@ mod grok_catalog_provider_tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             Workspace::open(root.clone()).unwrap().view().events.len(),
-            1
+            0
         );
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
@@ -6434,17 +6425,14 @@ async fn web_runtime_context(
     };
     let (listed_owner, grant, _) = state.market_workspace.access();
     let tenant = principal.source == session::WebPrincipalSource::LeaseTenant;
-    let leased_role = grant
-        .as_ref()
-        .map(|_| if tenant { "tenant" } else { "assistance" });
+    if state.market_workspace.management_locked() && !tenant {
+        return Err(ApiError::forbidden("Client is rented"));
+    }
+    let leased_role = tenant.then_some("tenant");
     let commands: Vec<_> = contract
         .commands
         .iter()
-        .filter(|cmd| match leased_role {
-            Some("tenant") => market_workspace::workspace_command(&cmd.name),
-            Some("assistance") => cmd.workspace_access == web_runtime::WorkspaceAccess::Maintenance,
-            _ => true,
-        })
+        .filter(|cmd| !tenant || market_workspace::workspace_command(&cmd.name))
         .collect();
     Ok(Json(json!({
         "mode": "local-admin","workspaceRole":leased_role,

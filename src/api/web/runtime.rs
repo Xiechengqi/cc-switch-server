@@ -66,7 +66,6 @@ pub struct WebRuntimeEndpoint {
 #[serde(rename_all = "camelCase")]
 pub enum WorkspaceAccess {
     Tenant,
-    Maintenance,
     Host,
     Excluded,
 }

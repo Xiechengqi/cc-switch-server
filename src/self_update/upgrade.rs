@@ -167,6 +167,41 @@ impl UpgradeRegistry {
         })
     }
 
+    fn lease_archive_path(&self, task_id: &str) -> Option<PathBuf> {
+        let lease = crate::market_lease::PROCESS_LEASE.get()?;
+        let operation = task_id.strip_prefix(&format!("lease-{lease}-"))?;
+        (operation.len() == 32 && operation.bytes().all(|c| c.is_ascii_hexdigit())).then(|| {
+            self.state_path
+                .parent()
+                .expect("installation directory")
+                .join("workspaces")
+                .join(format!("lease-{lease}"))
+                .join(format!("upgrade-{operation}.json"))
+        })
+    }
+    pub(crate) fn archived(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<UpgradeStatusSnapshot>, SelfUpdateError> {
+        let Some(path) = self.lease_archive_path(task_id) else {
+            return Ok(None);
+        };
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| SelfUpdateError::Internal(format!("read archived upgrade: {e}"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(SelfUpdateError::Internal(format!(
+                "read archived upgrade: {e}"
+            ))),
+        }
+    }
+
+    pub async fn busy(&self) -> bool {
+        self.status_snapshot().await.is_some_and(|task| {
+            matches!(task.status, UpgradeStatus::Running) || task.restart_pending
+        })
+    }
     pub async fn is_restart_pending(&self) -> bool {
         if let Some(handle) = self.inner.lock().await.as_ref() {
             return *handle.restart_pending.lock().await;
@@ -182,13 +217,54 @@ impl UpgradeRegistry {
         force: bool,
         health_addr: SocketAddr,
     ) -> Result<UpgradeHandle, SelfUpdateError> {
+        let id = new_task_id();
+        let task_id = crate::market_lease::PROCESS_LEASE
+            .get()
+            .map_or_else(|| id.clone(), |lease| format!("lease-{lease}-{id}"));
+        self.start_task(
+            client,
+            actor,
+            restart_after,
+            force,
+            health_addr,
+            task_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_task(
+        self: &Arc<Self>,
+        client: reqwest::Client,
+        actor: Option<String>,
+        restart_after: bool,
+        force: bool,
+        health_addr: SocketAddr,
+        task_id: String,
+        expected_commit: Option<String>,
+    ) -> Result<UpgradeHandle, SelfUpdateError> {
         let mut guard = self.inner.lock().await;
+        if let Some(snapshot) = self.archived(&task_id)? {
+            return Ok(handle_from_snapshot(snapshot));
+        }
         if let Some(handle) = guard.as_ref() {
-            if matches!(*handle.status.lock().await, UpgradeStatus::Running) {
+            if handle.task_id == task_id {
                 return Ok(handle.clone());
             }
+            if matches!(*handle.status.lock().await, UpgradeStatus::Running)
+                || *handle.restart_pending.lock().await
+            {
+                if handle.task_id.starts_with("lease-") || task_id.starts_with("lease-") {
+                    return Err(SelfUpdateError::Forbidden(
+                        "Client update already in progress".into(),
+                    ));
+                }
+                return Ok(handle.clone());
+            }
+            if let Some(path) = self.lease_archive_path(&handle.task_id) {
+                write_snapshot_atomic(&path, &snapshot_from_handle(handle).await)?;
+            }
         }
-        let task_id = new_task_id();
         let (sender, _receiver) = broadcast::channel(LOG_CHANNEL_CAPACITY);
         let handle = UpgradeHandle {
             task_id,
@@ -200,9 +276,9 @@ impl UpgradeRegistry {
             failure: Arc::new(Mutex::new(None)),
             restart_after,
         };
+        write_snapshot_atomic(&self.state_path, &snapshot_from_handle(&handle).await)?;
         *guard = Some(handle.clone());
         drop(guard);
-        self.persist(&handle).await?;
 
         let registry = self.clone();
         let task_handle = handle.clone();
@@ -215,6 +291,7 @@ impl UpgradeRegistry {
                 restart_after,
                 force,
                 health_addr,
+                expected_commit.as_deref(),
             )
             .await;
             match result {
@@ -226,12 +303,12 @@ impl UpgradeRegistry {
                     }
                 }
                 Err(error) => {
-                    *task_handle.status.lock().await = UpgradeStatus::Failed;
                     let mut failure = task_handle.failure.lock().await;
                     if failure.is_none() {
                         *failure = Some(UpgradeFailureDiagnostic::upgrade(&error));
                     }
                     drop(failure);
+                    *task_handle.status.lock().await = UpgradeStatus::Failed;
                     if let Err(persist_error) = registry.persist(&task_handle).await {
                         warn!(error = %persist_error, "persist failed upgrade failed");
                     }
@@ -253,6 +330,10 @@ impl UpgradeRegistry {
     }
 
     pub async fn refresh_from_disk(&self) {
+        let guard = self.inner.lock().await;
+        let Some(handle) = guard.as_ref() else {
+            return;
+        };
         let bytes = match std::fs::read(&self.state_path) {
             Ok(bytes) => bytes,
             Err(_) => return,
@@ -264,14 +345,16 @@ impl UpgradeRegistry {
                 return;
             }
         };
-        let Some(handle) = self.inner.lock().await.clone() else {
-            return;
-        };
         if handle.task_id != snapshot.task_id {
             return;
         }
         let new_entries = {
             let mut history = handle.history.lock().await;
+            // The replacement helper appends an outcome. An older snapshot of our
+            // own worker can be on disk while its latest transition is in memory.
+            if snapshot.logs.len() <= history.len() {
+                return;
+            }
             let entries = snapshot
                 .logs
                 .iter()
@@ -291,7 +374,7 @@ impl UpgradeRegistry {
     }
 
     pub async fn clear_restart_pending(&self) {
-        if let Some(handle) = self.inner.lock().await.clone() {
+        if let Some(handle) = self.current().await {
             *handle.restart_pending.lock().await = false;
             if let Err(error) = self.persist(&handle).await {
                 warn!(error = %error, "persist restart-pending state failed");
@@ -300,6 +383,13 @@ impl UpgradeRegistry {
     }
 
     async fn persist(&self, handle: &UpgradeHandle) -> Result<(), SelfUpdateError> {
+        let guard = self.inner.lock().await;
+        if !guard
+            .as_ref()
+            .is_some_and(|current| current.task_id == handle.task_id)
+        {
+            return Ok(());
+        }
         let snapshot = snapshot_from_handle(handle).await;
         write_snapshot_atomic(&self.state_path, &snapshot)
     }
@@ -358,6 +448,7 @@ async fn run_upgrade(
     restart_after: bool,
     force: bool,
     health_addr: SocketAddr,
+    expected_commit: Option<&str>,
 ) -> Result<UpgradeRunOutcome, SelfUpdateError> {
     let actor = actor.unwrap_or_else(|| "unknown".to_string());
     emit(
@@ -554,7 +645,16 @@ async fn run_upgrade(
         .state_path
         .parent()
         .ok_or_else(|| SelfUpdateError::Internal("upgrade state path has no parent".into()))?;
-    let target_commit = match sanity_exec(target, config_dir).await {
+    let target_commit = match sanity_exec(target, config_dir).await.and_then(|commit| {
+        if expected_commit
+            .is_some_and(|expected| !commit.starts_with(expected) && !expected.starts_with(&commit))
+        {
+            return Err(SelfUpdateError::Forbidden(
+                "downloaded Client differs from the authorized release".into(),
+            ));
+        }
+        Ok(commit)
+    }) {
         Ok(commit) => commit,
         Err(error) => {
             cleanup_tmp(target);
@@ -781,7 +881,7 @@ fn chmod_exec(path: &Path) -> Result<(), SelfUpdateError> {
         .map_err(|err| SelfUpdateError::Internal(format!("chmod staged file failed: {err}")))
 }
 
-async fn sanity_exec(path: &Path, config_dir: &Path) -> Result<String, SelfUpdateError> {
+pub(crate) async fn sanity_exec(path: &Path, config_dir: &Path) -> Result<String, SelfUpdateError> {
     let output = tokio::time::timeout(SANITY_TIMEOUT, Command::new(path).arg("--help").output())
         .await
         .map_err(|_| SelfUpdateError::Internal("sanity --help timed out".into()))?
@@ -983,6 +1083,13 @@ fn validate_staged_version_output(stdout: &[u8]) -> Result<String, SelfUpdateErr
     let value: serde_json::Value = serde_json::from_slice(stdout).map_err(|err| {
         SelfUpdateError::Internal(format!("parse staged binary version output failed: {err}"))
     })?;
+    if crate::market_lease::PROCESS_LEASE.get().is_some()
+        && value.get("exclusiveManagement").and_then(|v| v.as_bool()) != Some(true)
+    {
+        return Err(SelfUpdateError::Forbidden(
+            "release lacks exclusive rental management".into(),
+        ));
+    }
     let actual_commit = value
         .get("commitId")
         .and_then(serde_json::Value::as_str)

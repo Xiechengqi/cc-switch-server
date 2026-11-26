@@ -26,6 +26,7 @@ export default function App() {
       await initializeEmbeddedAuth();
       const next = await getWebRuntimeContext();
       if (current === generation.current) {
+        if (next.status === "workspace_leased") queryClient.clear();
         setContext(next);
         setError("");
       }
@@ -35,7 +36,7 @@ export default function App() {
         setError(cause instanceof Error ? cause.message : String(cause));
       throw cause;
     }
-  }, []);
+  }, [queryClient]);
 
   useEffect(() => {
     void refreshContext().catch(() => {});
@@ -79,6 +80,11 @@ export default function App() {
       </EmptyState>
     );
   if (!context) return <EmptyState title={t("common.loading")} value={t("server.common.runtime")} />;
+  if (context.status === "workspace_leased") {
+    return <EmptyState title={t("lease.title")} value={t("lease.ownerLocked")}>
+      <Button variant="outline" onClick={() => void refreshContext().catch(() => {})}>{t("lease.retry")}</Button>
+    </EmptyState>;
+  }
   if (context.mode !== "local-admin") {
     if (isTenantHost() || context.workspaceRole === "tenant") {
       const ended = context.status === "lease_ended";
@@ -105,17 +111,6 @@ export default function App() {
       <LoginPanel context={context} onAuthenticated={refreshContext} />
     );
   }
-  if (context.workspaceRole === "assistance")
-    return (
-      <LeaseWorkspace
-        key={context.leaseId}
-        role="assistance"
-        leaseId={context.leaseId}
-        expiresAt={context.leaseExpiresAt}
-        localOwner={context.localOwner}
-        onSignOut={signOut}
-      />
-    );
   const tenant = context.workspaceRole === "tenant";
   const app = (
     <ServerApp
@@ -130,7 +125,6 @@ export default function App() {
       <WorkspaceCommands.Provider value={new Set(context.commands?.map((c) => c.name))}>
         <LeaseWorkspace
           key={context.leaseId}
-          role="tenant"
           leaseId={context.leaseId}
           expiresAt={context.leaseExpiresAt}
           onSignOut={signOut}

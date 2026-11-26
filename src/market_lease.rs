@@ -11,6 +11,8 @@ pub(crate) const ACCESS_EVENT_BATCH: usize = 1024;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Grant {
     pub lease_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_id: Option<String>,
     pub tenant_email: String,
     pub alias: String,
     pub expires_at: i64,
@@ -31,6 +33,7 @@ pub enum Operation {
     Cancel { lease_id: String },
     Fence { lease_id: String },
     Clean { lease_id: String },
+    Return { lease_id: String },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -44,8 +47,6 @@ pub struct Command {
 pub struct Journal {
     #[serde(default)]
     pub events: Vec<AccessEvent>,
-    #[serde(skip)]
-    recent_visits: Vec<String>,
     #[serde(default)]
     pub managed_activity: bool,
     #[serde(default)]
@@ -56,6 +57,8 @@ pub struct Journal {
     pub grant: Option<Grant>,
     pub fenced: bool,
     pub purging: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_return: Option<String>,
     pub last: Option<Command>,
 }
 
@@ -218,11 +221,11 @@ impl Workspace {
                 std::fs::remove_dir_all(&path)?;
                 sync_directory(path.parent().unwrap())?;
             }
+            journal.awaiting_return = Some(grant.lease_id.clone());
             journal.grant = None;
             // Receipts belong to the purged lease. Without its grant the Router
             // can no longer acknowledge them, so they must not outlive cleanup.
             journal.events.clear();
-            journal.recent_visits.clear();
             journal.managed_activity = false;
             journal.token_hash = None;
             journal.sealed_until = 0;
@@ -255,9 +258,6 @@ impl Workspace {
         self.journal.read().expect("lease journal").clone()
     }
     pub fn record_event(&self, lease: &str, kind: &str) -> anyhow::Result<()> {
-        self.record_visit(lease, kind, None)
-    }
-    pub fn record_visit(&self, lease: &str, kind: &str, visit: Option<&str>) -> anyhow::Result<()> {
         let mut current = self.journal.write().expect("lease journal");
         ensure!(
             current.grant.as_ref().is_some_and(|g| g.lease_id == lease),
@@ -269,42 +269,10 @@ impl Workspace {
         if current.purging {
             return Ok(());
         }
-        let visit_id = matches!(kind, "assistance" | "terminal")
-            .then_some(visit)
-            .flatten()
-            .filter(|v| v.len() == 32 && v.bytes().all(|b| b.is_ascii_hexdigit()))
-            .map(|id| format!("{kind}:{id}"));
-        if visit_id
-            .as_ref()
-            .is_some_and(|id| current.recent_visits.contains(id))
-        {
-            return Ok(());
-        }
         let mut next = current.clone();
-        let event_id = if let Some(id) = &visit_id {
-            use sha2::{Digest, Sha256};
-            hex::encode(&Sha256::digest(format!("{lease}:{id}").as_bytes())[..16])
-        } else {
-            format!("{:032x}", rand::random::<u128>())
-        };
-        if current.events.iter().any(|e| e.id == event_id) {
-            return Ok(());
-        }
-        if let Some(id) = visit_id {
-            if next.recent_visits.len() >= 256 {
-                next.recent_visits.remove(0);
-            }
-            next.recent_visits.push(id);
-        }
         let overflow = next.events.len() >= ACCESS_EVENT_BATCH;
         let event = AccessEvent {
-            // An aggregate needs its own key. One of its visits may already
-            // have been acknowledged before the in-memory dedup cache expired.
-            id: if overflow {
-                format!("{:032x}", rand::random::<u128>())
-            } else {
-                event_id
-            },
+            id: format!("{:032x}", rand::random::<u128>()),
             kind: kind.into(),
             at: chrono::Utc::now().timestamp(),
             occurrences: overflow.then_some(1),
@@ -341,6 +309,34 @@ impl Workspace {
         }
         Ok(())
     }
+    /// The Router commits release before sending this acknowledgement. Its signed
+    /// acknowledgement leaves the sequence for any newer pending Begin untouched.
+    pub fn acknowledge_released(&self, lease: &str) -> anyhow::Result<()> {
+        let mut journal = self.journal.write().expect("lease journal");
+        ensure!(
+            self.boot_lease.is_none()
+                && journal.grant.is_none()
+                && journal.awaiting_return.as_deref() == Some(lease),
+            "unexpected released lease"
+        );
+        let mut next = journal.clone();
+        next.awaiting_return = None;
+        // Keep the idle journal readable by clients predating Return.
+        if let Some(command) = next.last.as_mut() {
+            if matches!(command.action, Operation::Return { .. }) {
+                command.action = Operation::Cancel {
+                    lease_id: lease.to_owned(),
+                };
+            }
+        }
+        write_json_pretty(&self.root.join("market-lease.json"), &next)?;
+        *journal = next;
+        Ok(())
+    }
+    pub fn management_locked(&self) -> bool {
+        let journal = self.journal.read().expect("lease journal");
+        journal.grant.is_some() || journal.awaiting_return.is_some() || self.boot_lease.is_some()
+    }
     pub fn access(&self) -> (Option<String>, Option<Grant>, bool) {
         let j = self.journal.read().expect("lease journal");
         let live = j.grant.as_ref().is_some_and(|g| {
@@ -369,7 +365,7 @@ impl Workspace {
         }
         Ok(())
     }
-    /// With no third-party liabilities or undelivered owner events the Client can
+    /// With no third-party liabilities or undelivered activity receipts the Client can
     /// finish an expired rental offline. Access was already disabled at expiry.
     /// A short grace period allows an in-flight, funded renewal to reach the Client.
     pub fn reap_expired(&self, now: i64, drained: bool) -> anyhow::Result<bool> {
@@ -438,15 +434,22 @@ impl Workspace {
         let mut config = ServerConfig::load_or_default(&self.data_dir()?)?;
         if let Some(grant) = self.view().grant {
             let installation = ServerConfig::load_or_default(&self.root)?;
-            config.auth = installation.auth;
-            config.auth.api_token_hash = None;
-            config.auth.debug_token_hash = None;
+            config.auth = Default::default();
             config.owner = installation.owner;
             config.client = installation.client;
             config.router = installation.router;
-            config.upgrade_policy = installation.upgrade_policy;
+            // Older workspace server.json snapshots could contain the installation policy.
+            config.upgrade_policy =
+                match std::fs::read(self.data_dir()?.join("lease-upgrade-policy.json")) {
+                    Ok(bytes) => {
+                        serde_json::from_slice(&bytes).context("read tenant upgrade policy")?
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Default::default(),
+                    Err(err) => return Err(err.into()),
+                };
+            config.upgrade_policy.delegate_upgrade_to_router_owner = false;
             config.request_body_limits = installation.request_body_limits;
-            config.enable_web_terminal = installation.enable_web_terminal;
+            config.enable_web_terminal = false;
             config.workspace = Some(grant);
         }
         Ok(config)
@@ -482,6 +485,12 @@ impl Workspace {
             command.sequence > 0 && !current.purging,
             "invalid operation sequence or cleanup in progress"
         );
+        if let Some(pending) = &current.awaiting_return {
+            ensure!(
+                matches!(&command.action, Operation::Return { lease_id } | Operation::Cancel { lease_id } if lease_id == pending),
+                "workspace handback pending"
+            );
+        }
         let mut next = current.clone();
         match &command.action {
             Operation::List { owner_email } => {
@@ -514,8 +523,7 @@ impl Workspace {
                             .is_some_and(|tail| tail.len() == 20
                                 && tail.bytes().all(|c| c.is_ascii_hexdigit()))
                         && grant.tenant_email.contains('@')
-                        && !grant.tenant_email.chars().any(char::is_control)
-                        && !grant.tenant_email.eq_ignore_ascii_case(verified_owner),
+                        && !grant.tenant_email.chars().any(char::is_control),
                     "invalid grant"
                 );
                 crate::domain::router::namespace::ClientSubdomain::parse(&grant.alias)?;
@@ -555,6 +563,15 @@ impl Workspace {
                     valid_id(lease_id) && current.grant.is_none() && self.boot_lease.is_none(),
                     "workspace still active"
                 );
+            }
+            Operation::Return { lease_id } => {
+                ensure!(
+                    current.awaiting_return.as_ref() == Some(lease_id)
+                        && current.grant.is_none()
+                        && self.boot_lease.is_none(),
+                    "unexpected workspace handback"
+                );
+                // Keep local management locked until the Router commits release.
             }
             Operation::Fence { lease_id } => {
                 ensure!(
@@ -597,6 +614,7 @@ mod tests {
         let first = "ee983484-2e81-499a-b3d4-10708cde2745";
         let second = "ee983484-2e81-499a-b3d4-10708cde2746";
         let grant = |id: &str| Grant {
+            buyer_id: None,
             lease_id: id.into(),
             alias: "rent-0123456789abcdef0123".into(),
             tenant_email: "buyer@test.net".into(),
@@ -663,11 +681,30 @@ mod tests {
             b"owner-test-key"
         );
         w.apply(clean.clone(), seller, 101, true).unwrap();
+        assert!(w.management_locked());
         w.apply(
             cmd(
                 5,
+                Operation::Return {
+                    lease_id: first.into(),
+                },
+            ),
+            seller,
+            101,
+            true,
+        )
+        .unwrap();
+        assert!(w.management_locked());
+        w.acknowledge_released(first).unwrap();
+        assert!(!w.management_locked());
+        w.apply(
+            cmd(
+                6,
                 Operation::Begin {
-                    grant: grant(second),
+                    grant: Grant {
+                        tenant_email: seller.into(),
+                        ..grant(second)
+                    },
                 },
             ),
             seller,
@@ -679,7 +716,7 @@ mod tests {
         assert!(w
             .apply(
                 cmd(
-                    6,
+                    7,
                     Operation::Fence {
                         lease_id: first.into()
                     }
@@ -694,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_visits_deduplicate_and_overflow_survives_lost_acknowledgements() {
+    fn historical_receipts_and_tenant_overflow_survives_lost_acknowledgements() {
         let root = std::env::temp_dir().join(format!("cc-market-events-{}", rand::random::<u64>()));
         std::fs::create_dir(&root).unwrap();
         let workspace = Workspace::open(root.clone()).unwrap();
@@ -702,6 +739,7 @@ mod tests {
         {
             let mut journal = workspace.journal.write().unwrap();
             journal.grant = Some(Grant {
+                buyer_id: None,
                 lease_id: lease.into(),
                 alias: "rent-0123456789abcdef0123".into(),
                 tenant_email: "buyer@example.test".into(),
@@ -716,14 +754,10 @@ mod tests {
                 })
                 .collect();
         }
-        let visit = "f".repeat(32);
         for _ in 0..2 {
-            workspace
-                .record_visit(lease, "terminal", Some(&visit))
-                .unwrap();
+            workspace.record_event(lease, "tenant_upgrade").unwrap();
         }
-        workspace.record_event(lease, "terminal").unwrap();
-        workspace.record_event(lease, "host_settings").unwrap();
+        workspace.record_event(lease, "tenant_restart").unwrap();
         let published = workspace.view();
         assert_eq!(published.events.len(), 1026);
         assert_eq!(published.events[1024].occurrences, Some(2));
@@ -735,23 +769,19 @@ mod tests {
         assert_eq!(workspace.view().events.len(), 1026);
         workspace.acknowledge(lease, &ids).unwrap();
         workspace.acknowledge(lease, &ids).unwrap();
-        workspace
-            .record_visit(lease, "terminal", Some(&visit))
-            .unwrap();
-        workspace.record_event(lease, "terminal").unwrap();
+        workspace.record_event(lease, "tenant_upgrade").unwrap();
         let next = workspace.view();
         assert_eq!(next.events.len(), 3);
         assert_eq!(next.events[0].occurrences, Some(2));
         assert_eq!(next.events[2].occurrences, None);
         let disk = std::fs::read(root.join("market-lease.json")).unwrap();
         let saved: Journal = serde_json::from_slice(&disk).unwrap();
-        assert!(saved.recent_visits.is_empty());
         assert_eq!(saved.events[0].id, published.events[1024].id);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn owner_receipts_never_outlive_cleanup() {
+    fn activity_receipts_never_outlive_cleanup() {
         let tmp = std::env::temp_dir().join(format!("cc-market-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&tmp).unwrap();
         let mut w = Workspace::open(tmp.clone()).unwrap();
@@ -759,6 +789,7 @@ mod tests {
         let lease = "ee983484-2e81-499a-b3d4-10708cde2747";
         let next = "ee983484-2e81-499a-b3d4-10708cde2748";
         let grant = |id: &str| Grant {
+            buyer_id: None,
             lease_id: id.into(),
             alias: "rent-0123456789abcdef0123".into(),
             tenant_email: "buyer@test.net".into(),
@@ -802,8 +833,8 @@ mod tests {
             true,
         )
         .unwrap();
-        // A fenced lease still records owner access; the Router acknowledges it.
-        w.record_event(lease, "terminal").unwrap();
+        // Unacknowledged activity must survive fencing.
+        w.record_event(lease, "tenant_restart").unwrap();
         let clean = cmd(
             4,
             Operation::Clean {
@@ -815,12 +846,25 @@ mod tests {
         w.acknowledge(lease, &ids).unwrap();
         w.apply(clean, seller, 101, true).unwrap();
         // Access during the shutdown after cleanup is dropped, not queued.
-        w.record_event(lease, "assistance").unwrap();
+        w.record_event(lease, "tenant_upgrade").unwrap();
         assert!(w.view().events.is_empty());
         w = Workspace::open(tmp.clone()).unwrap();
         assert!(w.view().grant.is_none() && w.view().events.is_empty());
         w.apply(
-            cmd(5, Operation::Begin { grant: grant(next) }),
+            cmd(
+                5,
+                Operation::Return {
+                    lease_id: lease.into(),
+                },
+            ),
+            seller,
+            101,
+            true,
+        )
+        .unwrap();
+        w.acknowledge_released(lease).unwrap();
+        w.apply(
+            cmd(6, Operation::Begin { grant: grant(next) }),
             seller,
             5,
             true,

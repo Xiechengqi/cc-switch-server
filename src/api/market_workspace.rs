@@ -24,47 +24,107 @@ pub(super) async fn control(
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Upgrade {
-            owner_email: String,
+            owner_email: Option<String>,
+            lease_id: Option<String>,
+            buyer_id: Option<String>,
+            tenant_email: Option<String>,
             restart_after: Option<bool>,
             task_id: Option<String>,
+            target_commit: Option<String>,
         }
         let v: Upgrade = serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
-        let (listed, grant, _) = state.market_workspace.access();
-        // The Router may still treat a Client as listed while a List or Unlist command
-        // is in flight, so only the owner is required here. A journal owner, when
-        // present, must agree with the installation owner.
-        if !owner.eq_ignore_ascii_case(&v.owner_email)
-            || listed.is_some_and(|e| !e.eq_ignore_ascii_case(owner))
+        let _command = state.market_workspace.commands.lock().await;
+        let (_, grant, live) = state.market_workspace.access();
+        let leased = v.lease_id.is_some();
+        if let Some(lease) = &v.lease_id {
+            let grant = grant
+                .as_ref()
+                .filter(|g| {
+                    live && g.lease_id == *lease
+                        && Some(&g.tenant_email) == v.tenant_email.as_ref()
+                        && v.buyer_id.is_some()
+                        && g.buyer_id
+                            .as_ref()
+                            .is_none_or(|id| Some(id) == v.buyer_id.as_ref())
+                })
+                .ok_or_else(|| ApiError::forbidden("current tenant required"))?;
+            if v.task_id.as_ref().is_some_and(|id| {
+                !id.strip_prefix(&format!("lease-{}-", grant.lease_id))
+                    .is_some_and(|suffix| {
+                        suffix.len() == 32 && suffix.bytes().all(|c| c.is_ascii_hexdigit())
+                    })
+            }) {
+                return Err(ApiError::forbidden("task belongs to another workspace"));
+            }
+        } else if state.market_workspace.management_locked()
+            || !v
+                .owner_email
+                .as_deref()
+                .is_some_and(|email| owner.eq_ignore_ascii_case(email))
         {
-            return Err(ApiError::forbidden("installation owner required"));
+            return Err(ApiError::forbidden("installation owner unavailable"));
         }
         if path == "/_ctl/market/upgrade-status" {
-            let id = v
-                .task_id
-                .as_deref()
-                .filter(|id| !id.is_empty() && id.len() <= 128)
-                .ok_or_else(|| ApiError::bad_request("task ID required"))?;
-            let snapshot = super::self_update::upgrade_status_for_task(&state, Some(id)).await?;
+            if let Some(task) = v.task_id.as_deref().filter(|_| leased) {
+                if let Some(snapshot) = state
+                    .upgrade
+                    .archived(task)
+                    .map_err(|e| ApiError::internal(e.to_string()))?
+                {
+                    return Ok(Json(json!(snapshot)));
+                }
+            }
+            let snapshot =
+                super::self_update::upgrade_status_for_task(&state, v.task_id.as_deref())
+                    .await?
+                    .0;
+            if let Some(lease) = &v.lease_id {
+                if !snapshot.task_id.starts_with(&format!("lease-{lease}-")) {
+                    return Err(ApiError::not_found("no upgrade for this lease"));
+                }
+            } else if snapshot.task_id.starts_with("lease-") {
+                return Err(ApiError::forbidden("rental task"));
+            }
             return Ok(Json(
-                serde_json::to_value(snapshot.0).map_err(ApiError::internal)?,
+                serde_json::to_value(snapshot).map_err(ApiError::internal)?,
             ));
         }
-        if !config.upgrade_policy.delegate_upgrade_to_router_owner {
+        if leased && v.task_id.is_none() {
+            return Err(ApiError::bad_request("rental task ID required"));
+        }
+        if !leased && !config.upgrade_policy.delegate_upgrade_to_router_owner {
             return Err(ApiError::forbidden("owner disabled delegated upgrades"));
         }
-        if let Some(g) = grant {
-            state
-                .market_workspace
-                .record_event(&g.lease_id, "upgrade")
-                .map_err(ApiError::internal)?;
+        if let Some(task) = v.task_id.as_deref().filter(|_| leased) {
+            if state
+                .upgrade
+                .archived(task)
+                .map_err(|e| ApiError::internal(e.to_string()))?
+                .is_some()
+                || state
+                    .upgrade
+                    .current()
+                    .await
+                    .is_some_and(|handle| handle.task_id == task)
+            {
+                return Ok(Json(json!({"ok":true,"taskId":task})));
+            }
         }
-        let id = super::self_update::start_upgrade_for_actor(
+        let id = super::self_update::start_authorized_upgrade(
             &state,
-            v.restart_after.unwrap_or(true),
-            "router-owner",
+            leased || v.restart_after.unwrap_or(true),
+            if leased { "tenant" } else { "router-owner" },
             true,
+            v.task_id,
+            v.target_commit,
         )
         .await?;
+        if let Some(lease) = v.lease_id {
+            state
+                .market_workspace
+                .record_event(&lease, "tenant_upgrade")
+                .map_err(ApiError::internal)?;
+        }
         return Ok(Json(json!({"ok":true,"taskId":id})));
     }
     let _command = if path == "/_ctl/market/command" {
@@ -103,6 +163,14 @@ pub(super) async fn control(
                     .await
                     .map_err(ApiError::internal)?;
             }
+            let beginning = matches!(command.action, Operation::Begin { .. });
+            if matches!(
+                command.action,
+                Operation::List { .. } | Operation::Begin { .. } | Operation::Clean { .. }
+            ) && state.client_update_in_progress().await
+            {
+                return Err(ApiError::conflict("Client update in progress"));
+            }
             let writer = state.clone();
             let owner = owner.to_owned();
             tokio::task::spawn_blocking(move || {
@@ -116,6 +184,14 @@ pub(super) async fn control(
             .await
             .map_err(ApiError::internal)?
             .map_err(|e| ApiError::conflict(e.to_string()))?;
+            if beginning && !replay {
+                state.terminal.end_session().await;
+                // The next boot revokes persistent credentials before serving requests.
+                if let Err(err) = state.web_auth.revoke_all_sessions() {
+                    tracing::warn!(%err,"defer session revocation to lease startup");
+                }
+                state.clear_sessions().await;
+            }
             if state.market_workspace.switch_required() {
                 state.begin_shutdown();
             }
@@ -164,8 +240,16 @@ pub(super) async fn control(
                 received: Vec<String>,
                 #[serde(default)]
                 hardware: bool,
+                released_lease_id: Option<String>,
             }
             let ack: Ack = serde_json::from_slice(&body).map_err(ApiError::bad_request)?;
+            if let Some(id) = ack.released_lease_id {
+                let _command = state.market_workspace.commands.lock().await;
+                state
+                    .market_workspace
+                    .acknowledge_released(&id)
+                    .map_err(|e| ApiError::conflict(e.to_string()))?;
+            }
             if ack.hardware {
                 hardware = Some(
                     crate::workspace_hardware::workspace_hardware(state.config_dir.clone())
@@ -184,7 +268,7 @@ pub(super) async fn control(
     }
     let journal = state.market_workspace.view();
     Ok(Json(
-        json!({"capability":"marketLeaseV1","ownerEmail":owner,"listedOwner":journal.owner,
+        json!({"capability":"marketLeaseV1","exclusiveManagement":true,"upgradeBusy":state.client_update_in_progress().await,"awaitingReturn":journal.awaiting_return,"ownerRental":true,"ownerEmail":owner,"listedOwner":journal.owner,
         "sequence":journal.last.as_ref().map_or(0,|c|c.sequence), "grant":journal.grant,
         "runningLease":state.market_workspace.boot_lease,"switching":state.market_workspace.switch_required(),
         "events":journal.events.iter().take(ACCESS_EVENT_BATCH).collect::<Vec<_>>(),"fenced":journal.fenced,"cleanupSafe":clear,"hardware":hardware,"version":env!("CARGO_PKG_VERSION")}),
@@ -258,6 +342,7 @@ fn tenant_path(route: &str, path: &str) -> bool {
         route,
         "/web-api/market/chat"
             | "/web-api/market/workspace"
+            | "/web-api/market/upgrade-policy"
             | "/web-api/market/token"
             | "/web-api/market/backups"
             | "/web-api/market/backups/:id/restore"
@@ -375,7 +460,7 @@ fn tenant_path(route: &str, path: &str) -> bool {
 }
 pub(super) async fn authorize(
     State(state): State<ServerState>,
-    mut request: Request,
+    request: Request,
     next: Next,
 ) -> Response {
     let (owner, grant, live) = state.market_workspace.access();
@@ -404,6 +489,9 @@ pub(super) async fn authorize(
     let denied = || workspace_error(StatusCode::FORBIDDEN, "workspace_leased").into_response();
     // Reject every alternate entry capable of changing installation identity.
     if grant.is_none() {
+        if state.market_workspace.management_locked() {
+            return denied();
+        }
         if path.starts_with("/_ctl/client-subdomain-adoption")
             || in_family(path, "/api/backup") && path.ends_with("/restore")
             || in_family(path, "/api/backups") && path.ends_with("/restore")
@@ -441,6 +529,9 @@ pub(super) async fn authorize(
         return next.run(request).await;
     }
     let grant = grant.unwrap();
+    if in_family(path, "/web-api/terminal") {
+        return denied();
+    }
     let ctx = request.extensions().get::<IngressContext>();
     let header_email = session::router_web_user_email(request.headers());
     let label = ctx.and_then(|c| c.public_host.split('.').next());
@@ -509,110 +600,6 @@ pub(super) async fn authorize(
             denied()
         };
     }
-    let on_owner =
-        ctx.is_none() || label == state.config.read().await.client.tunnel_subdomain.as_deref();
-    if !on_owner {
-        return denied();
-    }
-    if matches!(
-        path,
-        "/api/auth/login"
-            | "/api/auth/email/request-code"
-            | "/api/auth/email/verify-code"
-            | "/web-api/auth/email/request-code"
-            | "/web-api/auth/email/verify-code"
-            | "/web-api/auth/methods"
-            | "/web-api/auth/password/login"
-            | "/web-api/auth/password/refresh"
-            | "/web-api/auth/password/logout"
-            | "/web-api/auth/session/refresh"
-            | "/web-api/context"
-    ) && header_email.as_deref().is_none_or(|e| e == owner)
-    {
-        return next.run(request).await;
-    }
-    let principal = session::resolve_web_admin_principal(&state, request.headers())
-        .await
-        .ok()
-        .flatten();
-    let Some(principal) = principal else {
-        return if path.starts_with("/web-api/market/") || path.starts_with("/web-api/terminal/") {
-            workspace_error(StatusCode::UNAUTHORIZED, "owner_session_required").into_response()
-        } else {
-            denied()
-        };
-    };
-    let local = principal.source == session::WebPrincipalSource::LocalOwner;
-    if !local
-        && (principal.source != session::WebPrincipalSource::Router
-            || principal.user_email() != owner)
-    {
-        return denied();
-    }
-    let independent = !local
-        && request
-            .headers()
-            .get("x-cc-switch-owner-proof")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|t| state.web_auth.authenticate_access_token(t).ok().flatten())
-            .is_some();
-    let maintenance = path.starts_with("/web-api/terminal/")
-        || matches!(
-            path,
-            "/web-api/market/maintenance"
-                | "/web-api/market/maintenance/status"
-                | "/web-api/market/maintenance/upgrade-status"
-                | "/api/admin/upgrade"
-                | "/api/admin/rollback"
-                | "/api/admin/restart"
-                | "/web-api/invoke/start_admin_upgrade"
-                | "/web-api/invoke/restart_server_service"
-                | "/web-api/invoke/rollback_server_service"
-        );
-    if maintenance && !(local || independent) {
-        return workspace_error(StatusCode::FORBIDDEN, "owner_proof_required").into_response();
-    }
-    if path == "/web-api/market/workspace" || maintenance {
-        if let Some(kind) = match path {
-            "/web-api/market/workspace" => Some("assistance"),
-            "/web-api/terminal/stream" => Some("terminal"),
-            "/web-api/market/maintenance" => Some("host_settings"),
-            "/api/admin/upgrade" | "/web-api/invoke/start_admin_upgrade" => Some("upgrade"),
-            "/api/admin/restart" | "/web-api/invoke/restart_server_service" => Some("restart"),
-            "/api/admin/rollback" | "/web-api/invoke/rollback_server_service" => Some("rollback"),
-            _ => None,
-        } {
-            if state
-                .market_workspace
-                .record_visit(
-                    &grant.lease_id,
-                    kind,
-                    request
-                        .headers()
-                        .get("x-cc-switch-workspace-visit")
-                        .and_then(|v| v.to_str().ok()),
-                )
-                .is_err()
-            {
-                return ApiError::internal("record owner access").into_response();
-            }
-        }
-        if independent && path != "/web-api/market/workspace" {
-            // These routes use the existing local-owner maintenance policy.
-            let proof = request.headers_mut().remove("x-cc-switch-owner-proof");
-            if let Some(value) = proof.and_then(|v| {
-                v.to_str()
-                    .ok()
-                    .and_then(|v| format!("Bearer {v}").parse().ok())
-            }) {
-                let headers = request.headers_mut();
-                headers.remove("x-cc-switch-web-user-email");
-                headers.remove("x-cc-switch-web-role");
-                headers.insert(axum::http::header::AUTHORIZATION, value);
-            }
-        }
-        return next.run(request).await;
-    }
     denied()
 }
 
@@ -622,112 +609,48 @@ fn workspace_error(status: StatusCode, code: &'static str) -> ApiError {
     error
 }
 
-pub(super) async fn maintenance_status(
-    State(state): State<ServerState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    session::require_local_server_owner_session(&state, &headers).await?;
-    if state.market_workspace.access().1.is_none() {
-        return Err(ApiError::conflict("leased Client required"));
-    }
-    Ok(Json(
-        json!({"authorized":true,"instanceId":state.process_instance_id}),
-    ))
-}
-
 pub(super) async fn view(
     State(state): State<ServerState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let principal = session::require_web_admin_session(&state, &headers).await?;
-    let journal = state.market_workspace.view();
-    let Some(grant) = journal.grant else {
-        return Ok(Json(json!({"role":"owner"})));
-    };
-    let role = if principal.source == session::WebPrincipalSource::LeaseTenant {
-        "tenant"
-    } else {
-        "assistance"
-    };
-    let waiting_on_shares = journal.fenced && !state.market_workspace_drained().await;
-    // Counts and stable codes only. Raw request bodies, logs and account objects can contain secrets.
-    let (shares, registered, last_heartbeat_ms) = {
-        let store = state.shares.read().await;
-        (
-            store.shares.len(),
-            store.router_registered,
-            store.last_router_heartbeat_ms,
-        )
-    };
+    let grant = tenant(&state, &headers).await?;
     let config = state.config_snapshot().await;
-    let maintenance = (role == "assistance").then(|| json!({
-        "terminalEnabled":config.enable_web_terminal, "terminalAvailable":config.is_web_terminal_enabled(),
-        "upgradePolicy":config.upgrade_policy
-    }));
-    let hardware = if role == "assistance" {
-        crate::workspace_hardware::workspace_hardware(state.config_dir.clone())
-            .await
-            .ok()
-    } else {
-        None
-    };
-    let providers = {
-        let store = state.providers.read().await;
-        let usage = state.usage.read().await;
-        store.list(None).iter().map(|p|{
-            let plan=store.runtime_plan(p.app,&p.provider.id);
-            let h=crate::domain::health::provider_health_for_plan(p,&usage,plan.as_deref());
-            json!({"app":h.app,"providerId":h.provider_id,"status":h.status,"statusCode":h.last_status_code,"requests":h.requests,"failures":h.failures})
-        }).collect::<Vec<_>>()
-    };
-    let log = state.audit_log();
-    let audit = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<Value>> {
-        let Some(mut cursor) = log.latest_cursor()? else {
-            return Ok(vec![]);
-        };
-        cursor.sequence = cursor.sequence.saturating_sub(20);
-        Ok(log
-            .read_batch(Some(&cursor), 20)?
-            .events
-            .into_iter()
-            .map(|e| json!({"time":e.timestamp_ms,"status":e.status_code,"sequence":e.sequence}))
-            .collect())
-    })
-    .await
-    .map_err(ApiError::internal)?
-    .map_err(ApiError::internal)?;
+    let upgrade = state
+        .upgrade
+        .status_snapshot()
+        .await
+        .filter(|u| u.task_id.starts_with(&format!("lease-{}-", grant.lease_id)))
+        .map(|u| json!({"taskId":u.task_id,"status":u.status}));
     Ok(Json(
-        json!({"role":role,"leaseId":grant.lease_id,"expiresAt":grant.expires_at,"shareCount":shares,"providers":providers,"audit":audit,
-        "fenced":journal.fenced,"cleaning":journal.purging,"localOwner":principal.source == session::WebPrincipalSource::LocalOwner,
-        "pendingEvents":journal.events.len(),"waitingOnShares":waiting_on_shares,"version":env!("CARGO_PKG_VERSION"),"events":journal.events.iter().rev().take(50).collect::<Vec<_>>(),"hardware":hardware,"maintenance":maintenance,
-        "connectivity":{"registered":registered,"lastHeartbeatMs":last_heartbeat_ms}}),
+        json!({"upgrade":upgrade,"role":"tenant","leaseId":grant.lease_id,"expiresAt":grant.expires_at,
+        "autoUpgradeEnabled":config.upgrade_policy.auto_upgrade_enabled, "autoUpgradeCheckIntervalMinutes":config.upgrade_policy.auto_upgrade_check_interval_minutes}),
     ))
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct Maintenance {
-    terminal_enabled: bool,
-    upgrade_policy: crate::domain::settings::config::UpgradePolicyConfig,
+pub(super) struct TenantUpgradePolicy {
+    auto_upgrade_enabled: bool,
+    auto_upgrade_check_interval_minutes: u64,
 }
-pub(super) async fn maintenance(
+pub(super) async fn upgrade_policy(
     State(state): State<ServerState>,
     headers: HeaderMap,
-    Json(v): Json<Maintenance>,
+    Json(input): Json<TenantUpgradePolicy>,
 ) -> Result<Json<Value>, ApiError> {
-    session::require_local_server_owner_session(&state, &headers).await?;
-    let (_, grant, _) = state.market_workspace.access();
-    if grant.is_none() {
-        return Err(ApiError::conflict("leased Client required"));
+    let _command = state.market_workspace.commands.lock().await;
+    tenant(&state, &headers).await?;
+    let policy = crate::domain::settings::config::UpgradePolicyConfig {
+        delegate_upgrade_to_router_owner: false,
+        auto_upgrade_enabled: input.auto_upgrade_enabled,
+        auto_upgrade_check_interval_minutes: input.auto_upgrade_check_interval_minutes,
     }
+    .normalize();
     state
-        .set_workspace_host_maintenance(v.terminal_enabled, v.upgrade_policy)
+        .set_tenant_upgrade_policy(policy.clone())
         .await
         .map_err(ApiError::internal)?;
-    let cfg = state.config_snapshot().await;
-    Ok(Json(
-        json!({"terminalEnabled":cfg.enable_web_terminal,"terminalAvailable":cfg.is_web_terminal_enabled(),"upgradePolicy":cfg.upgrade_policy}),
-    ))
+    Ok(Json(json!(policy)))
 }
 
 pub(super) async fn token(
@@ -739,7 +662,7 @@ pub(super) async fn token(
         json!({"token":state.market_workspace.rotate_token(&grant.lease_id).map_err(ApiError::internal)?}),
     ))
 }
-async fn tenant(
+pub(super) async fn tenant(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> Result<crate::market_lease::Grant, ApiError> {

@@ -114,10 +114,17 @@ async fn run_auto_upgrade_tick(state: &ServerState) -> anyhow::Result<()> {
         .user_agent("cc-switch-server/0.1 auto-upgrade")
         .build()
         .context("build auto-upgrade client")?;
-    if let Some(grant) = state.market_workspace.access().1 {
-        state
-            .market_workspace
-            .record_event(&grant.lease_id, "upgrade")?;
+    let _command = state.market_workspace.commands.lock().await;
+    if state.client_update_in_progress().await
+        || !state
+            .config
+            .read()
+            .await
+            .upgrade_policy
+            .auto_upgrade_enabled
+        || state.market_workspace.management_locked() && !state.market_workspace.access().2
+    {
+        return Ok(());
     }
     state
         .upgrade
@@ -130,6 +137,11 @@ async fn run_auto_upgrade_tick(state: &ServerState) -> anyhow::Result<()> {
         )
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    if let Some(g) = state.market_workspace.access().1 {
+        state
+            .market_workspace
+            .record_event(&g.lease_id, "tenant_auto_upgrade")?;
+    }
     Ok(())
 }
 

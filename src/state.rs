@@ -6032,6 +6032,20 @@ impl ServerStateInner {
         crate::proxy::refresh_codex_model_capabilities(self, execution).await;
     }
 
+    pub(crate) async fn client_update_in_progress(&self) -> bool {
+        self.upgrade.busy().await
+            || crate::self_update::restart::restart_in_progress(&self.market_workspace.root)
+    }
+
+    pub async fn reap_expired_workspace(&self, now: i64) -> anyhow::Result<bool> {
+        let _command = self.market_workspace.commands.lock().await;
+        if self.client_update_in_progress().await {
+            return Ok(false);
+        }
+        self.market_workspace
+            .reap_expired(now, self.market_workspace_drained().await)
+    }
+
     pub async fn market_workspace_drained(&self) -> bool {
         use crate::domain::sharing::router_contract::ShareGrantManager;
         self.shares.read().await.shares.iter().all(|share| {
@@ -7432,6 +7446,11 @@ impl ServerStateInner {
 
         let tunnels = TunnelSupervisor::load_or_default(&config_dir)?;
         let web_auth = crate::domain::web_auth::WebAuthStore::load(market_workspace.root.clone());
+        if market_workspace.management_locked() {
+            web_auth
+                .revoke_all_sessions()
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        }
         let upgrade = Arc::new(crate::self_update::upgrade::UpgradeRegistry::load(
             &market_workspace.root,
         )?);
@@ -7783,6 +7802,22 @@ impl ServerStateInner {
         Ok(result)
     }
 
+    pub(crate) async fn set_tenant_upgrade_policy(
+        &self,
+        policy: crate::domain::settings::config::UpgradePolicyConfig,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.market_workspace.access().2, "active lease required");
+        let _commit = self.config_persistence.gate.lock().await;
+        let path = self.config_dir.join("lease-upgrade-policy.json");
+        let value = policy.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::infra::storage::write_json_pretty(&path, &value)
+        })
+        .await??;
+        self.config.write().await.upgrade_policy = policy;
+        Ok(())
+    }
+
     pub async fn set_upgrade_policy(
         &self,
         policy: crate::domain::settings::config::UpgradePolicyConfig,
@@ -7792,33 +7827,6 @@ impl ServerStateInner {
             Ok(())
         })
         .await
-    }
-
-    pub(crate) async fn set_workspace_host_maintenance(
-        &self,
-        terminal: bool,
-        policy: crate::domain::settings::config::UpgradePolicyConfig,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.market_workspace.boot_lease.is_some(),
-            "leased Client required"
-        );
-        let _commit = self.config_persistence.gate.lock().await;
-        let root = self.market_workspace.root.clone();
-        let policy = policy.normalize();
-        let saved_policy = policy.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let mut host = ServerConfig::load_or_default(&root)?;
-            host.enable_web_terminal = terminal;
-            host.upgrade_policy = saved_policy;
-            host.save(&root)
-        })
-        .await??;
-        let mut effective = self.config.write().await;
-        effective.enable_web_terminal = terminal;
-        effective.upgrade_policy = policy;
-        self.config_persistence.mark_published();
-        Ok(())
     }
 
     pub async fn set_provider_request_defaults(

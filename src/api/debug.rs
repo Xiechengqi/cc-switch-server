@@ -18,7 +18,6 @@ use crate::state::ServerState;
 
 const DEFAULT_TOKEN_TTL_HOURS: u64 = 1;
 const MAX_TOKEN_TTL_HOURS: u64 = 24;
-const RESTART_OPERATION_STALE_SECONDS: i64 = 120;
 
 #[derive(Debug, Clone, Copy)]
 enum DebugCapability {
@@ -168,7 +167,11 @@ pub(crate) async fn debug_diagnostics(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     require_debug_capability(&state, &headers, DebugCapability::Diagnostics).await?;
-    let upgrade = state.upgrade.status_snapshot().await;
+    let upgrade = state
+        .upgrade
+        .status_snapshot()
+        .await
+        .filter(|task| super::self_update::workspace_can_view_upgrade(&state, &task.task_id));
     let helper_log = crate::logging::tail_file_lines(
         &crate::logging::restart_helper_log_path(&state.config_dir),
         50,
@@ -205,16 +208,12 @@ pub(crate) async fn debug_restart(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     require_debug_capability(&state, &headers, DebugCapability::Restart).await?;
-    if let Some(operation) = read_restart_operation(&state.config_dir) {
-        let updated_at = chrono::DateTime::parse_from_rfc3339(&operation.updated_at)
-            .map(|value| value.timestamp())
-            .unwrap_or(i64::MIN);
-        if operation.status == "running"
-            && chrono::Utc::now().timestamp().saturating_sub(updated_at)
-                < RESTART_OPERATION_STALE_SECONDS
-        {
-            return Err(ApiError::conflict("a restart operation is already running"));
-        }
+    let _command = state.market_workspace.commands.lock().await;
+    if state.market_workspace.management_locked() {
+        return Err(ApiError::forbidden("current rental required"));
+    }
+    if crate::self_update::restart::restart_in_progress(&state.market_workspace.root) {
+        return Err(ApiError::conflict("a restart operation is already running"));
     }
     let schedule = restart_from_detected_service(&state.config_dir, state.bind_addr)
         .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -264,6 +263,7 @@ pub(crate) async fn debug_upgrade_status(
         .upgrade
         .status_snapshot()
         .await
+        .filter(|task| super::self_update::workspace_can_view_upgrade(&state, &task.task_id))
         .ok_or_else(|| ApiError::not_found("no upgrade task is available"))?;
     if query
         .task_id
@@ -285,6 +285,7 @@ pub(crate) async fn debug_upgrade_stream(
         .upgrade
         .status_snapshot()
         .await
+        .filter(|task| super::self_update::workspace_can_view_upgrade(&state, &task.task_id))
         .ok_or_else(|| ApiError::not_found("no upgrade task is available"))?;
     if query
         .task_id
@@ -301,7 +302,7 @@ pub(crate) async fn debug_upgrade_stream(
             if *shutdown.borrow() { break; }
             registry.refresh_from_disk().await;
             let Some(snapshot) = registry.status_snapshot().await else { break; };
-            if snapshot.task_id != task_id { break; }
+            if snapshot.task_id != task_id || !super::self_update::workspace_can_view_upgrade(&state, &task_id) { break; }
             let finished = !matches!(snapshot.status, UpgradeStatus::Running);
             yield Ok(Event::default().event("status").data(
                 serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into())

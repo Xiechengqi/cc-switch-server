@@ -25,7 +25,6 @@ pub(crate) enum SessionCommand {
     Detach {
         client_id: u64,
     },
-    Kill,
 }
 
 pub(crate) struct TerminalSession {
@@ -38,6 +37,7 @@ pub(crate) struct TerminalSession {
     pub foreground_attached: Arc<AtomicBool>,
     pub last_detach_at: Arc<Mutex<Option<Instant>>>,
     idle_cancel: Arc<Notify>,
+    stop: tokio::sync::watch::Sender<bool>,
 }
 
 impl std::fmt::Debug for TerminalSession {
@@ -90,6 +90,7 @@ impl TerminalSession {
             .map_err(|error| anyhow::anyhow!("take pty writer: {error}"))?;
         let master: Box<dyn MasterPty + Send> = pair.master;
 
+        let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
         let history = Arc::new(Mutex::new(HistoryBuffer::new(options.history_bytes)));
         let dead = Arc::new(AtomicBool::new(false));
@@ -136,6 +137,7 @@ impl TerminalSession {
             loop {
                 tokio::select! {
                     biased;
+                    _ = stop_rx.changed() => break,
                     cmd = cmd_rx.recv() => {
                         let Some(cmd) = cmd else { break; };
                         match cmd {
@@ -183,11 +185,6 @@ impl TerminalSession {
                                     idle_cancel_for_loop.notify_waiters();
                                 }
                             }
-                            SessionCommand::Kill => {
-                                let _ = child.kill();
-                                dead_for_loop.store(true, Ordering::SeqCst);
-                                break;
-                            }
                         }
                     }
                     chunk = output_bridge_rx.recv() => {
@@ -196,7 +193,12 @@ impl TerminalSession {
                             break;
                         };
                         if let Some((_, tx)) = foreground.as_ref() {
-                            if tx.send(chunk).await.is_err() {
+                            let sent = tokio::select! {
+                                biased;
+                                _ = stop_rx.changed() => break,
+                                sent = tx.send(chunk) => sent,
+                            };
+                            if sent.is_err() {
                                 foreground = None;
                                 foreground_flag.store(false, Ordering::SeqCst);
                                 if let Ok(mut guard) = last_detach.lock() {
@@ -233,6 +235,7 @@ impl TerminalSession {
             owner,
             created_at: Instant::now(),
             generation,
+            stop,
             cmd_tx,
             dead,
             foreground_attached,
@@ -261,8 +264,13 @@ impl TerminalSession {
         Arc::clone(&self.idle_cancel)
     }
 
+    pub(crate) async fn close(&self) {
+        self.kill();
+        self.stop.closed().await;
+    }
+
     pub(crate) fn kill(&self) {
-        let _ = self.request(SessionCommand::Kill);
+        self.stop.send_replace(true);
     }
 }
 

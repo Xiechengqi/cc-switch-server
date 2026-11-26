@@ -42,8 +42,7 @@ import {
   type ServerSettingsSection,
   type ServerView,
 } from "@/lib/serverView";
-import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
-import { UsageDashboard } from "@/components/usage/UsageDashboard";
+import { TenantSettings } from "@/components/settings/TenantSettings";
 import { cn } from "@/lib/utils";
 import { ProviderBundlesPage } from "@/server/providers/bundles/ProviderBundlesPage";
 
@@ -136,7 +135,7 @@ export default function ServerApp({
   const content = (() => {
     if (currentView === "settings") {
       if (workspaceOnly) return <div className={cn(PAGE_SHELL_PADDING_X,"h-full overflow-auto")}>
-        {settingsDefaultTab==="usage" ? <UsageDashboard/> : <AuthCenterPanel serverMode/>}
+        <TenantSettings initialTab={settingsDefaultTab}/>
       </div>;
       return (
         <SettingsPage
@@ -215,8 +214,8 @@ export default function ServerApp({
               <Button
                 variant="ghost"
                 size="icon"
-                onClick={() => openSettings(workspaceOnly ? "usage" : "general")}
-                title={t(workspaceOnly ? "usage.title" : "common.settings")}
+                onClick={() => openSettings("general")}
+                title={t("common.settings")}
               >
                 <Settings className="h-4 w-4" />
               </Button>

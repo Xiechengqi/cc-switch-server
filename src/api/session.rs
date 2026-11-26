@@ -26,20 +26,19 @@ pub(crate) async fn resolve_web_admin_principal(
 ) -> Result<Option<WebAdminPrincipal>, ApiError> {
     if let Some(user_email) = router_web_user_email(headers) {
         let (owner, grant, live) = state.market_workspace.access();
-        if owner.as_ref().is_some_and(|owner| owner != &user_email) {
-            let label = headers
-                .get("x-cc-switch-client-tunnel-subdomain")
-                .and_then(|value| value.to_str().ok());
-            if !live
-                || !grant.as_ref().is_some_and(|g| {
-                    g.tenant_email == user_email && label == Some(g.alias.as_str())
-                })
-            {
+        let label = headers
+            .get("x-cc-switch-client-tunnel-subdomain")
+            .and_then(|value| value.to_str().ok());
+        let source = if let Some(grant) = grant.as_ref().filter(|g| label == Some(g.alias.as_str()))
+        {
+            if !live || grant.tenant_email != user_email {
                 return Ok(None);
             }
-        }
-        let source = if live && grant.as_ref().is_some_and(|g| g.tenant_email == user_email) {
             WebPrincipalSource::LeaseTenant
+        } else if state.market_workspace.management_locked()
+            || owner.as_ref().is_some_and(|owner| owner != &user_email)
+        {
+            return Ok(None);
         } else {
             WebPrincipalSource::Router
         };
@@ -48,6 +47,10 @@ pub(crate) async fn resolve_web_admin_principal(
             user_email,
             role: router_web_role(headers),
         }));
+    }
+
+    if state.market_workspace.management_locked() {
+        return Ok(None);
     }
 
     let Some(token) = bearer_token(headers) else {
@@ -171,6 +174,9 @@ pub(crate) async fn require_event_session(
 ) -> Result<(), ApiError> {
     if resolve_web_admin_principal(state, headers).await?.is_some() {
         return Ok(());
+    }
+    if state.market_workspace.management_locked() {
+        return Err(ApiError::forbidden("current tenant required"));
     }
     if let Some(token) = bearer_token(headers) {
         if state
