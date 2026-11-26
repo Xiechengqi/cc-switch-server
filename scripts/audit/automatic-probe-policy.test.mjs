@@ -26,6 +26,15 @@ test("automatic scheduling and batch acceptance share the Share-scoped selector"
   assert.match(scheduler, /current_health_target\(state, &target\.provider\)/);
   assert.match(control, /automatic_share_probe\(/);
   assert.match(scheduler, /local_result_for_router_cycle/);
-  assert.match(scheduler, /log\.data_source\.as_deref\(\) == Some\(SCHEDULED_SOURCE\)/);
-  assert.match(scheduler, /in_slot\(log\.created_at_ms\)/);
+  const localCycle = scheduler.slice(
+    scheduler.indexOf("fn local_result_for_router_cycle("),
+    scheduler.indexOf("\nfn existing_cycle_result_from_usage("),
+  );
+  assert.match(localCycle, /usage\s*\.visit_logs\(/);
+  assert.match(localCycle, /data_source:\s*Some\(SCHEDULED_SOURCE\.into\(\)\)/);
+  assert.match(localCycle, /health_fingerprint:\s*Some\(fingerprint\.into\(\)\)/);
+  assert.match(localCycle, /from_ms:\s*Some\(slot \* 1000\)/);
+  assert.match(localCycle, /to_ms:\s*Some\(slot\.saturating_add\(1800\) \* 1000\)/);
+  assert.match(localCycle, /in_slot\(snapshot\.checked_at_ms\)/);
+  assert.doesNotMatch(localCycle, /usage\s*\.logs/);
 });
