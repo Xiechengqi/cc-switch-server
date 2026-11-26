@@ -136,6 +136,12 @@ pub struct UpgradeRegistry {
     state_path: PathBuf,
 }
 
+pub struct UpgradeOptions {
+    pub restart_after: bool,
+    pub force: bool,
+    pub expected_commit: Option<String>,
+}
+
 impl UpgradeRegistry {
     pub fn load(config_dir: &Path) -> Result<Self, SelfUpdateError> {
         let state_path = config_dir.join(STATE_FILENAME);
@@ -224,11 +230,13 @@ impl UpgradeRegistry {
         self.start_task(
             client,
             actor,
-            restart_after,
-            force,
             health_addr,
             task_id,
-            None,
+            UpgradeOptions {
+                restart_after,
+                force,
+                expected_commit: None,
+            },
         )
         .await
     }
@@ -237,11 +245,9 @@ impl UpgradeRegistry {
         self: &Arc<Self>,
         client: reqwest::Client,
         actor: Option<String>,
-        restart_after: bool,
-        force: bool,
         health_addr: SocketAddr,
         task_id: String,
-        expected_commit: Option<String>,
+        options: UpgradeOptions,
     ) -> Result<UpgradeHandle, SelfUpdateError> {
         let mut guard = self.inner.lock().await;
         if let Some(snapshot) = self.archived(&task_id)? {
@@ -274,7 +280,7 @@ impl UpgradeRegistry {
             restart_pending: Arc::new(Mutex::new(false)),
             target_commit_id: Arc::new(Mutex::new(None)),
             failure: Arc::new(Mutex::new(None)),
-            restart_after,
+            restart_after: options.restart_after,
         };
         write_snapshot_atomic(&self.state_path, &snapshot_from_handle(&handle).await)?;
         *guard = Some(handle.clone());
@@ -283,17 +289,8 @@ impl UpgradeRegistry {
         let registry = self.clone();
         let task_handle = handle.clone();
         tokio::spawn(async move {
-            let result = run_upgrade(
-                &registry,
-                client,
-                &task_handle,
-                actor,
-                restart_after,
-                force,
-                health_addr,
-                expected_commit.as_deref(),
-            )
-            .await;
+            let result =
+                run_upgrade(&registry, client, &task_handle, actor, health_addr, options).await;
             match result {
                 Ok(UpgradeRunOutcome::AwaitingRestart) => {}
                 Ok(UpgradeRunOutcome::Complete) => {
@@ -384,9 +381,9 @@ impl UpgradeRegistry {
 
     async fn persist(&self, handle: &UpgradeHandle) -> Result<(), SelfUpdateError> {
         let guard = self.inner.lock().await;
-        if !guard
+        if guard
             .as_ref()
-            .is_some_and(|current| current.task_id == handle.task_id)
+            .is_none_or(|current| current.task_id != handle.task_id)
         {
             return Ok(());
         }
@@ -445,10 +442,8 @@ async fn run_upgrade(
     client: reqwest::Client,
     handle: &UpgradeHandle,
     actor: Option<String>,
-    restart_after: bool,
-    force: bool,
     health_addr: SocketAddr,
-    expected_commit: Option<&str>,
+    options: UpgradeOptions,
 ) -> Result<UpgradeRunOutcome, SelfUpdateError> {
     let actor = actor.unwrap_or_else(|| "unknown".to_string());
     emit(
@@ -645,33 +640,34 @@ async fn run_upgrade(
         .state_path
         .parent()
         .ok_or_else(|| SelfUpdateError::Internal("upgrade state path has no parent".into()))?;
-    let target_commit = match sanity_exec(target, config_dir).await.and_then(|commit| {
-        if expected_commit
-            .is_some_and(|expected| !commit.starts_with(expected) && !expected.starts_with(&commit))
-        {
-            return Err(SelfUpdateError::Forbidden(
-                "downloaded Client differs from the authorized release".into(),
-            ));
-        }
-        Ok(commit)
-    }) {
-        Ok(commit) => commit,
-        Err(error) => {
-            cleanup_tmp(target);
-            *handle.failure.lock().await =
-                Some(UpgradeFailureDiagnostic::startup_contract_preflight(&error));
-            emit(
-                registry,
-                handle,
-                4,
-                UpgradeLogLevel::Error,
-                format!("sanity check failed: {error}"),
-                None,
-            )
-            .await;
-            return Err(error);
-        }
-    };
+    let target_commit =
+        match sanity_exec(target, config_dir).await.and_then(|commit| {
+            if options.expected_commit.as_deref().is_some_and(|expected| {
+                !commit.starts_with(expected) && !expected.starts_with(&commit)
+            }) {
+                return Err(SelfUpdateError::Forbidden(
+                    "downloaded Client differs from the authorized release".into(),
+                ));
+            }
+            Ok(commit)
+        }) {
+            Ok(commit) => commit,
+            Err(error) => {
+                cleanup_tmp(target);
+                *handle.failure.lock().await =
+                    Some(UpgradeFailureDiagnostic::startup_contract_preflight(&error));
+                emit(
+                    registry,
+                    handle,
+                    4,
+                    UpgradeLogLevel::Error,
+                    format!("sanity check failed: {error}"),
+                    None,
+                )
+                .await;
+                return Err(error);
+            }
+        };
     *handle.target_commit_id.lock().await = Some(target_commit.clone());
     emit(
         registry,
@@ -683,7 +679,7 @@ async fn run_upgrade(
     )
     .await;
 
-    if !force && commits_equal(&target_commit, crate::build_info::build_info().commit_id) {
+    if !options.force && commits_equal(&target_commit, crate::build_info::build_info().commit_id) {
         cleanup_tmp(target);
         emit(
             registry,
@@ -720,7 +716,7 @@ async fn run_upgrade(
     )
     .await;
 
-    if restart_after {
+    if options.restart_after {
         let command = registry
             .state_path
             .parent()

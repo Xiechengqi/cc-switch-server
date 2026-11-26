@@ -13,7 +13,9 @@ use crate::build_info::{build_info, BuildInfo};
 use crate::self_update::restart::{
     restart_from_detected_service, rollback_from_backup_and_restart,
 };
-use crate::self_update::upgrade::{UpgradeFailureDiagnostic, UpgradeLogEntry, UpgradeStatus};
+use crate::self_update::upgrade::{
+    UpgradeFailureDiagnostic, UpgradeLogEntry, UpgradeOptions, UpgradeStatus,
+};
 use crate::self_update::version::{
     ensure_binary_writable, fetch_latest_release_meta, rollback_available, BINARY_INSTALL_PATH,
     BINARY_ROLLBACK_PATH,
@@ -303,11 +305,13 @@ pub(super) async fn start_authorized_upgrade(
                 .start_task(
                     client,
                     Some(actor.to_owned()),
-                    restart_after,
-                    force,
                     state.bind_addr,
                     id,
-                    expected_commit,
+                    UpgradeOptions {
+                        restart_after,
+                        force,
+                        expected_commit,
+                    },
                 )
                 .await
         }
