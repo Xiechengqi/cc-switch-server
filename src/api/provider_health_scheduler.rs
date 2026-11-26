@@ -373,18 +373,18 @@ async fn recent_router_cycle_covers_provider(
         });
     recent_snapshot
         || plan.as_ref().is_some_and(|plan| {
-            let fingerprint = plan.health_fingerprint();
-            usage.logs.iter().any(|log| {
-                log.is_health_check
-                    && log.app == provider.app
-                    && log.provider_id == provider.provider.id
-                    && log
-                        .data_source
-                        .as_deref()
-                        .is_some_and(|source| source.starts_with("cc-switch-router-cycle:"))
-                    && log.provider_health_fingerprint.as_deref() == Some(fingerprint.as_str())
-                    && now_ms().saturating_sub(log.created_at_ms) < ROUTER_PROBE_FALLBACK_AFTER_MS
-            })
+            usage
+                .select_logs(&crate::domain::usage::history::UsageSelection {
+                    app: Some(provider.app),
+                    provider_id: Some(provider.provider.id.clone()),
+                    is_health_check: Some(true),
+                    health_fingerprint: Some(plan.health_fingerprint()),
+                    data_source_prefix: Some("cc-switch-router-cycle:".into()),
+                    from_ms: Some(now_ms().saturating_sub(ROUTER_PROBE_FALLBACK_AFTER_MS)),
+                    limit: Some(1),
+                    ..Default::default()
+                })
+                .is_ok_and(|logs| !logs.is_empty())
         })
 }
 
@@ -985,19 +985,34 @@ fn local_result_for_router_cycle(
         .parse()
         .ok()?;
     let in_slot = |at: u128| at / 1_000 / 1_800 * 1_800 == slot;
-    let log = usage
-        .logs
-        .iter()
-        .filter(|log| {
-            log.is_health_check
-                && log.app == provider.app
-                && log.provider_id == provider.provider.id
-                && log.data_source.as_deref() == Some(SCHEDULED_SOURCE)
-                && log.provider_health_fingerprint.as_deref() == Some(fingerprint)
-                && in_slot(log.created_at_ms)
-        })
-        .min_by_key(|log| log.created_at_ms);
-    if let Some(result) = log.and_then(|log| exact_cycle_result_from_log(log, provider)) {
+    let mut first: Option<UsageLog> = None;
+    usage
+        .visit_logs(
+            &crate::domain::usage::history::UsageSelection {
+                app: Some(provider.app),
+                provider_id: Some(provider.provider.id.clone()),
+                is_health_check: Some(true),
+                data_source: Some(SCHEDULED_SOURCE.into()),
+                health_fingerprint: Some(fingerprint.into()),
+                from_ms: Some(slot * 1000),
+                to_ms: Some(slot.saturating_add(1800) * 1000),
+                ..Default::default()
+            },
+            |log| {
+                if first
+                    .as_ref()
+                    .is_none_or(|previous| log.created_at_ms < previous.created_at_ms)
+                {
+                    first = Some(log.clone());
+                }
+                Ok(())
+            },
+        )
+        .ok()?;
+    if let Some(result) = first
+        .as_ref()
+        .and_then(|log| exact_cycle_result_from_log(log, provider))
+    {
         return Some(result);
     }
     let snapshot = usage
@@ -1018,17 +1033,18 @@ fn existing_cycle_result_from_usage(
     source: &str,
     expected_health_fingerprint: &str,
 ) -> Option<StreamCheckResult> {
-    let log = usage
-        .logs
-        .iter()
-        .filter(|log| {
-            log.is_health_check
-                && log.app == provider.app
-                && log.provider_id == provider.provider.id
-                && log.data_source.as_deref() == Some(source)
-                && log.provider_health_fingerprint.as_deref() == Some(expected_health_fingerprint)
+    let logs = usage
+        .select_logs(&crate::domain::usage::history::UsageSelection {
+            app: Some(provider.app),
+            provider_id: Some(provider.provider.id.clone()),
+            is_health_check: Some(true),
+            data_source: Some(source.into()),
+            health_fingerprint: Some(expected_health_fingerprint.into()),
+            limit: Some(1),
+            ..Default::default()
         })
-        .max_by_key(|log| log.created_at_ms);
+        .ok()?;
+    let log = logs.first();
     if let Some(result) = log.and_then(|log| exact_cycle_result_from_log(log, provider)) {
         return Some(result);
     }
@@ -1173,18 +1189,26 @@ fn existing_cycle_share_ids_from_usage(
     source: &str,
     expected_health_fingerprint: &str,
 ) -> HashSet<String> {
-    usage
-        .logs
-        .iter()
-        .filter(|log| {
-            log.is_health_check
-                && log.app == provider.app
-                && log.provider_id == provider.provider.id
-                && log.data_source.as_deref() == Some(source)
-                && log.provider_health_fingerprint.as_deref() == Some(expected_health_fingerprint)
-        })
-        .filter_map(|log| log.share_id.clone())
-        .collect()
+    let mut ids = HashSet::new();
+    if let Err(error) = usage.visit_logs(
+        &crate::domain::usage::history::UsageSelection {
+            app: Some(provider.app),
+            provider_id: Some(provider.provider.id.clone()),
+            is_health_check: Some(true),
+            data_source: Some(source.into()),
+            health_fingerprint: Some(expected_health_fingerprint.into()),
+            ..Default::default()
+        },
+        |log| {
+            if let Some(id) = &log.share_id {
+                ids.insert(id.clone());
+            }
+            Ok(())
+        },
+    ) {
+        tracing::warn!(%error,"read completed health cycle Shares failed");
+    }
+    ids
 }
 
 async fn project_probe_to_shares(

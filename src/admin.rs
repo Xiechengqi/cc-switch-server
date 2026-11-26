@@ -336,19 +336,41 @@ fn validate_config_stores_with_mode(cli: &Cli, read_only: bool) -> anyhow::Resul
     let config_dir = cli.resolved_config_dir()?;
     let web_dist_dir = cli.resolved_web_dist_dir();
     let config = ServerConfig::load_or_default(&config_dir)?;
-    let mut providers = ProviderStore::load_or_default(&config_dir)?;
+    let committed = crate::repository::server_sqlite::is_committed(&config_dir)?;
+    let mut providers = if committed {
+        crate::repository::server_sqlite::read_providers(&config_dir)?
+    } else {
+        ProviderStore::load_or_default(&config_dir)?
+    };
     if providers.storage_status().format == crate::domain::providers::store::ProviderStoreFormat::S1
     {
         providers.prepare_legacy_runtime_view();
     }
-    let accounts = AccountStore::load_or_default(&config_dir)?;
+    let accounts = if committed {
+        crate::repository::server_sqlite::read_accounts(&config_dir)?
+    } else {
+        AccountStore::load_or_default(&config_dir)?
+    };
     providers.set_runtime_defaults(config.provider_runtime_defaults());
     providers.rebuild_runtime_index(&accounts)?;
-    let shares = ShareStore::load_or_default(&config_dir)?;
-    let usage = if read_only {
-        UsageStore::load_read_only(&config_dir)?
+    let shares = if committed {
+        crate::repository::server_sqlite::read_shares(&config_dir)?
     } else {
-        UsageStore::load_or_default(&config_dir)?
+        ShareStore::load_or_default(&config_dir)?
+    };
+    let usage_count = if committed {
+        crate::repository::server_sqlite::usage_record_count(&config_dir)?
+    } else if read_only {
+        UsageStore::load_read_only(&config_dir)?.logs.len()
+    } else {
+        UsageStore::load_or_default(&config_dir)?.logs.len()
+    };
+    let data_path = |legacy| {
+        if committed {
+            crate::repository::server_sqlite::database_path(&config_dir)
+        } else {
+            legacy
+        }
     };
     let tunnels = TunnelRuntimeStoreForCli::load_or_default(&config_dir)?;
 
@@ -356,20 +378,24 @@ fn validate_config_stores_with_mode(cli: &Cli, read_only: bool) -> anyhow::Resul
         store_summary("server", config_path(&config_dir), None)?,
         store_summary(
             "providers",
-            providers_path(&config_dir),
+            data_path(providers_path(&config_dir)),
             Some(providers.providers.len()),
         )?,
         store_summary(
             "accounts",
-            accounts_path(&config_dir),
+            data_path(accounts_path(&config_dir)),
             Some(accounts.accounts.len()),
         )?,
         store_summary(
             "shares",
-            shares_path(&config_dir),
+            data_path(shares_path(&config_dir)),
             Some(shares.shares.len()),
         )?,
-        store_summary("usage", usage_path(&config_dir), Some(usage.logs.len()))?,
+        store_summary(
+            "usage",
+            data_path(usage_path(&config_dir)),
+            Some(usage_count),
+        )?,
         store_summary(
             "tunnels",
             tunnels_path(&config_dir),

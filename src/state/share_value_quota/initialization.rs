@@ -161,8 +161,9 @@ impl ValueUsageInitializationRequest {
                 anyhow::ensure!(
                     email == &email.trim().to_ascii_lowercase()
                         && before.is_none_or(|share| !share.user_grants.contains_key(email))
-                        && usage.share_user_quota_usage(&self.share_id, email, 0, i64::MAX)
-                            == (0, 0),
+                        && usage
+                            .try_share_user_quota_usage(&self.share_id, email, 0, i64::MAX)
+                            .is_ok_and(|value| value == (0, 0)),
                     "VALUE_QUOTA_TARGET_INVALID: only genuinely new users can initialize usage"
                 );
                 let grant = share

@@ -131,7 +131,7 @@ config → providers → accounts → usage → shares → ui_settings → sessi
 
 ### 7.1 SQLite schema 与不变量
 
-实现见 `src/repository/server_sqlite.rs`，当前 schema version 为 4；保留旧 checksum 并以独立迁移新增：
+实现见 `src/repository/server_sqlite.rs`，当前 schema version 为 10。历史迁移保留各自 checksum，并通过独立迁移追加。启动恢复、有界缓存及按需读取见 [启动恢复与历史用量](startup-recovery.md)。
 
 - `providers` 主键为 `(app, provider_id)`，保留 revision、credential generation 和原始 S2 密文 record；
 - `accounts` 主键为 `(provider_type, account_id)`，保留 auth identity/token refresh generation 和原始字段级密文；
@@ -145,7 +145,7 @@ config → providers → accounts → usage → shares → ui_settings → sessi
 所有时间写入 SQLite 时使用 Unix 毫秒并限制在 signed 64-bit 范围。所有 generation
 必须非负且不会在导入时重编号。数据库开启 `foreign_keys=ON`、`trusted_schema=OFF`、
 WAL、`synchronous=FULL`、5 秒 busy timeout 和 1000 page auto-checkpoint；这些参数是
-schema v1 的明确崩溃合同，后续只能凭故障/性能数据修改。
+schema v1 的明确崩溃合同，后续只能凭故障/性能数据修改。每个连接的页缓存设置为 4 MiB，临时排序使用磁盘，以控制历史查询工作集。
 
 各版本迁移事务提交后原子补 marker；数据库已升级而 marker 仍是旧版本时按 authority 幂等恢复，不重新导入旧 JSON。未知更高 schema 拒绝。写入新 schema 后不可直接换旧 binary；回退必须保留新 reader／账本，旧 schema 迁回须另设计离线迁移。
 
@@ -162,7 +162,7 @@ Server 已持有数据目录独占锁后，启动会执行以下过程：
    `cc-switch-server config migrate-server-store --apply`，或显式设置
    `CC_SWITCH_SERVER_SQLITE_AUTHORITY=committed` 再启动（空数据目录的首次启动自动进行），
    生成确定路径的只读 migration backup，依次持久化 DB/marker 的 `prepared` 与 `committed`；
-7. 验证 committed DB 后移除根目录 legacy 源，后续启动只从 SQLite 重建内存 Store。
+7. 验证 committed DB 后移除根目录 legacy 源，后续启动从 SQLite 加载必要运行状态，历史详情与精确额度按需读取。
 
 在临时库创建、事务提交或替换前失败不会改变上一个已验证数据库。Required 触发的切换
 失败会使启动 fail closed，Requested／FreshInstall 在 `prepared` 前失败则保留 legacy 权威并

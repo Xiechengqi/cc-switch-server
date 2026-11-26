@@ -22,7 +22,7 @@ fn authority_label(authority: Option<AuthorityState>) -> &'static str {
 
 pub(crate) async fn authority_snapshot(state: &ServerState) -> Result<Value, ApiError> {
     let config_dir = state.config_dir.clone();
-    let (marker, request, shadow) = tokio::task::spawn_blocking(move || {
+    let (marker, request, shadow, durable_usage_count) = tokio::task::spawn_blocking(move || {
         let marker = server_sqlite::read_marker(&config_dir)?;
         let request = server_sqlite::read_activation_request(&config_dir)?;
         let shadow = match marker.as_ref().map(|marker| marker.authority) {
@@ -31,16 +31,28 @@ pub(crate) async fn authority_snapshot(state: &ServerState) -> Result<Value, Api
             ),
             _ => None,
         };
-        anyhow::Ok((marker, request, shadow))
+        let usage_count = if marker
+            .as_ref()
+            .is_some_and(|marker| marker.authority == AuthorityState::Committed)
+        {
+            Some(server_sqlite::usage_record_count(&config_dir)?)
+        } else {
+            None
+        };
+        anyhow::Ok((marker, request, shadow, usage_count))
     })
     .await
     .map_err(ApiError::internal)?
     .map_err(ApiError::internal)?;
+    let usage_count = match durable_usage_count {
+        Some(count) => count,
+        None => state.usage.read().await.logs.len(),
+    };
     let counts = json!({
         "providers": state.providers.read().await.providers.len(),
         "accounts": state.accounts.read().await.accounts.len(),
         "shares": state.shares.read().await.shares.len(),
-        "usageRecords": state.usage.read().await.logs.len(),
+        "usageRecords": usage_count,
     });
     let authority = marker.as_ref().map(|marker| marker.authority);
     Ok(json!({

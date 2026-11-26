@@ -109,10 +109,30 @@ assert(
 assert(
   state.includes("server_sqlite::ensure_shadow") &&
     state.includes("server_sqlite::activate_authority") &&
-    state.includes("server_sqlite::load_authoritative") &&
+    state.includes("server_sqlite::load_runtime") &&
     state.includes("create_consistent_backup") &&
     state.includes("server_sqlite::validate_backup_pair"),
   "Server startup/backup/restore no longer closes the SQLite shadow loop",
+);
+const history = read("src/repository/server_sqlite/history.rs");
+const usageStore = read("src/domain/usage/store.rs");
+assert(
+  history.includes("recover_interrupted") && history.includes("quota::upsert_log") &&
+  history.includes("transaction.commit()") && !history.includes("DELETE FROM usage_records"),
+  "startup recovery must commit affected Usage revisions and their exact accounting incrementally",
+);
+assert(
+  repository.includes("a recent Usage cache cannot replace durable history") &&
+  usageStore.includes("CACHE_LIMIT") && usageStore.includes("CACHE_BYTES") &&
+  history.includes("BEGIN DEFERRED") && state.includes("acquire_owned"),
+  "bounded Usage caching, query snapshot, or cancellation-safe concurrency is missing",
+);
+const quotaLedger = read("src/domain/usage/quota_ledger.rs");
+const validateLogStart = quotaLedger.indexOf("pub fn validate_log(");
+const validateLogEnd = quotaLedger.indexOf("pub fn record(", validateLogStart);
+assert(
+  !/self\s*\.entries\s*\.iter\s*\(/.test(quotaLedger.slice(validateLogStart, validateLogEnd)),
+  "quota validation must use the request scope index on a new request",
 );
 for (const fragment of [
   "shadow_verified",

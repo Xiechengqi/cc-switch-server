@@ -2,6 +2,7 @@
 //! evicted after 32 days. All revisions needed by an active manual baseline
 //! remain available; no guessed identity or minute-rollup backfill is allowed.
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,17 @@ pub struct QuotaUsageEntry {
     pub pending: bool,
 }
 
+pub(crate) trait QuotaHistory: std::fmt::Debug + Send + Sync {
+    fn previous(&self, request: &str) -> Result<Option<QuotaUsageEntry>, &'static str>;
+    fn query(
+        &self,
+        cycle: &AccountQuotaCycle,
+        share: &str,
+        user: &str,
+        watermark: u64,
+    ) -> Result<(u64, u64), &'static str>;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QuotaUsageLedger {
@@ -57,6 +69,8 @@ pub struct QuotaUsageLedger {
     pub recovery_required: BTreeMap<String, QuotaAttribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrity_error: Option<String>,
+    #[serde(skip)]
+    pub(crate) history: Option<Arc<dyn QuotaHistory>>,
 }
 
 impl Default for QuotaUsageLedger {
@@ -69,6 +83,7 @@ impl Default for QuotaUsageLedger {
             record_scopes: BTreeMap::new(),
             recovery_required: BTreeMap::new(),
             integrity_error: None,
+            history: None,
         }
     }
 }
@@ -126,6 +141,13 @@ impl QuotaUsageLedger {
     }
     pub fn validate(&self) -> Result<(), &'static str> {
         self.validate_metadata()?;
+        if self.history.is_some() {
+            return if self.entries.is_empty() && self.record_scopes.is_empty() {
+                Ok(())
+            } else {
+                Err("quota_usage_integrity_error")
+            };
+        }
         let mut identities = BTreeMap::new();
         let mut watermarks = std::collections::BTreeSet::new();
         for (scope, records) in &self.entries {
@@ -218,6 +240,7 @@ impl QuotaUsageLedger {
             record_scopes: BTreeMap::new(),
             recovery_required: self.recovery_required.clone(),
             integrity_error: self.integrity_error.clone(),
+            history: None,
         }
     }
 
@@ -245,15 +268,19 @@ impl QuotaUsageLedger {
     }
 
     pub fn validate_log(&self, log: &UsageLog) -> Result<(), &'static str> {
+        if let Some(history) = &self.history {
+            let mut view = self.metadata();
+            if let Some(previous) = history.previous(&log.request_id)? {
+                view.insert_persisted(previous)?;
+            }
+            return view.validate_log(log);
+        }
         if self.schema_version != 1 {
             return Err("unsupported_quota_usage_schema");
         }
-        let previous_scope = self.record_scopes.get(&log.request_id).or_else(|| {
-            self.entries
-                .iter()
-                .find(|(_, entries)| entries.contains_key(&log.request_id))
-                .map(|(key, _)| key)
-        });
+        // Durable loads validate this index, and every record/insert updates it.
+        // An absent request is a normal indexed miss during bulk recovery.
+        let previous_scope = self.record_scopes.get(&log.request_id);
         let Some(attribution) = log.quota_attribution.as_ref() else {
             return if previous_scope.is_some() {
                 Err("quota_attribution_changed")
@@ -370,6 +397,9 @@ impl QuotaUsageLedger {
     ) -> Result<(u64, u64), &'static str> {
         if !self.complete_for(cycle) {
             return Err("history_incomplete");
+        }
+        if let Some(history) = &self.history {
+            return history.query(cycle, share, user, watermark);
         }
         let key = scope_key(
             &cycle.source_ref,

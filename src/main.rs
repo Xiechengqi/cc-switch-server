@@ -49,6 +49,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
+    let _startup =
+        cc_switch_server::infra::startup::StartupGuard::begin(&cli.resolved_config_dir()?);
     cc_switch_server::metrics::init()?;
     cc_switch_server::provider_identity::spawn_antigravity_version_updater();
     cc_switch_server::state::enable_fresh_install_sqlite_authority();
@@ -120,7 +122,6 @@ async fn serve(cli: Cli, log_capture: Arc<LogCapture>) -> anyhow::Result<()> {
             "ignored a Claude CLI identity override older than the audited wire profile"
         );
     }
-    cc_switch_server::state::restore_tunnels(state.clone()).await;
     cc_switch_server::state::spawn_public_ip_discovery(state.clone());
     cc_switch_server::state::spawn_installation_heartbeat(state.clone());
     if state.market_workspace.boot_lease.is_none() {

@@ -327,17 +327,51 @@ fn provider_health_with_runtime(
     probe_support: ProviderProbeSupport,
     runtime_fingerprint: Option<&str>,
 ) -> ProviderHealth {
-    let logs = usage.logs.iter().filter(|log| {
-        !log.is_health_check && log.provider_id == provider.provider.id && log.app == provider.app
-    });
-    health_from_logs(
+    let mut health = health_from_logs(
         provider,
-        logs,
+        std::iter::empty(),
         &usage.provider_health,
         probe_support,
         runtime_fingerprint,
         now_ms(),
-    )
+    );
+    let mut latency_total = 0_u128;
+    let result = usage.visit_logs(
+        &crate::domain::usage::history::UsageSelection {
+            app: Some(provider.app),
+            provider_id: Some(provider.provider.id.clone()),
+            is_health_check: Some(false),
+            ..Default::default()
+        },
+        |log| {
+            health.requests = health.requests.saturating_add(1);
+            latency_total = latency_total.saturating_add(log.duration_ms);
+            if (200..400).contains(&log.status_code) {
+                health.successes = health.successes.saturating_add(1);
+            } else {
+                health.failures = health.failures.saturating_add(1);
+            }
+            health.last_request_at_ms = Some(
+                health
+                    .last_request_at_ms
+                    .unwrap_or_default()
+                    .max(log.created_at_ms),
+            );
+            Ok(())
+        },
+    );
+    if let Err(error) = result {
+        tracing::error!(%error,"read Provider usage history failed");
+        health.status = ProviderHealthStatus::Unknown;
+        health.available = false;
+        health.healthy = false;
+        health.reason = Some("provider usage history is unavailable".into());
+    }
+    health.success_rate =
+        (health.requests > 0).then(|| health.successes as f64 / health.requests as f64);
+    health.avg_latency_ms =
+        (health.requests > 0).then(|| latency_total as f64 / health.requests as f64);
+    health
 }
 
 fn health_from_logs<'a>(

@@ -156,6 +156,9 @@ const HTTP_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(40);
 const MANAGED_REFRESH_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(35);
 
 pub async fn serve(state: ServerState) -> anyhow::Result<()> {
+    state
+        .market_workspace
+        .seal_expired(chrono::Utc::now().timestamp())?;
     if !state.config.read().await.is_setup_complete() {
         crate::setup::log_setup_required_hints(&state);
     }
@@ -166,6 +169,11 @@ pub async fn serve(state: ServerState) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {}", state.bind_addr))?;
 
+    crate::infra::startup::ready();
+    let restoring = state.clone();
+    tokio::spawn(async move {
+        crate::state::restore_tunnels(restoring).await;
+    });
     provider_health_scheduler::spawn_share_model_health_scheduler(state.clone());
     tracing::info!("cc-switch-server listening on {}", state.bind_addr);
     let mut shutdown = state.subscribe_shutdown();
@@ -1401,6 +1409,9 @@ async fn readiness(State(state): State<ServerState>) -> Response {
     if state.credential_persistence_degraded() {
         reasons.push("oauth_credential_persistence_degraded");
     }
+    if state.quota_usage_is_degraded() {
+        reasons.push("quota_usage_persistence_degraded");
+    }
     let ready = reasons.is_empty();
     (
         if ready {
@@ -1409,6 +1420,8 @@ async fn readiness(State(state): State<ServerState>) -> Response {
             StatusCode::SERVICE_UNAVAILABLE
         },
         Json(ReadinessResponse {
+            process_id: std::process::id(),
+            process_instance_id: state.process_instance_id.clone(),
             ok: ready,
             status: if ready { "ready" } else { "degraded" },
             reasons,

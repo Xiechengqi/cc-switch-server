@@ -24,6 +24,7 @@ use crate::domain::sharing::shares::{shares_path, ShareStore};
 use crate::domain::usage::store::{usage_directory, UsageLog, UsageStore};
 
 pub(crate) mod capability_context;
+mod history;
 pub(crate) mod market_termination;
 mod payload;
 mod quota;
@@ -336,7 +337,9 @@ pub(crate) fn upgrade_schema(config_dir: &Path) -> anyhow::Result<()> {
         "SQLite migration source digest mismatch"
     );
     schema::migrate_to_current(&connection)?;
-    checkpoint_database(&connection)?;
+    if version != SCHEMA_VERSION {
+        checkpoint_database(&connection)?;
+    }
     if marker.schema_version != SCHEMA_VERSION as u32 {
         marker.schema_version = SCHEMA_VERSION as u32;
         write_marker(config_dir, &marker)?;
@@ -723,7 +726,16 @@ impl ActivationTrigger {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn load_authoritative(config_dir: &Path) -> anyhow::Result<AuthoritativeStores> {
+    load_stores(config_dir, false)
+}
+
+pub(crate) fn load_runtime(config_dir: &Path) -> anyhow::Result<AuthoritativeStores> {
+    load_stores(config_dir, true)
+}
+
+fn load_stores(config_dir: &Path, runtime: bool) -> anyhow::Result<AuthoritativeStores> {
     upgrade_schema(config_dir)?;
     let marker = read_marker(config_dir)?.context("SQLite migration marker is missing")?;
     ensure!(
@@ -732,6 +744,8 @@ pub(crate) fn load_authoritative(config_dir: &Path) -> anyhow::Result<Authoritat
     );
     verify_committed_database(config_dir, &marker)?;
 
+    history::recover_interrupted(config_dir)?;
+    retire_legacy_sources(config_dir)?;
     let connection = open_database(&database_path(config_dir), true)?;
     let temporary = temporary_materialization_dir(config_dir);
     fs::create_dir_all(&temporary)
@@ -759,13 +773,27 @@ pub(crate) fn load_authoritative(config_dir: &Path) -> anyhow::Result<Authoritat
         .context("load Accounts from committed SQLite authority")?;
         let shares = ShareStore::load_or_default(&temporary)
             .context("load Shares from committed SQLite authority")?;
-        let logs = load_usage_logs(&connection)?;
-        let (mut usage, mut recovered) = UsageStore::from_authoritative_logs(logs);
-        usage.quota_ledger = quota::load(&connection)?;
-        for log in &usage.logs {
-            usage.quota_ledger.record(log).map_err(anyhow::Error::msg)?;
+        let mut usage = if runtime {
+            UsageStore::default()
+        } else {
+            UsageStore::from_authoritative_logs(load_usage_logs(&connection)?).0
+        };
+        let mut recovered = false;
+        usage.quota_ledger = if runtime {
+            quota::load_runtime(config_dir, &connection)?
+        } else {
+            quota::load(&connection)?
+        };
+        if !runtime {
+            for log in &usage.logs {
+                usage.quota_ledger.record(log).map_err(anyhow::Error::msg)?;
+            }
+            recovered |= usage.quota_ledger.recover_pending();
         }
-        recovered |= usage.quota_ledger.recover_pending();
+        usage.set_export_watermark(history::next_export_sequence(&connection)?.saturating_sub(1));
+        if runtime {
+            history::attach(config_dir, &mut usage)?;
+        }
         Ok((
             AuthoritativeStores {
                 providers,
@@ -783,10 +811,30 @@ pub(crate) fn load_authoritative(config_dir: &Path) -> anyhow::Result<Authoritat
     let (stores, recovered) = result?;
     drop(connection);
     if recovered {
-        replace_usage_records(config_dir, &stores.usage)
-            .context("persist interrupted Usage recovery to SQLite authority")?;
+        persist_quota_metadata(config_dir, &stores.usage.quota_ledger)
+            .context("persist interrupted quota recovery to SQLite authority")?;
     }
     Ok(stores)
+}
+
+pub(crate) fn runtime_quota(
+    config_dir: &Path,
+) -> anyhow::Result<crate::domain::usage::quota_ledger::QuotaUsageLedger> {
+    let connection = open_database(&database_path(config_dir), true)?;
+    quota::load_runtime(config_dir, &connection)
+}
+
+pub(crate) fn persist_quota_metadata(
+    config_dir: &Path,
+    ledger: &crate::domain::usage::quota_ledger::QuotaUsageLedger,
+) -> anyhow::Result<()> {
+    assert_committed(config_dir)?;
+    let mut connection = open_database(&database_path(config_dir), false)?;
+    let transaction = connection.transaction()?;
+    quota::merge(&transaction, ledger)?;
+    bump_repository_generation(&transaction)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 pub(crate) fn persist_providers(
@@ -1087,9 +1135,12 @@ pub(crate) fn persist_reference_graph(
     Ok(())
 }
 
-/// Returns whether USD-only accounting was isolated for recovery. The ordinary
-/// usage/Token transaction must not be lost because a monetary checkpoint failed.
-pub(crate) fn upsert_usage_log(config_dir: &Path, log: &UsageLog) -> anyhow::Result<bool> {
+/// Return the committed accounting metadata with the scoped USD recovery result.
+/// Publication uses the exact metadata captured in the same write transaction.
+pub(crate) fn upsert_usage_log(
+    config_dir: &Path,
+    log: &UsageLog,
+) -> anyhow::Result<(bool, crate::domain::usage::quota_ledger::QuotaUsageLedger)> {
     let mut observation = CommitObservation::start("usage_upsert");
     assert_committed(config_dir)?;
     let mut connection = open_database(&database_path(config_dir), false)?;
@@ -1103,9 +1154,10 @@ pub(crate) fn upsert_usage_log(config_dir: &Path, log: &UsageLog) -> anyhow::Res
     let value_degraded = value_quota::settle_usage_log_isolated(&transaction, log)?;
     market_termination::finalize_log_in(&transaction, log)?;
     bump_repository_generation(&transaction)?;
+    let quota = quota::load_runtime(config_dir, &transaction)?;
     transaction.commit().context("commit Usage SQLite UPSERT")?;
     observation.succeed();
-    Ok(value_degraded)
+    Ok((value_degraded, quota))
 }
 
 pub(crate) fn replace_usage_records(config_dir: &Path, usage: &UsageStore) -> anyhow::Result<()> {
@@ -1125,8 +1177,15 @@ pub(crate) fn checkpoint_authority(config_dir: &Path) -> anyhow::Result<()> {
 
 fn verify_committed_database(config_dir: &Path, marker: &MigrationMarker) -> anyhow::Result<()> {
     let database = database_path(config_dir);
-    validate_wal_if_present(&database)?;
     let connection = open_database(&database, true)?;
+    crate::infra::startup::advance("database_integrity", 0);
+    connection.progress_handler(
+        50_000,
+        Some(|| {
+            crate::infra::startup::advance("database_integrity", 50_000);
+            false
+        }),
+    );
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     ensure!(
         integrity == "ok",
@@ -1154,6 +1213,8 @@ fn verify_committed_database(config_dir: &Path, marker: &MigrationMarker) -> any
         source_digest == marker.source_digest,
         "committed SQLite marker/source digest mismatch"
     );
+    connection.progress_handler(0, None::<fn() -> bool>);
+    crate::infra::startup::advance("payload_validation", 0);
     validate_payload_digests(&connection)?;
     let fk_error: Option<(String, i64)> = connection
         .query_row("PRAGMA foreign_key_check", [], |row| {
@@ -1168,19 +1229,27 @@ fn verify_committed_database(config_dir: &Path, marker: &MigrationMarker) -> any
 }
 
 fn validate_payload_digests(connection: &Connection) -> anyhow::Result<()> {
-    quota::load(connection)?;
+    quota::validate(connection)?;
     for table in ["providers", "shares", "usage_records"] {
         let mut statement =
             connection.prepare(&format!("SELECT payload_json,payload_sha256 FROM {table}"))?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-        for row in rows {
+        for (index, row) in rows.enumerate() {
             let (payload, expected_sha) = row?;
+            if index.is_multiple_of(256) {
+                crate::infra::startup::advance("payload_validation", 256);
+            }
             ensure!(
                 sha256_hex(payload.as_bytes()) == expected_sha,
                 "SQLite {table} payload digest mismatch"
             );
+            if table == "usage_records" {
+                let log: UsageLog =
+                    serde_json::from_str(&payload).context("decode Usage SQLite payload")?;
+                quota::validate_usage_log(connection, &log)?;
+            }
         }
     }
     let mut statement = connection.prepare("SELECT payload_json,payload_sha256 FROM accounts")?;
@@ -1377,15 +1446,87 @@ fn materialize_blob_if_present(
 ) -> anyhow::Result<()> {
     let payload = connection
         .query_row(
-            "SELECT payload FROM legacy_blobs WHERE relative_path=?1",
+            "SELECT payload,sha256 FROM legacy_blobs WHERE relative_path=?1",
             params![relative],
-            |row| row.get::<_, Vec<u8>>(0),
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    if let Some(payload) = payload {
+    if let Some((payload, digest)) = payload {
+        ensure!(
+            sha256_hex(&payload) == digest,
+            "SQLite legacy blob digest mismatch"
+        );
         crate::infra::storage::write_bytes_atomic(&destination_dir.join(relative), &payload)?;
     }
     Ok(())
+}
+
+fn read_core_blob<T>(
+    config_dir: &Path,
+    relative: &str,
+    load: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    assert_committed(config_dir)?;
+    let connection = open_database(&database_path(config_dir), true)?;
+    let temporary = temporary_materialization_dir(config_dir);
+    fs::create_dir_all(&temporary)?;
+    set_private_directory_permissions(&temporary)?;
+    let result = (|| {
+        materialize_blob_if_present(&connection, relative, &temporary)?;
+        let key = crate::domain::accounts::store::accounts_key_path(config_dir);
+        if key.is_file() {
+            crate::infra::storage::write_bytes_atomic(
+                &crate::domain::accounts::store::accounts_key_path(&temporary),
+                &fs::read(key)?,
+            )?;
+        }
+        load(&temporary)
+    })();
+    if let Err(error) = fs::remove_dir_all(&temporary) {
+        tracing::warn!(%error,"remove scoped SQLite materialization failed");
+    }
+    result
+}
+
+pub(crate) fn read_accounts(config_dir: &Path) -> anyhow::Result<AccountStore> {
+    read_core_blob(config_dir, "accounts.json", |temporary| {
+        AccountStore::load_from_path(
+            config_dir,
+            &crate::domain::accounts::store::accounts_path(temporary),
+        )
+    })
+}
+
+pub(crate) fn read_providers(config_dir: &Path) -> anyhow::Result<ProviderStore> {
+    read_core_blob(
+        config_dir,
+        "providers.json",
+        ProviderStore::load_runtime_or_default,
+    )
+}
+
+pub(crate) fn read_shares(config_dir: &Path) -> anyhow::Result<ShareStore> {
+    read_core_blob(config_dir, "shares.json", ShareStore::load_or_default)
+}
+
+pub(crate) fn usage_record_count(config_dir: &Path) -> anyhow::Result<usize> {
+    let connection = open_database(&database_path(config_dir), true)?;
+    let count: i64 =
+        connection.query_row("SELECT count(*) FROM usage_records", [], |row| row.get(0))?;
+    Ok(usize::try_from(count)?)
+}
+
+pub(crate) fn read_runtime_usage(config_dir: &Path) -> anyhow::Result<UsageStore> {
+    assert_committed(config_dir)?;
+    let mut usage = UsageStore {
+        quota_ledger: runtime_quota(config_dir)?,
+        provider_health: crate::domain::health::ProviderHealthStore::load_rebuildable(config_dir),
+        ..Default::default()
+    };
+    let connection = open_database(&database_path(config_dir), true)?;
+    usage.set_export_watermark(history::next_export_sequence(&connection)?.saturating_sub(1));
+    history::attach(config_dir, &mut usage)?;
+    Ok(usage)
 }
 
 fn serialize_provider_store(
@@ -1541,6 +1682,10 @@ fn replace_usage_records_in_connection(
     connection: &Connection,
     usage: &UsageStore,
 ) -> anyhow::Result<()> {
+    ensure!(
+        usage.history.is_none(),
+        "a recent Usage cache cannot replace durable history"
+    );
     let transaction = connection
         .unchecked_transaction()
         .context("begin Usage SQLite replace")?;
@@ -1730,7 +1875,9 @@ fn open_database(path: &Path, read_only: bool) -> anyhow::Result<Connection> {
     connection.execute_batch(
         "PRAGMA foreign_keys=ON;
          PRAGMA trusted_schema=OFF;
-         PRAGMA recursive_triggers=OFF;",
+         PRAGMA recursive_triggers=OFF;
+         PRAGMA cache_size=-4096;
+         PRAGMA temp_store=FILE;",
     )?;
     if !read_only {
         connection.execute_batch(
@@ -3132,5 +3279,218 @@ mod tests {
             fs::remove_dir_all(export_parent).unwrap();
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+    #[test]
+    fn live_authority_switch_publishes_quota_revision_once() {
+        use crate::domain::usage::quota_ledger::QuotaAttribution;
+
+        let dir = temp_dir("live-quota-authority");
+        let mut log = usage_log(0);
+        log.created_at_ms = crate::infra::time::now_ms();
+        log.started_at_ms = log.created_at_ms;
+        log.share_id = Some("share".into());
+        log.user_email = Some("reader@example.com".into());
+        log.quota_attribution = Some(QuotaAttribution {
+            source_ref: "source".into(),
+            source_epoch: 1,
+            bucket_id: "weekly".into(),
+            started_at_ms: i64::try_from(log.started_at_ms).unwrap(),
+        });
+        let mut usage = UsageStore::default();
+        usage.quota_ledger.begin_collection("source", 0);
+        usage.push(log.clone());
+        refresh_shadow(
+            &dir,
+            ShadowImportInput {
+                providers: &ProviderStore::default(),
+                accounts: &AccountStore::default(),
+                shares: &ShareStore::default(),
+                usage: &usage,
+            },
+        )
+        .unwrap();
+        activate_authority(&dir).unwrap();
+
+        log.usage_revision += 1;
+        log.output_tokens = Some(5);
+        log.total_tokens = Some(6);
+        let append = usage.prepare_append(log).unwrap();
+        let (_, quota) = upsert_usage_log(&dir, append.log()).unwrap();
+        let committed_watermark = quota.watermark;
+        assert_eq!(committed_watermark, 2);
+        assert!(usage.history.is_none());
+        usage.quota_ledger = quota;
+        usage.apply_append(append);
+
+        assert_eq!(usage.quota_ledger.watermark, committed_watermark);
+        assert!(usage.quota_ledger.entries.is_empty());
+        usage.quota_ledger.validate().unwrap();
+        assert_eq!(usage.logs.len(), 1);
+        assert_eq!(usage.logs[0].total_tokens, Some(6));
+        assert_eq!(
+            usage
+                .query_overview(&Default::default())
+                .unwrap()
+                .metrics
+                .request_count,
+            1
+        );
+        assert_eq!(runtime_quota(&dir).unwrap().watermark, committed_watermark);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn runtime_cache_eviction_preserves_reports_and_late_request_updates() {
+        let dir = temp_dir("bounded-runtime-history");
+        let now = crate::infra::time::now_ms();
+        let logs = (0..2056)
+            .map(|index| {
+                let mut log = usage_log(index);
+                log.created_at_ms = now.saturating_sub(10_000).saturating_add(index as u128);
+                log.started_at_ms = log.created_at_ms;
+                log.share_id = Some("share-history".into());
+                log.user_email = Some("reader@example.com".into());
+                log
+            })
+            .collect();
+        let usage = UsageStore::from_authoritative_logs(logs).0;
+        refresh_shadow(
+            &dir,
+            ShadowImportInput {
+                providers: &ProviderStore::default(),
+                accounts: &AccountStore::default(),
+                shares: &ShareStore::default(),
+                usage: &usage,
+            },
+        )
+        .unwrap();
+        activate_authority(&dir).unwrap();
+        let mut runtime = load_runtime(&dir).unwrap().usage;
+        assert!(runtime.logs.len() <= 2048);
+        assert_eq!(usage_record_count(&dir).unwrap(), 2056);
+        assert!(!runtime
+            .logs
+            .iter()
+            .any(|log| log.request_id == "request-0000"));
+        assert_eq!(
+            runtime
+                .query_overview(&Default::default())
+                .unwrap()
+                .metrics
+                .request_count,
+            2056
+        );
+        assert_eq!(
+            runtime
+                .try_share_user_quota_usage("share-history", "READER@example.com", 0, i64::MAX)
+                .unwrap(),
+            (4112, 2056)
+        );
+        let mut previous = runtime.find_request("request-0000").unwrap().unwrap();
+        previous.usage_revision += 1;
+        previous.output_tokens = Some(5);
+        previous.total_tokens = Some(6);
+        let append = runtime.prepare_append(previous).unwrap();
+        upsert_usage_log(&dir, append.log()).unwrap();
+        runtime.quota_ledger = runtime_quota(&dir).unwrap();
+        runtime.apply_append(append);
+        assert_eq!(
+            runtime
+                .find_request("request-0000")
+                .unwrap()
+                .unwrap()
+                .total_tokens,
+            Some(6)
+        );
+        assert_eq!(
+            runtime
+                .query_overview(&Default::default())
+                .unwrap()
+                .metrics
+                .request_count,
+            2056
+        );
+        assert!(replace_usage_records(&dir, &runtime).is_err());
+        persist_quota_metadata(&dir, &runtime.quota_ledger).unwrap();
+        assert_eq!(
+            load_runtime(&dir)
+                .unwrap()
+                .usage
+                .query_overview(&Default::default())
+                .unwrap()
+                .metrics
+                .request_count,
+            2056
+        );
+        let snapshot = UsageStore {
+            history: Some(runtime.history.as_ref().unwrap().snapshot().unwrap()),
+            ..Default::default()
+        };
+        let mut added = usage_log(2056);
+        added.created_at_ms = now;
+        upsert_usage_log(&dir, &added).unwrap();
+        assert_eq!(
+            snapshot
+                .query_overview(&Default::default())
+                .unwrap()
+                .metrics
+                .request_count,
+            2056
+        );
+        assert_eq!(
+            runtime
+                .query_overview(&Default::default())
+                .unwrap()
+                .metrics
+                .request_count,
+            2057
+        );
+        assert_eq!(usage_record_count(&dir).unwrap(), 2057);
+        drop(snapshot);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_recovery_updates_only_pending_revisions_and_is_repeatable() {
+        use crate::domain::usage::store::{UsageOutcome, UsageState};
+        let dir = temp_dir("incremental-startup-recovery");
+        let mut pending = usage_log(0);
+        pending.created_at_ms = crate::infra::time::now_ms();
+        pending.usage_state = UsageState::Pending;
+        pending.outcome = UsageOutcome::Pending;
+        let mut finished = usage_log(1);
+        finished.created_at_ms = pending.created_at_ms;
+        let usage = UsageStore::from_authoritative_logs(vec![finished.clone()]).0;
+        refresh_shadow(
+            &dir,
+            ShadowImportInput {
+                providers: &ProviderStore::default(),
+                accounts: &AccountStore::default(),
+                shares: &ShareStore::default(),
+                usage: &usage,
+            },
+        )
+        .unwrap();
+        activate_authority(&dir).unwrap();
+        upsert_usage_log(&dir, &pending).unwrap();
+        let runtime = load_runtime(&dir).unwrap().usage;
+        let recovered = runtime.find_request(&pending.request_id).unwrap().unwrap();
+        assert_eq!(recovered.usage_state, UsageState::Interrupted);
+        assert_eq!(recovered.usage_revision, pending.usage_revision + 1);
+        assert_eq!(
+            serde_json::to_value(runtime.find_request(&finished.request_id).unwrap().unwrap())
+                .unwrap(),
+            serde_json::to_value(&finished).unwrap()
+        );
+        let restarted = load_runtime(&dir).unwrap().usage;
+        assert_eq!(
+            restarted
+                .find_request(&pending.request_id)
+                .unwrap()
+                .unwrap()
+                .usage_revision,
+            recovered.usage_revision
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

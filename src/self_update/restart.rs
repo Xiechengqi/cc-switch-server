@@ -14,7 +14,9 @@ use crate::self_update::version::{
 
 const HELPER_SPEC_FILENAME: &str = "upgrade-helper.json";
 const RESTART_OPERATION_FILENAME: &str = "restart-operation.json";
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(45);
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(180);
+const STARTUP_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const TOTAL_RESTART_TIMEOUT: Duration = Duration::from_secs(14 * 60);
 /// A start that commits the SQLite authority does so before it listens, so
 /// its first health answer can take much longer than a plain restart's.
 const MIGRATION_HEALTH_TIMEOUT: Duration = Duration::from_secs(600);
@@ -61,6 +63,8 @@ struct UpdateHelperSpec {
     parent_pid: u32,
     health_addr: SocketAddr,
     expected_commit: Option<String>,
+    #[serde(default)]
+    previous_commit: Option<String>,
     config_dir: PathBuf,
     server_args: Vec<String>,
     install_path: PathBuf,
@@ -103,6 +107,15 @@ impl std::fmt::Display for ReplacementFailure {
 }
 
 impl ReplacementFailure {
+    fn with_startup_phase(mut self, phase: Option<&str>) -> Self {
+        if let Some(phase) = phase {
+            self.stage = phase.to_owned();
+            self.diagnostic =
+                bounded_diagnostic(&format!("startup stage {phase}: {}", self.diagnostic));
+        }
+        self
+    }
+
     fn upgrade_diagnostic(&self) -> crate::self_update::upgrade::UpgradeFailureDiagnostic {
         crate::self_update::upgrade::UpgradeFailureDiagnostic {
             failure_code: self.failure_code.clone(),
@@ -270,6 +283,7 @@ pub fn schedule_upgrade_restart(
         parent_pid: std::process::id(),
         health_addr: loopback_health_addr(health_addr),
         expected_commit: Some(target_commit.to_string()),
+        previous_commit: None,
         config_dir: config_dir.to_path_buf(),
         server_args: std::env::args().skip(1).collect(),
         install_path: BINARY_INSTALL_PATH.into(),
@@ -309,6 +323,7 @@ pub fn restart_from_detected_service(
         expected_commit: pending
             .map(|value| value.1)
             .or_else(|| Some(crate::build_info::build_info().commit_id.to_string())),
+        previous_commit: None,
         config_dir: config_dir.to_path_buf(),
         server_args: std::env::args().skip(1).collect(),
         install_path,
@@ -368,6 +383,7 @@ pub fn rollback_from_backup_and_restart(
         parent_pid: std::process::id(),
         health_addr: loopback_health_addr(health_addr),
         expected_commit: None,
+        previous_commit: None,
         config_dir: config_dir.to_path_buf(),
         server_args: std::env::args().skip(1).collect(),
         install_path: BINARY_INSTALL_PATH.into(),
@@ -376,7 +392,8 @@ pub fn rollback_from_backup_and_restart(
     })
 }
 
-fn launch_helper(spec: UpdateHelperSpec) -> Result<String, SelfUpdateError> {
+fn launch_helper(mut spec: UpdateHelperSpec) -> Result<String, SelfUpdateError> {
+    spec.previous_commit = Some(crate::build_info::build_info().commit_id.to_owned());
     crate::logging::ensure_log_dir(&spec.config_dir).map_err(|error| {
         SelfUpdateError::Internal(format!(
             "initialize restart log directory under {} failed: {error}",
@@ -615,6 +632,7 @@ fn run_update_helper_inner_with_timeout(
     spec: &UpdateHelperSpec,
     health_timeout: Duration,
 ) -> anyhow::Result<()> {
+    let task_deadline = Instant::now() + TOTAL_RESTART_TIMEOUT;
     update_restart_operation(
         &spec.config_dir,
         &spec.operation_id,
@@ -636,10 +654,10 @@ fn run_update_helper_inner_with_timeout(
         HelperMode::RestartOnly => None,
     };
 
-    stop_process(spec)?;
+    stop_process(spec, task_deadline)?;
     if !matches!(spec.mode, HelperMode::RestartOnly) {
         if let Err(error) = install_staged_binary(&spec.staging_path, &spec.install_path) {
-            let recovery = start_process(spec)
+            let recovery = start_process(spec, task_deadline)
                 .map(|_| "previous binary restarted".to_string())
                 .unwrap_or_else(|restart_error| {
                     format!("previous binary restart also failed: {restart_error}")
@@ -647,7 +665,7 @@ fn run_update_helper_inner_with_timeout(
             anyhow::bail!("install staged binary failed: {error}; {recovery}");
         }
     }
-    let (mut started_process, restart_error) = match start_process(spec) {
+    let (mut started_process, restart_error) = match start_process(spec, task_deadline) {
         Ok(child) => (child, None),
         Err(error) => (None, Some(error)),
     };
@@ -664,7 +682,7 @@ fn run_update_helper_inner_with_timeout(
             started_process.as_mut(),
             spec.expected_commit.as_deref(),
             Some(spec.parent_pid),
-            health_timeout,
+            health_timeout.min(task_deadline.saturating_duration_since(Instant::now())),
         ),
     };
     if let Ok(new_pid) = replacement_result {
@@ -688,7 +706,6 @@ fn run_update_helper_inner_with_timeout(
         return Ok(());
     }
 
-    stop_replacement_process(spec, started_process.as_mut());
     let replacement_failure =
         replacement_result.expect_err("failed replacement must carry probe or restart diagnostics");
     let replacement_error = replacement_failure.to_string();
@@ -710,29 +727,38 @@ fn run_update_helper_inner_with_timeout(
             Some(replacement_failure.upgrade_diagnostic()),
         )?;
     }
-    let (rollback_stage, rollback_result) = match rollback_source
-        .as_deref()
-        .filter(|path| path.exists())
-    {
-        Some(source) => match (|| -> anyhow::Result<()> {
-            std::fs::copy(source, &spec.staging_path)?;
-            install_staged_binary(&spec.staging_path, &spec.install_path)?;
-            let mut rollback_process = start_process(spec)?;
-            wait_for_expected_version(spec, rollback_process.as_mut(), None, None, health_timeout)
+    stop_replacement_process(spec, started_process.as_mut(), task_deadline).map_err(|error| {
+        anyhow::anyhow!(
+            "replacement failed: {replacement_error}; stopping replacement failed: {error}"
+        )
+    })?;
+    let (rollback_stage, rollback_result) =
+        match rollback_source.as_deref().filter(|path| path.exists()) {
+            Some(source) => match (|| -> anyhow::Result<()> {
+                std::fs::copy(source, &spec.staging_path)?;
+                install_staged_binary(&spec.staging_path, &spec.install_path)?;
+                let mut rollback_process = start_process(spec, task_deadline)?;
+                wait_for_expected_version(
+                    spec,
+                    rollback_process.as_mut(),
+                    spec.previous_commit.as_deref(),
+                    started_process.as_ref().map(std::process::Child::id),
+                    HEALTH_TIMEOUT.min(task_deadline.saturating_duration_since(Instant::now())),
+                )
                 .map(|_| ())
                 .map_err(anyhow::Error::msg)
-        })() {
-            Ok(()) => (
-                "rollback_succeeded",
-                "rollback passed health checks".to_string(),
+            })() {
+                Ok(()) => (
+                    "rollback_succeeded",
+                    "rollback passed health checks".to_string(),
+                ),
+                Err(error) => ("rollback_failed", format!("rollback failed: {error}")),
+            },
+            None => (
+                "rollback_unavailable",
+                "rollback was not available".to_string(),
             ),
-            Err(error) => ("rollback_failed", format!("rollback failed: {error}")),
-        },
-        None => (
-            "rollback_unavailable",
-            "rollback was not available".to_string(),
-        ),
-    };
+        };
     let final_message = format!("replacement failed: {replacement_error}; {rollback_result}");
     let _ = update_restart_operation(
         &spec.config_dir,
@@ -753,7 +779,7 @@ fn run_update_helper_inner_with_timeout(
     anyhow::bail!(final_message)
 }
 
-fn stop_process(spec: &UpdateHelperSpec) -> anyhow::Result<()> {
+fn stop_process(spec: &UpdateHelperSpec, deadline: Instant) -> anyhow::Result<()> {
     update_restart_operation(
         &spec.config_dir,
         &spec.operation_id,
@@ -768,20 +794,25 @@ fn stop_process(spec: &UpdateHelperSpec) -> anyhow::Result<()> {
                 .service_unit
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("systemd stop target is missing"))?;
-            run_service_command("systemctl", &["stop", unit])?;
+            run_service_command("systemctl", &["stop", unit], deadline)?;
         }
         RestartStrategy::OpenRc => {
             let service = spec
                 .service_unit
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("OpenRC stop target is missing"))?;
-            run_service_command("rc-service", &[service, "stop"])?;
+            run_service_command("rc-service", &[service, "stop"], deadline)?;
         }
         RestartStrategy::Standalone => {
             signal_process(spec.parent_pid, libc::SIGTERM)?;
         }
     }
-    let forced = wait_for_process_exit(spec.parent_pid)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let forced = wait_for_process_exit_with_timeouts(
+        spec.parent_pid,
+        PROCESS_GRACEFUL_TIMEOUT.min(remaining.saturating_sub(PROCESS_KILL_TIMEOUT)),
+        PROCESS_KILL_TIMEOUT.min(remaining),
+    )?;
     update_restart_operation(
         &spec.config_dir,
         &spec.operation_id,
@@ -800,14 +831,18 @@ fn stop_process(spec: &UpdateHelperSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn start_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::process::Child>> {
+fn start_process(
+    spec: &UpdateHelperSpec,
+    deadline: Instant,
+) -> anyhow::Result<Option<std::process::Child>> {
+    anyhow::ensure!(Instant::now() < deadline, "restart task deadline exhausted");
     let child = match spec.strategy {
         RestartStrategy::Systemd => {
             let unit = spec
                 .service_unit
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("systemd start target is missing"))?;
-            run_service_command("systemctl", &["start", unit])?;
+            run_service_command("systemctl", &["start", unit], deadline)?;
             None
         }
         RestartStrategy::OpenRc => {
@@ -815,7 +850,7 @@ fn start_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::process:
                 .service_unit
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("OpenRC start target is missing"))?;
-            run_service_command("rc-service", &[service, "start"])?;
+            run_service_command("rc-service", &[service, "start"], deadline)?;
             None
         }
         RestartStrategy::Standalone => {
@@ -851,30 +886,58 @@ fn start_process(spec: &UpdateHelperSpec) -> anyhow::Result<Option<std::process:
     Ok(child)
 }
 
-fn stop_replacement_process(spec: &UpdateHelperSpec, child: Option<&mut std::process::Child>) {
+fn stop_replacement_process(
+    spec: &UpdateHelperSpec,
+    child: Option<&mut std::process::Child>,
+    deadline: Instant,
+) -> anyhow::Result<()> {
     match spec.strategy {
         RestartStrategy::Systemd => {
             if let Some(unit) = spec.service_unit.as_deref() {
-                let _ = run_service_command("systemctl", &["stop", unit]);
+                run_service_command("systemctl", &["stop", unit], deadline)?;
             }
         }
         RestartStrategy::OpenRc => {
             if let Some(service) = spec.service_unit.as_deref() {
-                let _ = run_service_command("rc-service", &[service, "stop"]);
+                run_service_command("rc-service", &[service, "stop"], deadline)?;
             }
         }
         RestartStrategy::Standalone => {
             if let Some(child) = child {
-                let _ = child.kill();
-                let _ = child.wait();
+                if child.try_wait()?.is_none() {
+                    child.kill()?;
+                }
+                let kill_deadline = (Instant::now() + PROCESS_KILL_TIMEOUT).min(deadline);
+                while child.try_wait()?.is_none() {
+                    anyhow::ensure!(
+                        Instant::now() < kill_deadline,
+                        "replacement process remained active after SIGKILL"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
     }
+    // Managed services can report a successful stop while a child is draining.
+    if let Some(progress) = read_startup_progress(spec, None, None, 0) {
+        let pid = progress.process_id;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        wait_for_process_exit_with_timeouts(
+            pid,
+            Duration::ZERO,
+            PROCESS_KILL_TIMEOUT.min(remaining),
+        )?;
+    }
+    Ok(())
 }
 
-fn run_service_command(program: &str, args: &[&str]) -> anyhow::Result<()> {
+fn run_service_command(program: &str, args: &[&str], task_deadline: Instant) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        Instant::now() < task_deadline,
+        "restart task deadline exhausted"
+    );
     let mut child = Command::new(program).args(args).spawn()?;
-    let deadline = Instant::now() + SERVICE_COMMAND_TIMEOUT;
+    let deadline = (Instant::now() + SERVICE_COMMAND_TIMEOUT).min(task_deadline);
     loop {
         if let Some(status) = child.try_wait()? {
             anyhow::ensure!(
@@ -886,7 +949,9 @@ fn run_service_command(program: &str, args: &[&str]) -> anyhow::Result<()> {
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
+            while child.try_wait()?.is_none() && Instant::now() < task_deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             anyhow::bail!(
                 "{program} {} timed out after {}s",
                 args.join(" "),
@@ -912,10 +977,6 @@ fn signal_process(pid: u32, signal: i32) -> anyhow::Result<()> {
         return Ok(());
     }
     Err(error.into())
-}
-
-fn wait_for_process_exit(pid: u32) -> anyhow::Result<bool> {
-    wait_for_process_exit_with_timeouts(pid, PROCESS_GRACEFUL_TIMEOUT, PROCESS_KILL_TIMEOUT)
 }
 
 fn wait_for_process_exit_with_timeouts(
@@ -980,31 +1041,159 @@ fn wait_for_expected_version(
     timeout: Duration,
 ) -> Result<u32, ReplacementFailure> {
     let deadline = Instant::now() + timeout;
+    let started_at_ms = crate::infra::time::now_ms();
+    let expected_pid = child.as_ref().map(|child| child.id());
     let mut last_error = "version endpoint did not respond".to_string();
+    let mut last_progress: Option<(String, String, u64)> = None;
+    let mut last_advance = Instant::now();
+    let mut last_phase = "health_check".to_owned();
+    let mut stalled = false;
+    let mut initialization_failed = false;
     while Instant::now() < deadline {
         if let Some(failure) = replacement_exited(spec, child.as_deref_mut()) {
-            return Err(failure);
+            return Err(
+                failure.with_startup_phase(last_progress.as_ref().map(|_| last_phase.as_str()))
+            );
         }
-        match probe_version_pid(spec.health_addr, expected_commit, replaced_pid) {
+        if let Some(progress) =
+            read_startup_progress(spec, expected_pid, expected_commit, started_at_ms)
+        {
+            let key = (
+                progress.instance_id.clone(),
+                progress.stage.clone(),
+                progress.completed,
+            );
+            if last_progress.as_ref() != Some(&key) {
+                last_advance = Instant::now();
+                last_phase = progress.stage.clone();
+                let _ = update_restart_operation(
+                    &spec.config_dir,
+                    &spec.operation_id,
+                    "running",
+                    "replacement_startup",
+                    format!(
+                        "startup stage {} processed {} after {}ms",
+                        progress.stage, progress.completed, progress.elapsed_ms
+                    ),
+                    Some(progress.process_id),
+                );
+                last_progress = Some(key);
+            }
+            if progress.status == "failed" {
+                last_error = format!("replacement initialization failed in {}", progress.stage);
+                initialization_failed = true;
+                break;
+            }
+            if progress.status == "starting" && last_advance.elapsed() >= STARTUP_IDLE_TIMEOUT {
+                stalled = true;
+                break;
+            }
+        }
+        match probe_replacement_ready(
+            spec.health_addr,
+            expected_commit,
+            replaced_pid,
+            expected_pid,
+            deadline,
+        ) {
             Ok(pid) => return Ok(pid),
             Err(error) => last_error = error,
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         std::thread::sleep(Duration::from_secs(1).min(remaining));
     }
-    // The replacement can exit during the last probe or sleep.
     if let Some(failure) = replacement_exited(spec, child) {
-        return Err(failure);
+        return Err(failure.with_startup_phase(last_progress.as_ref().map(|_| last_phase.as_str())));
     }
     Err(ReplacementFailure {
-        failure_code: "health_check_timeout".into(),
-        stage: "health_check".into(),
+        failure_code: if initialization_failed {
+            "startup_failed"
+        } else if stalled {
+            "startup_stalled"
+        } else {
+            "health_check_timeout"
+        }
+        .into(),
+        stage: last_phase,
         exit_code: None,
         diagnostic: bounded_diagnostic(&format!(
             "health/version checks timed out after {}s; last probe: {last_error}",
             timeout.as_secs()
         )),
     })
+}
+
+fn read_startup_progress(
+    spec: &UpdateHelperSpec,
+    expected_pid: Option<u32>,
+    expected_commit: Option<&str>,
+    since_ms: u128,
+) -> Option<crate::infra::startup::StartupProgress> {
+    let file =
+        std::fs::File::open(spec.config_dir.join(crate::infra::startup::PROGRESS_FILE)).ok()?;
+    let progress: crate::infra::startup::StartupProgress =
+        serde_json::from_reader(file.take(16 * 1024)).ok()?;
+    if progress.started_at_ms.saturating_add(1000) < since_ms
+        || progress.process_id == spec.parent_pid
+        || expected_pid.is_some_and(|pid| pid != progress.process_id)
+        || expected_commit.is_some_and(|commit| !commits_match(&progress.commit_id, commit))
+        || progress.process_start_ticks.is_none()
+        || progress.process_start_ticks
+            != crate::infra::startup::process_start_ticks(progress.process_id)
+        || !process_is_active(&PathBuf::from(format!("/proc/{}", progress.process_id)))
+    {
+        return None;
+    }
+    Some(progress)
+}
+
+fn probe_replacement_ready(
+    addr: SocketAddr,
+    expected_commit: Option<&str>,
+    replaced_pid: Option<u32>,
+    expected_pid: Option<u32>,
+    deadline: Instant,
+) -> Result<u32, String> {
+    let pid = probe_version_pid(addr, expected_commit, replaced_pid, deadline)?;
+    if expected_pid.is_some_and(|expected| expected != pid) {
+        return Err("version endpoint belongs to a different replacement process".into());
+    }
+    let ready = probe_json(addr, "/ready", deadline)?;
+    if ready.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("replacement has not completed local recovery".into());
+    }
+    if ready
+        .get("processId")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|ready_pid| ready_pid != u64::from(pid))
+    {
+        return Err("readiness endpoint belongs to a different process".into());
+    }
+    let confirmed = probe_json(addr, "/version", deadline)?;
+    if confirmed
+        .get("processId")
+        .and_then(serde_json::Value::as_u64)
+        != Some(u64::from(pid))
+    {
+        return Err("replacement changed during readiness probe".into());
+    }
+    if expected_commit.is_some_and(|commit| {
+        !commits_match(
+            confirmed
+                .get("commitId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            commit,
+        )
+    }) {
+        return Err("replacement version changed during readiness probe".into());
+    }
+    if let Some(instance) = ready.get("processInstanceId") {
+        if confirmed.get("processInstanceId") != Some(instance) {
+            return Err("replacement instance changed during readiness probe".into());
+        }
+    }
+    Ok(pid)
 }
 
 fn replacement_exited(
@@ -1152,36 +1341,22 @@ fn probe_version(
     expected_commit: Option<&str>,
     replaced_pid: Option<u32>,
 ) -> Result<(), String> {
-    probe_version_pid(addr, expected_commit, replaced_pid).map(|_| ())
+    probe_version_pid(
+        addr,
+        expected_commit,
+        replaced_pid,
+        Instant::now() + Duration::from_secs(2),
+    )
+    .map(|_| ())
 }
 
 fn probe_version_pid(
     addr: SocketAddr,
     expected_commit: Option<&str>,
     replaced_pid: Option<u32>,
+    deadline: Instant,
 ) -> Result<u32, String> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
-        .map_err(|error| format!("connect {addr} failed: {error}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(|error| format!("set probe timeout failed: {error}"))?;
-    stream
-        .write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .map_err(|error| format!("write version probe failed: {error}"))?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|error| format!("read version probe failed: {error}"))?;
-    let response = String::from_utf8_lossy(&response);
-    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
-        return Err("version probe returned an invalid HTTP response".into());
-    };
-    let status_line = headers.lines().next().unwrap_or_default();
-    if !status_line.contains(" 200 ") {
-        return Err(format!("version probe returned {status_line}"));
-    }
-    let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|error| format!("parse version response failed: {error}"))?;
+    let value = probe_json(addr, "/version", deadline)?;
     let actual_pid = value
         .get("processId")
         .and_then(serde_json::Value::as_u64)
@@ -1211,6 +1386,61 @@ fn probe_version_pid(
         }
     }
     Ok(actual_pid)
+}
+
+fn probe_json(
+    addr: SocketAddr,
+    path: &str,
+    deadline: Instant,
+) -> Result<serde_json::Value, String> {
+    let timeout = Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now()));
+    if timeout.is_zero() {
+        return Err("restart task deadline exhausted".into());
+    }
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|error| format!("connect {addr} failed: {error}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| error.to_string())?;
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("restart task deadline exhausted while reading health response".into());
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2).min(remaining)))
+            .map_err(|error| error.to_string())?;
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        if response.len().saturating_add(count) > 64 * 1024 {
+            return Err("health response exceeds 64 KiB".into());
+        }
+        response.extend_from_slice(&buffer[..count]);
+    }
+    let response = String::from_utf8_lossy(&response);
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or("health probe returned an invalid HTTP response")?;
+    let status = headers.lines().next().unwrap_or_default();
+    if !status.contains(" 200 ") {
+        return Err(format!("{path} probe returned {status}"));
+    }
+    serde_json::from_str(body).map_err(|error| format!("parse {path} response failed: {error}"))
 }
 
 fn commits_match(actual: &str, expected: &str) -> bool {
@@ -1610,6 +1840,7 @@ mod tests {
             parent_pid: u32::MAX,
             health_addr,
             expected_commit: Some("aabbccddeeff".into()),
+            previous_commit: None,
             config_dir: std::env::temp_dir(),
             server_args: Vec::new(),
             install_path: PathBuf::from("/nonexistent/server"),
@@ -1681,13 +1912,23 @@ mod tests {
         let health_addr = listener.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_server = stop.clone();
+        let server_dir = dir.clone();
         let server = thread::spawn(move || {
             while !stop_server.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         let mut request = [0u8; 512];
                         let _ = stream.read(&mut request);
-                        let body = r#"{"commitId":"aaaaaaaaaaaa","processId":42}"#;
+                        let pid = read_restart_operation(&server_dir)
+                            .and_then(|operation| operation.new_pid)
+                            .unwrap_or(42);
+                        let ready = String::from_utf8_lossy(&request).starts_with("GET /ready ");
+                        let body = if ready {
+                            serde_json::json!({"ok":true,"processId":pid}).to_string()
+                        } else {
+                            serde_json::json!({"commitId":"aaaaaaaaaaaa","processId":pid})
+                                .to_string()
+                        };
                         write!(
                             stream,
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1731,6 +1972,7 @@ mod tests {
             parent_pid: u32::MAX,
             health_addr,
             expected_commit: Some("bbbbbbbbbbbb".into()),
+            previous_commit: None,
             config_dir: dir.clone(),
             server_args: Vec::new(),
             install_path: install_path.clone(),
@@ -1773,5 +2015,61 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn startup_progress_rejects_stale_and_reused_process_identities() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-switch-startup-progress-{:016x}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid = std::process::id();
+        let spec = UpdateHelperSpec {
+            operation_id: "progress-identity".into(),
+            task_id: None,
+            mode: HelperMode::RestartOnly,
+            strategy: RestartStrategy::Standalone,
+            service_unit: None,
+            parent_pid: u32::MAX,
+            health_addr: "127.0.0.1:15721".parse().unwrap(),
+            expected_commit: Some("aabbccddeeff".into()),
+            previous_commit: None,
+            config_dir: dir.clone(),
+            server_args: Vec::new(),
+            install_path: dir.join("server"),
+            staging_path: dir.join("new"),
+            rollback_path: dir.join("old"),
+        };
+        let mut progress = crate::infra::startup::StartupProgress {
+            process_id: pid,
+            process_start_ticks: crate::infra::startup::process_start_ticks(pid),
+            instance_id: "boot-a".into(),
+            commit_id: "aabbccddeeff".into(),
+            started_at_ms: crate::infra::time::now_ms(),
+            stage: "payload_validation".into(),
+            completed: 256,
+            elapsed_ms: 10,
+            status: "starting".into(),
+        };
+        let path = dir.join(crate::infra::startup::PROGRESS_FILE);
+        crate::infra::storage::write_json_pretty(&path, &progress).unwrap();
+        assert!(read_startup_progress(
+            &spec,
+            Some(pid),
+            spec.expected_commit.as_deref(),
+            progress.started_at_ms
+        )
+        .is_some());
+        assert!(read_startup_progress(&spec, Some(pid.saturating_add(1)), None, 0).is_none());
+        assert!(read_startup_progress(&spec, Some(pid), Some("112233445566"), 0).is_none());
+        assert!(
+            read_startup_progress(&spec, Some(pid), None, progress.started_at_ms + 2000).is_none()
+        );
+        progress.process_start_ticks = progress
+            .process_start_ticks
+            .map(|ticks| ticks.saturating_add(1));
+        crate::infra::storage::write_json_pretty(&path, &progress).unwrap();
+        assert!(read_startup_progress(&spec, Some(pid), None, 0).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

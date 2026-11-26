@@ -171,7 +171,7 @@ fn proof(
             )
             .map_err(anyhow::Error::msg)?
     } else {
-        usage.share_user_quota_usage(&identity.share_id, &identity.email, from, until)
+        usage.try_share_user_quota_usage(&identity.share_id, &identity.email, from, until)?
     };
     Ok(ledger::conversion::CoverageProof {
         from_ms: from,

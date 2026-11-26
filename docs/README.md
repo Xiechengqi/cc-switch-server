@@ -21,6 +21,7 @@
 | [router-contract.md](architecture/router-contract.md) | 权威 | Server 侧 Router 协议：控制面、探针、IngressContext、Share v7 兼容与 v8–v12 独立能力协商 |
 | [storage.md](architecture/storage.md) | 权威 | 数据目录、文件清单、凭据加密、用量存储、备份、写入锁序 |
 | [usage-accounting.md](architecture/usage-accounting.md) | 权威 | Usage token 计量口径 |
+| [startup-recovery.md](architecture/startup-recovery.md) | 权威 | 流式启动恢复、有界历史缓存、增量请求恢复与升级就绪判定 |
 
 ## 指南 `docs/guide/`
 

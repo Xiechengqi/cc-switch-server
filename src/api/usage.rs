@@ -18,7 +18,10 @@ pub(in crate::api) async fn usage_overview(
 ) -> Result<Json<UsageOverviewResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let (query, meta) = usage_query(params)?;
-    let data = state.usage.read().await.query_overview(&query);
+    let data = state
+        .query_usage(move |usage| usage.query_overview(&query))
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(UsageDataResponse { data, meta }))
 }
 
@@ -54,7 +57,10 @@ pub(in crate::api) async fn usage_trends(
             "windowMs produces more than 2000 trend points for this range",
         ));
     }
-    let data = state.usage.read().await.query_trends(&query, window_ms);
+    let data = state
+        .query_usage(move |usage| usage.query_trends(&query, window_ms))
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(UsageDataResponse { data, meta }))
 }
 
@@ -65,7 +71,10 @@ pub(in crate::api) async fn usage_facets(
 ) -> Result<Json<UsageFacetsResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let (query, meta) = usage_query(params)?;
-    let data = state.usage.read().await.query_facets(&query);
+    let data = state
+        .query_usage(move |usage| usage.query_facets(&query))
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(UsageDataResponse { data, meta }))
 }
 
@@ -76,7 +85,10 @@ pub(in crate::api) async fn usage_provider_bundles(
 ) -> Result<Json<UsageProviderBundlesResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let (query, meta) = usage_query(params)?;
-    let data = state.usage.read().await.query_provider_bundles(&query);
+    let data = state
+        .query_usage(move |usage| usage.query_provider_bundles(&query))
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(UsageDataResponse { data, meta }))
 }
 
@@ -87,7 +99,10 @@ pub(in crate::api) async fn usage_models(
 ) -> Result<Json<UsageModelsResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let (query, meta) = usage_query(params)?;
-    let data = state.usage.read().await.query_models(&query);
+    let data = state
+        .query_usage(move |usage| usage.query_models(&query))
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(UsageDataResponse { data, meta }))
 }
 
@@ -98,7 +113,10 @@ pub(in crate::api) async fn usage_shares(
 ) -> Result<Json<UsageSharesResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let (query, meta) = usage_query(params)?;
-    let data = state.usage.read().await.query_shares(&query);
+    let data = state
+        .query_usage(move |usage| usage.query_shares(&query))
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(UsageDataResponse { data, meta }))
 }
 
@@ -115,14 +133,16 @@ pub(in crate::api) async fn usage_requests(
         .clamp(1, MAX_USAGE_REQUEST_LIMIT);
     let (query, meta) = usage_query(params)?;
     let (data, next_cursor, total) = state
-        .usage
-        .read()
+        .query_usage(move |usage| Ok(usage.query_requests(&query, cursor.as_deref(), limit)))
         .await
-        .query_requests(&query, cursor.as_deref(), limit)
-        .map_err(|_| {
-            ApiError::bad_request(
+        .map_err(ApiError::internal)?
+        .map_err(|error| match error {
+            crate::domain::usage::query::UsageCursorError::NotFound => ApiError::bad_request(
                 "cursor does not identify a request in the current filtered range",
-            )
+            ),
+            crate::domain::usage::query::UsageCursorError::Unavailable => {
+                ApiError::internal(anyhow::anyhow!("Usage history is unavailable"))
+            }
         })?;
     Ok(Json(UsageRequestPageResponse {
         data,
@@ -143,10 +163,16 @@ pub(in crate::api) async fn usage_request_detail(
 ) -> Result<Json<UsageRequestDetailResponse>, ApiError> {
     require_session(&state, &headers).await?;
     let log = state
-        .usage
-        .read()
+        .query_usage(move |usage| {
+            Ok(usage.find_request(&id)?.filter(|log| {
+                log.is_user_inference()
+                    && log.created_at_ms
+                        >= now_ms()
+                            .saturating_sub(crate::domain::usage::store::USAGE_DETAIL_RETENTION_MS)
+            }))
+        })
         .await
-        .request_detail(&id)
+        .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("usage request not found"))?;
     let generated_at_ms = now_ms();
     Ok(Json(UsageDataResponse {

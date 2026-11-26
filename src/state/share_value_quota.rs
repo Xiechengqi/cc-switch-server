@@ -182,8 +182,9 @@ fn proven_empty_window_start(
     if new_grant {
         return Some(start);
     }
-    let (tokens, requests) =
-        usage?.share_user_quota_usage(share_id, email, start, now.saturating_add(1));
+    let (tokens, requests) = usage?
+        .try_share_user_quota_usage(share_id, email, start, now.saturating_add(1))
+        .ok()?;
     (tokens == 0 && requests == 0).then_some(start)
 }
 fn activation_rule(
@@ -1055,8 +1056,9 @@ impl ServerStateInner {
                 })
                 .map(|email| {
                     let email = email.trim().to_ascii_lowercase();
-                    let empty =
-                        usage.share_user_quota_usage(share_id, &email, 0, i64::MAX) == (0, 0);
+                    let empty = usage
+                        .try_share_user_quota_usage(share_id, &email, 0, i64::MAX)
+                        .is_ok_and(|value| value == (0, 0));
                     (email, empty)
                 })
                 .collect();

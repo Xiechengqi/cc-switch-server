@@ -22,6 +22,7 @@ pub struct UsageQuery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageCursorError {
     NotFound,
+    Unavailable,
 }
 
 impl UsageQuery {
@@ -352,14 +353,15 @@ struct ShareAccumulator {
 }
 
 impl UsageStore {
-    pub fn query_overview(&self, query: &UsageQuery) -> UsageOverview {
+    pub fn query_overview(&self, query: &UsageQuery) -> anyhow::Result<UsageOverview> {
         let mut total = MetricsAccumulator::default();
         let mut surfaces = BTreeMap::<AppKind, MetricsAccumulator>::new();
-        for log in self.logs.iter().filter(|log| query.matches(log)) {
+        self.visit_query(query, false, |log| {
             total.push(log);
             surfaces.entry(log.app).or_default().push(log);
-        }
-        UsageOverview {
+            Ok(())
+        })?;
+        Ok(UsageOverview {
             metrics: total.finish(),
             surfaces: surfaces
                 .into_iter()
@@ -368,16 +370,21 @@ impl UsageStore {
                     metrics: metrics.finish(),
                 })
                 .collect(),
-        }
+        })
     }
 
-    pub fn query_trends(&self, query: &UsageQuery, window_ms: u128) -> Vec<UsageTrendPoint> {
+    pub fn query_trends(
+        &self,
+        query: &UsageQuery,
+        window_ms: u128,
+    ) -> anyhow::Result<Vec<UsageTrendPoint>> {
         let window_ms = window_ms.max(1);
         let mut buckets = BTreeMap::<u128, MetricsAccumulator>::new();
-        for log in self.logs.iter().filter(|log| query.matches(log)) {
+        self.visit_query(query, false, |log| {
             let start_ms = log.started_at_ms - (log.started_at_ms % window_ms);
             buckets.entry(start_ms).or_default().push(log);
-        }
+            Ok(())
+        })?;
         if !buckets.is_empty() {
             if let (Some(from_ms), Some(to_ms)) = (query.from_ms, query.to_ms) {
                 let mut start_ms = from_ms - (from_ms % window_ms);
@@ -391,19 +398,22 @@ impl UsageStore {
                 }
             }
         }
-        buckets
+        Ok(buckets
             .into_iter()
             .map(|(start_ms, metrics)| UsageTrendPoint {
                 start_ms,
                 end_ms: start_ms.saturating_add(window_ms),
                 metrics: metrics.finish(),
             })
-            .collect()
+            .collect())
     }
 
-    pub fn query_provider_bundles(&self, query: &UsageQuery) -> Vec<ProviderBundleUsage> {
+    pub fn query_provider_bundles(
+        &self,
+        query: &UsageQuery,
+    ) -> anyhow::Result<Vec<ProviderBundleUsage>> {
         let mut groups = BTreeMap::<String, BundleAccumulator>::new();
-        for log in self.logs.iter().filter(|log| query.matches(log)) {
+        self.visit_query(query, false, |log| {
             let group = groups
                 .entry(log.bundle_id.clone())
                 .or_insert_with(|| BundleAccumulator {
@@ -441,7 +451,8 @@ impl UsageStore {
                     surface.2 = log.started_at_ms;
                 }
             }
-        }
+            Ok(())
+        })?;
         let mut result = groups
             .into_iter()
             .map(|(bundle_id, group)| ProviderBundleUsage {
@@ -472,13 +483,13 @@ impl UsageStore {
                 .then(right.metrics.request_count.cmp(&left.metrics.request_count))
                 .then(left.bundle_id.cmp(&right.bundle_id))
         });
-        result
+        Ok(result)
     }
 
-    pub fn query_models(&self, query: &UsageQuery) -> Vec<ModelUsage> {
+    pub fn query_models(&self, query: &UsageQuery) -> anyhow::Result<Vec<ModelUsage>> {
         let mut groups =
             BTreeMap::<(AppKind, String), (BTreeSet<String>, MetricsAccumulator)>::new();
-        for log in self.logs.iter().filter(|log| query.matches(log)) {
+        self.visit_query(query, false, |log| {
             let key = (log.app, effective_model(log).to_string());
             let group = groups.entry(key).or_default();
             if let Some(requested_model) = log
@@ -489,7 +500,8 @@ impl UsageStore {
                 group.0.insert(requested_model.to_string());
             }
             group.1.push(log);
-        }
+            Ok(())
+        })?;
         let mut result = groups
             .into_iter()
             .map(
@@ -510,14 +522,14 @@ impl UsageStore {
                 .then(left.app.cmp(&right.app))
                 .then(left.actual_model.cmp(&right.actual_model))
         });
-        result
+        Ok(result)
     }
 
-    pub fn query_shares(&self, query: &UsageQuery) -> Vec<ShareUsage> {
+    pub fn query_shares(&self, query: &UsageQuery) -> anyhow::Result<Vec<ShareUsage>> {
         let mut groups = BTreeMap::<String, ShareAccumulator>::new();
-        for log in self.logs.iter().filter(|log| query.matches(log)) {
+        self.visit_query(query, false, |log| {
             let Some(share_id) = log.share_id.as_deref() else {
-                continue;
+                return Ok(());
             };
             let group = groups
                 .entry(share_id.to_string())
@@ -537,7 +549,8 @@ impl UsageStore {
             if let Some(email) = log.user_email.as_deref() {
                 group.users.entry(email.to_string()).or_default().push(log);
             }
-        }
+            Ok(())
+        })?;
         let mut result = groups
             .into_iter()
             .map(|(share_id, group)| {
@@ -574,10 +587,10 @@ impl UsageStore {
                 .then(right.metrics.request_count.cmp(&left.metrics.request_count))
                 .then(left.share_id.cmp(&right.share_id))
         });
-        result
+        Ok(result)
     }
 
-    pub fn query_facets(&self, query: &UsageQuery) -> UsageFacets {
+    pub fn query_facets(&self, query: &UsageQuery) -> anyhow::Result<UsageFacets> {
         let mut surfaces = BTreeMap::<String, u64>::new();
         let mut bundles = BTreeMap::<String, (String, BTreeSet<AppKind>, u64, u128)>::new();
         let mut shares = BTreeMap::<String, (Option<String>, Option<String>, u64, u128)>::new();
@@ -585,11 +598,7 @@ impl UsageStore {
         let mut models = BTreeMap::<(AppKind, String), u64>::new();
         let mut outcomes = BTreeMap::<String, u64>::new();
         let mut usage_states = BTreeMap::<String, u64>::new();
-        for log in self
-            .logs
-            .iter()
-            .filter(|log| query.matches_user_request(log))
-        {
+        self.visit_query(query, true, |log| {
             *surfaces.entry(log.app.as_str().to_string()).or_default() += 1;
             let bundle = bundles.entry(log.bundle_id.clone()).or_insert_with(|| {
                 (
@@ -633,8 +642,9 @@ impl UsageStore {
             *usage_states
                 .entry(log.usage_state.as_str().to_string())
                 .or_default() += 1;
-        }
-        UsageFacets {
+            Ok(())
+        })?;
+        Ok(UsageFacets {
             surfaces: value_facets(surfaces),
             bundles: bundles
                 .into_iter()
@@ -675,7 +685,21 @@ impl UsageStore {
                 .collect(),
             outcomes: value_facets(outcomes),
             usage_states: value_facets(usage_states),
-        }
+        })
+    }
+
+    fn visit_query(
+        &self,
+        query: &UsageQuery,
+        inference_only: bool,
+        mut visitor: impl FnMut(&UsageLog) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        self.visit_logs(&Default::default(), |log| {
+            if query.matches(log) && (!inference_only || log.is_user_inference()) {
+                visitor(log)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn query_requests(
@@ -684,41 +708,51 @@ impl UsageStore {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<UsageLog>, Option<String>, usize), UsageCursorError> {
-        let mut logs = self
-            .logs
-            .iter()
-            .filter(|log| query.matches_user_request(log))
-            .collect::<Vec<_>>();
-        logs.sort_by(|left, right| {
-            right
-                .started_at_ms
-                .cmp(&left.started_at_ms)
-                .then(right.request_id.cmp(&left.request_id))
-        });
-        let total = logs.len();
-        let offset = match cursor {
-            Some(cursor) => logs
-                .iter()
-                .position(|log| log.request_id == cursor)
-                .map(|index| index.saturating_add(1))
-                .ok_or(UsageCursorError::NotFound)?,
-            None => 0,
-        };
-        let selected = logs
-            .into_iter()
-            .skip(offset)
-            .take(limit.saturating_add(1))
-            .collect::<Vec<_>>();
+        let anchor = cursor
+            .map(|id| {
+                self.find_request(id)
+                    .map_err(|_| UsageCursorError::Unavailable)?
+                    .filter(|log| {
+                        query.matches_user_request(log)
+                            && (self.history.is_none()
+                                || log.created_at_ms
+                                    >= crate::infra::time::now_ms()
+                                        .saturating_sub(super::store::USAGE_DETAIL_RETENTION_MS))
+                    })
+                    .map(|log| (log.started_at_ms, log.request_id))
+                    .ok_or(UsageCursorError::NotFound)
+            })
+            .transpose()?;
+        let mut selected = BTreeMap::new();
+        let mut total = 0_usize;
+        self.visit_query(query, true, |log| {
+            total = total.saturating_add(1);
+            let key = (log.started_at_ms, log.request_id.clone());
+            if anchor.as_ref().is_some_and(|anchor| &key >= anchor) {
+                return Ok(());
+            }
+            if selected.len() <= limit
+                || selected
+                    .first_key_value()
+                    .is_some_and(|(first, _)| &key > first)
+            {
+                selected.insert(key, log.clone());
+                if selected.len() > limit.saturating_add(1) {
+                    selected.pop_first();
+                }
+            }
+            Ok(())
+        })
+        .map_err(|error| {
+            tracing::error!(%error,"read Usage request page failed");
+            UsageCursorError::Unavailable
+        })?;
         let has_more = selected.len() > limit;
-        let items = selected
-            .into_iter()
-            .take(limit)
-            .cloned()
-            .collect::<Vec<_>>();
-        let next_cursor = has_more
+        let items: Vec<_> = selected.into_values().rev().take(limit).collect();
+        let next = has_more
             .then(|| items.last().map(|log| log.request_id.clone()))
             .flatten();
-        Ok((items, next_cursor, total))
+        Ok((items, next, total))
     }
 }
 
@@ -798,17 +832,19 @@ mod tests {
             ..UsageStore::default()
         };
 
-        let bundles = store.query_provider_bundles(&UsageQuery::default());
+        let bundles = store
+            .query_provider_bundles(&UsageQuery::default())
+            .unwrap();
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0].provider_name, "Current Bundle");
         assert_eq!(bundles[0].supported_apps, vec![AppKind::Codex]);
         assert_eq!(bundles[0].metrics.request_count, 2);
         assert_eq!(bundles[0].surfaces.len(), 2);
         assert_eq!(bundles[0].metrics.processed_tokens, 40);
-        let shares = store.query_shares(&UsageQuery::default());
+        let shares = store.query_shares(&UsageQuery::default()).unwrap();
         assert_eq!(shares[0].share_name.as_deref(), Some("Current Share"));
         assert_eq!(shares[0].share_slug.as_deref(), Some("current-share"));
-        let facets = store.query_facets(&UsageQuery::default());
+        let facets = store.query_facets(&UsageQuery::default()).unwrap();
         assert_eq!(facets.bundles[0].provider_name, "Current Bundle");
         assert_eq!(facets.bundles[0].supported_apps, vec![AppKind::Codex]);
         assert_eq!(
@@ -828,7 +864,7 @@ mod tests {
             ..UsageStore::default()
         };
 
-        let overview = store.query_overview(&UsageQuery::default());
+        let overview = store.query_overview(&UsageQuery::default()).unwrap();
         assert_eq!(overview.metrics.request_count, 1);
         assert_eq!(overview.metrics.processed_tokens, 40);
         assert_eq!(overview.metrics.supplemental_tokens, 20);
@@ -843,11 +879,13 @@ mod tests {
             ],
             ..UsageStore::default()
         };
-        let overview = store.query_overview(&UsageQuery {
-            from_ms: Some(100),
-            to_ms: Some(200),
-            ..UsageQuery::default()
-        });
+        let overview = store
+            .query_overview(&UsageQuery {
+                from_ms: Some(100),
+                to_ms: Some(200),
+                ..UsageQuery::default()
+            })
+            .unwrap();
         assert_eq!(overview.metrics.request_count, 1);
     }
 
@@ -866,7 +904,7 @@ mod tests {
             ..UsageQuery::default()
         };
 
-        let trends = store.query_trends(&query, 50);
+        let trends = store.query_trends(&query, 50).unwrap();
 
         assert_eq!(
             trends
@@ -895,7 +933,7 @@ mod tests {
             ..UsageStore::default()
         };
 
-        let overview = store.query_overview(&UsageQuery::default());
+        let overview = store.query_overview(&UsageQuery::default()).unwrap();
 
         assert_eq!(overview.metrics.request_count, 2);
         assert_eq!(overview.metrics.pending_count, 1);

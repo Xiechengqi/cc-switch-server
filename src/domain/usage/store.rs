@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
 use chrono::{TimeZone, Utc};
@@ -18,7 +19,7 @@ const USAGE_SNAPSHOT_FILE_NAME: &str = "requests.json";
 const USAGE_EVENTS_DIRECTORY_NAME: &str = "events";
 const USAGE_ROLLUPS_FILE_NAME: &str = "rollups.json";
 const USAGE_DETAIL_RETENTION_DAYS: u128 = 32;
-const USAGE_DETAIL_RETENTION_MS: u128 = USAGE_DETAIL_RETENTION_DAYS * USAGE_DAY_MS;
+pub(crate) const USAGE_DETAIL_RETENTION_MS: u128 = USAGE_DETAIL_RETENTION_DAYS * USAGE_DAY_MS;
 const USAGE_ROLLUP_BUCKET_MS: u128 = 60 * 1000;
 const USAGE_DAY_MS: u128 = 24 * 60 * 60 * 1000;
 const USAGE_COMPACT_EVERY_EVENTS: u64 = 500;
@@ -154,7 +155,7 @@ impl Default for UsageManifest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UsageStore {
     pub schema_version: u8,
@@ -170,6 +171,12 @@ pub struct UsageStore {
     pub(crate) journal_checkpoint: Option<UsageJournalCheckpoint>,
     #[serde(skip)]
     pub provider_health: ProviderHealthStore,
+    #[serde(skip)]
+    pub(crate) history: Option<Arc<dyn super::history::UsageHistory>>,
+    #[serde(skip)]
+    pub(crate) cache_bytes: usize,
+    #[serde(skip)]
+    pub(crate) cache_owner: Option<crate::infra::resident_memory::ResidentMemoryReservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +219,33 @@ impl PreparedUsageAppend {
     }
 }
 
+impl Clone for UsageStore {
+    fn clone(&self) -> Self {
+        let cache_owner = if self.history.is_some() && self.cache_bytes > 0 {
+            crate::infra::resident_memory::process_resident_memory().reserve(self.cache_bytes)
+        } else {
+            None
+        };
+        let retain = self.history.is_none() || self.cache_bytes == 0 || cache_owner.is_some();
+        Self {
+            schema_version: self.schema_version,
+            quota_ledger: self.quota_ledger.clone(),
+            logs: if retain {
+                self.logs.clone()
+            } else {
+                Vec::new()
+            },
+            rollups: self.rollups.clone(),
+            writes_since_compact: self.writes_since_compact,
+            journal_checkpoint: self.journal_checkpoint.clone(),
+            provider_health: self.provider_health.clone(),
+            history: self.history.clone(),
+            cache_bytes: if retain { self.cache_bytes } else { 0 },
+            cache_owner,
+        }
+    }
+}
+
 impl Default for UsageStore {
     fn default() -> Self {
         let checkpoint = UsageJournalCheckpoint::new();
@@ -227,6 +261,9 @@ impl Default for UsageStore {
             writes_since_compact: 0,
             journal_checkpoint: Some(checkpoint),
             provider_health: ProviderHealthStore::default(),
+            history: None,
+            cache_bytes: 0,
+            cache_owner: None,
         }
     }
 }
@@ -663,10 +700,18 @@ impl UsageStore {
     /// legacy journal checkpoint is deliberately regenerated instead of being
     /// treated as a second source of truth.
     pub(crate) fn from_authoritative_logs(logs: Vec<UsageLog>) -> (Self, bool) {
-        let mut store = Self::default();
-        for log in logs {
-            store.push(log);
+        let cutoff = now_ms().saturating_sub(USAGE_DETAIL_RETENTION_MS);
+        let mut store = Self {
+            logs,
+            ..Self::default()
+        };
+        for log in &store.logs {
+            store.rollups.add_log(log);
+            if let Err(error) = store.quota_ledger.record(log) {
+                store.quota_ledger.integrity_error = Some(error.into());
+            }
         }
+        store.logs.retain(|log| log.created_at_ms >= cutoff);
         let recovered = store.recover_pending_after_restart();
         (store, recovered)
     }
@@ -693,6 +738,7 @@ impl UsageStore {
         config_dir: &Path,
         persist_recovery: bool,
     ) -> anyhow::Result<Self> {
+        let cutoff = now_ms().saturating_sub(USAGE_DETAIL_RETENTION_MS);
         let path = usage_path(config_dir);
         let provider_health = ProviderHealthStore::load_rebuildable(config_dir);
         let usage_dir = usage_directory(config_dir);
@@ -760,7 +806,7 @@ impl UsageStore {
             compatible_usage_rollups(&store.logs, &snapshot_checkpoint, loaded_rollups, &journal);
         let replayed = replay_versioned_usage_journal(&mut store, &journal, &snapshot_checkpoint);
         store.writes_since_compact = replayed as u64;
-        store.trim_recent_window();
+        store.logs.retain(|log| log.created_at_ms >= cutoff);
         let pending_recovered = store.recover_pending_after_restart();
         let quota_recovered = store.quota_ledger.recover_pending();
         if (pending_recovered || quota_recovered) && persist_recovery {
@@ -808,12 +854,20 @@ impl UsageStore {
     }
 
     pub fn save(&self, config_dir: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.history.is_none(),
+            "a recent Usage cache cannot replace durable history"
+        );
         self.save_recent_snapshot(config_dir)?;
         self.save_rollups(config_dir)?;
         save_usage_manifest(config_dir)
     }
 
     pub fn save_recent_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.history.is_none(),
+            "a recent Usage cache cannot replace durable history"
+        );
         fs::create_dir_all(usage_directory(config_dir)).with_context(|| {
             format!(
                 "create Usage directory {}",
@@ -826,6 +880,10 @@ impl UsageStore {
     }
 
     pub fn save_rollups(&self, config_dir: &Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.history.is_none(),
+            "a recent Usage cache cannot replace durable history"
+        );
         fs::create_dir_all(usage_directory(config_dir)).with_context(|| {
             format!(
                 "create Usage directory {}",
@@ -837,9 +895,150 @@ impl UsageStore {
             .with_context(|| format!("write usage rollups {}", path.display()))
     }
 
+    pub(crate) fn set_export_watermark(&mut self, sequence: u64) {
+        self.advance_journal_checkpoint(sequence);
+    }
+
+    pub(crate) fn visit_logs(
+        &self,
+        selection: &super::history::UsageSelection,
+        mut visitor: impl FnMut(&UsageLog) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if let Some(history) = &self.history {
+            return history.visit(selection, &mut visitor);
+        }
+        for log in self.logs.iter().filter(|log| selection.matches(log)) {
+            visitor(log)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn select_logs(
+        &self,
+        selection: &super::history::UsageSelection,
+    ) -> anyhow::Result<Vec<UsageLog>> {
+        if let Some(history) = &self.history {
+            let mut logs = Vec::new();
+            history.visit(selection, &mut |log| {
+                logs.push(log.clone());
+                Ok(())
+            })?;
+            return Ok(logs);
+        }
+        let mut logs: Vec<_> = self
+            .logs
+            .iter()
+            .filter(|log| selection.matches(log))
+            .cloned()
+            .collect();
+        logs.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then(b.request_id.cmp(&a.request_id))
+        });
+        if let Some(limit) = selection.limit {
+            logs.truncate(limit);
+        }
+        Ok(logs)
+    }
+
+    pub(crate) fn find_request(&self, id: &str) -> anyhow::Result<Option<UsageLog>> {
+        if let Some(history) = &self.history {
+            return history.request(id);
+        }
+        Ok(self.logs.iter().find(|log| log.request_id == id).cloned())
+    }
+
+    pub(crate) fn try_share_user_quota_usage(
+        &self,
+        share_id: &str,
+        email: &str,
+        from: i64,
+        to: i64,
+    ) -> anyhow::Result<(u64, u64)> {
+        if self.history.is_none() {
+            return Ok(self.share_user_quota_usage(share_id, email, from, to));
+        }
+        if from < 0 || to < 0 || from >= to {
+            return Ok((0, 0));
+        }
+        let selection = super::history::UsageSelection {
+            from_ms: Some(from as u128),
+            to_ms: Some(to as u128),
+            share_id: Some(share_id.into()),
+            user_email: Some(email.trim().into()),
+            is_health_check: Some(false),
+            include_expired: true,
+            ..Default::default()
+        };
+        let mut total = (0_u64, 0_u64);
+        self.visit_logs(&selection, |log| {
+            if is_share_user_quota_record(log) {
+                total.0 = total.0.saturating_add(log.quota_tokens());
+                total.1 = total
+                    .1
+                    .saturating_add(u64::from(log.record_kind == UsageRecordKind::UserInference));
+            }
+            Ok(())
+        })?;
+        Ok(total)
+    }
+
+    pub(crate) fn cache_log(&mut self, log: UsageLog) {
+        const CACHE_LIMIT: usize = 2048;
+        const CACHE_BYTES: usize = 8 * 1024 * 1024;
+        if let Some(existing) = self
+            .logs
+            .iter_mut()
+            .find(|old| old.request_id == log.request_id)
+        {
+            self.cache_bytes = self.cache_bytes.saturating_sub(usage_log_bytes(existing));
+            *existing = log;
+            self.cache_bytes = self.cache_bytes.saturating_add(usage_log_bytes(existing));
+        } else {
+            self.cache_bytes = self.cache_bytes.saturating_add(usage_log_bytes(&log));
+            let key = (log.created_at_ms, log.request_id.as_str());
+            let index = self
+                .logs
+                .partition_point(|old| (old.created_at_ms, old.request_id.as_str()) <= key);
+            self.logs.insert(index, log);
+        }
+        self.logs.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then(a.request_id.cmp(&b.request_id))
+        });
+        while self.logs.len() > CACHE_LIMIT || self.cache_bytes > CACHE_BYTES {
+            self.cache_bytes = self
+                .cache_bytes
+                .saturating_sub(usage_log_bytes(&self.logs.remove(0)));
+        }
+        let reserved = if let Some(owner) = self.cache_owner.as_mut() {
+            owner.try_resize(self.cache_bytes)
+        } else {
+            self.cache_owner =
+                crate::infra::resident_memory::process_resident_memory().reserve(self.cache_bytes);
+            self.cache_owner.is_some()
+        };
+        if !reserved {
+            self.logs.clear();
+            self.cache_bytes = 0;
+            self.cache_owner = None;
+        }
+    }
+
     pub fn push(&mut self, log: UsageLog) {
-        if let Err(error) = self.quota_ledger.record(&log) {
-            self.quota_ledger.integrity_error = Some(error.to_string());
+        if self.history.is_some() {
+            self.cache_log(log);
+            return;
+        }
+        // A live authority switch can publish SQL quota metadata before the
+        // next restart installs the bounded history cache. The transaction
+        // already recorded this revision; only legacy ledgers record here.
+        if self.quota_ledger.history.is_none() {
+            if let Err(error) = self.quota_ledger.record(&log) {
+                self.quota_ledger.integrity_error = Some(error.to_string());
+            }
         }
         if let Some(existing) = self
             .logs
@@ -863,6 +1062,14 @@ impl UsageStore {
         starts_at_ms: i64,
         ends_at_ms: i64,
     ) -> (u64, u64) {
+        if self.history.is_some() {
+            return self
+                .try_share_user_quota_usage(share_id, user_email, starts_at_ms, ends_at_ms)
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error,"quota history unavailable");
+                    (u64::MAX, u64::MAX)
+                });
+        }
         let (Ok(starts_at_ms), Ok(ends_at_ms)) =
             (u128::try_from(starts_at_ms), u128::try_from(ends_at_ms))
         else {
@@ -923,31 +1130,12 @@ impl UsageStore {
         )
     }
 
-    fn push_log_only(&mut self, log: UsageLog) {
-        if let Err(error) = self.quota_ledger.record(&log) {
-            self.quota_ledger.integrity_error = Some(error.to_string());
-        }
-        if let Some(existing) = self
-            .logs
-            .iter_mut()
-            .find(|existing| existing.request_id == log.request_id)
-        {
-            *existing = log;
-            return;
-        }
-        self.logs.push(log);
-        self.trim_recent_window();
-    }
-
     pub(crate) fn prepare_append(&self, mut log: UsageLog) -> anyhow::Result<PreparedUsageAppend> {
         // Admission creates a durable pending revision. A later first result
         // replaces that placeholder, it is not a second request or a conflict
         // with its initial (zero) Token value.
-        if let Some(existing) = self
-            .logs
-            .iter()
-            .find(|existing| existing.request_id == log.request_id)
-        {
+        let durable_previous = self.find_request(&log.request_id)?;
+        if let Some(existing) = durable_previous.as_ref() {
             if existing.quota_attribution.is_some()
                 && log.usage_revision <= existing.usage_revision
                 && (existing.usage_state == UsageState::Pending
@@ -967,10 +1155,7 @@ impl UsageStore {
             .as_ref()
             .context("usage journal checkpoint is unavailable")?;
         let sequence = checkpoint.through_sequence.saturating_add(1);
-        let existing = self
-            .logs
-            .iter()
-            .find(|existing| existing.request_id == log.request_id);
+        let existing = durable_previous.as_ref();
         if existing.is_none_or(|existing| {
             existing.usage_revision != log.usage_revision || existing.router_export_sequence == 0
         }) {
@@ -1027,22 +1212,50 @@ impl UsageStore {
     }
 
     pub fn latest_filtered(&self, query: UsageLogFilter) -> Vec<UsageLog> {
-        self.logs
-            .iter()
-            .rev()
-            .filter(|log| matches_log_filter(log, &query))
-            .take(query.limit.unwrap_or(100))
-            .cloned()
-            .collect()
+        let limit = query.limit.unwrap_or(100);
+        let mut selected = BTreeMap::new();
+        let result = self.visit_logs(&Default::default(), |log| {
+            if matches_log_filter(log, &query) && limit > 0 {
+                let key = (log.created_at_ms, log.request_id.clone());
+                if selected.len() < limit
+                    || selected
+                        .first_key_value()
+                        .is_some_and(|(first, _)| &key > first)
+                {
+                    selected.insert(key, log.clone());
+                    if selected.len() > limit {
+                        selected.pop_first();
+                    }
+                }
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::warn!(%error,"read filtered Usage history failed");
+            return Vec::new();
+        }
+        selected.into_values().rev().collect()
     }
 
     pub fn request_detail(&self, request_id: &str) -> Option<UsageLog> {
-        self.logs
-            .iter()
-            .rev()
-            .find(|log| log.is_user_inference() && log.request_id == request_id)
-            .cloned()
+        match self.find_request(request_id) {
+            Ok(log) => log.filter(|log| {
+                log.is_user_inference()
+                    && (self.history.is_none()
+                        || log.created_at_ms >= now_ms().saturating_sub(USAGE_DETAIL_RETENTION_MS))
+            }),
+            Err(error) => {
+                tracing::warn!(%error,"read Usage request detail failed");
+                None
+            }
+        }
     }
+}
+
+fn usage_log_bytes(log: &UsageLog) -> usize {
+    std::mem::size_of::<UsageLog>().saturating_add(
+        crate::infra::resident_memory::serialized_json_bytes(log, usize::MAX).unwrap_or(usize::MAX),
+    )
 }
 
 fn ceil_to_usage_bucket(value: u128) -> u128 {
@@ -1965,6 +2178,12 @@ fn replay_versioned_usage_journal(
         .collect::<Vec<_>>();
     records.sort_by_key(|record| record.sequence);
 
+    let mut positions: BTreeMap<String, usize> = store
+        .logs
+        .iter()
+        .enumerate()
+        .map(|(index, log)| (log.request_id.clone(), index))
+        .collect();
     let mut log_through = snapshot_checkpoint.through_sequence;
     let mut rollup_through = store
         .rollups
@@ -1978,11 +2197,24 @@ fn replay_versioned_usage_journal(
         if record.sequence <= log_through {
             continue;
         }
-        if record.sequence > rollup_through {
-            store.push(record.log.clone());
-            rollup_through = record.sequence;
+        if let Err(error) = store.quota_ledger.record(&record.log) {
+            store.quota_ledger.integrity_error = Some(error.into());
+        }
+        let update_rollups = record.sequence > rollup_through;
+        if let Some(index) = positions.get(&record.log.request_id).copied() {
+            if update_rollups {
+                store.rollups.replace_log(&store.logs[index], &record.log);
+            }
+            store.logs[index] = record.log.clone();
         } else {
-            store.push_log_only(record.log.clone());
+            if update_rollups {
+                store.rollups.add_log(&record.log);
+            }
+            positions.insert(record.log.request_id.clone(), store.logs.len());
+            store.logs.push(record.log.clone());
+        }
+        if update_rollups {
+            rollup_through = record.sequence;
         }
         log_through = record.sequence;
         replayed += 1;
@@ -2997,7 +3229,9 @@ mod tests {
         assert_eq!(final_second.input_tokens, Some(7));
         assert_eq!(final_second.output_tokens, Some(3));
         assert_eq!(final_second.stream_status.as_deref(), Some("completed"));
-        let overview = loaded.query_overview(&crate::domain::usage::query::UsageQuery::default());
+        let overview = loaded
+            .query_overview(&crate::domain::usage::query::UsageQuery::default())
+            .unwrap();
         assert_eq!(overview.metrics.request_count, 2);
         assert_eq!(overview.metrics.fresh_input_tokens, 8);
         assert_eq!(overview.metrics.output_tokens, 4);
@@ -3008,6 +3242,7 @@ mod tests {
         assert_eq!(
             reloaded
                 .query_overview(&crate::domain::usage::query::UsageQuery::default())
+                .unwrap()
                 .metrics
                 .request_count,
             2
@@ -3183,6 +3418,7 @@ mod tests {
         assert_eq!(
             recovered
                 .query_overview(&crate::domain::usage::query::UsageQuery::default())
+                .unwrap()
                 .metrics
                 .request_count,
             USAGE_COMPACT_EVERY_EVENTS

@@ -54,9 +54,30 @@ pub fn manual_observations_for_share(
         return Vec::new();
     };
     let now = now_ms();
-    let matching = || {
-        usage.logs.iter().filter(|log| {
-            log.is_health_check
+    let rank = |log: &UsageLog| {
+        (
+            log.created_at_ms,
+            log.provider_health_result
+                .as_ref()
+                .is_some_and(|result| result.status != "operational"),
+            log.request_id.clone(),
+        )
+    };
+    let mut latest: Option<UsageLog> = None;
+    let mut adverse: Option<UsageLog> = None;
+    let result = usage.visit_logs(
+        &crate::domain::usage::history::UsageSelection {
+            app: Some(provider.app),
+            provider_id: Some(provider.provider.id.clone()),
+            share_id: Some(share.id.clone()),
+            is_health_check: Some(true),
+            from_ms: Some(now.saturating_sub(65 * 60 * 1000)),
+            to_ms: Some(now.saturating_add(1)),
+            data_source: Some("cc-switch-manual".into()),
+            ..Default::default()
+        },
+        |log| {
+            if log.is_health_check
                 && log.data_source.as_deref() == Some("cc-switch-manual")
                 && log.share_id.as_deref() == Some(share.id.as_str())
                 && log.app == provider.app
@@ -72,35 +93,38 @@ pub fn manual_observations_for_share(
                         "operational" | "degraded" | "failed"
                     )
                 })
-        })
-    };
-    let rank = |log: &&UsageLog| {
-        (
-            log.created_at_ms,
-            log.provider_health_result
-                .as_ref()
-                .map(|result| result.status != "operational")
-                .unwrap_or(false),
-            log.request_id.clone(),
-        )
-    };
-    let Some(latest) = matching().max_by_key(rank) else {
+            {
+                if latest
+                    .as_ref()
+                    .is_none_or(|previous| rank(log) > rank(previous))
+                {
+                    latest = Some(log.clone());
+                }
+                if log
+                    .provider_health_result
+                    .as_ref()
+                    .is_some_and(|result| result.status != "operational")
+                    && adverse
+                        .as_ref()
+                        .is_none_or(|previous| rank(log) > rank(previous))
+                {
+                    adverse = Some(log.clone());
+                }
+            }
+            Ok(())
+        },
+    );
+    if let Err(error) = result {
+        tracing::warn!(%error,"read manual model health history failed");
+        return Vec::new();
+    }
+    let Some(latest) = latest else {
         return Vec::new();
     };
-    // Also deliver the latest adverse manual result: a disconnected Router
-    // must not miss a failure just because the user clicked success repeatedly
-    // before notification delivery recovered. This is not a cycle projection.
-    let adverse = matching()
-        .filter(|log| {
-            log.provider_health_result
-                .as_ref()
-                .is_some_and(|result| result.status != "operational")
-        })
-        .max_by_key(rank)
-        .filter(|log| log.request_id != latest.request_id);
+    let adverse = adverse.filter(|log| log.request_id != latest.request_id);
     // The accepted raw result, not effective scheduling availability. In
     // particular a tolerated first 429 must remain a failed observation.
-    [Some(latest), adverse]
+    [Some(&latest), adverse.as_ref()]
         .into_iter()
         .flatten()
         .map(|log| {
@@ -200,7 +224,9 @@ pub fn summary_for_share(
             Some(quota_blocked_result(
                 app,
                 provider,
-                usage.and_then(|usage| latest_quota_health_log(share, app, provider, usage)),
+                usage
+                    .and_then(|usage| latest_quota_health_log(share, app, provider, usage))
+                    .as_ref(),
                 &block,
             ))
         } else {
@@ -255,7 +281,13 @@ fn provider_snapshot_result(
         return None;
     }
 
-    let logs = health_logs_for_binding(share, app, provider, usage);
+    let logs = health_logs_for_binding(
+        share,
+        app,
+        provider,
+        usage,
+        health.checked_at_ms.unwrap_or_default(),
+    );
     // effective availability deliberately tolerates a first transient failure.
     // That scheduling decision must never turn a real 429/failed probe into a
     // successful observation (or overwrite Router's immutable cycle evidence).
@@ -298,43 +330,48 @@ fn provider_snapshot_result(
     })
 }
 
-fn health_logs_for_binding<'a>(
+fn health_logs_for_binding(
     share: &Share,
     app: AppKind,
     provider: &StoredProvider,
-    usage: &'a UsageStore,
-) -> Vec<&'a UsageLog> {
-    let mut logs = usage
-        .logs
-        .iter()
-        .filter(|log| {
-            log.is_health_check
-                && log.app == app
-                && log.provider_id == provider.provider.id
-                && log.share_id.as_deref() == Some(share.id.as_str())
+    usage: &UsageStore,
+    before_ms: u128,
+) -> Vec<UsageLog> {
+    usage
+        .select_logs(&crate::domain::usage::history::UsageSelection {
+            app: Some(app),
+            provider_id: Some(provider.provider.id.clone()),
+            share_id: Some(share.id.clone()),
+            is_health_check: Some(true),
+            to_ms: Some(before_ms / 1000 * 1000),
+            limit: Some(RECENT_RESULT_LIMIT.saturating_sub(1)),
+            ..Default::default()
         })
-        .collect::<Vec<_>>();
-    logs.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
-    logs
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error,"read recent model health failed");
+            Vec::new()
+        })
 }
 
-fn latest_quota_health_log<'a>(
+fn latest_quota_health_log(
     share: &Share,
     app: AppKind,
     provider: &StoredProvider,
-    usage: &'a UsageStore,
-) -> Option<&'a UsageLog> {
+    usage: &UsageStore,
+) -> Option<UsageLog> {
     usage
-        .logs
-        .iter()
-        .filter(|log| {
-            log.is_health_check
-                && log.app == app
-                && log.provider_id == provider.provider.id
-                && log.share_id.as_deref() == Some(share.id.as_str())
-                && log.data_source.as_deref() == Some("cc-switch-quota")
+        .select_logs(&crate::domain::usage::history::UsageSelection {
+            app: Some(app),
+            provider_id: Some(provider.provider.id.clone()),
+            share_id: Some(share.id.clone()),
+            is_health_check: Some(true),
+            data_source: Some("cc-switch-quota".into()),
+            limit: Some(1),
+            ..Default::default()
         })
-        .max_by_key(|log| log.created_at_ms)
+        .ok()?
+        .into_iter()
+        .next()
 }
 
 fn quota_blocked_result(

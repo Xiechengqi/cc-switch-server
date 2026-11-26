@@ -603,7 +603,7 @@ impl PersistedStateSnapshot for AccountStore {
 
     fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
         if crate::repository::server_sqlite::is_committed(config_dir)? {
-            Ok(crate::repository::server_sqlite::load_authoritative(config_dir)?.accounts)
+            Ok(crate::repository::server_sqlite::read_accounts(config_dir)?)
         } else {
             Self::load_or_default(config_dir)
         }
@@ -619,7 +619,14 @@ impl PersistedStateSnapshot for UsageStore {
 
     fn save_snapshot(&self, config_dir: &Path) -> anyhow::Result<()> {
         if crate::repository::server_sqlite::is_committed(config_dir)? {
-            crate::repository::server_sqlite::replace_usage_records(config_dir, self)
+            if self.history.is_some() {
+                crate::repository::server_sqlite::persist_quota_metadata(
+                    config_dir,
+                    &self.quota_ledger,
+                )
+            } else {
+                crate::repository::server_sqlite::replace_usage_records(config_dir, self)
+            }
         } else {
             self.save(config_dir)
         }
@@ -627,14 +634,20 @@ impl PersistedStateSnapshot for UsageStore {
 
     fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
         if crate::repository::server_sqlite::is_committed(config_dir)? {
-            Ok(crate::repository::server_sqlite::load_authoritative(config_dir)?.usage)
+            Ok(crate::repository::server_sqlite::read_runtime_usage(
+                config_dir,
+            )?)
         } else {
             Self::load_or_default(config_dir)
         }
     }
 
     fn reconciliation_value(&self) -> Option<Value> {
-        serde_json::to_value(self).ok()
+        if self.history.is_some() {
+            serde_json::to_value(self.quota_ledger.metadata()).ok()
+        } else {
+            serde_json::to_value(self).ok()
+        }
     }
 }
 
@@ -651,7 +664,7 @@ impl PersistedStateSnapshot for ShareStore {
 
     fn load_snapshot(config_dir: &Path) -> anyhow::Result<Self> {
         if crate::repository::server_sqlite::is_committed(config_dir)? {
-            Ok(crate::repository::server_sqlite::load_authoritative(config_dir)?.shares)
+            Ok(crate::repository::server_sqlite::read_shares(config_dir)?)
         } else {
             Self::load_or_default(config_dir)
         }
@@ -718,7 +731,9 @@ async fn reconcile_usage_store_after_persistence_error(
     let load_dir = config_dir.to_path_buf();
     let reconciled = match tokio::task::spawn_blocking(move || {
         if crate::repository::server_sqlite::is_committed(&load_dir)? {
-            Ok(crate::repository::server_sqlite::load_authoritative(&load_dir)?.usage)
+            Ok(crate::repository::server_sqlite::read_runtime_usage(
+                &load_dir,
+            )?)
         } else {
             UsageStore::load_or_default(&load_dir)
         }
@@ -743,9 +758,8 @@ async fn reconcile_usage_store_after_persistence_error(
     };
     let expected_value = serde_json::to_value(&expected_log).ok();
     let disk_matches = reconciled
-        .logs
-        .iter()
-        .find(|log| log.request_id == expected_log.request_id)
+        .find_request(&expected_log.request_id)?
+        .as_ref()
         .and_then(|log| serde_json::to_value(log).ok())
         .zip(expected_value)
         .is_some_and(|(disk, expected)| disk == expected);
@@ -7097,6 +7111,7 @@ impl ServerStateInner {
         std::fs::create_dir_all(&config_dir)
             .with_context(|| format!("create config dir {}", config_dir.display()))?;
         let data_directory_lock = crate::infra::storage::acquire_data_directory_lock(&config_dir)?;
+        crate::infra::startup::advance("workspace_authorization", 0);
         let market_workspace = crate::market_lease::Workspace::open(config_dir)?;
         let config_dir = market_workspace.data_dir()?;
         crate::logging::ensure_log_dir(&config_dir)
@@ -7129,11 +7144,14 @@ impl ServerStateInner {
                 "legacy universal provider data requires an explicit migration; startup left it unchanged"
             );
         }
-        crate::repository::server_sqlite::upgrade_schema(&config_dir)?;
+        crate::infra::startup::advance("database_schema", 0);
         let existing_sqlite_marker = crate::repository::server_sqlite::read_marker(&config_dir)?;
         let sqlite_committed = existing_sqlite_marker.as_ref().is_some_and(|marker| {
             marker.authority == crate::repository::server_sqlite::AuthorityState::Committed
         });
+        if !sqlite_committed {
+            crate::repository::server_sqlite::upgrade_schema(&config_dir)?;
+        }
         let sqlite_roll_forward_required = existing_sqlite_marker.as_ref().is_some_and(|marker| {
             marker.authority == crate::repository::server_sqlite::AuthorityState::Prepared
         });
@@ -7153,19 +7171,15 @@ impl ServerStateInner {
                 }
             }
         };
-        if sqlite_committed {
-            crate::repository::server_sqlite::activate_authority(&config_dir)
-                .context("resume committed Server SQLite authority cleanup")?;
-        }
-        let authoritative = sqlite_committed
-            .then(|| crate::repository::server_sqlite::load_authoritative(&config_dir))
+        let mut authoritative = sqlite_committed
+            .then(|| crate::repository::server_sqlite::load_runtime(&config_dir))
             .transpose()?;
-        let mut providers = match authoritative.as_ref() {
-            Some(stores) => stores.providers.clone(),
+        let mut providers = match authoritative.as_mut() {
+            Some(stores) => std::mem::take(&mut stores.providers),
             None => ProviderStore::load_runtime_or_default(&config_dir)?,
         };
-        let mut accounts = match authoritative.as_ref() {
-            Some(stores) => stores.accounts.clone(),
+        let mut accounts = match authoritative.as_mut() {
+            Some(stores) => std::mem::take(&mut stores.accounts),
             None => AccountStore::load_or_default(&config_dir)?,
         };
         recover_pending_native_refresh_journals(&config_dir, &mut accounts)?;
@@ -7176,8 +7190,8 @@ impl ServerStateInner {
         providers
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index")?;
-        let mut usage = match authoritative.as_ref() {
-            Some(stores) => stores.usage.clone(),
+        let mut usage = match authoritative.as_mut() {
+            Some(stores) => std::mem::take(&mut stores.usage),
             None => UsageStore::load_or_default(&config_dir)?,
         };
         usage.provider_health =
@@ -7186,8 +7200,8 @@ impl ServerStateInner {
         let grok_media_tasks =
             GrokMediaResidentSnapshot::load(&config_dir, crate::infra::time::now_ms() as i64)
                 .context("load Grok media task store")?;
-        let mut shares = match authoritative.as_ref() {
-            Some(stores) => stores.shares.clone(),
+        let mut shares = match authoritative.as_mut() {
+            Some(stores) => std::mem::take(&mut stores.shares),
             None => {
                 let legacy_share_load =
                     crate::domain::sharing::legacy_token_market_migration::load_and_migrate(
@@ -7421,6 +7435,10 @@ impl ServerStateInner {
                 );
             }
         }
+        if !sqlite_committed && crate::repository::server_sqlite::is_committed(&config_dir)? {
+            usage = crate::repository::server_sqlite::read_runtime_usage(&config_dir)?;
+        }
+        crate::infra::startup::advance("local_state", 0);
         let ui_settings = UiSettingsStore::load_or_default(&config_dir)?;
         let parsed_log_config =
             ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&ui_settings));
@@ -8672,23 +8690,23 @@ impl ServerStateInner {
         let web_session_http_client = build_web_session_http_client()?;
         let reasoning_root_key = crate::infra::credentials::load_root_key(&self.config_dir)
             .context("resolve proxy reasoning bridge root key")?;
-        let authoritative = crate::repository::server_sqlite::is_committed(&self.config_dir)?
-            .then(|| crate::repository::server_sqlite::load_authoritative(&self.config_dir))
+        let mut authoritative = crate::repository::server_sqlite::is_committed(&self.config_dir)?
+            .then(|| crate::repository::server_sqlite::load_runtime(&self.config_dir))
             .transpose()?;
-        let mut providers = match authoritative.as_ref() {
-            Some(stores) => stores.providers.clone(),
+        let mut providers = match authoritative.as_mut() {
+            Some(stores) => std::mem::take(&mut stores.providers),
             None => ProviderStore::load_runtime_or_default(&self.config_dir)?,
         };
-        let accounts = match authoritative.as_ref() {
-            Some(stores) => stores.accounts.clone(),
+        let accounts = match authoritative.as_mut() {
+            Some(stores) => std::mem::take(&mut stores.accounts),
             None => AccountStore::load_or_default(&self.config_dir)?,
         };
         providers.set_runtime_defaults(config.provider_runtime_defaults());
         providers
             .rebuild_runtime_index(&accounts)
             .context("compile Provider runtime index")?;
-        let mut usage = match authoritative.as_ref() {
-            Some(stores) => stores.usage.clone(),
+        let mut usage = match authoritative.as_mut() {
+            Some(stores) => std::mem::take(&mut stores.usage),
             None => UsageStore::load_or_default(&self.config_dir)?,
         };
         usage.provider_health =
@@ -8696,8 +8714,8 @@ impl ServerStateInner {
         remove_obsolete_model_pricing_file(&self.config_dir)?;
         let grok_media_tasks =
             GrokMediaResidentSnapshot::load(&self.config_dir, crate::infra::time::now_ms() as i64)?;
-        let mut shares = match authoritative.as_ref() {
-            Some(stores) => stores.shares.clone(),
+        let mut shares = match authoritative.as_mut() {
+            Some(stores) => std::mem::take(&mut stores.shares),
             None => {
                 let legacy_share_load =
                     crate::domain::sharing::legacy_token_market_migration::load_and_migrate(
@@ -11680,8 +11698,7 @@ impl ServerStateInner {
             // rename is the commit point. A directory-fsync error can be reported after the
             // candidate is already authoritative on disk, so reconcile before deciding.
             let on_disk = if crate::repository::server_sqlite::is_committed(&self.config_dir)? {
-                crate::repository::server_sqlite::load_authoritative(&self.config_dir)
-                    .map(|stores| stores.providers)
+                crate::repository::server_sqlite::read_providers(&self.config_dir)
             } else {
                 ProviderStore::load_runtime_or_default(&self.config_dir)
             };
@@ -13728,6 +13745,37 @@ impl ServerStateInner {
         persist_state_snapshot(&self.config_dir, snapshot).await
     }
 
+    pub(crate) async fn query_usage<T: Send + 'static>(
+        self: &Arc<Self>,
+        query: impl FnOnce(&UsageStore) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        static QUERY_SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let permit = QUERY_SLOTS
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+            .clone()
+            .acquire_owned()
+            .await
+            .context("Usage query slots closed")?;
+        let history = self.usage.read().await.history.clone();
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if let Some(history) = history {
+                let snapshot = UsageStore {
+                    history: Some(history.snapshot()?),
+                    ..Default::default()
+                };
+                query(&snapshot)
+            } else {
+                let usage = state.usage.blocking_read();
+                query(&usage)
+            }
+        })
+        .await
+        .context("Usage query task panicked")?
+    }
+
     pub async fn usage_snapshot(&self) -> UsageStore {
         self.usage.read().await.clone()
     }
@@ -13763,21 +13811,20 @@ impl ServerStateInner {
             return Ok(None);
         }
         let _commit = self.usage_persistence.gate.lock().await;
-        let mut candidate = self.usage.read().await.clone();
-        let previous = candidate
-            .provider_health
-            .get(event_app, &event_provider_id)
-            .cloned();
+        let mut candidate = self.usage.read().await.provider_health.clone();
+        let previous = candidate.get(event_app, &event_provider_id).cloned();
         let failure_kind = observation.error_category.clone();
         let error_message = observation.error_message.clone();
         let transient_failure = observation.transient_failure;
-        let snapshot = candidate.provider_health.record(observation);
-        let persisted_health = candidate.provider_health.clone();
+        let snapshot = candidate.record(observation);
         let config_dir = self.config_dir.clone();
-        tokio::task::spawn_blocking(move || persisted_health.save(&config_dir))
-            .await
-            .context("provider health persistence task panicked")??;
-        *self.usage.write().await = candidate;
+        let candidate = tokio::task::spawn_blocking(move || {
+            candidate.save(&config_dir)?;
+            Ok::<_, anyhow::Error>(candidate)
+        })
+        .await
+        .context("provider health persistence task panicked")??;
+        self.usage.write().await.provider_health = candidate;
         self.usage_persistence.mark_published();
         drop(providers);
         self.emit_event(
@@ -13826,15 +13873,17 @@ impl ServerStateInner {
     pub async fn prune_provider_health_snapshots(&self) -> anyhow::Result<bool> {
         let providers = self.providers.read().await.providers.clone();
         let _commit = self.usage_persistence.gate.lock().await;
-        let mut candidate = self.usage.read().await.clone();
-        let changed = candidate.provider_health.retain_providers(&providers);
+        let mut candidate = self.usage.read().await.provider_health.clone();
+        let changed = candidate.retain_providers(&providers);
         if changed {
-            let persisted_health = candidate.provider_health.clone();
             let config_dir = self.config_dir.clone();
-            tokio::task::spawn_blocking(move || persisted_health.save(&config_dir))
-                .await
-                .context("provider health persistence task panicked")??;
-            *self.usage.write().await = candidate;
+            let candidate = tokio::task::spawn_blocking(move || {
+                candidate.save(&config_dir)?;
+                Ok::<_, anyhow::Error>(candidate)
+            })
+            .await
+            .context("provider health persistence task panicked")??;
+            self.usage.write().await.provider_health = candidate;
             self.usage_persistence.mark_published();
         }
         Ok(changed)
@@ -13881,11 +13930,24 @@ impl ServerStateInner {
         if crate::repository::server_sqlite::is_committed(&self.config_dir)? {
             let config_dir = self.config_dir.clone();
             let persisted_log = expected_log.clone();
-            let value_degraded = tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 crate::repository::server_sqlite::upsert_usage_log(&config_dir, &persisted_log)
             })
             .await
-            .context("Usage SQLite persistence task panicked")??;
+            .context("Usage SQLite persistence task panicked")
+            .and_then(|result| result);
+            let (value_degraded, quota) = match result {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    let reconciled = reconcile_usage_store_after_persistence_error(
+                        &self.config_dir,
+                        expected_log.clone(),
+                        error,
+                    )
+                    .await?;
+                    (false, reconciled.quota_ledger)
+                }
+            };
             if value_degraded {
                 // Settlement failures are scoped to one (scope, window)
                 // block; there is no global USD degraded state any more.
@@ -13893,7 +13955,11 @@ impl ServerStateInner {
                     "USD settlement reported an unscoped failure; usage evidence was kept"
                 );
             }
-            self.usage.write().await.apply_append(append);
+            {
+                let mut usage = self.usage.write().await;
+                usage.quota_ledger = quota;
+                usage.apply_append(append);
+            }
             self.usage_persistence.mark_published();
             if expected_log.share_id.is_some() {
                 // A Share request may have settled a USD attempt: push the
@@ -13997,19 +14063,25 @@ impl ServerStateInner {
         let append = {
             let usage = self.usage.read().await;
             let latest = usage
-                .logs
-                .iter()
-                .filter(|existing| {
-                    existing.is_health_check
-                        && existing.share_id == log.share_id
-                        && existing.app == log.app
-                        && existing.provider_id == log.provider_id
+                .select_logs(&crate::domain::usage::history::UsageSelection {
+                    app: Some(log.app),
+                    provider_id: Some(log.provider_id.clone()),
+                    share_id: log.share_id.clone(),
+                    is_health_check: Some(true),
+                    data_source: log.data_source.clone(),
+                    health_fingerprint: log.provider_health_fingerprint.clone(),
+                    requested_model: log.requested_model.clone(),
+                    exact_probe_identity: true,
+                    limit: Some(1),
+                    ..Default::default()
+                })?
+                .into_iter()
+                .find(|existing| {
+                    existing.share_id == log.share_id
                         && existing.data_source == log.data_source
                         && existing.provider_health_fingerprint == log.provider_health_fingerprint
                         && existing.requested_model == log.requested_model
-                })
-                .max_by_key(|existing| existing.created_at_ms)
-                .cloned();
+                });
             if let Some(existing) = latest {
                 if log.created_at_ms.saturating_sub(existing.created_at_ms) < min_interval_ms {
                     return Ok(existing);
@@ -14030,12 +14102,7 @@ impl ServerStateInner {
         let _commit = self.usage_persistence.gate.lock().await;
         let append = {
             let usage = self.usage.read().await;
-            let Some(mut updated) = usage
-                .logs
-                .iter()
-                .find(|log| log.request_id == request_id)
-                .cloned()
-            else {
+            let Some(mut updated) = usage.find_request(request_id)? else {
                 return Ok(None);
             };
             update(&mut updated);
@@ -14054,12 +14121,7 @@ impl ServerStateInner {
         let _commit = self.usage_persistence.gate.lock().await;
         let append = {
             let usage = self.usage.read().await;
-            let Some(mut updated) = usage
-                .logs
-                .iter()
-                .find(|log| log.request_id == request_id)
-                .cloned()
-            else {
+            let Some(mut updated) = usage.find_request(request_id)? else {
                 return Ok(false);
             };
             if !update(&mut updated) {
@@ -19861,6 +19923,11 @@ impl ServerStateInner {
         Ok(Ok(result))
     }
 
+    pub(crate) fn quota_usage_is_degraded(&self) -> bool {
+        self.quota_usage_degraded
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn mark_quota_usage_degraded(&self) {
         self.quota_usage_degraded
             .store(true, std::sync::atomic::Ordering::Release);
@@ -20122,6 +20189,7 @@ impl ServerStateInner {
             .coverage_from_ms
             .contains_key(&source_ref)
         {
+            let _usage_commit = self.usage_persistence.gate.lock().await;
             let mut usage = self.usage.read().await.clone();
             usage.quota_ledger.begin_collection(&source_ref, now);
             persist_state_snapshot(&self.config_dir, usage.clone()).await?;
@@ -20270,7 +20338,7 @@ impl ServerStateInner {
         let _commit = self.usage_persistence.gate.lock().await;
         let append = {
             let usage = self.usage.read().await;
-            if let Some(existing) = usage.logs.iter().find(|log| log.request_id == request_id) {
+            if let Some(existing) = usage.find_request(&request_id)? {
                 anyhow::ensure!(
                     existing.share_id == context.share_id
                         && existing.user_email.as_deref().is_some_and(|email| context
@@ -22033,24 +22101,42 @@ pub async fn sync_pending_router_share_logs(
     force_retry: bool,
 ) -> RouterLogSyncSummary {
     let now_ms = crate::infra::time::now_ms();
-    let mut logs = {
-        let usage = state.usage.read().await;
-        usage
-            .logs
-            .iter()
-            .filter(|log| eligible_router_share_log(log))
-            .filter(|log| {
-                log.router_last_synced_at_ms.is_none()
-                    && (force_retry
-                        || log
-                            .router_next_sync_attempt_at_ms
-                            .is_none_or(|next_attempt| next_attempt <= now_ms))
-            })
-            .cloned()
-            .collect::<Vec<_>>()
+    let logs = state
+        .query_usage(move |usage| {
+            if usage.history.is_some() {
+                usage.select_logs(&crate::domain::usage::history::UsageSelection {
+                    pending_router_sync: true,
+                    retry_before_ms: (!force_retry).then_some(now_ms),
+                    limit: Some(limit),
+                    ..Default::default()
+                })
+            } else {
+                let mut logs: Vec<_> = usage
+                    .logs
+                    .iter()
+                    .filter(|log| {
+                        eligible_router_share_log(log)
+                            && log.router_last_synced_at_ms.is_none()
+                            && (force_retry
+                                || log
+                                    .router_next_sync_attempt_at_ms
+                                    .is_none_or(|at| at <= now_ms))
+                    })
+                    .cloned()
+                    .collect();
+                logs.sort_by_key(|log| log.router_export_sequence);
+                logs.truncate(limit);
+                Ok(logs)
+            }
+        })
+        .await;
+    let logs = match logs {
+        Ok(logs) => logs,
+        Err(error) => {
+            tracing::warn!(%error,"read pending Router log batch failed");
+            return RouterLogSyncSummary::default();
+        }
     };
-    logs.sort_by_key(|log| log.router_export_sequence);
-    logs.truncate(limit);
     let mut summary = RouterLogSyncSummary::default();
     if logs.is_empty() {
         return summary;
@@ -22122,12 +22208,28 @@ pub async fn sync_pending_router_share_logs(
 }
 
 pub async fn pending_router_log_count(state: &ServerState) -> usize {
-    let usage = state.usage.read().await;
-    usage
-        .logs
-        .iter()
-        .filter(|log| eligible_router_share_log(log) && log.router_last_synced_at_ms.is_none())
-        .count()
+    state
+        .query_usage(|usage| {
+            let mut count = 0;
+            usage.visit_logs(
+                &crate::domain::usage::history::UsageSelection {
+                    pending_router_sync: true,
+                    ..Default::default()
+                },
+                |log| {
+                    if eligible_router_share_log(log) {
+                        count += 1;
+                    }
+                    Ok(())
+                },
+            )?;
+            Ok(count)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error,"count pending Router logs failed");
+            0
+        })
 }
 
 fn project_provider_identity_capability(descriptor: &mut ShareDescriptor, supported: bool) {

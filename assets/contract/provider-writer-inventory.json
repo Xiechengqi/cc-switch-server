@@ -5,7 +5,7 @@
   "currentSourceEvidence": [
     {
       "path": "src/admin.rs",
-      "sha256": "3d04b42e48ea98e2bae6a5a85e43ff50094e80b4dea5f2a126ab6c0f00687aab"
+      "sha256": "5505da7de7463bc9e29c975a3525a5e67e632f8bf5e51ffd577d584fd1e38d09"
     },
     {
       "path": "src/api/invoke/dispatch.rs",
@@ -49,7 +49,7 @@
     },
     {
       "path": "src/state.rs",
-      "sha256": "5b1d07b2eb3ec0f374922c7673684e209f07dcc86477108518cb8efc97187355"
+      "sha256": "3bc33d434d5e45439b89e2c1c42647f4e8785445fd078c6d6f553c7f7f591f41"
     },
     {
       "path": "src/state/provider_bundle.rs",

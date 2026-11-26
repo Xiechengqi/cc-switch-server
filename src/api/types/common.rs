@@ -17,6 +17,8 @@ pub(in crate::api) struct HealthResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct ReadinessResponse {
+    pub(in crate::api) process_id: u32,
+    pub(in crate::api) process_instance_id: String,
     pub(in crate::api) ok: bool,
     pub(in crate::api) status: &'static str,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

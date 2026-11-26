@@ -415,10 +415,12 @@ pub fn recover(
         .map(|(id, _)| id.clone())
         .collect();
     for id in pending {
-        if let Some(log) = usage.logs.iter().find(|l| {
-            l.request_id == id && l.usage_state != crate::domain::usage::store::UsageState::Pending
-        }) {
-            changed |= record(share, log)?;
+        if let Some(log) = usage
+            .find_request(&id)
+            .map_err(|error| error.to_string())?
+            .filter(|log| log.usage_state != crate::domain::usage::store::UsageState::Pending)
+        {
+            changed |= record(share, &log)?;
         }
         let receipt = &share.market_requests[&id];
         if receipt.revision == 0 && receipt.phase == ShareMarketPhase::Trial {

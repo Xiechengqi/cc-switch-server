@@ -38,27 +38,43 @@ pub(crate) async fn share_router_request_logs(
         .unwrap_or(SHARE_ROUTER_REQUEST_LOGS_LIMIT)
         .clamp(1, SHARE_ROUTER_REQUEST_LOGS_LIMIT);
     let after_sequence = query.after_sequence.unwrap_or_default();
-    let mut matching = {
-        let usage = state.usage.read().await;
-        usage
-            .logs
-            .iter()
-            .filter(|log| {
-                log.share_id.as_deref() == Some(share_id.as_str())
-                    && log.is_user_inference()
-                    && log.data_source.as_deref() == Some("router_share")
-                    && !log.is_health_check
-                    && log.router_export_sequence > after_sequence
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    matching.sort_by(|left, right| {
-        left.router_export_sequence
-            .cmp(&right.router_export_sequence)
-            .then_with(|| left.request_id.cmp(&right.request_id))
-    });
-    let has_more = matching.len() > limit;
+    let selected_share = share_id.clone();
+    let (matching, has_more) = state
+        .query_usage(move |usage| {
+            let mut selected = std::collections::BTreeMap::new();
+            usage.visit_logs(
+                &crate::domain::usage::history::UsageSelection {
+                    share_id: Some(selected_share),
+                    is_health_check: Some(false),
+                    data_source: Some("router_share".into()),
+                    include_expired: true,
+                    ..Default::default()
+                },
+                |log| {
+                    if log.is_user_inference() && log.router_export_sequence > after_sequence {
+                        let key = (log.router_export_sequence, log.request_id.clone());
+                        if selected.len() <= limit
+                            || selected
+                                .last_key_value()
+                                .is_some_and(|(last, _)| &key < last)
+                        {
+                            selected.insert(key, log.clone());
+                            if selected.len() > limit.saturating_add(1) {
+                                selected.pop_last();
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+            let has_more = selected.len() > limit;
+            Ok((
+                selected.into_values().take(limit).collect::<Vec<_>>(),
+                has_more,
+            ))
+        })
+        .await
+        .map_err(ApiError::internal)?;
     let mut logs = Vec::new();
     for log in matching.into_iter().take(limit) {
         if let Some(entry) = crate::state::share_request_log_entry(&state, &log).await {

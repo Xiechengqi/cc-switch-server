@@ -166,6 +166,19 @@ pub(crate) struct ResidentMemoryReservation {
     _owner: Arc<ResidentMemoryOwner>,
 }
 
+impl ResidentMemoryReservation {
+    pub(crate) fn try_resize(&mut self, bytes: usize) -> bool {
+        let Some(owner) = Arc::get_mut(&mut self._owner) else {
+            return false;
+        };
+        if !owner.budget.try_resize(owner.bytes, bytes) {
+            return false;
+        }
+        owner.bytes = bytes;
+        true
+    }
+}
+
 #[derive(Debug)]
 struct ResidentMemoryOwner {
     budget: ResidentMemoryBudget,

@@ -29,7 +29,7 @@ Router allows only these exact paths to bypass its Web login check and forwards 
 
 ## Restart evidence
 
-Restart requests are executed by the detached self-update helper. The helper persists `restart-operation.json` before the old process exits, captures old/new PID and stage transitions, and completes only after the replacement `/version` endpoint reports a different PID and the expected commit. Upgrade state remains in `upgrade-state.json`.
+Restart requests are executed by the detached self-update helper. The helper persists `restart-operation.json` before the old process exits, captures old/new PID and stage transitions, and completes after `/version` and `/ready` confirm the replacement PID, expected commit, and local readiness. Initialization progress in `<config-dir>/startup-state.json` records the current phase, completed work, process start identity, and elapsed time. The helper uses this evidence during startup and retains the last phase in failure diagnostics. Upgrade state remains in `upgrade-state.json`.
 
 If the replacement cannot start, the operation file, `<config-dir>/log/server.log`, and `<config-dir>/log/restart-helper.log` retain the helper failure. Router also retains its normal tunnel `last_seen_at`/offline lifecycle, which distinguishes a replacement that never reconnected from an HTTP stream interruption.
 

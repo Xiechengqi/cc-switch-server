@@ -407,8 +407,9 @@ fn observe_user_quota(
         (None, None) => (0, now_ms.saturating_add(1)),
         _ => return Err("quota window has only one boundary".to_string()),
     };
-    let (observed_tokens, observed_requests) =
-        usage.share_user_quota_usage(share_id, email, starts_at_ms, ends_at_ms);
+    let (observed_tokens, observed_requests) = usage
+        .try_share_user_quota_usage(share_id, email, starts_at_ms, ends_at_ms)
+        .map_err(|error| format!("usage_history_unavailable: {error}"))?;
     Ok(ShareUserQuotaSnapshot {
         window,
         observed_tokens,
@@ -4015,12 +4016,15 @@ fn runtime_snapshot_for_share(
         crate::domain::health::provider_health_for_plan(item, usage, runtime_plan.as_deref())
     });
     let last_request = usage
-        .logs
-        .iter()
-        .filter(|log| {
-            !log.is_health_check && log.provider_id == share.provider_id && log.app == share.app
+        .select_logs(&crate::domain::usage::history::UsageSelection {
+            app: Some(share.app),
+            provider_id: Some(share.provider_id.clone()),
+            is_health_check: Some(false),
+            limit: Some(1),
+            ..Default::default()
         })
-        .max_by_key(|log| log.created_at_ms);
+        .ok()
+        .and_then(|logs| logs.into_iter().next());
 
     json!({
         "shareId": share.id,
