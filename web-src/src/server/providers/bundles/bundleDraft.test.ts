@@ -170,6 +170,22 @@ function openAiOAuthBundle(
 }
 
 describe("Provider Bundle drafts", () => {
+  it("round-trips image transport and text driver without migrating legacy settings", () => {
+    const legacy = toProviderBundleWriteDraft(editProviderBundleDraft(openAiOAuthBundle()));
+    expect(legacy.surfaces.every(surface => surface.driverOptions?.codexImageTransport === undefined)).toBe(true);
+    expect(legacy.surfaces.every(surface => surface.driverOptions?.codexImageResponsesModel === undefined)).toBe(true);
+    const bundle = openAiOAuthBundle();
+    for (const resource of Object.values(bundle.surfaces)) {
+      if (resource) resource.provider.meta = { ...resource.provider.meta,
+        codexImageGenerationEnabled: true, codexImageTransport: "images", codexImageResponsesModel: "gpt-6.2-astra" };
+    }
+    const draft = editProviderBundleDraft(bundle);
+    const write = toProviderBundleWriteDraft(draft);
+    expect(write.surfaces.every(surface => surface.driverOptions?.codexImageTransport === "images")).toBe(true);
+    expect(write.surfaces.every(surface => surface.driverOptions?.codexImageResponsesModel === "gpt-6.2-astra")).toBe(true);
+    for (const surface of draft.surfaces) surface.driverOptions.codexImageResponsesModel = "  ";
+    expect(toProviderBundleWriteDraft(draft).surfaces.every(surface => surface.driverOptions?.codexImageResponsesModel === undefined)).toBe(true);
+  });
   it("round-trips explicit Codex service tiers and preserves absent legacy overrides", () => {
     const legacy = openAiOAuthBundle();
     for (const surface of Object.values(legacy.surfaces)) {

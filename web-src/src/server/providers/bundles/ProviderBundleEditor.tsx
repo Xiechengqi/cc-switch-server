@@ -3104,6 +3104,12 @@ export function ProviderBundleEditor({
                             surface.driverOptions
                               .codexImageGenerationEnabled === true,
                         ),
+                        codexImageResponsesModel: draft.surfaces.find(
+                          (surface) => surface.driverOptions.codexImageResponsesModel,
+                        )?.driverOptions.codexImageResponsesModel ?? "",
+                        codexImageTransport: draft.surfaces.find(
+                          (surface) => surface.driverOptions.codexImageTransport,
+                        )?.driverOptions.codexImageTransport ?? "responses",
                         codexWebsocketEnabled: draft.surfaces.some(
                           (surface) =>
                             surface.driverOptions.codexWebsocketEnabled ===

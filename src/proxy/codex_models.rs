@@ -302,6 +302,21 @@ impl ManifestModelCache {
             .unwrap_or_default()
     }
 
+    fn contains_model(&self, scope: &ManifestModelScope, model: &str) -> Option<bool> {
+        let entry = self
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| &entry.scope == scope && entry.expires_at > Instant::now())?;
+        let model = normalize_model_id(model);
+        Some(
+            entry
+                .models
+                .iter()
+                .any(|entry| normalize_model_id(&entry.id) == model),
+        )
+    }
+
     fn capability(
         &self,
         scope: Option<&ManifestModelScope>,
@@ -546,6 +561,16 @@ pub(crate) fn manifest_model_ids(provider: &StoredProvider) -> Vec<String> {
         .model_ids(scope.as_ref())
 }
 
+/// None means no fresh account manifest, including failed or expired fetches.
+/// A fresh empty manifest is authoritative and returns Some(false).
+pub(crate) fn manifest_contains_model(provider: &StoredProvider, model: &str) -> Option<bool> {
+    let scope = manifest_model_scope(provider)?;
+    let cache = manifest_model_cache()
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    cache.contains_model(&scope, model)
+}
+
 pub(crate) fn capability_for_model(model: &str) -> Option<&'static CodexModelCapability> {
     let model = normalize_model_id(model);
     BUILTIN_CODEX_MODELS
@@ -750,13 +775,20 @@ mod tests {
         let provider = manifest_provider("cache-version-test", 1);
         let scope = manifest_model_scope(&provider).unwrap();
         let mut cache = ManifestModelCache::default();
+        assert_eq!(cache.contains_model(&scope, "model-a"), None);
+        cache.replace(Some(scope.clone()), Vec::new());
+        assert_eq!(cache.contains_model(&scope, "model-a"), Some(false));
         cache.replace(Some(scope.clone()), vec![manifest_model("model-a")]);
+        assert_eq!(cache.contains_model(&scope, "model-a"), Some(true));
+        assert_eq!(cache.contains_model(&scope, "model-b"), Some(false));
         assert!(cache.capability(Some(&scope), "model-a").is_some());
         let mut newer = scope.clone();
         newer.client_version = "99.0.0".into();
+        assert_eq!(cache.contains_model(&newer, "model-a"), None);
         assert!(cache.model_ids(Some(&newer)).is_empty());
         assert!(cache.capability(Some(&newer), "model-a").is_none());
         cache.entries[0].expires_at = Instant::now() - Duration::from_secs(1);
+        assert_eq!(cache.contains_model(&scope, "model-a"), None);
         assert!(cache.model_ids(Some(&scope)).is_empty());
         assert!(cache.capability(Some(&scope), "model-a").is_none());
         cache.replace(Some(scope.clone()), vec![manifest_model("model-b")]);

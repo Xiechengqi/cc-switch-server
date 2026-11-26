@@ -4,7 +4,7 @@
     "legacyCompatibility": "assets/contract/provider-legacy-compatibility.json",
     "serverProviderTypes": {
       "path": "src/domain/providers/model.rs",
-      "sha256": "06ffa300d0571e21683fafe214b09e8a61864702005993af8cf553d02e7835bc"
+      "sha256": "7706d96e6b4efa3ec401be3e200dc362d87e2793b983583ecbe9fcde6e6f362a"
     },
     "qoderOracle": "assets/contract/qoder-cli-oracle.json"
   },

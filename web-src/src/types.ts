@@ -47,6 +47,8 @@ export interface ProviderMeta {
   codexFastMode?: boolean;
     codexServiceTier?: "standard" | "priority" | "ultrafast";
   codexImageGenerationEnabled?: boolean;
+  codexImageResponsesModel?: string;
+  codexImageTransport?: "responses" | "images";
   grokImageGenerationEnabled?: boolean;
   grokImageEditEnabled?: boolean;
   grokVideoGenerationEnabled?: boolean;

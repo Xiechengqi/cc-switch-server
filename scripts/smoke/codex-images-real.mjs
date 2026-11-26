@@ -180,7 +180,7 @@ function parseArgs(argv, env) {
       env.CC_SWITCH_IMAGE_SMOKE_PROMPT ||
       "A precise black square centered on a plain white background, no text, no watermark.",
     imageModel: env.CC_SWITCH_IMAGE_MODEL || "gpt-image-2",
-    responsesModel: env.CC_SWITCH_IMAGE_RESPONSES_MODEL || "gpt-5.4-mini",
+    responsesModel: env.CC_SWITCH_IMAGE_RESPONSES_MODEL || "gpt-6.2-sol",
     size: env.CC_SWITCH_IMAGE_SIZE || "3840x2160",
     quality: env.CC_SWITCH_IMAGE_QUALITY || "high",
     timeoutMs: numberOption(env.CC_SWITCH_IMAGE_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),

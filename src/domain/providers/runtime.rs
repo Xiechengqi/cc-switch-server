@@ -1215,6 +1215,17 @@ fn runtime_driver_options(
             meta.grok_image_generation_enabled.map(|value| json!(value)),
         ),
         (
+            "codexImageResponsesModel",
+            super::model::normalize_codex_image_responses_model(
+                meta.codex_image_responses_model.as_deref(),
+            )?
+            .map(|value| json!(value)),
+        ),
+        (
+            "codexImageTransport",
+            meta.codex_image_transport.map(|value| json!(value)),
+        ),
+        (
             "grokImageEditEnabled",
             meta.grok_image_edit_enabled.map(|value| json!(value)),
         ),

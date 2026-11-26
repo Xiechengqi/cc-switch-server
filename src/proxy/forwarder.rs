@@ -151,7 +151,10 @@ use super::{setting, ProxyConcurrencyScope, ProxyError};
 #[cfg(test)]
 use crate::domain::accounts::store::{active_account_capacity_pool_limit, CLAUDE_FABLE_QUOTA_TIER};
 
-const CODEX_IMAGES_RESPONSES_MAIN_MODEL: &str = "gpt-5.4-mini";
+const CODEX_IMAGES_RESPONSES_MAIN_MODEL: &str =
+    crate::domain::providers::model::DEFAULT_CODEX_IMAGE_RESPONSES_MODEL;
+use crate::domain::providers::model::CodexImageTransport;
+include!("forwarder/codex_images_policy.rs");
 const CODEX_IMAGES_DEFAULT_TOOL_MODEL: &str = "gpt-image-2";
 const CODEX_IMAGES_LIVE_PENDING_25_MODELS: &[&str] = &[
     "gpt-image-2.5",
@@ -10198,6 +10201,11 @@ async fn forward_codex_images_request(
     share_invocation_guard: Option<ShareInFlightGuard>,
 ) -> Result<Response, ProxyError> {
     let mut value_attempt;
+    request_context.request_kind = RequestKind::Image;
+    request_context.operation = match prepared.operation {
+        CodexImagesOperation::Generation => InferenceOperation::ImageGeneration,
+        CodexImagesOperation::Edit => InferenceOperation::ImageEdit,
+    };
     let stored = execution.runtime_stored_view();
     let mut audit_attempt = ForwardAttemptContext::default();
     audit_forward_attempt(
@@ -10235,13 +10243,19 @@ async fn forward_codex_images_request(
         responses_tool_context: Default::default(),
         claude_tool_name_map: Default::default(),
     };
-    execution.enforce_model_policy(&mut adapter_request)?;
-    prepared.body =
-        super::remote_image::inline_codex_images_endpoint_images(&prepared.body).await?;
-    adapter_request.body = prepared.body.clone();
-    let final_model = codex_model_from_body(&adapter_request.body)
-        .or_else(|| adapter_request.actual_model.clone())
-        .or_else(|| adapter_request.model.clone());
+    configure_codex_images_adapter(&execution, &mut prepared, &mut adapter_request)?;
+    let final_model = Some(prepared.actual_model.clone());
+    if prepared.transport == CodexImageTransport::Responses {
+        state.ensure_codex_model_capabilities(&execution).await;
+        if super::codex_models::manifest_contains_model(&stored, &prepared.actual_model)
+            == Some(false)
+        {
+            return Err(ProxyError::bad_request(format!(
+                "Codex Images text driver '{}' is not in the bound account's current model catalog; configure an accessible image text driver",
+                prepared.actual_model,
+            )));
+        }
+    }
     ensure_share_model_available(
         &state,
         &execution,
@@ -10249,16 +10263,24 @@ async fn forward_codex_images_request(
         final_model.as_deref(),
     )
     .await?;
-    let (body, metadata) = super::codex_request_policy::apply_to_bytes(
-        &adapter_request.body,
-        &stored,
-        final_model.as_deref(),
-        codex_service_tier(&execution),
-        &prepared.intent,
-    )?;
-    adapter_request.body = body.clone();
-    prepared.body = body;
-    apply_codex_policy_metadata(&mut request_context, metadata);
+    if prepared.transport == CodexImageTransport::Responses {
+        let (body, metadata) = super::codex_request_policy::apply_to_bytes(
+            &adapter_request.body,
+            &stored,
+            final_model.as_deref(),
+            codex_service_tier(&execution),
+            &prepared.intent,
+        )?;
+        adapter_request.body = body;
+        apply_codex_policy_metadata(&mut request_context, metadata);
+    }
+    // Continue from the policy's final body, never the original prepared body.
+    adapter_request.body =
+        super::remote_image::inline_codex_images_endpoint_images(&adapter_request.body).await?;
+    if prepared.transport == CodexImageTransport::Images {
+        adapter_request.body = codex_images_direct_body(&adapter_request.body, prepared.operation)?;
+    }
+    prepared.body = adapter_request.body.clone();
     let public_origin = if prepared.response_format == "url" {
         Some(codex_images_public_origin(&headers)?)
     } else {
@@ -10301,19 +10323,30 @@ async fn forward_codex_images_request(
         request_context.attempt_count = Some(audit_attempt.attempt().saturating_add(1));
         let model = final_model.as_deref().unwrap_or("");
         let facts = crate::domain::usage::value_pricing::value_request_facts(&adapter_request.body);
-        let mut resource_plan = serde_json::from_slice(&adapter_request.body)
-            .ok()
-            .map(|body| {
-                crate::domain::usage::value_pricing::resource_request_plan(
-                    &body,
-                    request_context.operation,
-                )
-            });
+        let mut resource_plan =
+            serde_json::from_slice(&adapter_request.body)
+                .ok()
+                .map(|mut body: Value| {
+                    if prepared.transport == CodexImageTransport::Responses {
+                        // Prices for a dedicated image operation use its validated
+                        // tool dimensions, alongside the actual text-driver price.
+                        for key in ["size", "quality"] {
+                            if let Some(value) = body.pointer(&format!("/tools/0/{key}")).cloned() {
+                                body[key] = value;
+                            }
+                        }
+                        body["n"] = json!(1);
+                    }
+                    crate::domain::usage::value_pricing::resource_request_plan(
+                        &body,
+                        request_context.operation,
+                    )
+                });
         if let Some(plan) = resource_plan.as_mut() {
             plan.binding_fingerprint = Some(
                 crate::domain::sharing::capability_intent::binding_fingerprint(&execution.plan),
             );
-            plan.text_tokens = true;
+            plan.text_tokens = prepared.transport == CodexImageTransport::Responses;
         }
         value_attempt = state
             .admit_share_value_request(
@@ -10334,6 +10367,7 @@ async fn forward_codex_images_request(
             &execution,
             &stored,
             &adapter_request,
+            &prepared,
             session_id.as_deref(),
             header_timeout,
         )
@@ -10576,7 +10610,16 @@ async fn forward_codex_images_request(
         );
         usage_accumulator.push(&decoded.body);
         let usage = usage_accumulator.finish();
-        let error_message = bounded_codex_image_error_message(&decoded.body);
+        let text_driver_rejected = status == StatusCode::BAD_REQUEST
+            && codex_images_text_driver_rejected(&decoded.body, &prepared);
+        let error_message = if text_driver_rejected {
+            bounded_codex_image_message(format!(
+                "image_text_model_unavailable: {}",
+                bounded_codex_image_error_message(&decoded.body)
+            ))
+        } else {
+            bounded_codex_image_error_message(&decoded.body)
+        };
         log_usage(
             &state,
             &stored,
@@ -10600,11 +10643,18 @@ async fn forward_codex_images_request(
             usage,
         )
         .await;
-        record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code)).await;
+        if !text_driver_rejected {
+            record_provider_outcome(&state, &stored, provider_outcome_from_status(status_code))
+                .await;
+        }
         crate::metrics::record_codex_images_request(
             prepared.operation.as_str(),
             prepared.stream,
-            "http_error",
+            if text_driver_rejected {
+                "text_model_unavailable"
+            } else {
+                "http_error"
+            },
         );
         let mut response = Response::new(Body::from(decoded.body));
         *response.status_mut() = status;
@@ -10729,6 +10779,7 @@ async fn send_codex_images_attempt(
     execution: &ProviderExecution,
     stored: &StoredProvider,
     adapter_request: &adapters::AdapterRequest,
+    prepared: &CodexImagesPreparedRequest,
     session_id: Option<&str>,
     header_timeout: Duration,
 ) -> Result<CodexImagesAttempt, ProxyError> {
@@ -10744,10 +10795,13 @@ async fn send_codex_images_attempt(
     crate::codex_identity::finalize_headers(&mut target_headers);
     let mut target_headers = owned_headers(target_headers);
     let mut url = execution.resolve_endpoint(ProxyRoute::CodexResponses, None, adapter_request)?;
+    url = codex_images_upstream_endpoint(&url, prepared)?;
     let materialized_auth = execution.materialize_auth(&accounts)?;
     execution.apply_auth(&mut target_headers, &mut url, &materialized_auth)?;
     apply_account_header_overrides(&mut target_headers, stored, &accounts)?;
     execution.finalize_outbound_identity(&mut target_headers)?;
+    target_headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("x-openai-internal-codex-responses-lite"));
     let mut body = adapter_request.body.clone();
     if let Some(scope) = codex_metadata_scope(execution, &accounts) {
         let (scrubbed, body_decision) = super::codex_metadata::scrub_body_bytes(&body, &scope)?;
@@ -10844,6 +10898,9 @@ struct CodexImagesPreparedRequest {
     requested_model: String,
     response_format: String,
     stream: bool,
+    transport: CodexImageTransport,
+    actual_model: String,
+    actual_model_source: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10906,14 +10963,10 @@ fn codex_images_generation_request(body: &[u8]) -> Result<CodexImagesPreparedReq
         .ok_or_else(|| ProxyError::bad_request("image generation prompt is required"))?;
     let common = codex_images_common_options(&value, prompt, CodexImagesOperation::Generation)?;
     let intent = super::codex_request_policy::extract_intent(&value);
-    let reasoning_effort = intent
-        .requested_reasoning_effort
-        .as_deref()
-        .unwrap_or("medium");
-    let request = json!({
+    let mut request = json!({
         "instructions": "",
         "stream": true,
-        "reasoning": {"effort": reasoning_effort, "summary": "auto"},
+        "reasoning": {"summary": "auto"},
         "parallel_tool_calls": false,
         "include": ["reasoning.encrypted_content"],
         "model": CODEX_IMAGES_RESPONSES_MAIN_MODEL,
@@ -10926,6 +10979,9 @@ fn codex_images_generation_request(body: &[u8]) -> Result<CodexImagesPreparedReq
         }],
         "tools": [common.tool],
     });
+    if let Some(effort) = intent.requested_reasoning_effort.as_deref() {
+        request["reasoning"]["effort"] = json!(effort);
+    }
     let body = serde_json::to_vec(&request)
         .map(Bytes::from)
         .map_err(|error| ProxyError {
@@ -10939,6 +10995,9 @@ fn codex_images_generation_request(body: &[u8]) -> Result<CodexImagesPreparedReq
         requested_model: common.requested_model,
         response_format: common.response_format,
         stream: common.stream,
+        transport: CodexImageTransport::Responses,
+        actual_model: CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string(),
+        actual_model_source: "codex_image_generation_bridge".to_string(),
     })
 }
 
@@ -11089,10 +11148,6 @@ fn codex_images_edit_request_from_value(
     }
     let mut common = codex_images_common_options(&value, prompt, CodexImagesOperation::Edit)?;
     let intent = super::codex_request_policy::extract_intent(&value);
-    let reasoning_effort = intent
-        .requested_reasoning_effort
-        .as_deref()
-        .unwrap_or("medium");
     if let Some(mask) = value
         .pointer("/mask/image_url")
         .and_then(Value::as_str)
@@ -11108,10 +11163,10 @@ fn codex_images_edit_request_from_value(
             .into_iter()
             .map(|image_url| json!({"type": "input_image", "image_url": image_url})),
     );
-    let request = json!({
+    let mut request = json!({
         "instructions": "",
         "stream": true,
-        "reasoning": {"effort": reasoning_effort, "summary": "auto"},
+        "reasoning": {"summary": "auto"},
         "parallel_tool_calls": false,
         "include": ["reasoning.encrypted_content"],
         "model": CODEX_IMAGES_RESPONSES_MAIN_MODEL,
@@ -11120,6 +11175,9 @@ fn codex_images_edit_request_from_value(
         "input": [{"type": "message", "role": "user", "content": content}],
         "tools": [common.tool],
     });
+    if let Some(effort) = intent.requested_reasoning_effort.as_deref() {
+        request["reasoning"]["effort"] = json!(effort);
+    }
     let body = serde_json::to_vec(&request)
         .map(Bytes::from)
         .map_err(|error| ProxyError {
@@ -11133,6 +11191,9 @@ fn codex_images_edit_request_from_value(
         requested_model: common.requested_model,
         response_format: common.response_format,
         stream: common.stream,
+        transport: CodexImageTransport::Responses,
+        actual_model: CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string(),
+        actual_model_source: "codex_image_generation_bridge".to_string(),
     })
 }
 
@@ -11467,7 +11528,8 @@ fn codex_images_response_stream(
     };
     async_stream::stream! {
         let mut inner = upstream.bytes_stream();
-        let mut parser = CodexImagesResponseParser::new();
+        let mut parser = CodexImagesResponseParser::for_request(prepared.transport, prepared.operation);
+        parser.text_driver = Some(prepared.actual_model.clone());
         let initial = if prepared.stream {
             Bytes::from_static(b": connected\n\n")
         } else {
@@ -11846,10 +11908,23 @@ struct CodexImagesResponseParser {
     pending_refusal: Option<String>,
     stream_meta: CodexImageResult,
     created_at: i64,
+    transport: CodexImageTransport,
+    operation: CodexImagesOperation,
+    done_seen: bool,
+    text_driver: Option<String>,
+    pending_direct_json: Vec<ResponsesTransportItem>,
 }
 
 impl CodexImagesResponseParser {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::for_request(
+            CodexImageTransport::Responses,
+            CodexImagesOperation::Generation,
+        )
+    }
+
+    fn for_request(transport: CodexImageTransport, operation: CodexImagesOperation) -> Self {
         Self {
             decoder: ResponsesTransportDecoder::new(
                 CODEX_IMAGES_MAX_UPSTREAM_BYTES,
@@ -11861,6 +11936,11 @@ impl CodexImagesResponseParser {
             pending_refusal: None,
             stream_meta: CodexImageResult::default(),
             created_at: (current_time_ms() / 1000) as i64,
+            transport,
+            operation,
+            done_seen: false,
+            text_driver: None,
+            pending_direct_json: Vec::new(),
         }
     }
 
@@ -11875,7 +11955,22 @@ impl CodexImagesResponseParser {
         let items = self.decoder.push(chunk).map_err(|error| {
             CodexImagesFailure::protocol(format!("invalid Codex Images SSE: {error}"))
         })?;
-        if !items.is_empty() && !self.decoder.is_sse() {
+        if self.transport == CodexImageTransport::Images && !self.decoder.is_sse() {
+            if self.pending_direct_json.len() + items.len() > 1 {
+                return Err(CodexImagesFailure::protocol(
+                    "direct Images JSON must contain one document",
+                ));
+            }
+            self.pending_direct_json.extend(items);
+            return Ok(CodexImagesParsedChunk {
+                events: Vec::new(),
+                saw_semantic_event: false,
+            });
+        }
+        if !items.is_empty()
+            && !self.decoder.is_sse()
+            && self.transport == CodexImageTransport::Responses
+        {
             return Err(CodexImagesFailure::protocol(
                 "Codex Images upstream did not use the expected SSE data framing",
             ));
@@ -11884,10 +11979,23 @@ impl CodexImagesResponseParser {
     }
 
     fn finish(&mut self) -> Result<CodexImagesParsedChunk, CodexImagesFailure> {
-        let items = self.decoder.finish().map_err(|error| {
+        let mut items = self.decoder.finish().map_err(|error| {
             CodexImagesFailure::protocol(format!("invalid Codex Images SSE tail: {error}"))
         })?;
-        if !items.is_empty() && !self.decoder.is_sse() {
+        if self.transport == CodexImageTransport::Images && !self.decoder.is_sse() {
+            if self.pending_direct_json.len() + items.len() > 1 {
+                return Err(CodexImagesFailure::protocol(
+                    "direct Images JSON must contain one document",
+                ));
+            }
+            let mut pending = std::mem::take(&mut self.pending_direct_json);
+            pending.append(&mut items);
+            items = pending;
+        }
+        if !items.is_empty()
+            && !self.decoder.is_sse()
+            && self.transport == CodexImageTransport::Responses
+        {
             return Err(CodexImagesFailure::protocol(
                 "Codex Images upstream did not use the expected SSE data framing",
             ));
@@ -11917,14 +12025,23 @@ impl CodexImagesResponseParser {
                 }
                 ResponsesTransportItem::Done => {
                     crate::metrics::record_responses_sse_transport("codex_images", "done");
+                    if self.terminal_seen && !self.done_seen {
+                        self.done_seen = true;
+                        continue;
+                    }
                     return Err(CodexImagesFailure::protocol(
-                        "Codex image stream emitted [DONE] before a terminal response event",
+                        "Codex image stream emitted an early or duplicate [DONE]",
                     ));
                 }
                 ResponsesTransportItem::Json {
                     declared_event,
                     value,
                 } => {
+                    if self.terminal_seen {
+                        return Err(CodexImagesFailure::protocol(
+                            "Codex image stream emitted data after its terminal event",
+                        ));
+                    }
                     let observation = response_semantics::classify_value(&value);
                     saw_semantic_event |=
                         observation.counts_as_business_output() || observation.commits_downstream();
@@ -11941,10 +12058,8 @@ impl CodexImagesResponseParser {
                                 | CodexImagesProtocolEvent::Failed(_)
                         );
                         self.terminal_seen |= terminal;
+                        saw_semantic_event = true;
                         events.push(parsed);
-                        if terminal {
-                            break;
-                        }
                     }
                 }
             }
@@ -11960,6 +12075,9 @@ impl CodexImagesResponseParser {
         value: &Value,
         event_name: Option<&str>,
     ) -> Result<Option<CodexImagesProtocolEvent>, CodexImagesFailure> {
+        if self.transport == CodexImageTransport::Images {
+            return self.direct_event_from_value(value);
+        }
         self.merge_lifecycle_meta(value);
         let event_type = value
             .get("type")
@@ -11981,6 +12099,18 @@ impl CodexImagesResponseParser {
                     matches!(status, "failed" | "incomplete" | "cancelled" | "canceled")
                 })
         {
+            if self
+                .text_driver
+                .as_deref()
+                .is_some_and(|model| codex_images_value_rejects_text_driver(value, model))
+            {
+                return Ok(Some(CodexImagesProtocolEvent::Failed(CodexImagesFailure {
+                    kind: CodexImagesFailureKind::ModelUnavailable,
+                    status_code: StatusCode::BAD_REQUEST.as_u16(),
+                    code: "image_text_model_unavailable",
+                    message: bounded_codex_image_message(codex_image_failure_message(value)),
+                })));
+            }
             return Ok(Some(CodexImagesProtocolEvent::Failed(
                 CodexImagesFailure::upstream(codex_image_failure_message(value)),
             )));
@@ -12127,6 +12257,7 @@ enum CodexImagesFailureKind {
     Network,
     Timeout,
     Local,
+    ModelUnavailable,
 }
 
 #[derive(Debug)]
@@ -12202,7 +12333,7 @@ impl CodexImagesFailure {
             CodexImagesFailureKind::Timeout => Some(ProviderOutcome::Failure {
                 status_code: StatusCode::GATEWAY_TIMEOUT.as_u16(),
             }),
-            CodexImagesFailureKind::Local => None,
+            CodexImagesFailureKind::Local | CodexImagesFailureKind::ModelUnavailable => None,
         }
     }
 
@@ -12221,6 +12352,7 @@ impl CodexImagesFailure {
             CodexImagesFailureKind::Network => "network_failure",
             CodexImagesFailureKind::Timeout => "timeout",
             CodexImagesFailureKind::Local => "local_error",
+            CodexImagesFailureKind::ModelUnavailable => "text_model_unavailable",
         }
     }
 }
@@ -12421,7 +12553,7 @@ fn render_codex_images_error(stream: bool, error: &CodexImagesFailure) -> Bytes 
     let payload = json!({
         "type": "error",
         "error": {
-            "type": "server_error",
+            "type": if matches!(error.kind, CodexImagesFailureKind::ModelUnavailable) { "invalid_request_error" } else { "server_error" },
             "code": error.code,
             "message": error.message,
         }
@@ -12604,8 +12736,8 @@ fn codex_images_model_metadata(prepared: &CodexImagesPreparedRequest) -> UsageMo
     UsageModelMetadata {
         model: Some(prepared.requested_model.clone()),
         requested_model: Some(prepared.requested_model.clone()),
-        actual_model: Some(CODEX_IMAGES_RESPONSES_MAIN_MODEL.to_string()),
-        actual_model_source: Some("codex_image_generation_bridge".to_string()),
+        actual_model: Some(prepared.actual_model.clone()),
+        actual_model_source: Some(prepared.actual_model_source.clone()),
     }
 }
 
@@ -33415,6 +33547,7 @@ mod tests {
     include!("forwarder/codex_tool_result_error_tests.rs");
     include!("forwarder/codex_r4_tests.rs");
     include!("forwarder/codex62_tests.rs");
+    include!("forwarder/codex_images_policy_tests.rs");
     include!("forwarder/claude_timing_tests.rs");
     include!("forwarder/r5_timing_tests.rs");
     include!("forwarder/claude_r5_tests.rs");

@@ -195,7 +195,16 @@ OpenAI OAuth 上游最终会删除不支持的 `previous_response_id`。Share �
 
 ### Images 兼容与资源边界
 
-Codex OAuth 图片桥覆盖 Share URL 下的 `POST /v1/images/generations`、`POST /images/generations`、`POST /v1/images/edits` 和 `POST /images/edits`。它把 OpenAI Images 请求转换成同一绑定账号上的 Responses `image_generation` tool 调用；上游固定发送 `stream=true` 与唯一的 `Accept: text/event-stream`，所有成功 body 都按增量 SSE 消费，不用上游 `Content-Type` 选择 JSON/SSE 解析模式。generation 与 edit 分别回放为 `image_generation.*` 和 `image_edit.*` 事件。`n` 当前只接受 `1`，不会用未验证的多图语义制造重复生成或重复计费。
+Codex OAuth 图片入口覆盖 Share URL 下的 `POST /v1/images/generations`、`POST /images/generations`、`POST /v1/images/edits` 和 `POST /images/edits`。Provider 的 `codexImageTransport` 在发送前固定本次传输：默认 `responses` 将请求转换成同一绑定账号的 Responses `image_generation` tool 调用；显式 `images` 是实验性专用 Images 直连，访问同一 Codex origin 下的 `/images/generations` 或 `/images/edits`。两种方式均发送 `stream=true`、`response_format=b64_json`（专用 Images）和唯一的 `Accept: text/event-stream`。Responses 成功 body 必须为 SSE；直连另接受完整 Images JSON，按实际线格式增量解析，不依据 `Content-Type` 猜测成功。下游 generation/edit 仍分别回放为 `image_generation.*` / `image_edit.*` 或 Images JSON。`n` 当前只接受 `1`。
+
+- Responses 文本驱动默认 **`gpt-6.2-sol`**；`codexImageResponsesModel` 可为透传模式配置独立文本驱动，留空恢复默认。已有显式 single-model 策略优先，图片内联继续处理策略执行后的请求体；实发模型、额度准入和 `actualModel` 始终一致，`requestedModel` 保留图像模型及尺寸别名。
+- 专用 Images 的顶层 `model` 是图像模型，普通文本 single-model 映射不改写该字段；它没有文本驱动，`actualModelSource=codex_images_direct`。切换传输不迁移文本模型设置。
+- 未显式指定时不再注入 `reasoning.effort=medium`。Responses 的显式 effort 经过最终模型策略校验；专用 Images 明确拒绝 reasoning effort。Dedicated Images 请求不携带 Responses Lite header。
+- Responses 文本驱动复用绑定账号、身份代次和客户端版本隔离的实时 manifest。新鲜目录明确缺失模型（含有效空目录）会在生成前拒绝；未加载、加载失败和过期目录保持 unknown，不从静态能力快照推断账号权益。图片输入能力也不代表图片生成权限。
+- 上游明确拒绝当前文本驱动时，日志标记 `image_text_model_unavailable`，保留原始 HTTP 错误 body；该错误不计整个 Provider 失败或图片模型不可用。不引入模型、传输或账号 fallback；首次 401 仍仅刷新原绑定账号一次。
+- 直连的 JSON/SSE、图片输入/输出校验、终态/EOF、心跳、URL capability、usage 和取消共用现有生命周期。partial 不计完成图片，completed/data 的输出数量是实际资源证据；原生直连不预留文本驱动费用。2.5 型号原有独立 live gate 保持，新增可识别型号不会自动获得权益。
+
+参考协议证据是 CLIProxyAPI `38fe92950` 的专用 Images 路径和 codex2api `8ecd1860` 的独立文本驱动及参数处理；本地回环验证不代表真实账号、Cloudflare 或定价验收。默认驱动改为 6.2-sol 是本项目的明确配置选择，两个传输的真实生图验收均保持 `live_pending`。
 
 - 输入模型只接受 `gpt-image-*`；`gpt-image-2-2k` 和 `gpt-image-2-4k` 会规范化为 `gpt-image-2` 及对应方向尺寸。
 - `response_format` 支持 `b64_json` 和 `url`；同时校验 `size`、`quality`、`background`、`output_format`、`moderation`、`input_fidelity`、`output_compression`、`partial_images` 和 `stream` 的类型、范围及组合关系。

@@ -6,6 +6,8 @@ import { FeatureToggleList, FeatureToggleRow } from "./FeatureToggleRow";
 export interface CodexFeatureOptionValues {
   codexServiceTier: "standard" | "priority" | "ultrafast";
   codexImageGenerationEnabled: boolean;
+  codexImageResponsesModel?: string;
+  codexImageTransport?: "responses" | "images";
   codexWebsocketEnabled: boolean;
 }
 
@@ -71,6 +73,45 @@ export function CodexFeatureOptions({
           onCheckedChange={(enabled) => onChange(option.key, enabled)}
         />
       ))}
+      {values.codexImageGenerationEnabled ? (
+        <div className="space-y-2 px-3 py-2">
+          <label htmlFor={`${idPrefix}-image-transport`} className="block text-sm">
+            {t("codexOauth.imageTransport")}
+          </label>
+          <select
+            id={`${idPrefix}-image-transport`}
+            className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm"
+            value={values.codexImageTransport ?? "responses"}
+            aria-describedby={`${idPrefix}-image-transport-description`}
+            onChange={(event) => onChange("codexImageTransport", event.target.value as "responses" | "images")}
+          >
+            <option value="responses">{t("codexOauth.imageTransportResponses")}</option>
+            <option value="images">{t("codexOauth.imageTransportImages")}</option>
+          </select>
+          <p id={`${idPrefix}-image-transport-description`} className="text-xs text-muted-foreground">
+            {t("codexOauth.imageTransportDescription")}
+          </p>
+          {(values.codexImageTransport ?? "responses") === "responses" ? (
+            <>
+              <label htmlFor={`${idPrefix}-image-model`} className="block text-sm">
+                {t("codexOauth.imageResponsesModel")}
+              </label>
+              <input
+                id={`${idPrefix}-image-model`}
+                className="w-full rounded-md border border-input bg-background px-2 py-1 text-sm"
+                value={values.codexImageResponsesModel ?? ""}
+                placeholder="gpt-6.2-sol"
+                maxLength={128}
+                aria-describedby={`${idPrefix}-image-model-description`}
+                onChange={(event) => onChange("codexImageResponsesModel", event.target.value)}
+              />
+              <p id={`${idPrefix}-image-model-description`} className="text-xs text-muted-foreground">
+                {t("codexOauth.imageResponsesModelDescription")}
+              </p>
+            </>
+          ) : null}
+        </div>
+      ) : null}
     </FeatureToggleList>
   );
 }

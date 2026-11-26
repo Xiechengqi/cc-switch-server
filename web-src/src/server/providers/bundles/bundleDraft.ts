@@ -105,6 +105,8 @@ export interface BundleSurfaceEditorDraft {
     codexFastMode?: boolean;
     codexServiceTier?: "standard" | "priority" | "ultrafast";
     codexImageGenerationEnabled?: boolean;
+    codexImageResponsesModel?: string;
+    codexImageTransport?: "responses" | "images";
     grokImageGenerationEnabled?: boolean;
     grokImageEditEnabled?: boolean;
     grokVideoGenerationEnabled?: boolean;
@@ -560,6 +562,11 @@ function surfaceFromResource(
       codexImageGenerationEnabled:
         booleanOption(runtimeOptions.codexImageGenerationEnabled) ??
         configuredMeta.codexImageGenerationEnabled,
+      codexImageResponsesModel:
+        stringOption(runtimeOptions.codexImageResponsesModel) ?? configuredMeta.codexImageResponsesModel,
+      codexImageTransport: (["responses", "images"] as const).find(
+        (mode) => mode === (runtimeOptions.codexImageTransport ?? configuredMeta.codexImageTransport),
+      ),
       grokImageGenerationEnabled:
         booleanOption(runtimeOptions.grokImageGenerationEnabled) ??
         configuredMeta.grokImageGenerationEnabled ??
@@ -996,6 +1003,12 @@ function typedDriverOptions(surface: BundleSurfaceEditorDraft) {
       : undefined,
     codexImageGenerationEnabled: fields.has("codexImageGenerationEnabled")
       ? surface.driverOptions.codexImageGenerationEnabled
+      : undefined,
+    codexImageResponsesModel: fields.has("codexImageResponsesModel")
+      ? surface.driverOptions.codexImageResponsesModel?.trim() || undefined
+      : undefined,
+    codexImageTransport: fields.has("codexImageTransport")
+      ? surface.driverOptions.codexImageTransport
       : undefined,
     grokImageGenerationEnabled: fields.has("grokImageGenerationEnabled")
       ? surface.driverOptions.grokImageGenerationEnabled

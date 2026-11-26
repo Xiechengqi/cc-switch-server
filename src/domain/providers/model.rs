@@ -65,6 +65,39 @@ impl From<bool> for CodexServiceTier {
     }
 }
 
+/// Images requests choose a transport before sending. Failures never switch it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexImageTransport {
+    #[default]
+    Responses,
+    Images,
+}
+
+pub const DEFAULT_CODEX_IMAGE_RESPONSES_MODEL: &str = "gpt-6.2-sol";
+
+pub fn normalize_codex_image_responses_model(
+    value: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() > 128
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+        || value
+            .rsplit('/')
+            .next()
+            .unwrap_or(value)
+            .to_ascii_lowercase()
+            .starts_with("gpt-image-")
+    {
+        anyhow::bail!("codexImageResponsesModel must be a text model of at most 128 bytes without whitespace or control characters");
+    }
+    Ok(Some(value.to_string()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderType {
     #[serde(rename = "claude")]
@@ -261,6 +294,10 @@ pub struct ProviderMeta {
     pub codex_service_tier: Option<CodexServiceTier>,
     #[serde(default)]
     pub codex_image_generation_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_image_responses_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_image_transport: Option<CodexImageTransport>,
     #[serde(default)]
     pub grok_image_generation_enabled: Option<bool>,
     #[serde(default)]

@@ -241,6 +241,10 @@ pub struct ProviderDriverOptionsWriteDraft {
     #[serde(default)]
     pub codex_image_generation_enabled: Option<bool>,
     #[serde(default)]
+    pub codex_image_responses_model: Option<String>,
+    #[serde(default)]
+    pub codex_image_transport: Option<super::model::CodexImageTransport>,
+    #[serde(default)]
     pub grok_image_generation_enabled: Option<bool>,
     #[serde(default)]
     pub grok_image_edit_enabled: Option<bool>,
@@ -465,6 +469,13 @@ impl ProviderBundleWriteDraft {
             codex_fast_mode: surface.driver_options.codex_fast_mode,
             codex_service_tier: surface.driver_options.codex_service_tier,
             codex_image_generation_enabled: surface.driver_options.codex_image_generation_enabled,
+            codex_image_responses_model: super::model::normalize_codex_image_responses_model(
+                surface
+                    .driver_options
+                    .codex_image_responses_model
+                    .as_deref(),
+            )?,
+            codex_image_transport: surface.driver_options.codex_image_transport,
             grok_image_generation_enabled: surface.driver_options.grok_image_generation_enabled,
             grok_image_edit_enabled: surface.driver_options.grok_image_edit_enabled,
             grok_video_generation_enabled: surface.driver_options.grok_video_generation_enabled,
@@ -705,6 +716,12 @@ impl ProviderBundleWriteDraft {
             driver,
             &surface.driver_options.configured_fields(),
         )?;
+        super::model::normalize_codex_image_responses_model(
+            surface
+                .driver_options
+                .codex_image_responses_model
+                .as_deref(),
+        )?;
 
         let api_key_field =
             normalized_optional_string(surface.driver_options.api_key_field.as_deref());
@@ -859,6 +876,12 @@ impl ProviderDriverOptionsWriteDraft {
         }
         if self.codex_image_generation_enabled.is_some() {
             fields.insert("codexImageGenerationEnabled");
+        }
+        if self.codex_image_responses_model.is_some() {
+            fields.insert("codexImageResponsesModel");
+        }
+        if self.codex_image_transport.is_some() {
+            fields.insert("codexImageTransport");
         }
         if self.grok_image_generation_enabled.is_some() {
             fields.insert("grokImageGenerationEnabled");
@@ -1572,6 +1595,9 @@ mod tests {
         let mut draft = openai_oauth_bundle();
         for surface in &mut draft.surfaces {
             surface.driver_options.codex_service_tier = Some(CodexServiceTier::Ultrafast);
+            surface.driver_options.codex_image_responses_model = Some(" gpt-6.2-sol ".to_string());
+            surface.driver_options.codex_image_transport =
+                Some(super::super::model::CodexImageTransport::Images);
             surface.driver_options.codex_responses_keepalive_interval_ms = Some(22_000);
             surface.driver_options.codex_routing_hint_enabled = Some(false);
         }
@@ -1581,9 +1607,35 @@ mod tests {
             let provider = draft.provider_for_surface(surface).unwrap();
             let meta = provider.meta.unwrap();
             assert_eq!(meta.codex_service_tier, Some(CodexServiceTier::Ultrafast));
+            assert_eq!(
+                meta.codex_image_responses_model.as_deref(),
+                Some("gpt-6.2-sol")
+            );
+            assert_eq!(
+                meta.codex_image_transport,
+                Some(super::super::model::CodexImageTransport::Images)
+            );
             assert_eq!(meta.codex_responses_keepalive_interval_ms, Some(22_000));
             assert_eq!(meta.codex_routing_hint_enabled, Some(false));
         }
+    }
+
+    #[test]
+    fn openai_oauth_bundle_rejects_invalid_image_driver_and_transport() {
+        for value in [
+            "gpt-image-2",
+            "relay/GPT-IMAGE-2",
+            "gpt-6.2 sol",
+            "gpt-6.2-sol\ninvalid",
+        ] {
+            let mut draft = openai_oauth_bundle();
+            draft.surfaces[0].driver_options.codex_image_responses_model = Some(value.to_string());
+            assert!(draft.validate().is_err(), "accepted invalid image driver");
+        }
+        assert!(serde_json::from_value::<ProviderDriverOptionsWriteDraft>(
+            json!({"codexImageTransport":"auto"})
+        )
+        .is_err());
     }
 
     #[test]

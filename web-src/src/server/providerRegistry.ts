@@ -126,6 +126,8 @@ export type ProviderDriverOptionField =
   | "codexFastMode"
   | "codexServiceTier"
   | "codexImageGenerationEnabled"
+  | "codexImageResponsesModel"
+  | "codexImageTransport"
   | "grokImageGenerationEnabled"
   | "grokImageEditEnabled"
   | "grokVideoGenerationEnabled"

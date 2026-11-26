@@ -369,6 +369,32 @@ impl ResourceUsageObserver {
             .get("response")
             .or_else(|| value.get("message"))
             .unwrap_or(value);
+        // Native Images terminals report one result directly, while JSON uses
+        // data[]. Partial frames never count and cumulative counters deduplicate.
+        if matches!(
+            root.get("type").and_then(Value::as_str),
+            Some("image_generation.completed" | "image_edit.completed")
+        ) && root
+            .get("b64_json")
+            .and_then(Value::as_str)
+            .is_some_and(|image| !image.is_empty())
+        {
+            self.counter("image.output", 1);
+        }
+        if let Some(data) = root.get("data").and_then(Value::as_array) {
+            let count = data
+                .iter()
+                .filter(|item| {
+                    item.get("b64_json")
+                        .or_else(|| item.get("url"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|image| !image.is_empty())
+                })
+                .count();
+            if count > 0 {
+                self.counter("image.output", count as u64);
+            }
+        }
         if let Some(id) = root
             .get("id")
             .and_then(Value::as_str)
