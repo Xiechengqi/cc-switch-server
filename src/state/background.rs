@@ -1055,6 +1055,23 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
         return;
     }
     if !client_control_tunnel_ready(state).await {
+        if state
+            .recovered_share_tunnels_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // A registration caller may have stopped after persisting the new ID.
+            // ensure_running reuses a live matching actor and replaces a finished
+            // one, even if its last status still describes the current spec.
+            let runtime = state.tunnels.status(&tunnel::client_tunnel_key()).await;
+            let expected =
+                client_tunnel_spec_id(state, &tunnel::local_forward_addr(state.bind_addr)).await;
+            let blocked = runtime.as_ref().is_some_and(|status| {
+                status.status == "blocked" && status.spec_id.as_deref() == Some(expected.as_str())
+            });
+            if should_restore_client_tunnel(&config, runtime.as_ref()) && !blocked {
+                ensure_client_tunnel_running(state.clone(), "client_identity_recovered").await;
+            }
+        }
         // Revocation is independent of establishing a new Client/Share claim.
         // Keep deletions moving while restoration waits for the control tunnel.
         retry_pending_router_share_deletes(state.clone()).await;
@@ -1064,17 +1081,20 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
         .router_registration_reconcile_pending
         .swap(false, std::sync::atomic::Ordering::AcqRel)
     {
-        match reconcile_all_shares_to_router(state.clone()).await {
+        let reconciliation = reconcile_all_shares_to_router(state.clone()).await;
+        rebind_recovered_share_tunnels(state).await;
+        retry_pending_router_share_deletes(state.clone()).await;
+        state.retry_pending_setup_completion_notification().await;
+        match reconciliation {
             Ok(_) => state.router_share_sync_wakeup.notify_one(),
             Err(error) => {
                 state
                     .router_registration_reconcile_pending
                     .store(true, std::sync::atomic::Ordering::Release);
                 tracing::warn!(%error, "background Router registration reconciliation remains pending");
+                state.flush_router_model_health_refreshes(true).await;
             }
         }
-        retry_pending_router_share_deletes(state.clone()).await;
-        state.retry_pending_setup_completion_notification().await;
         return;
     }
     // Startup/reader capability upgrades must backfill already-acknowledged Shares too.
@@ -1102,6 +1122,7 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
     if state.router_share_prune_retry_requested() {
         if let Err(error) = reconcile_all_shares_to_router(state.clone()).await {
             tracing::warn!(error = %error, "periodic router share prune snapshot retry failed");
+            state.flush_router_model_health_refreshes(true).await;
         }
         return;
     }
@@ -1129,7 +1150,7 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
             tracing::warn!(share_id = %share_id, error = %error, "periodic router share sync retry failed");
         }
     }
-    state.flush_router_model_health_refreshes().await;
+    state.flush_router_model_health_refreshes(false).await;
 }
 
 pub fn spawn_share_edit_event_listener(state: ServerState) {

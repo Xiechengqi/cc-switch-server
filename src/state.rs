@@ -1172,6 +1172,7 @@ pub struct ServerStateInner {
     setup_completion_notification_flight: AsyncMutex<()>,
     router_share_prune_retry_pending: std::sync::atomic::AtomicBool,
     router_registration_reconcile_pending: std::sync::atomic::AtomicBool,
+    recovered_share_tunnels_pending: std::sync::atomic::AtomicBool,
     // Low bit marks degraded persistence; upper bits form a monotonic failure generation.
     credential_persistence_state: std::sync::atomic::AtomicU64,
     credential_persistence_retry_scheduled: std::sync::atomic::AtomicBool,
@@ -7629,6 +7630,7 @@ impl ServerStateInner {
             setup_completion_notification_flight: AsyncMutex::new(()),
             router_share_prune_retry_pending: std::sync::atomic::AtomicBool::new(false),
             router_registration_reconcile_pending: std::sync::atomic::AtomicBool::new(false),
+            recovered_share_tunnels_pending: std::sync::atomic::AtomicBool::new(false),
             credential_persistence_state: std::sync::atomic::AtomicU64::new(0),
             credential_persistence_retry_scheduled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -8641,7 +8643,7 @@ impl ServerStateInner {
             anyhow::bail!("router installation register returned an empty installation id");
         }
 
-        self.mutate_config_immediate(|config| {
+        let (identity, recovered) = self.mutate_config_immediate(|config| {
             let current_api_base = config
                 .router_api_base()
                 .map(str::trim)
@@ -8658,9 +8660,8 @@ impl ServerStateInner {
             if current.public_key.trim() != expected_public_key.trim() {
                 anyhow::bail!("pending router identity changed while registration was in progress");
             }
-            if !current.installation_id.is_empty()
-                && current.installation_id != installation_id
-                && !response.previous_installation_ids.contains(&current.installation_id)
+            let recovered = !current.installation_id.is_empty() && current.installation_id != installation_id;
+            if recovered && !response.previous_installation_ids.contains(&current.installation_id)
             {
                 anyhow::bail!("client_identity_recovery_required: Router returned a different Client ID; original identity and local accounts were preserved");
             }
@@ -8683,9 +8684,19 @@ impl ServerStateInner {
                 config.router.last_register_error = None;
                 config.router.last_registered_at_ms = Some(registered_at_ms);
             }
-            Ok(identity)
+            Ok((identity, recovered))
         })
-        .await
+        .await?;
+        if recovered {
+            // Publish only after the canonical ID is durable. A process restart
+            // reconstructs the same work from enabled Shares in restore_tunnels.
+            self.recovered_share_tunnels_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.router_registration_reconcile_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.router_share_sync_wakeup.notify_one();
+        }
+        Ok(identity)
     }
 
     async fn record_router_registration_error(&self, message: String) -> anyhow::Result<()> {
@@ -22001,6 +22012,35 @@ fn share_tunnel_restore_ids(shares: &[crate::domain::sharing::shares::Share]) ->
         .collect()
 }
 
+/// Called by the Share coordinator with the canonical Client control tunnel ready.
+/// Checking the spec in the manager's slot lock also handles concurrent restarts.
+async fn rebind_recovered_share_tunnels(state: &ServerState) {
+    if !state
+        .recovered_share_tunnels_pending
+        .swap(false, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+    if !client_control_tunnel_ready(state).await {
+        state
+            .recovered_share_tunnels_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        state
+            .router_registration_reconcile_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        return;
+    }
+    let ids = share_tunnel_restore_ids(&state.shares.read().await.shares);
+    for id in ids {
+        if ensure_share_tunnel_running_for(state.clone(), &id, "client_identity_recovered")
+            .await
+            .is_some()
+        {
+            state.queue_router_model_health_refresh(&id).await;
+        }
+    }
+}
+
 pub async fn ensure_share_tunnel_running(
     state: ServerState,
     share_id: &str,
@@ -23306,7 +23346,10 @@ impl ServerStateInner {
         self.router_share_sync_wakeup.notify_one();
     }
 
-    pub(super) async fn flush_router_model_health_refreshes(self: &Arc<Self>) {
+    pub(super) async fn flush_router_model_health_refreshes(
+        self: &Arc<Self>,
+        confirm_descriptors_individually: bool,
+    ) {
         if !client_control_tunnel_ready(self).await {
             return;
         }
@@ -23318,7 +23361,10 @@ impl ServerStateInner {
         );
         futures_util::stream::iter(pending)
             .for_each_concurrent(4, |share_id| {
-                self.flush_one_router_model_health_refresh(share_id)
+                self.flush_one_router_model_health_refresh(
+                    share_id,
+                    confirm_descriptors_individually,
+                )
             })
             .await;
     }
@@ -23332,7 +23378,22 @@ impl ServerStateInner {
             .insert(share_id);
     }
 
-    async fn flush_one_router_model_health_refresh(self: &Arc<Self>, share_id: String) {
+    async fn share_transport_matches(&self, key: &str, spec: &str) -> bool {
+        self.tunnels.has_live_actor(key).await
+            && self.tunnels.status(key).await.is_some_and(|status| {
+                matches!(
+                    status.status.as_str(),
+                    "connected" | "running" | "active" | "renewing"
+                ) && status.spec_id.as_deref() == Some(spec)
+                    && status.transport_state.as_deref() == Some("active")
+            })
+    }
+
+    async fn flush_one_router_model_health_refresh(
+        self: &Arc<Self>,
+        share_id: String,
+        confirm_descriptor: bool,
+    ) {
         let Some(subdomain) = router_share_runtime_refresh_target(self, &share_id).await else {
             if self
                 .shares
@@ -23345,30 +23406,49 @@ impl ServerStateInner {
             }
             return;
         };
-        let published = {
-            let shares = self.shares.read().await;
-            shares
-                .get(&share_id)
-                .is_some_and(|share| !shares.descriptor_projection_pending(share))
-        };
         let key = tunnel::share_tunnel_key(&share_id);
-        let expected =
-            share_tunnel_spec_id(self, &share_id, &tunnel::local_forward_addr(self.bind_addr))
-                .await;
-        let runtime = self.tunnels.status(&key).await;
-        let active = self.tunnels.has_live_actor(&key).await
-            && runtime.as_ref().is_some_and(|status| {
-                matches!(
-                    status.status.as_str(),
-                    "connected" | "running" | "active" | "renewing"
-                ) && status.spec_id.as_deref() == Some(expected.as_str())
-                    && status.transport_state.as_deref() == Some("active")
-            });
-        if !published || !active || !client_control_tunnel_ready(self).await {
+        let local = tunnel::local_forward_addr(self.bind_addr);
+        let expected = share_tunnel_spec_id(self, &share_id, &local).await;
+        if !self.share_transport_matches(&key, &expected).await {
             self.requeue_router_model_health_refresh(share_id);
             return;
         }
         let config = self.config_snapshot().await;
+        if confirm_descriptor {
+            // A failed full snapshot may include a different, invalid Share.
+            // Sign the individual descriptor and the health update with the same identity.
+            let confirmed = {
+                let _sync = self.lock_router_share_sync().await;
+                if client_control_tunnel_ready(self).await {
+                    sync_one_share_to_router_locked_with_policy(self, &config, &share_id, true)
+                        .await
+                } else {
+                    Ok(false)
+                }
+            };
+            if let Err(error) = &confirmed {
+                tracing::debug!(%share_id, %error, "individual Share descriptor confirmation pending");
+            }
+            if !matches!(confirmed, Ok(true))
+                || share_tunnel_spec_id(self, &share_id, &local).await != expected
+                || !self.share_transport_matches(&key, &expected).await
+            {
+                self.requeue_router_model_health_refresh(share_id);
+                return;
+            }
+        }
+        let published = {
+            let shares = self.shares.read().await;
+            shares.get(&share_id).is_some_and(|share| {
+                should_restore_share_tunnel(share)
+                    && share.tunnel_subdomain.as_deref().map(str::trim) == Some(subdomain.as_str())
+                    && !shares.descriptor_projection_pending(share)
+            })
+        };
+        if !published || !client_control_tunnel_ready(self).await {
+            self.requeue_router_model_health_refresh(share_id);
+            return;
+        }
         let result = async {
             let domain = client::canonicalize_share_subdomain(&config, &subdomain)?;
             let http = self.http_client().await;
@@ -23651,28 +23731,27 @@ async fn sync_one_share_to_router_locked(
     state: &ServerState,
     share_id: &str,
 ) -> anyhow::Result<()> {
-    sync_one_share_to_router_locked_with_policy(state, share_id, false).await
+    let config = state.config_snapshot().await;
+    sync_one_share_to_router_locked_with_policy(state, &config, share_id, false)
+        .await
+        .map(|_| ())
 }
 
+/// True only if the Router accepted an upsert for this Share.
 async fn sync_one_share_to_router_locked_with_policy(
     state: &ServerState,
+    config: &ServerConfig,
     share_id: &str,
     force: bool,
-) -> anyhow::Result<()> {
-    let config = state.config_snapshot().await;
+) -> anyhow::Result<bool> {
     if !config.has_registered_router_identity() {
         anyhow::bail!("router installation is not registered");
     }
     {
         let store = state.shares.read().await;
-        let blocked_by_delete = store.has_pending_router_delete_for_share(share_id);
-        if blocked_by_delete {
-            return Ok(());
+        if store.has_pending_router_delete_for_share(share_id) || store.get(share_id).is_none() {
+            return Ok(false);
         }
-        let Some(share) = store.shares.iter().find(|share| share.id == share_id) else {
-            return Ok(());
-        };
-        let _ = share;
     }
     let operations = build_router_share_upsert_ops_with_policy(
         state,
@@ -23681,26 +23760,26 @@ async fn sync_one_share_to_router_locked_with_policy(
     )
     .await?;
     if operations.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let http_client = state.http_client().await;
     let result =
-        push_router_share_operations(state, &http_client, &config, operations.clone()).await;
+        push_router_share_operations(state, &http_client, config, operations.clone()).await;
     match &result {
         Ok(outcome) => {
             mark_router_share_upserts_synced_with_outcome(
                 state,
-                &config,
+                config,
                 &operations,
                 outcome.clone(),
             )
             .await;
         }
         Err(error) => {
-            mark_router_share_upserts_failed(state, &config, &operations, error.to_string()).await;
+            mark_router_share_upserts_failed(state, config, &operations, error.to_string()).await;
         }
     }
-    result.map(|_| ())
+    result.map(|_| true)
 }
 
 pub(crate) async fn reconcile_router_share_after_failed_claim(
@@ -23725,7 +23804,10 @@ pub(crate) async fn reconcile_router_share_after_failed_claim(
             .map(|_| ())
     } else if current_exists {
         let _sync = state.lock_router_share_sync().await;
-        sync_one_share_to_router_locked_with_policy(state, share_id, true).await
+        let config = state.config_snapshot().await;
+        sync_one_share_to_router_locked_with_policy(state, &config, share_id, true)
+            .await
+            .map(|_| ())
     } else {
         anyhow::bail!(
             "cannot reconcile Router Share {share_id}: no current Share or pending delete"
@@ -25600,7 +25682,7 @@ mod tests {
             .tunnels
             .stop(&tunnel::client_tunnel_key(), "connected")
             .await;
-        state.flush_router_model_health_refreshes().await;
+        state.flush_router_model_health_refreshes(false).await;
         assert_eq!(
             state
                 .router_model_health_refresh_pending
@@ -25612,7 +25694,7 @@ mod tests {
         assert_eq!(router.runtime_refreshes.load(AtomicOrdering::SeqCst), 0);
 
         configure_registered_test_router(&state, &router_url, "health-client").await;
-        state.flush_router_model_health_refreshes().await;
+        state.flush_router_model_health_refreshes(false).await;
         assert_eq!(router.runtime_refreshes.load(AtomicOrdering::SeqCst), 0);
         let spec = share_tunnel_spec_id(
             &state,
@@ -25624,11 +25706,11 @@ mod tests {
             .tunnels
             .mock_active_tunnel(tunnel::share_tunnel_key("health0"), "share-http", spec)
             .await;
-        state.flush_router_model_health_refreshes().await;
+        state.flush_router_model_health_refreshes(false).await;
         assert_eq!(router.runtime_refreshes.load(AtomicOrdering::SeqCst), 0);
         assert!(router.batch_sizes.lock().await.is_empty());
         sync_one_share_to_router(&state, "health0").await.unwrap();
-        state.flush_router_model_health_refreshes().await;
+        state.flush_router_model_health_refreshes(false).await;
         assert_eq!(router.runtime_refreshes.load(AtomicOrdering::SeqCst), 1);
         assert!(state
             .router_model_health_refresh_pending
@@ -25701,7 +25783,7 @@ mod tests {
         state.queue_router_model_health_refresh("health0").await;
         let flushing = state.clone();
         let flush =
-            tokio::spawn(async move { flushing.flush_router_model_health_refreshes().await });
+            tokio::spawn(async move { flushing.flush_router_model_health_refreshes(false).await });
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
             .unwrap();
@@ -25724,30 +25806,243 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
-    async fn model_health_refresh_is_rebuilt_for_enabled_shares_after_restart() {
-        let state = test_state();
-        state.mutate_providers_immediate(|store| {
+    async fn create_recovery_shares(
+        state: &ServerState,
+        prefix: &'static str,
+        second_enabled: bool,
+    ) {
+        state.mutate_providers_immediate(move |store| {
             for index in 0..2 {
-                let id = format!("provider-restoredhealth-{index}");
+                let id = format!("provider-{prefix}-{index}");
                 let mut provider = test_provider(&id, &id);
-                provider.settings_config = json!({"auth":{"OPENAI_API_KEY":"restart-fixture-key"},"modelMapping":{"mode":"passthrough"}});
+                provider.settings_config = json!({"auth":{"OPENAI_API_KEY":format!("fixture-{prefix}-{index}")},"modelMapping":{"mode":"passthrough"}});
                 provider.meta = Some(ProviderMeta {provider_type:Some("codex".into()),..Default::default()});
                 store.upsert_with_resource(AppKind::Codex, provider, provider_resource("codex.openai_api_key", 1));
             }
         }).await.unwrap();
-        create_router_shares(&state, "restoredhealth", 2).await;
+        create_router_shares(state, prefix, 2).await;
         state
             .mutate_shares_immediate(|store| {
                 store
                     .shares
                     .iter_mut()
-                    .find(|share| share.id == "restoredhealth1")
+                    .find(|share| share.id == format!("{prefix}1"))
                     .unwrap()
-                    .enabled = false;
+                    .enabled = second_enabled;
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn identity_recovery_rebinds_enabled_shares_after_the_canonical_client_is_ready() {
+        let (url, _, server) =
+            spawn_share_prune_mock_router(Vec::<String>::new(), StatusCode::OK).await;
+        let state = test_state();
+        create_recovery_shares(&state, "recover", false).await;
+        configure_registered_test_router(&state, &url, "temporary").await;
+        state
+            .mutate_config_immediate(|config| {
+                config.auth.password_hash = Some("configured".into());
+                config.owner.email = Some("owner@example.com".into());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let active = tunnel::share_tunnel_key("recover0");
+        let local = tunnel::local_forward_addr(state.bind_addr);
+        let previous_spec = share_tunnel_spec_id(&state, "recover0", &local).await;
+        state
+            .tunnels
+            .mock_active_tunnel(active.clone(), "share-http", previous_spec.clone())
+            .await;
+        let key = state
+            .config_snapshot()
+            .await
+            .router
+            .identity
+            .unwrap()
+            .public_key;
+        let response = || client::RegisterInstallationResponse {
+            installation_id: "canonical".into(),
+            control_secret: "registered-secret".into(),
+            previous_installation_ids: vec!["temporary".into()],
+        };
+        state
+            .merge_router_registration_response(&url, &key, response(), None)
+            .await
+            .unwrap();
+        assert!(!client_control_tunnel_ready(&state).await);
+        run_periodic_share_sync_retry_once(&state).await;
+        assert_eq!(
+            state.tunnels.status(&active).await.unwrap().spec_id,
+            Some(previous_spec)
+        );
+
+        let canonical = client_tunnel_spec_id(&state, &local).await;
+        let control = tunnel::client_tunnel_key();
+        state
+            .tunnels
+            .mock_active_client_tunnel(canonical.clone())
+            .await;
+        state.tunnels.stop(&control, "blocked").await;
+        run_periodic_share_sync_retry_once(&state).await;
+        assert_eq!(
+            state.tunnels.status(&control).await.unwrap().status,
+            "blocked"
+        );
+        assert!(!state.tunnels.has_live_actor(&control).await);
+        // A recoverable status for the same spec can also outlive its actor.
+        state.tunnels.stop(&control, "retrying").await;
+        let previous_generation = state.tunnels.status(&control).await.unwrap().generation;
+        run_periodic_share_sync_retry_once(&state).await;
+        assert!(state.tunnels.status(&control).await.unwrap().generation > previous_generation);
+        state.tunnels.mock_active_client_tunnel(canonical).await;
+        run_periodic_share_sync_retry_once(&state).await;
+        let restored = state.tunnels.status(&active).await.unwrap();
+        assert_eq!(
+            restored.spec_id,
+            Some(share_tunnel_spec_id(&state, "recover0", &local).await)
+        );
+        assert!(restored.generation > 1);
+        assert!(state
+            .tunnels
+            .status(&tunnel::share_tunnel_key("recover1"))
+            .await
+            .is_none());
+        assert!(state
+            .router_model_health_refresh_pending
+            .lock()
+            .unwrap()
+            .contains("recover0"));
+
+        state
+            .merge_router_registration_response(&url, &key, response(), None)
+            .await
+            .unwrap();
+        assert!(!state
+            .recovered_share_tunnels_pending
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            state.tunnels.status(&active).await.unwrap().generation,
+            restored.generation
+        );
+        state.tunnels.stop(&active, "stopped").await;
+        state
+            .tunnels
+            .stop(&tunnel::client_tunnel_key(), "stopped")
+            .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn identity_recovery_confirms_healthy_shares_when_a_peer_blocks_the_batch() {
+        async fn descriptors(Json(request): Json<Value>) -> (StatusCode, Json<Value>) {
+            let shares: Vec<_> = request["ops"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|op| &op["share"])
+                .collect();
+            if request["installationId"] == "canonical"
+                && shares.iter().any(|s| s["shareId"] == "partial1")
+            {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"message":"Share host conflict"})),
+                );
+            }
+            let acks: Vec<_> = shares.iter().map(|s| json!({
+                "shareId": s["shareId"], "descriptorFingerprint": s["descriptorFingerprint"],
+                "descriptorGeneration": s["descriptorGeneration"], "applied": true
+            })).collect();
+            (StatusCode::OK, Json(json!({"ok": true, "acks": acks})))
+        }
+        async fn refresh(
+            AxumState(sent): AxumState<Arc<TokioMutex<Vec<Value>>>>,
+            Json(request): Json<Value>,
+        ) -> StatusCode {
+            sent.lock().await.push(request);
+            StatusCode::OK
+        }
+        let sent = Arc::new(TokioMutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/shares/descriptor-batch-sync", post(descriptors))
+            .route("/v1/shares/runtime-refresh", post(refresh))
+            .with_state(sent.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state();
+        configure_registered_test_router(&state, &url, "temporary").await;
+        create_recovery_shares(&state, "partial", true).await;
+        let ids = ["partial0".to_string(), "partial1".to_string()];
+        // Both descriptors already had a matching generation and fingerprint
+        // acknowledged by the temporary installation.
+        sync_shares_to_router_with_policy(&state, &ids, true)
+            .await
+            .unwrap();
+        let key = state
+            .config_snapshot()
+            .await
+            .router
+            .identity
+            .unwrap()
+            .public_key;
+        state
+            .merge_router_registration_response(
+                &url,
+                &key,
+                client::RegisterInstallationResponse {
+                    installation_id: "canonical".into(),
+                    control_secret: "secret".into(),
+                    previous_installation_ids: vec!["temporary".into()],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let local = tunnel::local_forward_addr(state.bind_addr);
+        state
+            .tunnels
+            .mock_active_client_tunnel(client_tunnel_spec_id(&state, &local).await)
+            .await;
+        for id in &ids {
+            let spec = share_tunnel_spec_id(&state, id, &local).await;
+            state
+                .tunnels
+                .mock_active_tunnel(tunnel::share_tunnel_key(id), "share-http", spec)
+                .await;
+        }
+        run_periodic_share_sync_retry_once(&state).await;
+        {
+            let sent = sent.lock().await;
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0]["installationId"], "canonical");
+            assert_eq!(sent[0]["refresh"]["shareId"], "partial0");
+        }
+        {
+            let pending = state.router_model_health_refresh_pending.lock().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert!(pending.contains("partial1"));
+        }
+        for id in &ids {
+            state
+                .tunnels
+                .stop(&tunnel::share_tunnel_key(id), "stopped")
+                .await;
+        }
+        state
+            .tunnels
+            .stop(&tunnel::client_tunnel_key(), "stopped")
+            .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn model_health_refresh_is_rebuilt_for_enabled_shares_after_restart() {
+        let state = test_state();
+        create_recovery_shares(&state, "restoredhealth", false).await;
         let config_dir = state.config_dir.clone();
         drop(state);
         let restarted = test_state_at(config_dir);
@@ -25765,7 +26060,7 @@ mod tests {
             BTreeSet::from(["restoredhealth0".into()])
         );
         assert!(!client_control_tunnel_ready(&restarted).await);
-        restarted.flush_router_model_health_refreshes().await;
+        restarted.flush_router_model_health_refreshes(false).await;
         assert!(restarted.shares.read().await.last_router_error.is_none());
         restarted
             .tunnels
