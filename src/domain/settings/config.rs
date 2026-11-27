@@ -25,6 +25,9 @@ pub const ROUTER_CONTROL_DB_FILE_NAME: &str = "router-control.sqlite";
 pub struct ServerConfig {
     #[serde(skip)]
     pub workspace: Option<crate::market_lease::Grant>,
+    /// Durable local initialization. Zero records a legacy initialized config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialized_at_ms: Option<i64>,
     pub auth: AuthConfig,
     pub owner: OwnerConfig,
     pub router: RouterConfig,
@@ -509,6 +512,7 @@ impl ServerConfig {
     pub fn empty() -> Self {
         Self {
             workspace: None,
+            initialized_at_ms: None,
             auth: AuthConfig::default(),
             owner: OwnerConfig::default(),
             router: RouterConfig::default(),
@@ -560,11 +564,12 @@ impl ServerConfig {
 
         let content = fs::read_to_string(&config_path)
             .with_context(|| format!("read config {}", config_path.display()))?;
-        let config: Self = serde_json::from_str(&content)
+        let mut config: Self = serde_json::from_str(&content)
             .with_context(|| format!("parse config {}", config_path.display()))?;
         config
             .validate_provider_settings()
             .with_context(|| format!("validate config {}", config_path.display()))?;
+        config.remember_local_initialization();
         Ok(config)
     }
 
@@ -584,7 +589,9 @@ impl ServerConfig {
             stored.provider_health_check = self.provider_health_check.clone();
             &stored
         } else {
-            self
+            stored = self.clone();
+            stored.remember_local_initialization();
+            &stored
         };
         crate::infra::storage::write_json_pretty(&config_path, value)
             .with_context(|| format!("write config {}", config_path.display()))
@@ -602,6 +609,24 @@ impl ServerConfig {
             .as_ref()
             .map(|g| g.alias.as_str())
             .or(self.client.tunnel_subdomain.as_deref())
+    }
+
+    /// Transport recovery never reopens bootstrap or revokes local login.
+    pub fn is_initialized(&self) -> bool {
+        self.workspace.is_some()
+            || self.initialized_at_ms.is_some()
+            || (self.auth.password_hash.is_some()
+                && self
+                    .owner
+                    .email
+                    .as_deref()
+                    .is_some_and(|email| !email.trim().is_empty()))
+    }
+
+    pub fn remember_local_initialization(&mut self) {
+        if self.workspace.is_none() && self.initialized_at_ms.is_none() && self.is_initialized() {
+            self.initialized_at_ms = Some(0);
+        }
     }
 
     pub fn is_local_setup_complete(&self) -> bool {
@@ -648,8 +673,10 @@ impl ServerConfig {
         false
     }
 
+    /// Kept for existing Web contracts: setup is the durable local state.
+    /// Call is_router_client_ready separately for remote operations.
     pub fn is_setup_complete(&self) -> bool {
-        self.is_local_setup_complete() && self.is_router_client_ready()
+        self.is_initialized()
     }
 
     pub fn has_registered_router_identity(&self) -> bool {
@@ -756,6 +783,7 @@ impl ServerConfig {
 
         Ok(Self {
             workspace: None,
+            initialized_at_ms: Some(crate::infra::time::now_ms().min(i64::MAX as u128) as i64),
             auth: AuthConfig {
                 password_hash: Some(hash_secret(&input.password, 8)?),
                 api_token_hash: None,
@@ -1219,9 +1247,9 @@ mod tests {
     }
 
     #[test]
-    fn is_setup_complete_requires_router_claim_when_router_configured() {
+    fn is_setup_complete_survives_router_claim_failure() {
         let mut config = sample_local_complete_config();
-        assert!(!config.is_setup_complete());
+        assert!(config.is_setup_complete());
         assert!(config.is_local_setup_complete());
         assert!(!config.is_router_client_ready());
 
@@ -1231,8 +1259,22 @@ mod tests {
         config.client.tunnel_status = Some("claim_skipped".to_string());
         assert!(config.is_setup_complete());
 
-        config.client.tunnel_status = Some("pending".to_string());
-        assert!(!config.is_setup_complete());
+        config.client.tunnel_status = Some("claim_conflict".to_string());
+        assert!(config.is_setup_complete());
+    }
+
+    #[test]
+    fn legacy_initialization_is_remembered_before_transport_fields_are_repaired() {
+        let mut config = sample_local_complete_config();
+        config.initialized_at_ms = None;
+        config.client.tunnel_status = Some("claim_conflict".into());
+        config.remember_local_initialization();
+        assert_eq!(config.initialized_at_ms, Some(0));
+        config.router.url = None;
+        config.client.tunnel_subdomain = None;
+        assert!(config.is_initialized());
+        assert!(!config.is_local_setup_complete());
+        assert!(!ServerConfig::empty().is_initialized());
     }
 
     #[test]
@@ -1242,7 +1284,7 @@ mod tests {
         config.router.domain = None;
         assert!(config.is_router_client_ready());
         assert!(!config.is_local_setup_complete());
-        assert!(!config.is_setup_complete());
+        assert!(config.is_setup_complete());
     }
 
     #[test]

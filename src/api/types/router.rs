@@ -62,11 +62,15 @@ pub(in crate::api) struct RouterStatusResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(in crate::api) struct RouterConnectivityView {
+    pub(in crate::api) initialized: bool,
+    pub(in crate::api) router_configuration_ready: bool,
     pub(in crate::api) local_ready: bool,
     pub(in crate::api) registered: bool,
     pub(in crate::api) heartbeat_online: bool,
     pub(in crate::api) client_tunnel_online: bool,
     pub(in crate::api) phase: String,
+    pub(in crate::api) recovery_required: bool,
+    pub(in crate::api) reason_code: Option<String>,
     pub(in crate::api) tunnel_status: Option<String>,
     pub(in crate::api) tunnel_updated_at_ms: Option<u128>,
     pub(in crate::api) last_tunnel_error: Option<String>,

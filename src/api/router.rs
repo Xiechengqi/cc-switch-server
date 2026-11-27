@@ -169,6 +169,35 @@ pub(in crate::api) async fn issue_client_tunnel_lease(
     headers: HeaderMap,
 ) -> Result<Json<ClientTunnelLeaseResponse>, ApiError> {
     require_session(&state, &headers).await?;
+    let config = state.config_snapshot().await;
+    let runtime = state
+        .tunnels
+        .status(&crate::clients::router::tunnel::client_tunnel_key())
+        .await;
+    let recovering = config.client.tunnel_status.as_deref() == Some("claim_conflict")
+        || config
+            .router
+            .last_register_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("client_identity_recovery_required:"))
+        || runtime
+            .as_ref()
+            .is_some_and(|status| status.status == "blocked");
+    if recovering {
+        // An explicit Recheck must re-register with the existing key before
+        // starting the actor; otherwise a persisted identity block would
+        // immediately block again after the administrator repaired the Router.
+        state
+            .register_router_installation()
+            .await
+            .map_err(|error| {
+                ApiError::bad_gateway(format!("Client identity recovery recheck failed: {error}"))
+            })?;
+        state
+            .complete_router_registration_control_plane("explicit_recovery_recheck")
+            .await
+            .map_err(ApiError::internal)?;
+    }
     crate::state::ensure_client_tunnel_running(state.clone(), "client_tunnel_api_start").await;
     emit_tunnel_event(&state, "tunnel.changed", "client", "started");
     Ok(Json(ClientTunnelLeaseResponse {
@@ -405,21 +434,50 @@ async fn router_connectivity(state: &ServerState) -> RouterConnectivityView {
         .tunnels
         .status(&crate::clients::router::tunnel::client_tunnel_key())
         .await;
+    let spec = crate::state::client_tunnel_spec_id(
+        state,
+        &crate::clients::router::tunnel::local_forward_addr(state.bind_addr),
+    )
+    .await;
     let current = runtime
         .as_ref()
-        .filter(|status| status.updated_at_ms >= started_at_ms);
-    let tunnel_online = current.is_some_and(|status| {
-        status.status == "connected" && status.transport_state.as_deref() == Some("active")
-    });
+        .filter(|status| status.spec_id.as_deref() == Some(spec.as_str()));
+    let tunnel_online = crate::state::client_control_tunnel_ready(state).await;
     let registered = config.has_registered_router_identity();
     let stopped = config.client.tunnel_status.as_deref() == Some("stopped")
-        || runtime
-            .as_ref()
-            .is_some_and(|status| status.status == "stopped");
-    let phase = if !config.is_local_setup_complete() {
+        || current.is_some_and(|status| status.status == "stopped");
+    let reason_code = current
+        .and_then(|status| status.blocked_reason_code.clone())
+        .or_else(|| {
+            config
+                .router
+                .last_register_error
+                .as_deref()
+                .and_then(|error| {
+                    error
+                        .starts_with("client_identity_recovery_required:")
+                        .then(|| "client_identity_recovery_required".to_string())
+                })
+        })
+        .or_else(|| {
+            (config.client.tunnel_status.as_deref() == Some("claim_conflict"))
+                .then(|| "client_tunnel_subdomain_conflict".to_string())
+        });
+    let blocked = current.is_some_and(|status| status.status == "blocked");
+    let initialized = config.is_initialized();
+    let router_configuration_ready = config.is_local_setup_complete();
+    let phase = if !initialized {
         "setup_required"
+    } else if !router_configuration_ready {
+        "configuration_required"
     } else if stopped {
         "stopped"
+    } else if reason_code.as_deref() == Some("client_identity_recovery_required") {
+        "identity_recovery_required"
+    } else if reason_code.as_deref() == Some("client_tunnel_subdomain_conflict") {
+        "claim_conflict"
+    } else if blocked {
+        "blocked"
     } else if !registered {
         "registering"
     } else if !tunnel_online {
@@ -430,6 +488,8 @@ async fn router_connectivity(state: &ServerState) -> RouterConnectivityView {
         "online"
     };
     RouterConnectivityView {
+        initialized,
+        router_configuration_ready,
         local_ready: !state.is_shutting_down()
             && !state.credential_persistence_degraded()
             && !state.quota_usage_is_degraded(),
@@ -437,9 +497,13 @@ async fn router_connectivity(state: &ServerState) -> RouterConnectivityView {
         heartbeat_online,
         client_tunnel_online: tunnel_online,
         phase: phase.into(),
+        recovery_required: reason_code.is_some() || blocked,
+        reason_code,
         tunnel_status: current.map(|status| status.status.clone()),
         tunnel_updated_at_ms: current.map(|status| status.updated_at_ms),
-        last_tunnel_error: current.and_then(|status| status.last_error.clone()),
+        last_tunnel_error: current
+            .and_then(|status| status.last_error.clone())
+            .or(config.router.last_register_error),
     }
 }
 

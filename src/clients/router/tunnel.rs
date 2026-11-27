@@ -51,8 +51,19 @@ const TUNNELS_FILE_NAME: &str = "tunnels.json";
 pub struct LeaseIssueDeferred;
 
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct LeaseIssueBlocked(pub String);
+#[error("{message}")]
+pub struct LeaseIssueBlocked {
+    pub code: &'static str,
+    pub message: String,
+}
+impl LeaseIssueBlocked {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
 const LEASE_RENEW_MIN_DELAY: Duration = Duration::from_secs(5);
 const LEASE_RENEW_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 const LEASE_ISSUE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -193,6 +204,8 @@ pub struct TunnelRuntimeStatus {
     pub remote_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected_at_ms: Option<u128>,
     #[serde(default)]
@@ -507,7 +520,12 @@ impl TunnelSupervisor {
 
     #[cfg(test)]
     pub(crate) async fn mock_active_client_tunnel(&self, spec_id: String) {
-        let key = client_tunnel_key();
+        self.mock_active_tunnel(client_tunnel_key(), "client-web", spec_id)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn mock_active_tunnel(&self, key: String, kind: &str, spec_id: String) {
         self.stop(&key, "stopped").await;
         let slot = Arc::new(Mutex::new(TunnelTaskSlot {
             generation: 1,
@@ -521,8 +539,9 @@ impl TunnelSupervisor {
             key.clone(),
             TunnelRuntimeStatus {
                 key,
-                kind: "client-web".into(),
+                kind: kind.into(),
                 status: "connected".into(),
+                transport_state: Some("active".into()),
                 generation: 1,
                 desired_generation: 1,
                 spec_id: Some(spec_id),
@@ -815,7 +834,7 @@ async fn run_tunnel_actor(
             Ok(Err(error)) => {
                 let error_message = error.to_string();
                 last_attempt_error = Some(error_message.clone());
-                if error.downcast_ref::<LeaseIssueBlocked>().is_some() {
+                if let Some(blocked) = error.downcast_ref::<LeaseIssueBlocked>() {
                     set_status_for_generation(
                         &statuses,
                         &store_path,
@@ -823,7 +842,8 @@ async fn run_tunnel_actor(
                             key: key.clone(),
                             kind: kind.clone(),
                             status: "blocked".into(),
-                            last_error: Some(error_message),
+                            blocked_reason_code: Some(blocked.code.to_string()),
+                            last_error: Some(error_message.clone()),
                             generation,
                             desired_generation: generation,
                             start_reason: Some(reason.clone()),
@@ -833,7 +853,8 @@ async fn run_tunnel_actor(
                         },
                     )
                     .await;
-                    tracing::warn!(tunnel_key=%key,"Client identity needs recovery; automatic tunnel retries suspended");
+                    tracing::warn!(tunnel_key=%key, reason_code=blocked.code, error=%error_message,
+                        "Client tunnel recovery is blocked; original identity and local data were preserved; administrator recovery is required");
                     break;
                 }
                 if error.downcast_ref::<LeaseIssueDeferred>().is_some() {
@@ -1968,6 +1989,61 @@ mod tests {
 
     fn pending_tunnel_control_fn() -> ActivateTunnelFn {
         Arc::new(|_| Box::pin(std::future::pending()))
+    }
+
+    #[tokio::test]
+    async fn blocked_identity_records_reason_and_stops_automatic_lease_retries() {
+        let dir = temp_config_dir("identity-blocked");
+        let supervisor = TunnelSupervisor::load_or_default(&dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let lease: LeaseFn = {
+            let calls = calls.clone();
+            Arc::new(move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(LeaseIssueBlocked::new(
+                        "client_tunnel_subdomain_conflict",
+                        "reserved domain requires original Client identity",
+                    )
+                    .into())
+                })
+            })
+        };
+        supervisor
+            .ensure_running(
+                client_tunnel_key(),
+                "client-web",
+                "127.0.0.1:9".into(),
+                lease,
+                pending_tunnel_control_fn(),
+                pending_tunnel_control_fn(),
+                pending_renew_fn(),
+                "startup_restore",
+                "current-client-spec",
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while supervisor.has_live_actor(&client_tunnel_key()).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let loaded = TunnelSupervisor::load_or_default(&dir).unwrap();
+        let status = loaded.status(&client_tunnel_key()).await.unwrap();
+        assert_eq!(status.status, "blocked");
+        assert_eq!(
+            status.blocked_reason_code.as_deref(),
+            Some("client_tunnel_subdomain_conflict")
+        );
+        assert!(status
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("original Client identity"));
+        assert!(status.tunnel_url.is_none());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

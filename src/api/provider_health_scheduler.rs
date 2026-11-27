@@ -1627,34 +1627,7 @@ fn is_transient_probe_category(category: &str) -> bool {
 }
 
 async fn notify_runtime_refresh(state: &ServerState, share: &Share) {
-    let Some(subdomain) = share
-        .tunnel_subdomain
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return;
-    };
-    let config = state.config_snapshot().await;
-    if config.router_api_base().is_none() || !config.has_registered_router_identity() {
-        return;
-    }
-    let http = state.http_client().await;
-    if let Err(error) = crate::clients::router::client::notify_runtime_refresh(
-        &http,
-        &config,
-        share.id.clone(),
-        subdomain.to_string(),
-    )
-    .await
-    {
-        tracing::warn!(
-            share_id = %share.id,
-            subdomain,
-            error = %error,
-            "notify Router model health refresh failed"
-        );
-    }
+    state.queue_router_model_health_refresh(&share.id).await;
 }
 
 async fn notify_runtime_refreshes(state: &ServerState, shares: Vec<Share>) {

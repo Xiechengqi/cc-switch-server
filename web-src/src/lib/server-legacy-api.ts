@@ -787,11 +787,13 @@ export interface TunnelRuntimeStatus {
   leaseExpiresAt?: string | null;
   remotePort?: number | null;
   lastError?: string | null;
+  blockedReasonCode?: string | null;
   connectedAtMs?: number | null;
   generation: number;
   desiredGeneration: number;
   transportState?: string | null;
   startReason?: string | null;
+  specId?: string | null;
   updatedAtMs: number;
 }
 
@@ -809,6 +811,22 @@ export interface RouterStatusResponse {
   lastError?: string | null;
   lastHeartbeatMs?: number | null;
   pendingRequestLogSync: number;
+  connectivity: RouterConnectivity;
+}
+
+export interface RouterConnectivity {
+  initialized: boolean;
+  routerConfigurationReady: boolean;
+  localReady: boolean;
+  registered: boolean;
+  heartbeatOnline: boolean;
+  clientTunnelOnline: boolean;
+  phase: string;
+  recoveryRequired: boolean;
+  reasonCode?: string | null;
+  tunnelStatus?: string | null;
+  tunnelUpdatedAtMs?: number | null;
+  lastTunnelError?: string | null;
 }
 
 export interface ShareSyncDiagnostic {

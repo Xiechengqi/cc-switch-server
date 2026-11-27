@@ -159,8 +159,20 @@ pub async fn serve(state: ServerState) -> anyhow::Result<()> {
     state
         .market_workspace
         .seal_expired(chrono::Utc::now().timestamp())?;
-    if !state.config.read().await.is_setup_complete() {
+    let config = state.config_snapshot().await;
+    if !config.is_initialized() {
         crate::setup::log_setup_required_hints(&state);
+    } else if !config.is_local_setup_complete() {
+        tracing::warn!(
+            reason_code = "router_configuration_required",
+            "Local setup is complete; repair the Router configuration through the existing local console"
+        );
+    } else if !config.is_router_client_ready() {
+        tracing::info!(
+            installation_id = ?config.router.identity.as_ref().map(|identity| &identity.installation_id),
+            subdomain = ?config.client.tunnel_subdomain,
+            "Local setup is complete; Router registration and Client tunnel recovery continue in the background"
+        );
     }
 
     let app = app_router(state.clone());
@@ -6398,6 +6410,7 @@ mod grok_catalog_provider_tests {
     }
     include!("buddy_catalog_tests.rs");
     include!("zen_catalog_tests.rs");
+    include!("client_recovery_tests.rs");
 }
 
 async fn web_runtime_context(

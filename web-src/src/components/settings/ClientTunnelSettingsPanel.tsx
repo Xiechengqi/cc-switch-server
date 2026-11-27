@@ -45,7 +45,15 @@ export function ClientTunnelSettingsPanel({
     [settings],
   );
   const currentOwnerEmail = clientTunnel?.config?.ownerEmail?.trim() ?? "";
-  const isRunning = Boolean(clientTunnel?.status?.info);
+  const recoveryRequired = Boolean(clientTunnel?.status?.recoveryRequired);
+  const isRunning =
+    Boolean(clientTunnel?.status?.info?.healthy) && !recoveryRequired;
+  const isConnecting =
+    !recoveryRequired &&
+    !isRunning &&
+    ["starting", "connecting", "reconnecting", "retrying", "waiting_client"].includes(
+      clientTunnel?.status?.tunnelStatus ?? "",
+    );
   const isToggling = startMutation.isPending || stopMutation.isPending;
 
   useEffect(() => {
@@ -54,21 +62,25 @@ export function ClientTunnelSettingsPanel({
   }, [onFormStateChange]);
 
   const handleToggleTunnel = useCallback(async () => {
-    if (isRunning) {
+    if (isRunning || isConnecting) {
       await stopMutation.mutateAsync();
       return;
     }
     await startMutation.mutateAsync();
-  }, [isRunning, startMutation, stopMutation]);
+  }, [isRunning, isConnecting, startMutation, stopMutation]);
 
-  const statusLabel = isRunning
-    ? t("settings.share.clientTunnel.running", { defaultValue: "运行中" })
-    : clientTunnel?.status?.lastError
-      ? t("settings.share.clientTunnel.failed", {
-          defaultValue: "失败: {{error}}",
-          error: clientTunnel.status.lastError,
-        })
-      : t("settings.share.clientTunnel.stopped", { defaultValue: "未运行" });
+  const statusLabel = recoveryRequired
+    ? t("settings.share.clientTunnel.recoveryRequired")
+    : isRunning
+      ? t("settings.share.clientTunnel.running", { defaultValue: "运行中" })
+      : isConnecting
+        ? t("settings.share.clientTunnel.connecting")
+        : clientTunnel?.status?.lastError
+          ? t("settings.share.clientTunnel.failed", {
+              defaultValue: "失败: {{error}}",
+              error: clientTunnel.status.lastError,
+            })
+          : t("settings.share.clientTunnel.stopped", { defaultValue: "未运行" });
 
   const body = (
     <>
@@ -137,18 +149,35 @@ export function ClientTunnelSettingsPanel({
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-xs text-muted-foreground">{statusLabel}</span>
+        <span className="text-xs text-muted-foreground" role="status">
+          {statusLabel}
+        </span>
         <Button
           variant="outline"
           size="sm"
           disabled={isToggling}
           onClick={() => void handleToggleTunnel()}
         >
-          {isRunning
+          {recoveryRequired
+            ? t("settings.share.clientTunnel.recheckRecovery")
+            : isRunning || isConnecting
             ? t("settings.share.clientTunnel.stop", { defaultValue: "停止" })
             : t("settings.share.clientTunnel.start", { defaultValue: "启动" })}
         </Button>
       </div>
+      {recoveryRequired && (
+        <div className="rounded-lg border border-amber-500/25 bg-amber-500/5 p-3 text-sm text-muted-foreground">
+          <p>{t("settings.share.clientTunnel.recoveryHint")}</p>
+          {clientTunnel?.status.lastError && (
+            <details className="mt-2 text-xs">
+              <summary className="cursor-pointer">
+                {t("settings.share.clientTunnel.errorDetails")}
+              </summary>
+              <p className="mt-2 break-words">{clientTunnel.status.lastError}</p>
+            </details>
+          )}
+        </div>
+      )}
     </>
   );
 

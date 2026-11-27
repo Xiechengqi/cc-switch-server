@@ -75,6 +75,12 @@ jobs:
           cargo test --locked market_termination --lib
           cargo test --locked market_lease:: --lib
           cargo test --locked market_workspace_roles --lib
+          cargo test --locked identity_recovery --lib
+          cargo test --locked model_health_refresh_ --lib
+          cargo test --locked local_initialization_ --lib
+          cargo test --locked blocked_identity_records_reason_ --lib
+          cargo test --locked client_control_readiness_ --lib
+          cargo test --locked registration_cannot_silently_replace_a_known_client_identity --lib
           cargo test --locked workspace_nonces --lib
           cargo test --locked repository::server_sqlite::schema::tests --lib
           cargo test --locked opening_usd --lib

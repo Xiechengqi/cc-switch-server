@@ -1030,10 +1030,15 @@
     },
     "share": {
       "clientTunnel": {
+        "connecting": "Connecting to Router",
         "description": "The Client subdomain is selected during setup and is read-only afterward.",
+        "errorDetails": "Error details",
         "failed": "Failed: {{error}}",
         "ownerEmail": "Owner email",
         "running": "Running",
+        "recoveryRequired": "Client identity or subdomain recovery required",
+        "recoveryHint": "Your configuration and Provider accounts are preserved. Ask the Router administrator to verify the original Client identity and subdomain, then select Recheck after recovery. You do not need to run setup again or clear local data.",
+        "recheckRecovery": "Recheck",
         "start": "Start",
         "stop": "Stop",
         "stopped": "Stopped",

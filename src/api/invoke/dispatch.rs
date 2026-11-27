@@ -966,14 +966,7 @@ async fn web_invoke_dispatch(
         }
         "get_client_tunnel" => Ok(web_client_tunnel_state(state).await),
         "get_client_tunnel_status" => {
-            if state.market_workspace.access().1.is_some() {
-                return Ok(web_client_tunnel_state(state).await["status"].clone());
-            }
-            let runtime = state
-                .tunnels
-                .status(&crate::clients::router::tunnel::client_tunnel_key())
-                .await;
-            Ok(web_client_tunnel_share_status(runtime))
+            Ok(web_client_tunnel_state(state).await["status"].clone())
         }
         "get_share_health_status" => Ok(web_share_health_status(state).await),
         "check_client_tunnel_subdomain" => {

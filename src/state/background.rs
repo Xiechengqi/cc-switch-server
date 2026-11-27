@@ -1064,11 +1064,14 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
         .router_registration_reconcile_pending
         .swap(false, std::sync::atomic::Ordering::AcqRel)
     {
-        if let Err(error) = reconcile_all_shares_to_router(state.clone()).await {
-            state
-                .router_registration_reconcile_pending
-                .store(true, std::sync::atomic::Ordering::Release);
-            tracing::warn!(%error, "background Router registration reconciliation remains pending");
+        match reconcile_all_shares_to_router(state.clone()).await {
+            Ok(_) => state.router_share_sync_wakeup.notify_one(),
+            Err(error) => {
+                state
+                    .router_registration_reconcile_pending
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::warn!(%error, "background Router registration reconciliation remains pending");
+            }
         }
         retry_pending_router_share_deletes(state.clone()).await;
         state.retry_pending_setup_completion_notification().await;
@@ -1126,6 +1129,7 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
             tracing::warn!(share_id = %share_id, error = %error, "periodic router share sync retry failed");
         }
     }
+    state.flush_router_model_health_refreshes().await;
 }
 
 pub fn spawn_share_edit_event_listener(state: ServerState) {

@@ -2278,6 +2278,13 @@ pub(in crate::api) fn web_client_tunnel_share_status(
     let last_error = runtime
         .as_ref()
         .and_then(|status| status.last_error.clone());
+    let tunnel_status = runtime.as_ref().map(|status| status.status.clone());
+    let blocked_reason_code = runtime
+        .as_ref()
+        .and_then(|status| status.blocked_reason_code.clone());
+    let recovery_required = runtime
+        .as_ref()
+        .is_some_and(|status| status.status == "blocked");
     let info = runtime.and_then(|status| {
         let tunnel_url = status.tunnel_url.clone()?;
         Some(json!({
@@ -2296,6 +2303,9 @@ pub(in crate::api) fn web_client_tunnel_share_status(
     json!({
         "info": info,
         "lastError": last_error,
+        "tunnelStatus": tunnel_status,
+        "blockedReasonCode": blocked_reason_code,
+        "recoveryRequired": recovery_required,
         "requiresOwnerLogin": false,
     })
 }
@@ -2340,19 +2350,29 @@ pub(in crate::api) async fn web_configure_share_tunnel(
 }
 
 pub(in crate::api) async fn web_client_tunnel_state(state: &ServerState) -> Value {
-    let config = state.config.read().await;
-    let ui_settings = state.ui_settings.read().await;
-    let router_domain = ui_settings
+    let config = state.config_snapshot().await;
+    let router_domain = state
+        .ui_settings
+        .read()
+        .await
         .settings_for_frontend(&config)
         .get("shareRouterDomain")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim()
         .to_string();
-    let runtime = state
+    let mut runtime = state
         .tunnels
         .status(&crate::clients::router::tunnel::client_tunnel_key())
         .await;
+    if config.workspace.is_none() {
+        let spec = crate::state::client_tunnel_spec_id(
+            state,
+            &crate::clients::router::tunnel::local_forward_addr(state.bind_addr),
+        )
+        .await;
+        runtime = runtime.filter(|status| status.spec_id.as_deref() == Some(spec.as_str()));
+    }
     let active_tunnel_url = runtime
         .as_ref()
         .and_then(|status| status.tunnel_url.clone());
@@ -2378,7 +2398,34 @@ pub(in crate::api) async fn web_client_tunnel_state(state: &ServerState) -> Valu
                 "remotePort":0,"healthy":enabled,"status":if enabled {"connected"} else {"offline"}})),
                 "lastError":null,"requiresOwnerLogin":false}});
     }
-    let status = web_client_tunnel_share_status(runtime);
+    let enabled = crate::state::client_control_tunnel_ready(state).await;
+    let mut status = web_client_tunnel_share_status(runtime);
+    if status["tunnelStatus"].is_null() {
+        status["tunnelStatus"] = json!(config.client.tunnel_status);
+    }
+    if status["info"].is_object() {
+        status["info"]["healthy"] = json!(enabled);
+    }
+    if !enabled && status["recoveryRequired"] != true {
+        let reason = if config
+            .router
+            .last_register_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("client_identity_recovery_required:"))
+        {
+            Some("client_identity_recovery_required")
+        } else if config.client.tunnel_status.as_deref() == Some("claim_conflict") {
+            Some("client_tunnel_subdomain_conflict")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            status["recoveryRequired"] = json!(true);
+            status["blockedReasonCode"] = json!(reason);
+            status["tunnelStatus"] = json!("blocked");
+            status["lastError"] = json!(config.router.last_register_error);
+        }
+    }
     let mut response = json!({
         "config": {
             "ownerEmail": owner_email,

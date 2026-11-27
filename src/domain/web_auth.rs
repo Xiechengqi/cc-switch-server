@@ -437,6 +437,7 @@ mod tests {
     fn test_config(password: Option<&str>) -> ServerConfig {
         let mut config = ServerConfig {
             workspace: None,
+            initialized_at_ms: None,
             auth: AuthConfig::default(),
             owner: OwnerConfig {
                 email: Some("owner@example.com".to_string()),

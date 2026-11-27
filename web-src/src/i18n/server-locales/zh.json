@@ -1030,10 +1030,15 @@
     },
     "share": {
       "clientTunnel": {
+        "connecting": "正在连接 Router",
         "description": "Client 子域名在初始化时确定，之后只读且不可修改。",
+        "errorDetails": "错误详情",
         "failed": "失败: {{error}}",
         "ownerEmail": "Owner 邮箱",
         "running": "运行中",
+        "recoveryRequired": "Client 身份或域名需要恢复",
+        "recoveryHint": "现有配置和供应商账号保持不变。请联系 Router 管理员核验原 Client 身份与域名归属，修复后点击“重新检查”。无需重新初始化或清空数据。",
+        "recheckRecovery": "重新检查",
         "start": "启动",
         "stop": "停止",
         "stopped": "未运行",

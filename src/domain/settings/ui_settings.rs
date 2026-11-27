@@ -503,6 +503,7 @@ mod tests {
         };
         let config = ServerConfig {
             workspace: None,
+            initialized_at_ms: None,
             auth: Default::default(),
             owner: Default::default(),
             router: crate::domain::settings::config::RouterConfig {

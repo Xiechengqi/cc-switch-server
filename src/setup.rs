@@ -122,7 +122,7 @@ pub async fn complete_setup(
 
     {
         let config = state.config.read().await;
-        if config.is_setup_complete() {
+        if config.is_initialized() {
             if exec.idempotent {
                 return Ok(SetupOutcome::already_complete(&config));
             }

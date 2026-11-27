@@ -390,6 +390,9 @@ export interface TunnelInfo {
 export interface ShareTunnelStatus {
   info?: TunnelInfo | null;
   lastError?: string | null;
+  tunnelStatus?: string | null;
+  blockedReasonCode?: string | null;
+  recoveryRequired?: boolean;
   requiresOwnerLogin: boolean;
 }
 
@@ -623,6 +626,7 @@ async function getTunnelStatus(shareId: string): Promise<ShareTunnelStatus> {
         remotePort?: number | null;
         status?: string | null;
         lastError?: string | null;
+        blockedReasonCode?: string | null;
       } | null;
     }
   >("get_tunnel_status", { shareId });
@@ -637,11 +641,13 @@ function normalizeShareTunnelStatus(
       remotePort?: number | null;
       status?: string | null;
       lastError?: string | null;
+      blockedReasonCode?: string | null;
     } | null;
   },
 ): ShareTunnelStatus {
   if (raw.info) {
     return {
+      ...raw,
       info: raw.info,
       lastError: raw.lastError ?? null,
       requiresOwnerLogin: raw.requiresOwnerLogin ?? false,
@@ -651,6 +657,7 @@ function normalizeShareTunnelStatus(
   if (runtime?.tunnelUrl) {
     const status = runtime.status?.trim().toLowerCase() ?? "";
     return {
+      ...raw,
       info: {
         tunnelUrl: runtime.tunnelUrl,
         subdomain: runtime.subdomain?.trim() || "",
@@ -663,12 +670,19 @@ function normalizeShareTunnelStatus(
           status === "renewal_retrying",
       },
       lastError: raw.lastError ?? runtime.lastError ?? null,
+      tunnelStatus: raw.tunnelStatus ?? runtime.status,
+      blockedReasonCode: raw.blockedReasonCode ?? runtime.blockedReasonCode,
+      recoveryRequired: raw.recoveryRequired ?? runtime.status === "blocked",
       requiresOwnerLogin: raw.requiresOwnerLogin ?? false,
     };
   }
   return {
+    ...raw,
     info: null,
-    lastError: raw.lastError ?? null,
+    lastError: raw.lastError ?? runtime?.lastError ?? null,
+    tunnelStatus: raw.tunnelStatus ?? runtime?.status,
+    blockedReasonCode: raw.blockedReasonCode ?? runtime?.blockedReasonCode,
+    recoveryRequired: raw.recoveryRequired ?? runtime?.status === "blocked",
     requiresOwnerLogin: raw.requiresOwnerLogin ?? false,
   };
 }

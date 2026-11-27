@@ -43,7 +43,7 @@ pub(in crate::api) async fn setup_check_router(
     State(state): State<ServerState>,
     Json(input): Json<SetupRouterCheckRequest>,
 ) -> Result<Json<RouterReachabilityOutcome>, ApiError> {
-    if state.config.read().await.is_setup_complete() {
+    if state.config.read().await.is_initialized() {
         return Err(ApiError::conflict_code(
             "setup_already_complete",
             "server setup is already complete",
@@ -59,7 +59,7 @@ pub(in crate::api) async fn setup_suggest_subdomain(
     State(state): State<ServerState>,
     Json(input): Json<SetupSuggestSubdomainRequest>,
 ) -> Result<Json<SuggestSubdomainOutcome>, ApiError> {
-    if state.config.read().await.is_setup_complete() {
+    if state.config.read().await.is_initialized() {
         return Err(ApiError::conflict_code(
             "setup_already_complete",
             "server setup is already complete",
@@ -75,7 +75,7 @@ pub(in crate::api) async fn setup_check_subdomain(
     State(state): State<ServerState>,
     Json(input): Json<SetupSubdomainCheckRequest>,
 ) -> Result<Json<SetupSubdomainCheckResponse>, ApiError> {
-    if state.config.read().await.is_setup_complete() {
+    if state.config.read().await.is_initialized() {
         return Err(ApiError::conflict_code(
             "setup_already_complete",
             "server setup is already complete",
@@ -115,7 +115,7 @@ pub(in crate::api) async fn setup_validate(
     State(state): State<ServerState>,
     Json(mut input): Json<SetupInput>,
 ) -> Result<Json<SetupResponse>, ApiError> {
-    if state.config.read().await.is_setup_complete() {
+    if state.config.read().await.is_initialized() {
         return Err(ApiError::conflict_code(
             "setup_already_complete",
             "server setup is already complete",
@@ -164,7 +164,7 @@ pub(in crate::api) async fn login(
     Json(input): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
     let config = state.config.read().await;
-    if !config.is_setup_complete() {
+    if !config.is_initialized() {
         return Err(ApiError::forbidden("setup is required before login"));
     }
     match input.method.as_str() {
@@ -431,7 +431,7 @@ pub(in crate::api) async fn ensure_email_router_config(
     state: &ServerState,
 ) -> Result<ServerConfig, ApiError> {
     let mut config = state.config.read().await.clone();
-    if !config.is_setup_complete() {
+    if !config.is_initialized() {
         return Err(ApiError::forbidden("setup is required before email login"));
     }
     if config.has_registered_router_identity() {

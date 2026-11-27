@@ -65,6 +65,8 @@ Code Agent CLI
 
 Client 身份恢复与市场离线下架遵循 [专项契约](client-identity-recovery.md)。普通离线回收保留公钥对应的原 installationId 和域名预留；Server 不因注册返回不同 UUID 静默替换已知身份。控制隧道就绪后再恢复 Share 及其后台元数据同步。Owner 市场下架不依赖原机在线，租约、清理和本机解锁分别协调，供应商账号及加密根密钥不参与身份修复。
 
+本地初始化使用持久 `initializedAtMs`，Router 域名冲突不重开 bootstrap、不撤销既有本地登录资格；在租 Owner 的管理限制继续优先。Router 注册、Client/Share transport 与描述 ACK 分别判定，模型健康刷新经待同步队列等待当前身份及完整 spec 的活跃 actor。`blockedReasonCode` 与 connectivity 分阶段诊断直接解释恢复原因，避免把身份修复问题显示为未初始化或持续普通重连。
+
 `src/lib.rs` 声明的顶层模块：
 
 | 模块 | `.rs` 数 | 职责 |

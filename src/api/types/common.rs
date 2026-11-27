@@ -39,6 +39,8 @@ pub(in crate::api) struct VersionResponse {
 pub(in crate::api) struct SetupStatusResponse {
     pub(in crate::api) ok: bool,
     pub(in crate::api) needs_setup: bool,
+    pub(in crate::api) initialized: bool,
+    pub(in crate::api) router_configuration_ready: bool,
     pub(in crate::api) owner_email: Option<String>,
     pub(in crate::api) router_url: Option<String>,
     pub(in crate::api) client_tunnel_subdomain: Option<String>,
@@ -48,7 +50,9 @@ impl SetupStatusResponse {
     pub(in crate::api) fn from_config(config: &ServerConfig) -> Self {
         Self {
             ok: true,
-            needs_setup: !config.is_setup_complete(),
+            needs_setup: !config.is_initialized(),
+            initialized: config.is_initialized(),
+            router_configuration_ready: config.is_local_setup_complete(),
             owner_email: config.owner.email.clone(),
             router_url: config.router.url.clone(),
             client_tunnel_subdomain: config.client.tunnel_subdomain.clone(),
