@@ -1161,8 +1161,10 @@ fn qoder_catalog_replacement_revocation_and_expiry_fence_prepared_generation() {
             let name = format!("qoder-catalog-{drift}");
             let mut state = qoder_test_state(&name);
             let parent = crate::infra::resident_memory::ResidentMemoryBudget::new(None);
-            Arc::get_mut(&mut state).unwrap().qoder_runtime =
-                crate::proxy::qoder_runtime::QoderRuntimeCache::with_parent(parent.clone());
+            state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+                state.qoder_runtime =
+                    crate::proxy::qoder_runtime::QoderRuntimeCache::with_parent(parent.clone());
+            });
             install_qoder_provider(
                 &state,
                 &name,
@@ -2269,10 +2271,10 @@ fn qoder_r4_review_discovery_capacity_is_local_and_zero_outbound_on_every_rail_s
                     spawn_qoder_upstream(rail, vec![QoderGenerationReply::Success]).await;
                 let parent = crate::infra::resident_memory::ResidentMemoryBudget::new(Some(0));
                 let mut state = qoder_test_state(&name);
-                Arc::get_mut(&mut state)
-                    .expect("unique fixture state")
-                    .qoder_runtime =
-                    crate::proxy::qoder_runtime::QoderRuntimeCache::with_parent(parent.clone());
+                state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+                    state.qoder_runtime =
+                        crate::proxy::qoder_runtime::QoderRuntimeCache::with_parent(parent.clone());
+                });
                 let (provider_id, account_id) =
                     install_qoder_provider(&state, &name, app, rail, &format!("http://{address}"))
                         .await;
@@ -2336,8 +2338,10 @@ fn qoder_r4_review_optional_alias_pressure_keeps_completed_response_successful()
             .await;
             let parent = crate::infra::resident_memory::ResidentMemoryBudget::new(None);
             let mut state = qoder_test_state(&name);
-            Arc::get_mut(&mut state).unwrap().qoder_runtime =
-                crate::proxy::qoder_runtime::QoderRuntimeCache::with_parent(parent.clone());
+            state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+                state.qoder_runtime =
+                    crate::proxy::qoder_runtime::QoderRuntimeCache::with_parent(parent.clone());
+            });
             let (provider_id, _) = install_qoder_provider(
                 &state,
                 &name,
@@ -2406,10 +2410,9 @@ fn qoder_request_memory_rejects_all_surfaces_before_any_upstream_request() {
             .await;
             let (_, _, body) = surface_request(app, false);
             let mut state = qoder_test_state(&name);
-            Arc::get_mut(&mut state)
-                .expect("Qoder test state must be uniquely owned")
-                .request_body_limits
-                .memory_budget_bytes = body.len().saturating_add(1);
+            state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+                state.request_body_limits.memory_budget_bytes = body.len().saturating_add(1);
+            });
             let origin = format!("http://{address}");
             let (provider_id, _) =
                 install_qoder_provider(&state, &name, app, QoderFixtureRail::GlobalOauth, &origin)
@@ -2447,10 +2450,9 @@ fn qoder_nonstream_aggregate_is_bounded_by_request_memory() {
         )
         .await;
         let mut state = qoder_test_state(name);
-        Arc::get_mut(&mut state)
-            .expect("Qoder test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = 192 * 1024;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 192 * 1024;
+        });
         let origin = format!("http://{address}");
         let (provider_id, _) = install_qoder_provider(
             &state,
@@ -2502,10 +2504,9 @@ fn qoder_stream_tool_state_exhaustion_emits_one_redacted_terminal() {
         )
         .await;
         let mut state = qoder_test_state(name);
-        Arc::get_mut(&mut state)
-            .expect("Qoder test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = 192 * 1024;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 192 * 1024;
+        });
         let origin = format!("http://{address}");
         let (provider_id, _) = install_qoder_provider(
             &state,
@@ -2574,10 +2575,9 @@ fn qoder_memory_exhaustion_never_replays_unauthorized_on_any_rail() {
                 spawn_qoder_upstream(rail, vec![QoderGenerationReply::OversizedHttpUnauthorized])
                     .await;
             let mut state = qoder_test_state(&name);
-            Arc::get_mut(&mut state)
-                .expect("Qoder test state must be uniquely owned")
-                .request_body_limits
-                .memory_budget_bytes = 128 * 1024;
+            state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+                state.request_body_limits.memory_budget_bytes = 128 * 1024;
+            });
             let origin = format!("http://{address}");
             let (provider_id, _) =
                 install_qoder_provider(&state, &name, AppKind::Codex, rail, &origin).await;

@@ -495,10 +495,9 @@ fn buddy_image_inputs_obey_request_memory_before_catalog_or_inference() {
                 let (address, fixture, server) = spawn_codebuddy_upstream(site, vec![]).await;
                 let (path, body) = buddy_image_surface_request(route, false);
                 let mut state = codebuddy_test_state("buddy-image-memory");
-                Arc::get_mut(&mut state)
-                    .unwrap()
-                    .request_body_limits
-                    .memory_budget_bytes = body.len() + 1;
+                state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+                    state.request_body_limits.memory_budget_bytes = body.len() + 1;
+                });
                 let (id, _) = install_buddy_provider(
                     &state,
                     product,

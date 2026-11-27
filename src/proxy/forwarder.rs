@@ -36522,10 +36522,9 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let mut state = forwarder_test_state("grok-request-memory-pre-network");
-        Arc::get_mut(&mut state)
-            .expect("test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = body.len().saturating_add(1);
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = body.len().saturating_add(1);
+        });
         let execution = install_grok_test_execution(
             &state,
             "grok-request-memory-pre-network",
@@ -36591,10 +36590,9 @@ mod tests {
         );
 
         let mut share_state = forwarder_test_state("cursor-share-request-memory");
-        Arc::get_mut(&mut share_state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = body.len() + 1;
+        share_state = crate::state::ServerStateInner::configure_test_state(share_state, |state| {
+            state.request_body_limits.memory_budget_bytes = body.len() + 1;
+        });
         let share_provider_id = install_cursor_api_key_forwarder_test_provider(
             &share_state,
             "cursor-share-request-memory",
@@ -36637,10 +36635,10 @@ mod tests {
         );
 
         let mut pinned_state = forwarder_test_state("cursor-pinned-request-memory");
-        Arc::get_mut(&mut pinned_state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = body.len() + 1;
+        pinned_state =
+            crate::state::ServerStateInner::configure_test_state(pinned_state, |state| {
+                state.request_body_limits.memory_budget_bytes = body.len() + 1;
+            });
         let pinned_provider_id = install_cursor_api_key_forwarder_test_provider(
             &pinned_state,
             "cursor-pinned-request-memory",
@@ -36694,10 +36692,9 @@ mod tests {
         );
 
         let mut share_state = forwarder_test_state("claude-share-request-memory");
-        Arc::get_mut(&mut share_state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = body.len() + 1;
+        share_state = crate::state::ServerStateInner::configure_test_state(share_state, |state| {
+            state.request_body_limits.memory_budget_bytes = body.len() + 1;
+        });
         let share_provider_id = install_claude_oauth_forwarder_test_provider(
             &share_state,
             "claude-share-request-memory",
@@ -36735,10 +36732,10 @@ mod tests {
         );
 
         let mut pinned_state = forwarder_test_state("claude-pinned-request-memory");
-        Arc::get_mut(&mut pinned_state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = body.len() + 1;
+        pinned_state =
+            crate::state::ServerStateInner::configure_test_state(pinned_state, |state| {
+                state.request_body_limits.memory_budget_bytes = body.len() + 1;
+            });
         let pinned_provider_id = install_claude_oauth_forwarder_test_provider(
             &pinned_state,
             "claude-pinned-request-memory",
@@ -36793,10 +36790,9 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let mut state = forwarder_test_state("claude-compressed-request-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = compressed.len() + plain.len() + 1;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = compressed.len() + plain.len() + 1;
+        });
         let provider_id = install_claude_oauth_forwarder_test_provider(
             &state,
             "claude-compressed-request-memory",
@@ -36828,10 +36824,9 @@ mod tests {
         let gemini_body =
             Bytes::from_static(br#"{"contents":[{"parts":[{"text":"memory-bound share"}]}]}"#);
         let mut share_state = forwarder_test_state("antigravity-share-request-memory");
-        Arc::get_mut(&mut share_state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = gemini_body.len() + 1;
+        share_state = crate::state::ServerStateInner::configure_test_state(share_state, |state| {
+            state.request_body_limits.memory_budget_bytes = gemini_body.len() + 1;
+        });
         let (share_provider_id, _, _) = install_antigravity_test_provider(
             &share_state,
             "share-request-memory",
@@ -36868,10 +36863,10 @@ mod tests {
             br#"{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":"memory-bound provider test"}]}"#,
         );
         let mut pinned_state = forwarder_test_state("agy-pinned-request-memory");
-        Arc::get_mut(&mut pinned_state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = claude_body.len() + 1;
+        pinned_state =
+            crate::state::ServerStateInner::configure_test_state(pinned_state, |state| {
+                state.request_body_limits.memory_budget_bytes = claude_body.len() + 1;
+            });
         let (pinned_provider_id, _, _) = install_antigravity_test_provider(
             &pinned_state,
             "pinned-request-memory",
@@ -36907,10 +36902,9 @@ mod tests {
         );
         let compressed = Bytes::from(gzip_bytes(&plain));
         let mut state = forwarder_test_state("antigravity-compressed-request-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = compressed.len() + plain.len() + 1;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = compressed.len() + plain.len() + 1;
+        });
         let (provider_id, _, _) = install_antigravity_test_provider(
             &state,
             "compressed-request-memory",
@@ -37441,10 +37435,9 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let mut state = forwarder_test_state("claude-compressed-sse-request-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = 8 * 1024;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 8 * 1024;
+        });
         let provider_id = install_claude_oauth_forwarder_test_provider(
             &state,
             "claude-compressed-sse-request-memory",
@@ -37537,10 +37530,9 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let mut state = forwarder_test_state("claude-stream-state-request-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = 24 * 1024;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 24 * 1024;
+        });
         let provider_id = install_claude_oauth_forwarder_test_provider(
             &state,
             "claude-stream-state-request-memory",
@@ -41999,10 +41991,9 @@ mod tests {
     async fn antigravity_semantic_prelude_memory_exhaustion_rejects_before_commit_without_retry() {
         let (address, requests, server) = spawn_antigravity_memory_stream_upstream().await;
         let mut state = forwarder_test_state("antigravity-grounding-request-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = 16 * 1024;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 16 * 1024;
+        });
         let provider_id = install_antigravity_claude_test_provider(
             &state,
             "grounding-request-memory",
@@ -42039,10 +42030,9 @@ mod tests {
     async fn antigravity_grounding_state_exhaustion_terminates_stream_without_retry() {
         let (address, requests, server) = spawn_antigravity_memory_stream_upstream().await;
         let mut state = forwarder_test_state("antigravity-grounding-request-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must still be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = 256 * 1024;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 256 * 1024;
+        });
         let provider_id = install_antigravity_claude_test_provider(
             &state,
             "grounding-request-memory",
@@ -44709,10 +44699,9 @@ mod tests {
         );
 
         let mut kiro_state = forwarder_test_state("kiro-request-memory-pre-network");
-        std::sync::Arc::get_mut(&mut kiro_state)
-            .expect("Kiro test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = body.len().saturating_add(1);
+        kiro_state = crate::state::ServerStateInner::configure_test_state(kiro_state, |state| {
+            state.request_body_limits.memory_budget_bytes = body.len().saturating_add(1);
+        });
         let kiro_provider = install_kiro_test_provider_for_app(
             &kiro_state,
             AppKind::Claude,
@@ -44758,10 +44747,10 @@ mod tests {
         );
 
         let mut amazon_q_state = forwarder_test_state("amazon-q-request-memory-pre-network");
-        std::sync::Arc::get_mut(&mut amazon_q_state)
-            .expect("Amazon Q test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = body.len().saturating_add(1);
+        amazon_q_state =
+            crate::state::ServerStateInner::configure_test_state(amazon_q_state, |state| {
+                state.request_body_limits.memory_budget_bytes = body.len().saturating_add(1);
+            });
         let (amazon_q_provider, _, _) = install_amazon_q_test_bundle(
             &amazon_q_state,
             "amazon-q-request-memory-pre-network",
@@ -44826,10 +44815,9 @@ mod tests {
         let (address, requests, server) =
             spawn_counted_kiro_eventstream_upstream(vec![Bytes::from(response_body)]).await;
         let mut state = forwarder_test_state("kiro-non-stream-response-memory");
-        std::sync::Arc::get_mut(&mut state)
-            .expect("Kiro test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = 64 * 1024;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 64 * 1024;
+        });
         let provider = install_kiro_test_provider_for_app(
             &state,
             AppKind::Claude,
@@ -44897,10 +44885,9 @@ mod tests {
         let (address, requests, server) =
             spawn_counted_kiro_eventstream_upstream(response_chunks).await;
         let mut state = forwarder_test_state("kiro-stream-tool-memory");
-        std::sync::Arc::get_mut(&mut state)
-            .expect("Kiro test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = 96 * 1024;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 96 * 1024;
+        });
         let provider = install_kiro_test_provider_for_app(
             &state,
             AppKind::Claude,
@@ -53163,10 +53150,9 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let upstream_server =
             tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
         let mut state = forwarder_test_state("grok-shared-image-decode-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = compressed.len().saturating_add(1024);
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = compressed.len().saturating_add(1024);
+        });
         let execution = install_grok_test_execution(
             &state,
             "grok-shared-image-decode-memory",
@@ -53228,10 +53214,9 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let body = Bytes::from(multipart);
 
         let mut state = forwarder_test_state("grok-image-edit-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = body.len().saturating_add(32);
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = body.len().saturating_add(32);
+        });
         let execution = install_grok_test_execution(
             &state,
             "grok-image-edit-memory",
@@ -53317,10 +53302,9 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let upstream_server =
             tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
         let mut state = forwarder_test_state("grok-media-response-decode-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = 8 * 1024;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 8 * 1024;
+        });
         let execution = install_grok_test_execution(
             &state,
             "grok-media-response-decode-memory",
@@ -58785,10 +58769,9 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
         let continuation = grok_replay_continuation_body(false);
         let mut state = forwarder_test_state("grok-http-replay-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = continuation.len().saturating_mul(6);
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = continuation.len().saturating_mul(6);
+        });
         let execution = install_grok_test_execution(
             &state,
             "grok-http-replay-memory",
@@ -59707,10 +59690,9 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
         let upstream_server =
             tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
         let mut state = forwarder_test_state("grok-sse-inspector-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = 16 * 1024;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 16 * 1024;
+        });
         let execution = install_grok_test_execution(
             &state,
             "grok-sse-inspector-memory",
@@ -60971,10 +60953,10 @@ data: {"type":"response.failed","response":{"status":"failed","status_details":{
             serde_json::from_slice(&grok_replay_continuation_body(false)).unwrap();
         let request = json!({"type":"response.create","response":continuation});
         let mut state = forwarder_test_state("grok-ws-replay-memory");
-        Arc::get_mut(&mut state)
-            .expect("test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = request.to_string().len().saturating_mul(6);
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes =
+                request.to_string().len().saturating_mul(6);
+        });
         let execution = install_grok_test_execution(
             &state,
             "grok-ws-replay-memory",

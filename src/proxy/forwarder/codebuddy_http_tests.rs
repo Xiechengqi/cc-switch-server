@@ -1631,10 +1631,9 @@ fn codebuddy_request_memory_rejects_all_surfaces_before_any_upstream_request() {
             .await;
             let (_, _, body) = surface_request(app, false);
             let mut state = codebuddy_test_state(&name);
-            Arc::get_mut(&mut state)
-                .expect("CodeBuddy test state must be uniquely owned")
-                .request_body_limits
-                .memory_budget_bytes = body.len().saturating_add(1);
+            state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+                state.request_body_limits.memory_budget_bytes = body.len().saturating_add(1);
+            });
             let (provider_id, _) = install_codebuddy_provider(
                 &state,
                 &name,
@@ -1669,10 +1668,9 @@ fn codebuddy_nonstream_content_reasoning_and_tool_aggregate_is_memory_bounded() 
         )
         .await;
         let mut state = codebuddy_test_state(name);
-        Arc::get_mut(&mut state)
-            .expect("CodeBuddy test state must be uniquely owned")
-            .request_body_limits
-            .memory_budget_bytes = 192 * 1024;
+        state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 192 * 1024;
+        });
         let (provider_id, _) = install_codebuddy_provider(
             &state,
             name,
@@ -1726,10 +1724,9 @@ fn codebuddy_stream_bridge_memory_exhaustion_emits_one_redacted_terminal() {
             )
             .await;
             let mut state = codebuddy_test_state(&name);
-            Arc::get_mut(&mut state)
-                .expect("CodeBuddy test state must be uniquely owned")
-                .request_body_limits
-                .memory_budget_bytes = 128 * 1024;
+            state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+                state.request_body_limits.memory_budget_bytes = 128 * 1024;
+            });
             let (provider_id, _) = install_codebuddy_provider(
                 &state,
                 &name,
@@ -1794,10 +1791,9 @@ fn codebuddy_memory_exhaustion_never_replays_or_refreshes_on_either_site() {
             )
             .await;
             let mut state = codebuddy_test_state(&name);
-            Arc::get_mut(&mut state)
-                .expect("CodeBuddy test state must be uniquely owned")
-                .request_body_limits
-                .memory_budget_bytes = 128 * 1024;
+            state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+                state.request_body_limits.memory_budget_bytes = 128 * 1024;
+            });
             let (provider_id, _) = install_codebuddy_provider(
                 &state,
                 &name,
@@ -1844,10 +1840,9 @@ fn codebuddy_both_sites_keep_one_request_budget_across_401_recovery() {
                 )
                 .await;
                 let mut state = codebuddy_test_state(&name);
-                Arc::get_mut(&mut state)
-                    .expect("CodeBuddy test state must be uniquely owned")
-                    .request_body_limits
-                    .memory_budget_bytes = 512 * 1024;
+                state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+                    state.request_body_limits.memory_budget_bytes = 512 * 1024;
+                });
                 let (provider_id, _) = install_buddy_provider(
                     &state,
                     product,
@@ -2895,12 +2890,12 @@ fn codebuddy_r4_discovery_capacity_rejection_is_local_and_sends_no_requests() {
                     spawn_codebuddy_upstream(site, vec![CodeBuddyGenerationReply::Success]).await;
                 let parent = crate::infra::resident_memory::ResidentMemoryBudget::new(Some(0));
                 let mut state = codebuddy_test_state(&name);
-                Arc::get_mut(&mut state)
-                    .expect("unique fixture state")
-                    .codebuddy_runtime =
-                    crate::proxy::codebuddy_runtime::CodeBuddyRuntimeCache::with_parent(
-                        parent.clone(),
-                    );
+                state = crate::state::ServerStateInner::configure_test_state(state, |state| {
+                    state.codebuddy_runtime =
+                        crate::proxy::codebuddy_runtime::CodeBuddyRuntimeCache::with_parent(
+                            parent.clone(),
+                        );
+                });
                 let (provider_id, account_id) = install_codebuddy_provider(
                     &state,
                     &name,

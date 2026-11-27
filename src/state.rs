@@ -7659,6 +7659,23 @@ impl ServerStateInner {
         }))
     }
 
+    /// Configure an unused fixture before it is shared with tasks. A self Weak
+    /// makes Arc::get_mut unsuitable even with one strong owner. Consuming the
+    /// Arc and rebuilding its back-reference preserves the production graph.
+    #[cfg(test)]
+    pub(crate) fn configure_test_state(
+        state: ServerState,
+        configure: impl FnOnce(&mut Self),
+    ) -> ServerState {
+        let mut state =
+            Arc::try_unwrap(state).expect("test runtime overrides require one strong state owner");
+        configure(&mut state);
+        Arc::new_cyclic(|weak| {
+            state.self_weak = weak.clone();
+            state
+        })
+    }
+
     pub async fn sync_log_config_from_ui_settings(&self) {
         let store = self.ui_settings.read().await;
         let config = ui_settings::parse_log_config(&ui_settings::log_config_for_frontend(&store));
@@ -24712,6 +24729,28 @@ async fn issue_share_tunnel_lease(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn value_quota_fixture_configuration_preserves_state_owner() {
+        let state = test_state();
+        let config_dir = state.config_dir.clone();
+        let process_instance_id = state.process_instance_id.clone();
+        let old_owner = Arc::downgrade(&state);
+        let state = ServerStateInner::configure_test_state(state, |state| {
+            state.request_body_limits.memory_budget_bytes = 4096;
+        });
+        assert!(old_owner.upgrade().is_none());
+        assert_eq!(state.process_instance_id, process_instance_id);
+        assert_eq!(state.request_body_limits.memory_budget_bytes, 4096);
+        let owner = state.self_weak.upgrade().unwrap();
+        assert!(Arc::ptr_eq(&state, &owner));
+        drop(owner);
+        // Share policy preparation upgrades the internal Weak on a blocking
+        // worker. Exercise that path after the fixture changes its runtime.
+        state.mutate_shares_immediate(|_| ()).await.unwrap();
+        drop(state);
+        fs::remove_dir_all(config_dir).unwrap();
+    }
+
     #[tokio::test]
     async fn buddy_quota_capability_is_explicit_scoped_expires_and_requests_backfill() {
         let state = test_state();
