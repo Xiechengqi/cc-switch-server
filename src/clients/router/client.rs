@@ -56,6 +56,8 @@ pub struct RegisterInstallationRequest {
 pub struct RegisterInstallationResponse {
     pub installation_id: String,
     pub control_secret: String,
+    #[serde(default)]
+    pub previous_installation_ids: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

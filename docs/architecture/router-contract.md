@@ -27,6 +27,8 @@ Server 持有两类 Ed25519 身份（详见 `PROTOCOL.md §2`）：一类用于 
 
 ### Client Web 嵌入登录
 
+普通离线清理后的原密钥注册恢复原 installationId；注册响应可追加 `previousInstallationIds` 证明经过 Router 审计的历史 ID 收敛。Server 仅在同一 Router、公钥未变且该列表包含当前本地 ID 时接受 ID 变化。完整恢复与下架边界见 [身份恢复契约](client-identity-recovery.md)。
+
 Client Web 在嵌入窗口中根据 `routerOrigin` 与父窗口协商一次性登录票据。握手严格校验 origin、窗口对象与随机 nonce，向 Client Host 的 Router 交换端点换取仅保存在内存的窗口凭据。普通 API 和终端 SSE／输入使用 `x-cc-switch-client-web-session`；Router 校验父 Session、当前 owner、Host revision 和市场租约后，通过现有签名 IngressContext 注入身份。Server 不保存窗口凭据，仍按既有 Router 委托身份执行管理权限。退出清除窗口凭据并请求 Router 撤销，父页面退出也会触发退出。旧版 Router 或握手失败时进入原登录页。
 
 完整线格式与市场终端权限见 Router `PROTOCOL.md` §3.3。两端 Web 升级后启用，Server 的本地身份设置继续走已有 `require_local_server_owner_session`。

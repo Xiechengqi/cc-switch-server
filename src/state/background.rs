@@ -1054,6 +1054,12 @@ pub(super) async fn run_periodic_share_sync_retry_once(state: &ServerState) {
     if !config.has_registered_router_identity() {
         return;
     }
+    if !client_control_tunnel_ready(state).await {
+        // Revocation is independent of establishing a new Client/Share claim.
+        // Keep deletions moving while restoration waits for the control tunnel.
+        retry_pending_router_share_deletes(state.clone()).await;
+        return;
+    }
     if state
         .router_registration_reconcile_pending
         .swap(false, std::sync::atomic::Ordering::AcqRel)

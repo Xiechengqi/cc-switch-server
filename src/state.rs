@@ -8532,6 +8532,19 @@ impl ServerStateInner {
             .store(true, std::sync::atomic::Ordering::Release);
         self.router_share_sync_wakeup.notify_one();
         tracing::debug!(source, "queued Router Share reconciliation");
+        let expected_spec =
+            client_tunnel_spec_id(self, &tunnel::local_forward_addr(self.bind_addr)).await;
+        if self
+            .tunnels
+            .status(&tunnel::client_tunnel_key())
+            .await
+            .is_some_and(|runtime| {
+                runtime.status == "blocked"
+                    || runtime.spec_id.as_deref() != Some(expected_spec.as_str())
+            })
+        {
+            ensure_client_tunnel_running(self.clone(), "registration_recovered").await;
+        }
         Ok(())
     }
 
@@ -8628,8 +8641,18 @@ impl ServerStateInner {
             if current.public_key.trim() != expected_public_key.trim() {
                 anyhow::bail!("pending router identity changed while registration was in progress");
             }
+            if !current.installation_id.is_empty()
+                && current.installation_id != installation_id
+                && !response.previous_installation_ids.contains(&current.installation_id)
+            {
+                anyhow::bail!("client_identity_recovery_required: Router returned a different Client ID; original identity and local accounts were preserved");
+            }
 
             let identity = {
+                if current.installation_id != installation_id {
+                    config.client.claim_pending = None;
+                    config.client.tunnel_status = Some("claimed".into());
+                }
                 let identity = config
                     .router
                     .identity
@@ -13684,6 +13707,10 @@ impl ServerStateInner {
             let state = self.clone();
             let pending_ids = share_ids.clone();
             tokio::spawn(async move {
+                if !client_control_tunnel_ready(&state).await {
+                    state.router_share_sync_wakeup.notify_one();
+                    return;
+                }
                 let result = if matches!(mode, AccountShareMetadataRefresh::QuotaPresentation) {
                     sync_shares_to_router_with_policy(&state, &pending_ids, true).await
                 } else {
@@ -21644,6 +21671,37 @@ pub async fn restore_tunnels(state: ServerState) {
     state.router_share_sync_wakeup.notify_one();
 }
 
+/// A configured/previously connected tunnel is not proof of current transport.
+/// Match the active spec to the current Router and installation after recovery.
+pub(super) async fn client_control_tunnel_ready(state: &ServerState) -> bool {
+    if !state
+        .tunnels
+        .has_live_actor(&tunnel::client_tunnel_key())
+        .await
+    {
+        return false;
+    }
+    let config = state.config_snapshot().await;
+    let Some(identity) = config.registered_router_identity() else {
+        return false;
+    };
+    let Some(status) = state.tunnels.status(&tunnel::client_tunnel_key()).await else {
+        return false;
+    };
+    let expected_prefix = format!(
+        "client-web|{}|{}|",
+        config.router_api_base().unwrap_or_default(),
+        identity.installation_id
+    );
+    matches!(
+        status.status.as_str(),
+        "connected" | "running" | "active" | "renewing"
+    ) && status
+        .spec_id
+        .as_deref()
+        .is_some_and(|spec| spec.starts_with(&expected_prefix))
+}
+
 async fn resume_client_subdomain_adoption(state: ServerState) -> anyhow::Result<()> {
     let adoption = state
         .config_snapshot()
@@ -24625,9 +24683,21 @@ async fn issue_client_tunnel_lease(
     if !config.is_local_setup_complete() {
         anyhow::bail!("setup is incomplete");
     }
-    config = crate::client_tunnel_provision::claim_client_tunnel_config(&state)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.message))?;
+    if config
+        .router
+        .last_register_error
+        .as_deref()
+        .is_some_and(|error| error.starts_with("client_identity_recovery_required:"))
+    {
+        return Err(tunnel::LeaseIssueBlocked("client_identity_recovery_required: restore the original Router identity before reconnecting".into()).into());
+    }
+    config = match crate::client_tunnel_provision::claim_client_tunnel_config(&state).await {
+        Ok(config) => config,
+        Err(error) if error.code == Some("client_tunnel_subdomain_conflict") => {
+            return Err(tunnel::LeaseIssueBlocked(error.message).into());
+        }
+        Err(error) => return Err(anyhow::anyhow!(error.message)),
+    };
     let intent = ClientTunnelClaimIntent::from_config(&config)?;
     let subdomain = intent.subdomain.clone();
     ClientSubdomain::parse(&subdomain)?;
@@ -24681,6 +24751,9 @@ async fn issue_share_tunnel_lease(
     share_id: String,
     request: TunnelLeaseRequest,
 ) -> anyhow::Result<NamespaceLeaseResponse> {
+    if !client_control_tunnel_ready(&state).await {
+        return Err(tunnel::LeaseIssueDeferred.into());
+    }
     let config = state.config.read().await.clone();
     if !config.has_registered_router_identity() {
         anyhow::bail!("router installation is not registered");
@@ -25271,6 +25344,63 @@ mod tests {
         config.router.identity = Some(identity);
         config.client.tunnel_subdomain = Some("clienttest".to_string());
         state.replace_config(config).await.unwrap();
+        let spec = client_tunnel_spec_id(state, &tunnel::local_forward_addr(state.bind_addr)).await;
+        state.tunnels.mock_active_client_tunnel(spec).await;
+    }
+
+    #[tokio::test]
+    async fn registration_cannot_silently_replace_a_known_client_identity() {
+        let state = test_state();
+        configure_registered_test_router(&state, "http://127.0.0.1:9", "original").await;
+        let before = state.config_snapshot().await;
+        let key = before.router.identity.as_ref().unwrap().public_key.clone();
+        let result = state
+            .merge_router_registration_response(
+                "http://127.0.0.1:9",
+                &key,
+                client::RegisterInstallationResponse {
+                    installation_id: "unexpected".into(),
+                    control_secret: "new-secret".into(),
+                    previous_installation_ids: vec![],
+                },
+                None,
+            )
+            .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("client_identity_recovery_required"));
+        assert_eq!(
+            state.config_snapshot().await.router.identity,
+            before.router.identity
+        );
+        let restored = state
+            .merge_router_registration_response(
+                "http://127.0.0.1:9",
+                &key,
+                client::RegisterInstallationResponse {
+                    installation_id: "canonical".into(),
+                    control_secret: "restored-secret".into(),
+                    previous_installation_ids: vec!["original".into()],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.installation_id, "canonical");
+        assert_eq!(restored.public_key, key);
+    }
+
+    #[tokio::test]
+    async fn persisted_connected_status_without_a_live_actor_does_not_release_share_recovery() {
+        let state = test_state();
+        configure_registered_test_router(&state, "http://127.0.0.1:9", "ready-client").await;
+        assert!(client_control_tunnel_ready(&state).await);
+        state
+            .tunnels
+            .stop(&tunnel::client_tunnel_key(), "connected")
+            .await;
+        assert!(!client_control_tunnel_ready(&state).await);
     }
 
     #[test]
@@ -27191,6 +27321,7 @@ mod tests {
             counts.registrations.fetch_add(1, AtomicOrdering::SeqCst);
             Json(json!({
                 "installationId": "inst-heartbeat-recovered",
+                "previousInstallationIds": ["inst-heartbeat-expired"],
                 "controlSecret": "recovered-secret"
             }))
         }
@@ -27261,6 +27392,7 @@ mod tests {
             counts.registrations.fetch_add(1, AtomicOrdering::SeqCst);
             Json(json!({
                 "installationId": "inst-heartbeat-remapped",
+                "previousInstallationIds": ["inst-heartbeat-401"],
                 "controlSecret": "recovered-secret"
             }))
         }
@@ -27389,6 +27521,7 @@ mod tests {
             requests.fetch_add(1, AtomicOrdering::SeqCst);
             Json(json!({
                 "installationId": "inst-startup-recovered",
+                "previousInstallationIds": ["inst-startup-expired"],
                 "controlSecret": "startup-recovered-secret"
             }))
         }
@@ -27453,9 +27586,10 @@ mod tests {
                 (
                     StatusCode::OK,
                     Json(json!({
-                        "installationId": "inst-threshold-recovered",
-                        "controlSecret": "threshold-recovered-secret"
-                    })),
+                            "installationId": "inst-threshold-recovered",
+                    "previousInstallationIds": ["inst-threshold-expired"],
+                            "controlSecret": "threshold-recovered-secret"
+                        })),
                 )
             }
         }

@@ -45,6 +45,14 @@ pub type ActivateTunnelFn =
 pub type TunnelStateFn = Arc<dyn Fn(NamespaceLeaseResponse) -> TunnelControlFuture + Send + Sync>;
 
 const TUNNELS_FILE_NAME: &str = "tunnels.json";
+
+#[derive(Debug, thiserror::Error)]
+#[error("waiting for the Client control tunnel before restoring Shares")]
+pub struct LeaseIssueDeferred;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct LeaseIssueBlocked(pub String);
 const LEASE_RENEW_MIN_DELAY: Duration = Duration::from_secs(5);
 const LEASE_RENEW_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 const LEASE_ISSUE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -484,6 +492,45 @@ impl TunnelSupervisor {
         self.statuses.read().await.get(key).cloned()
     }
 
+    pub async fn has_live_actor(&self, key: &str) -> bool {
+        let slot = self.slots.lock().await.get(key).cloned();
+        match slot {
+            Some(slot) => slot
+                .lock()
+                .await
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished()),
+            None => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn mock_active_client_tunnel(&self, spec_id: String) {
+        let key = client_tunnel_key();
+        self.stop(&key, "stopped").await;
+        let slot = Arc::new(Mutex::new(TunnelTaskSlot {
+            generation: 1,
+            desired_generation: 1,
+            spec_id: Some(spec_id.clone()),
+            handle: Some(tokio::spawn(std::future::pending())),
+            retiring_handles: vec![],
+        }));
+        self.slots.lock().await.insert(key.clone(), slot);
+        self.statuses.write().await.insert(
+            key.clone(),
+            TunnelRuntimeStatus {
+                key,
+                kind: "client-web".into(),
+                status: "connected".into(),
+                generation: 1,
+                desired_generation: 1,
+                spec_id: Some(spec_id),
+                ..TunnelRuntimeStatus::default()
+            },
+        );
+    }
+
     pub async fn statuses(&self) -> Vec<TunnelRuntimeStatus> {
         self.statuses.read().await.values().cloned().collect()
     }
@@ -768,6 +815,50 @@ async fn run_tunnel_actor(
             Ok(Err(error)) => {
                 let error_message = error.to_string();
                 last_attempt_error = Some(error_message.clone());
+                if error.downcast_ref::<LeaseIssueBlocked>().is_some() {
+                    set_status_for_generation(
+                        &statuses,
+                        &store_path,
+                        TunnelRuntimeStatus {
+                            key: key.clone(),
+                            kind: kind.clone(),
+                            status: "blocked".into(),
+                            last_error: Some(error_message),
+                            generation,
+                            desired_generation: generation,
+                            start_reason: Some(reason.clone()),
+                            spec_id: Some(spec_id.clone()),
+                            updated_at_ms: now_ms(),
+                            ..TunnelRuntimeStatus::default()
+                        },
+                    )
+                    .await;
+                    tracing::warn!(tunnel_key=%key,"Client identity needs recovery; automatic tunnel retries suspended");
+                    break;
+                }
+                if error.downcast_ref::<LeaseIssueDeferred>().is_some() {
+                    set_status_for_generation(
+                        &statuses,
+                        &store_path,
+                        TunnelRuntimeStatus {
+                            key: key.clone(),
+                            kind: kind.clone(),
+                            status: "waiting_client".into(),
+                            generation,
+                            desired_generation: generation,
+                            last_error: Some(error_message),
+                            start_reason: Some(reason.clone()),
+                            spec_id: Some(spec_id.clone()),
+                            updated_at_ms: now_ms(),
+                            ..TunnelRuntimeStatus::default()
+                        },
+                    )
+                    .await;
+                    drop(share_permit);
+                    sleep_with_full_jitter(retry_cap).await;
+                    retry_cap = next_backoff(retry_cap);
+                    continue;
+                }
                 recover_lease_issue_state_after_error(
                     &error_message,
                     &mut router_generation,

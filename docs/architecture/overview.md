@@ -63,6 +63,8 @@ Code Agent CLI
 
 ## 3. 代码分层
 
+Client 身份恢复与市场离线下架遵循 [专项契约](client-identity-recovery.md)。普通离线回收保留公钥对应的原 installationId 和域名预留；Server 不因注册返回不同 UUID 静默替换已知身份。控制隧道就绪后再恢复 Share 及其后台元数据同步。Owner 市场下架不依赖原机在线，租约、清理和本机解锁分别协调，供应商账号及加密根密钥不参与身份修复。
+
 `src/lib.rs` 声明的顶层模块：
 
 | 模块 | `.rs` 数 | 职责 |
