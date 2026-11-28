@@ -465,7 +465,13 @@ impl StreamBridgeState {
             Self::GrokResponsesTools(state) => state.transform(input),
             Self::ResponsesAnthropic(state) => state.transform(input),
             Self::ChatAnthropic(state) => state.transform(input),
-            Self::GeminiAnthropic(state) => state.transform(input),
+            Self::GeminiAnthropic(state) => {
+                let frames = state.transform(input);
+                if state.invalid_tool_identity {
+                    return Err(gemini_tool_identity_error());
+                }
+                frames
+            }
             Self::GeminiOpenAi(state) => return state.transform(input),
             Self::ResponsesChat(state) => state.transform(input),
             Self::AnthropicChat(state) => state.transform(input),
@@ -1760,8 +1766,15 @@ impl ResponsesAnthropicState {
     }
 }
 
+fn gemini_tool_identity_error() -> ProxyError {
+    protocol_error("gemini_tool_identity");
+    ProxyError::bad_gateway("Gemini function call has an invalid or unavailable tool identity")
+}
+
 #[derive(Debug, Default)]
 struct GeminiAnthropicState {
+    message_id: Option<String>,
+    invalid_tool_identity: bool,
     web_search_expected: bool,
     web_search_gate_resolved: bool,
     buffered_web_search_inputs: Vec<Value>,
@@ -1868,6 +1881,7 @@ impl GeminiAnthropicState {
             })
             .sum::<usize>();
         buffered_inputs
+            .saturating_add(self.message_id.as_ref().map_or(0, String::capacity))
             .saturating_add(self.text_seen.capacity())
             .saturating_add(mappings)
             .saturating_add(text_by_block)
@@ -1898,6 +1912,13 @@ impl GeminiAnthropicState {
     }
 
     fn transform(&mut self, input: &Value) -> Vec<StreamFrame> {
+        if self.invalid_tool_identity {
+            return Vec::new();
+        }
+        if self.message_id.is_none() {
+            self.message_id =
+                super::gemini_response_identity::explicit_message_id(input).map(str::to_string);
+        }
         self.observe_usage(input);
         if self.completed {
             return Vec::new();
@@ -1953,6 +1974,22 @@ impl GeminiAnthropicState {
             self.grounding.observe_candidate(candidate);
         }
         if self.pending_finish_reason.is_some() {
+            // Missing names must not hide late argument data from the shared
+            // terminal observer's name-based semantic check.
+            if candidate
+                .and_then(|(_, candidate)| candidate.pointer("/content/parts"))
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part.get("functionCall")
+                            .or_else(|| part.get("function_call"))
+                            .is_some_and(|call| !call.is_null())
+                    })
+                })
+            {
+                self.invalid_tool_identity = true;
+                return Vec::new();
+            }
             let mut frames = if self.grounding.has_web_grounding() {
                 self.ensure_message_start(input)
             } else {
@@ -2030,11 +2067,12 @@ impl GeminiAnthropicState {
                 if let Some(function_call) = part
                     .get("functionCall")
                     .or_else(|| part.get("function_call"))
+                    .filter(|call| !call.is_null())
                 {
                     let name = function_call
                         .get("name")
                         .and_then(Value::as_str)
-                        .unwrap_or("tool")
+                        .unwrap_or_default()
                         .to_string();
                     let occurrence = occurrences.entry(name).or_default();
                     frames.extend(self.function_call(
@@ -2060,11 +2098,9 @@ impl GeminiAnthropicState {
             return Vec::new();
         }
         self.message_started = true;
-        let response_id = input
-            .get("responseId")
-            .or_else(|| input.get("response_id"))
-            .and_then(Value::as_str)
-            .unwrap_or("gemini");
+        let response_id = self
+            .message_id
+            .get_or_insert_with(|| super::gemini_response_identity::message_id(input));
         let model = input
             .get("modelVersion")
             .or_else(|| input.get("model_version"))
@@ -2149,7 +2185,7 @@ impl GeminiAnthropicState {
         frames.extend(self.close_tool_blocks());
         let tool_index = self.allocate_index();
         let result_index = self.allocate_index();
-        let tool_use_id = "srvtoolu_gemini_search";
+        let tool_use_id = super::gemini_response_identity::search_tool_id();
         frames.push(StreamFrame::event(
             "content_block_start",
             json!({
@@ -2276,16 +2312,41 @@ impl GeminiAnthropicState {
         part: &Value,
         function_call: &Value,
     ) -> Vec<StreamFrame> {
-        let mut frames = self.close_text_block();
-        frames.extend(self.close_thinking_block());
-        let name = function_call
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
         let explicit_id = function_call
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty());
+        let known = explicit_id.and_then(|id| {
+            self.tools
+                .values()
+                .find(|tool| !tool.emitted && tool.id_was_explicit && tool.id == id)
+        });
+        let provided_name = match function_call.get("name") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(name)) => (!name.trim().is_empty()).then_some(name.as_str()),
+            Some(_) => {
+                self.invalid_tool_identity = true;
+                return Vec::new();
+            }
+        };
+        if provided_name
+            .zip(known)
+            .is_some_and(|(name, tool)| tool.name != name)
+        {
+            self.invalid_tool_identity = true;
+            return Vec::new();
+        }
+        let Some(name) = provided_name
+            .map(str::to_string)
+            .or_else(|| known.map(|tool| tool.name.clone()))
+        else {
+            // An explicit known ID may inherit its already fixed name. An
+            // unproven args-only slot cannot guess the most recent tool.
+            self.invalid_tool_identity = true;
+            return Vec::new();
+        };
+        let mut frames = self.close_text_block();
+        frames.extend(self.close_thinking_block());
         let slot = GeminiAnthropicToolKey {
             candidate_index,
             part_index,
@@ -2433,6 +2494,9 @@ impl GeminiAnthropicState {
     }
 
     fn finish_stream(&mut self) -> Result<Vec<StreamFrame>, ProxyError> {
+        if self.invalid_tool_identity {
+            return Err(gemini_tool_identity_error());
+        }
         if self.completed {
             return Ok(Vec::new());
         }
@@ -2443,6 +2507,9 @@ impl GeminiAnthropicState {
             for input in &buffered {
                 frames.extend(self.transform(input));
             }
+        }
+        if self.invalid_tool_identity {
+            return Err(gemini_tool_identity_error());
         }
         if self.completed {
             return Ok(frames);
@@ -5278,10 +5345,7 @@ fn response_message_text(item: &Value) -> Option<String> {
 }
 
 fn chat_reasoning_delta(delta: &Value) -> Option<&str> {
-    ["reasoning_content", "reasoning_text", "reasoning"]
-        .into_iter()
-        .find_map(|key| delta.get(key).and_then(Value::as_str))
-        .filter(|value| !value.is_empty())
+    super::chat_reasoning::text(delta)
 }
 
 fn response_id_suffix(value: &str) -> &str {
@@ -6412,6 +6476,8 @@ fn protocol_error(kind: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("stream_transforms/gemini_r6_tests.rs");
 
     fn gemini_v1internal_stored_provider(
         app: crate::domain::providers::model::AppKind,

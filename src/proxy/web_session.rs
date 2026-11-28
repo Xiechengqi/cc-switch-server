@@ -5,7 +5,7 @@ use axum::http::header::{
     ACCEPT, CACHE_CONTROL, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, USER_AGENT,
 };
 use axum::http::{HeaderValue, StatusCode};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use rand::RngCore;
 use serde_json::{json, Map, Value};
 use zeroize::Zeroizing;
@@ -21,9 +21,17 @@ use crate::domain::providers::web_session::{
 use crate::state::{ServerState, WebSessionStateError};
 
 use super::provider_ops::ProviderExecution;
+use super::request_memory::{
+    json_parse_working_bytes, retained_json_bytes, serialized_json_bytes, RequestMemoryBudget,
+    RequestMemoryComponent, RequestMemoryReservation,
+};
+
+#[path = "web_session/memory.rs"]
+mod memory;
 use super::request_timing::{Milestone, TimingResult, TimingSlot, WaitKind};
 use super::router::ProxyRoute;
 use super::ProxyError;
+use memory::{reserve, resize, serialize};
 
 const MAX_WEB_SESSION_FRAME_BYTES: usize = 1024 * 1024;
 const GROK_WEB_USER_AGENT: &str =
@@ -109,15 +117,73 @@ pub(crate) fn is_web_session_driver(driver_id: &str) -> bool {
     WebSessionKind::for_driver(driver_id).is_some()
 }
 
-pub(crate) fn preflight_actual_model(
+// Parse once, before admission, and keep the canonical allocation charged
+// through native preparation and response accounting.
+#[derive(Debug)]
+pub(super) struct PreparedWebSessionRequest {
+    request: CanonicalRequest,
+    selection: ModelSelection,
+    memory: Option<RequestMemoryReservation>,
+}
+
+impl PreparedWebSessionRequest {
+    pub(super) fn requested_model(&self) -> &str {
+        &self.selection.requested
+    }
+    pub(super) fn actual_model(&self) -> &str {
+        &self.selection.actual
+    }
+    pub(super) fn stream_requested(&self) -> bool {
+        self.request.stream_requested
+    }
+}
+
+pub(super) struct WebSessionExecutionContext<'a> {
+    pub memory: Option<&'a RequestMemoryBudget>,
+    pub upstream_attempted: bool,
+}
+
+pub(super) fn prepare(
     execution: &ProviderExecution,
     route: ProxyRoute,
     body: &[u8],
-) -> Result<String, ProxyError> {
+    budget: Option<&RequestMemoryBudget>,
+) -> Result<PreparedWebSessionRequest, ProxyError> {
     let kind = WebSessionKind::for_driver(execution.plan.driver_id.as_str())
         .ok_or_else(|| ProxyError::bad_request("Provider is not a Web Session Driver"))?;
+    let profile = web_session_profile_for_driver(execution.plan.driver_id.as_str())
+        .ok_or_else(|| ProxyError::bad_request("Web Session Driver has no reviewed profile"))?;
+    if body.len() > profile.request_body_limit_bytes {
+        return Err(ProxyError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: format!(
+                "Web Session request exceeds the {} byte profile limit",
+                profile.request_body_limit_bytes
+            ),
+        });
+    }
+    let working = json_parse_working_bytes(body);
+    let _json_memory = reserve(budget, RequestMemoryComponent::NormalizedBody, working)?;
+    // Covers the canonical strings, vector growth and joined token-estimation
+    // scratch while the original JSON Value remains alive.
+    let canonical_memory = reserve(
+        budget,
+        RequestMemoryComponent::NormalizedBody,
+        working.saturating_mul(2),
+    )?;
     let request = parse_downstream_request(route, body)?;
-    resolve_model(execution, kind, &request.requested_model).map(|selection| selection.actual)
+    let selection = resolve_model(execution, kind, &request.requested_model)?;
+    resize(
+        &canonical_memory,
+        request
+            .retained_bytes()
+            .saturating_add(selection.retained_bytes()),
+    )?;
+    Ok(PreparedWebSessionRequest {
+        request,
+        selection,
+        memory: canonical_memory,
+    })
 }
 
 #[derive(Debug)]
@@ -132,6 +198,7 @@ pub(crate) struct WebSessionForwardResult {
     pub output_tokens: u64,
     pub upstream_status: u16,
     pub local_only: bool,
+    _metadata_memory: Option<RequestMemoryReservation>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,12 +216,40 @@ struct CanonicalRequest {
     input_tokens: u64,
 }
 
+impl CanonicalRequest {
+    fn retained_bytes(&self) -> usize {
+        self.system
+            .iter()
+            .fold(
+                std::mem::size_of::<Self>()
+                    + self.requested_model.capacity()
+                    + self.system.capacity() * std::mem::size_of::<String>()
+                    + self.messages.capacity() * std::mem::size_of::<CanonicalMessage>(),
+                |bytes, text| bytes.saturating_add(text.capacity()),
+            )
+            .saturating_add(self.messages.iter().fold(0usize, |bytes, message| {
+                bytes
+                    .saturating_add(message.role.capacity())
+                    .saturating_add(message.content.capacity())
+            }))
+    }
+}
+
 #[derive(Debug)]
 struct ModelSelection {
     requested: String,
     actual: String,
     actual_source: Option<String>,
     upstream_selector: &'static str,
+}
+
+impl ModelSelection {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.requested.capacity()
+            + self.actual.capacity()
+            + self.actual_source.as_ref().map_or(0, String::capacity)
+    }
 }
 
 #[derive(Debug)]
@@ -167,26 +262,22 @@ pub(super) async fn execute(
     state: &ServerState,
     execution: &ProviderExecution,
     route: ProxyRoute,
-    body: Bytes,
+    prepared: PreparedWebSessionRequest,
     value_attempt: Option<&crate::state::ValueAttemptGuard>,
     timing: &TimingSlot,
+    context: &mut WebSessionExecutionContext<'_>,
 ) -> Result<WebSessionForwardResult, ProxyError> {
     let driver_id = execution.plan.driver_id.as_str();
     let kind = WebSessionKind::for_driver(driver_id)
         .ok_or_else(|| ProxyError::bad_request("Provider is not a Web Session Driver"))?;
     let profile = web_session_profile_for_driver(driver_id)
         .ok_or_else(|| ProxyError::bad_request("Web Session Driver has no reviewed profile"))?;
-    if body.len() > profile.request_body_limit_bytes {
-        return Err(ProxyError {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: format!(
-                "Web Session request exceeds the {} byte profile limit",
-                profile.request_body_limit_bytes
-            ),
-        });
-    }
-    let request = parse_downstream_request(route, &body)?;
-    let selection = resolve_model(execution, kind, &request.requested_model)?;
+    let PreparedWebSessionRequest {
+        request,
+        selection,
+        memory: metadata_memory,
+    } = prepared;
+    let budget = context.memory;
 
     if route == ProxyRoute::ClaudeCountTokens {
         if let Some(timing) = timing.get() {
@@ -194,10 +285,7 @@ pub(super) async fn execute(
             timing.observe_terminal(TimingResult::Complete);
         }
         return Ok(WebSessionForwardResult {
-            downstream_body: Bytes::from(
-                serde_json::to_vec(&json!({"input_tokens": request.input_tokens}))
-                    .map_err(|error| ProxyError::bad_gateway(error.to_string()))?,
-            ),
+            downstream_body: serialize(&json!({"input_tokens": request.input_tokens}), budget)?,
             downstream_content_type: "application/json",
             stream_requested: false,
             requested_model: selection.requested,
@@ -207,6 +295,7 @@ pub(super) async fn execute(
             output_tokens: 0,
             upstream_status: StatusCode::OK.as_u16(),
             local_only: true,
+            _metadata_memory: metadata_memory,
         });
     }
 
@@ -228,22 +317,33 @@ pub(super) async fn execute(
 
     let endpoint = validate_runtime_endpoint(profile, &execution.plan.endpoint)?;
     let request_id = random_uuid_like();
+    // Includes joined conversation/history, nested Perplexity query JSON,
+    // escaped strings, and the final Value while canonical input stays live.
+    let upstream_memory = reserve(
+        budget,
+        RequestMemoryComponent::NormalizedBody,
+        request
+            .retained_bytes()
+            .saturating_mul(12)
+            .saturating_add(16 * 1024),
+    )?;
     let upstream_body = match kind {
         WebSessionKind::Grok => build_grok_request(&request, selection.upstream_selector),
         WebSessionKind::Perplexity => {
             build_perplexity_request(&request, selection.upstream_selector, &request_id)?
         }
     };
-    let encoded = serde_json::to_vec(&upstream_body)
-        .map(Bytes::from)
-        .map_err(|error| ProxyError::bad_gateway(format!("encode Web Session request: {error}")))?;
-    if encoded.len() > profile.request_body_limit_bytes {
+    resize(&upstream_memory, retained_json_bytes(&upstream_body))?;
+    if serialized_json_bytes(&upstream_body) > profile.request_body_limit_bytes {
         return Err(ProxyError {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: "translated Web Session request exceeds the reviewed profile limit"
                 .to_string(),
         });
     }
+    let encoded = serialize(&upstream_body, budget)?;
+    drop(upstream_body);
+    drop(upstream_memory);
 
     let client = state.web_session_http_client().await;
     let mut request_builder = client
@@ -271,6 +371,7 @@ pub(super) async fn execute(
             .header("x-request-id", &request_id),
     };
 
+    context.upstream_attempted = true;
     if let Some(attempt) = value_attempt {
         attempt.mark_sent();
     }
@@ -341,12 +442,26 @@ pub(super) async fn execute(
             .unwrap_or_else(|| execution.request_timeout()),
         execution.request_timeout(),
         forward_timing.as_ref(),
+        budget,
     )
     .await?;
+    let parse_memory = reserve(
+        budget,
+        RequestMemoryComponent::StreamRetainedState,
+        json_parse_working_bytes(&response_body).saturating_mul(4),
+    )?;
     let parsed = match kind {
         WebSessionKind::Grok => parse_grok_ndjson(&response_body)?,
-        WebSessionKind::Perplexity => parse_perplexity_sse(&response_body)?,
+        WebSessionKind::Perplexity => parse_perplexity_sse_with_memory(&response_body, budget)?,
     };
+    drop(response_body);
+    resize(
+        &parse_memory,
+        parsed
+            .text
+            .capacity()
+            .saturating_add(parsed.session_id.as_ref().map_or(0, String::capacity)),
+    )?;
     if let Some(timing) = &forward_timing {
         if !parsed.text.is_empty() {
             timing.mark(Milestone::FirstSemantic);
@@ -367,6 +482,7 @@ pub(super) async fn execute(
         &parsed.text,
         request.input_tokens,
         output_tokens,
+        budget,
     )?;
     Ok(WebSessionForwardResult {
         downstream_body,
@@ -379,6 +495,7 @@ pub(super) async fn execute(
         output_tokens,
         upstream_status: status.as_u16(),
         local_only: false,
+        _metadata_memory: metadata_memory,
     })
 }
 
@@ -949,6 +1066,7 @@ fn validate_response_content_type(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Existing per-phase timeout contract plus memory owner.
 async fn read_response_body_strict(
     mut response: reqwest::Response,
     limit: usize,
@@ -956,6 +1074,7 @@ async fn read_response_body_strict(
     idle_timeout: Duration,
     total_timeout: Duration,
     timing: Option<&super::request_timing::ForwardTiming>,
+    budget: Option<&RequestMemoryBudget>,
 ) -> Result<Bytes, ProxyError> {
     if response
         .content_length()
@@ -967,7 +1086,8 @@ async fn read_response_body_strict(
     }
     let deadline = tokio::time::Instant::now() + total_timeout;
     let mut first = true;
-    let mut output = BytesMut::with_capacity(limit.min(16 * 1024));
+    let mut output = Vec::new();
+    let output_memory = reserve(budget, RequestMemoryComponent::TransportPending, 0)?;
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -1004,6 +1124,17 @@ async fn read_response_body_strict(
                 "Web Session response exceeds the {limit} byte profile limit"
             )));
         }
+        let _chunk_memory = reserve(
+            budget,
+            RequestMemoryComponent::TransportPending,
+            chunk.len(),
+        )?;
+        let next = output.len().saturating_add(chunk.len());
+        resize(&output_memory, next.max(output.capacity()))?;
+        output
+            .try_reserve_exact(next.saturating_sub(output.len()))
+            .map_err(|_| ProxyError::request_memory_exhausted())?;
+        resize(&output_memory, output.capacity())?;
         output.extend_from_slice(&chunk);
     }
     if first {
@@ -1011,7 +1142,11 @@ async fn read_response_body_strict(
             "Web Session upstream returned an empty response body",
         ));
     }
-    Ok(output.freeze())
+    let bytes = Bytes::from(output);
+    Ok(match output_memory {
+        Some(memory) => memory.retain_bytes(bytes),
+        None => bytes,
+    })
 }
 
 fn network_error(operation: &str, error: reqwest::Error) -> ProxyError {
@@ -1092,7 +1227,80 @@ struct PerplexityAccumulator {
 }
 
 impl PerplexityAccumulator {
-    fn observe(&mut self, event: &Value) -> Result<(), ProxyError> {
+    fn retained_bytes(&self) -> usize {
+        let strings = self.candidates.iter().fold(0usize, |n, (k, v)| {
+            n.saturating_add(96 + k.capacity() + v.capacity())
+        });
+        self.chunks
+            .iter()
+            .fold(strings, |n, (k, v)| {
+                n.saturating_add(96 + k.capacity() + v.capacity() * std::mem::size_of::<String>())
+                    .saturating_add(v.iter().map(String::capacity).sum::<usize>())
+            })
+            .saturating_add(self.fallback_text.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.session_id.as_ref().map_or(0, String::capacity))
+    }
+
+    fn reserve_event(
+        &self,
+        event: &Value,
+        memory: &Option<RequestMemoryReservation>,
+    ) -> Result<(), ProxyError> {
+        // A tiny /chunks/4096 patch can allocate a sparse Vec much larger
+        // than its wire frame. Reserve that expansion before resize/cloning.
+        let mut sparse = 0usize;
+        if let Some(blocks) = event.get("blocks").and_then(Value::as_array) {
+            for block in blocks {
+                let field = block
+                    .pointer("/diff_block/field")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !field.is_empty() && field != "markdown_block" {
+                    continue;
+                }
+                if let Some(patches) = block
+                    .pointer("/diff_block/patches")
+                    .and_then(Value::as_array)
+                {
+                    let max = patches
+                        .iter()
+                        .filter_map(|p| {
+                            p.get("path")
+                                .and_then(Value::as_str)
+                                .and_then(|p| p.strip_prefix("/chunks/"))
+                                .and_then(|p| p.parse::<usize>().ok())
+                        })
+                        .max();
+                    if let Some(index) = max {
+                        if index > 4096 {
+                            return Err(ProxyError::bad_gateway(
+                                "Perplexity Web markdown patch index exceeds the bound",
+                            ));
+                        }
+                        sparse = sparse.saturating_add(
+                            (index + 1)
+                                .saturating_mul(std::mem::size_of::<String>())
+                                .saturating_mul(2),
+                        );
+                    }
+                }
+            }
+        }
+        resize(
+            memory,
+            self.retained_bytes()
+                .saturating_mul(2)
+                .saturating_add(retained_json_bytes(event).saturating_mul(4))
+                .saturating_add(sparse)
+                .saturating_add(1024),
+        )
+    }
+
+    fn observe(
+        &mut self,
+        event: &Value,
+        budget: Option<&RequestMemoryBudget>,
+    ) -> Result<(), ProxyError> {
         if event
             .get("error_code")
             .or_else(|| event.get("error_message"))
@@ -1121,7 +1329,7 @@ impl PerplexityAccumulator {
             }
         }
         if let Some(text) = event.get("text").and_then(Value::as_str) {
-            if let Some(answer) = extract_perplexity_final_text(text) {
+            if let Some(answer) = extract_perplexity_final_text(text, budget)? {
                 self.fallback_text = Some(answer);
             }
         }
@@ -1147,10 +1355,10 @@ impl PerplexityAccumulator {
             let patches = diff
                 .get("patches")
                 .and_then(Value::as_array)
-                .cloned()
+                .map(Vec::as_slice)
                 .unwrap_or_default();
             if field == "markdown_block" || field.is_empty() {
-                apply_markdown_patches(self.chunks.entry(key.clone()).or_default(), &patches)?;
+                apply_markdown_patches(self.chunks.entry(key.clone()).or_default(), patches)?;
                 let joined = self
                     .chunks
                     .get(&key)
@@ -1161,7 +1369,7 @@ impl PerplexityAccumulator {
                 }
             }
             if field == "workflow_block" {
-                for patch in &patches {
+                for patch in patches {
                     if let Some(answer) = extract_workflow_answer(patch.get("value")) {
                         self.candidates.insert(format!("workflow:{index}"), answer);
                     }
@@ -1193,7 +1401,16 @@ impl PerplexityAccumulator {
     }
 }
 
+#[cfg(test)]
 fn parse_perplexity_sse(body: &[u8]) -> Result<ParsedUpstreamCompletion, ProxyError> {
+    parse_perplexity_sse_with_memory(body, None)
+}
+
+fn parse_perplexity_sse_with_memory(
+    body: &[u8],
+    budget: Option<&RequestMemoryBudget>,
+) -> Result<ParsedUpstreamCompletion, ProxyError> {
+    let accumulator_memory = reserve(budget, RequestMemoryComponent::StreamRetainedState, 0)?;
     let text = std::str::from_utf8(body)
         .map_err(|_| ProxyError::bad_gateway("Perplexity Web SSE is not valid UTF-8"))?;
     let mut accumulator = PerplexityAccumulator::default();
@@ -1226,7 +1443,9 @@ fn parse_perplexity_sse(body: &[u8]) -> Result<ParsedUpstreamCompletion, ProxyEr
         let event: Value = serde_json::from_str(&payload).map_err(|_| {
             ProxyError::bad_gateway("Perplexity Web SSE data contains malformed JSON")
         })?;
-        accumulator.observe(&event)?;
+        accumulator.reserve_event(&event, &accumulator_memory)?;
+        accumulator.observe(&event, budget)?;
+        resize(&accumulator_memory, accumulator.retained_bytes())?;
         if event.get("status").and_then(Value::as_str) == Some("COMPLETED") {
             *completed = true;
         }
@@ -1410,18 +1629,30 @@ fn extract_workflow_answer(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn extract_perplexity_final_text(text: &str) -> Option<String> {
+fn extract_perplexity_final_text(
+    text: &str,
+    budget: Option<&RequestMemoryBudget>,
+) -> Result<Option<String>, ProxyError> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
     if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
-        return Some(trimmed.to_string());
+        return Ok(Some(trimmed.to_string()));
     }
-    let value: Value = serde_json::from_str(trimmed).ok()?;
+    let _outer_memory = reserve(
+        budget,
+        RequestMemoryComponent::NormalizedEvent,
+        json_parse_working_bytes(trimmed.as_bytes()).saturating_mul(2),
+    )?;
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return Ok(None);
+    };
     let values = value.as_array().cloned().unwrap_or_else(|| vec![value]);
     for step in values {
-        let object = step.as_object()?;
+        let Some(object) = step.as_object() else {
+            return Ok(None);
+        };
         if object
             .get("step_type")
             .or_else(|| object.get("stepType"))
@@ -1433,26 +1664,36 @@ fn extract_perplexity_final_text(text: &str) -> Option<String> {
         let raw = step
             .pointer("/content/answer")
             .or_else(|| object.get("answer"))
-            .and_then(Value::as_str)?;
+            .and_then(Value::as_str);
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let _inner_memory = reserve(
+            budget,
+            RequestMemoryComponent::NormalizedEvent,
+            json_parse_working_bytes(raw.as_bytes()).saturating_mul(2),
+        )?;
         if let Ok(inner) = serde_json::from_str::<Value>(raw) {
             if let Some(answer) = inner.get("answer").and_then(Value::as_str) {
                 if !answer.trim().is_empty() {
-                    return Some(answer.to_string());
+                    return Ok(Some(answer.to_string()));
                 }
             }
             if let Some(chunks) = inner.get("chunks").and_then(Value::as_array) {
                 let answer = chunks.iter().filter_map(Value::as_str).collect::<String>();
                 if !answer.trim().is_empty() {
-                    return Some(answer);
+                    return Ok(Some(answer));
                 }
             }
         }
         if !raw.trim().is_empty() {
-            return Some(raw.to_string());
+            return Ok(Some(raw.to_string()));
         }
     }
-    None
+    Ok(None)
 }
+
+type DownstreamEvent = (Option<&'static str>, Value);
 
 fn render_downstream(
     route: ProxyRoute,
@@ -1461,6 +1702,7 @@ fn render_downstream(
     text: &str,
     input_tokens: u64,
     output_tokens: u64,
+    budget: Option<&RequestMemoryBudget>,
 ) -> Result<(Bytes, &'static str), ProxyError> {
     let id = random_id(match route {
         ProxyRoute::ClaudeMessages => "msg_web_",
@@ -1469,17 +1711,31 @@ fn render_downstream(
         _ => "web_",
     });
     let created = super::openai_chat_compat::unix_timestamp_seconds();
-    let encoded = match (route, stream) {
-        (ProxyRoute::ClaudeMessages, false) => serde_json::to_vec(&json!({
-            "id": id,
-            "type": "message",
-            "role": "assistant",
-            "model": model,
-            "content": [{"type":"text","text":text}],
-            "stop_reason": "end_turn",
-            "stop_sequence": null,
-            "usage": {"input_tokens":input_tokens,"output_tokens":output_tokens}
-        }))?,
+    let values_memory = reserve(
+        budget,
+        RequestMemoryComponent::NormalizedEvent,
+        text.len()
+            .saturating_mul(12)
+            .saturating_add(model.len().saturating_mul(24))
+            .saturating_add(32 * 1024),
+    )?;
+    let (events, done): (Vec<DownstreamEvent>, bool) = match (route, stream) {
+        (ProxyRoute::ClaudeMessages, false) => (
+            vec![(
+                None,
+                json!({
+                    "id": id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [{"type":"text","text":text}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null,
+                    "usage": {"input_tokens":input_tokens,"output_tokens":output_tokens}
+                }),
+            )],
+            false,
+        ),
         (ProxyRoute::ClaudeMessages, true) => {
             let events = [
                 (
@@ -1504,37 +1760,43 @@ fn render_downstream(
                 ),
                 ("message_stop", json!({"type":"message_stop"})),
             ];
-            events
-                .into_iter()
-                .map(|(event, value)| format!("event: {event}\ndata: {value}\n\n"))
-                .collect::<String>()
-                .into_bytes()
+            (
+                events
+                    .into_iter()
+                    .map(|(name, value)| (Some(name), value))
+                    .collect(),
+                false,
+            )
         }
-        (ProxyRoute::CodexChatCompletions, false) => serde_json::to_vec(&json!({
-            "id": id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model,
-            "choices": [{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop","logprobs":null}],
-            "usage": {"prompt_tokens":input_tokens,"completion_tokens":output_tokens,"total_tokens":input_tokens.saturating_add(output_tokens)}
-        }))?,
+        (ProxyRoute::CodexChatCompletions, false) => (
+            vec![(
+                None,
+                json!({
+                    "id": id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop","logprobs":null}],
+                    "usage": {"prompt_tokens":input_tokens,"completion_tokens":output_tokens,"total_tokens":input_tokens.saturating_add(output_tokens)}
+                }),
+            )],
+            false,
+        ),
         (ProxyRoute::CodexChatCompletions, true) => {
             let chunks = [
                 json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null,"logprobs":null}]}),
                 json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":text},"finish_reason":null,"logprobs":null}]}),
                 json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{},"finish_reason":"stop","logprobs":null}],"usage":{"prompt_tokens":input_tokens,"completion_tokens":output_tokens,"total_tokens":input_tokens.saturating_add(output_tokens)}}),
             ];
-            let mut output = chunks
-                .iter()
-                .map(|value| format!("data: {value}\n\n"))
-                .collect::<String>();
-            output.push_str("data: [DONE]\n\n");
-            output.into_bytes()
+            (
+                chunks.into_iter().map(|value| (None, value)).collect(),
+                true,
+            )
         }
         (ProxyRoute::CodexResponses, false) => {
             let response =
                 completed_response(&id, created, model, text, input_tokens, output_tokens);
-            serde_json::to_vec(&response)?
+            (vec![(None, response)], false)
         }
         (ProxyRoute::CodexResponses, true) => {
             let item_id = random_id("msg_web_");
@@ -1582,12 +1844,13 @@ fn render_downstream(
                     json!({"type":"response.completed","response":completed}),
                 ),
             ];
-            let mut output = events
-                .into_iter()
-                .map(|(event, value)| format!("event: {event}\ndata: {value}\n\n"))
-                .collect::<String>();
-            output.push_str("data: [DONE]\n\n");
-            output.into_bytes()
+            (
+                events
+                    .into_iter()
+                    .map(|(name, value)| (Some(name), value))
+                    .collect(),
+                true,
+            )
         }
         _ => {
             return Err(ProxyError::bad_request(
@@ -1595,12 +1858,53 @@ fn render_downstream(
             ))
         }
     };
+    resize(
+        &values_memory,
+        events.iter().fold(0usize, |n, (_, value)| {
+            n.saturating_add(retained_json_bytes(value))
+        }),
+    )?;
+    let length = events
+        .iter()
+        .fold(if done { 14usize } else { 0 }, |n, (event, value)| {
+            n.saturating_add(serialized_json_bytes(value))
+                .saturating_add(if stream {
+                    8usize.saturating_add(event.map_or(0, |name| name.len() + 8))
+                } else {
+                    0
+                })
+        });
+    let output_memory = reserve(budget, RequestMemoryComponent::NormalizedBody, length)?;
+    let mut encoded = Vec::with_capacity(length);
+    for (event, value) in &events {
+        if stream {
+            if let Some(event) = event {
+                encoded.extend_from_slice(b"event: ");
+                encoded.extend_from_slice(event.as_bytes());
+                encoded.push(b'\n');
+            }
+            encoded.extend_from_slice(b"data: ");
+        }
+        serde_json::to_writer(&mut encoded, value)?;
+        if stream {
+            encoded.extend_from_slice(b"\n\n");
+        }
+    }
+    if done {
+        encoded.extend_from_slice(b"data: [DONE]\n\n");
+    }
+    debug_assert_eq!(encoded.len(), length);
+    let bytes = Bytes::from(encoded);
+    let bytes = match output_memory {
+        Some(memory) => memory.retain_bytes(bytes),
+        None => bytes,
+    };
     let content_type = if stream {
         "text/event-stream"
     } else {
         "application/json"
     };
-    Ok((Bytes::from(encoded), content_type))
+    Ok((bytes, content_type))
 }
 
 fn completed_response(
@@ -1682,6 +1986,7 @@ mod tests {
             "hello",
             2,
             1,
+            None,
         )
         .unwrap();
         assert_eq!(content_type, "application/json");
@@ -1696,6 +2001,7 @@ mod tests {
             "hello",
             2,
             1,
+            None,
         )
         .unwrap();
         assert_eq!(content_type, "text/event-stream");

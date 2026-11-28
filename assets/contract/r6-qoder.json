@@ -1,0 +1,149 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "round": "R6",
+  "providerClass": "qoder_cosy",
+  "baseline": "f1e3e0dbb77fbe3d21c4ce52d12da05771db179f",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "referencePolicy": "read_only_committed_objects_never_build_test_runtime_or_release_dependency",
+  "references": [
+    {
+      "repository": "Qoder/qoder2api-hub",
+      "commit": "2b0981c99166d681cdc8c9b38629c8c1b7306634",
+      "tree": "f2054a24ed47af6cfa32cf9f583fd010fbf9ff3b",
+      "files": [
+        {
+          "path": "qoder_proxy.py",
+          "sha256": "84a0429448e4e079989c6122769a48ffd7254835519b883df3ff780a1fd5a3bd"
+        },
+        {
+          "path": "qoder_catalog.py",
+          "sha256": "aa153b8b16ce6189098f1ad5a5872b96c5d1dfd2f72923c9b8b2731ff939be1b"
+        }
+      ]
+    },
+    {
+      "repository": "cli2api",
+      "commit": "ccd4744555060a9b78882f246263c7060d8cb6bb",
+      "tree": "2f5233f533194d1260fe0b02d9ac9961c944757a",
+      "files": [
+        {
+          "path": "internal/providers/qoder/direct.go",
+          "sha256": "6210b7452725cf85ecbf81b19b0e3a79314e81e848f8446952c0a318bb647dbe"
+        }
+      ]
+    }
+  ],
+  "existingOracle": [
+    {
+      "path": "assets/contract/qoder-cli-oracle.json",
+      "sha256": "da796f08b590661793d12556cb774d1646b83fa12e6e6ce5f6093e8d21beac02"
+    },
+    {
+      "path": "assets/contract/qoder-capability-extension.json",
+      "sha256": "eee23842cdf8e9b419ebfcb794ee6801774634a68f4bc18e46806dea1d99465e"
+    },
+    {
+      "path": "assets/contract/qoder-catalog-scenes.json",
+      "sha256": "aafcc0c2ae77be09daf115dbd1af0e66c052ac23676fcb9de1887f4f5b42ec74"
+    }
+  ],
+  "planItems": [
+    {
+      "id": "R6-QD-01",
+      "status": "reviewed_gated_no_wire_delta",
+      "scope": "New nested catalog thinking/context metadata has no independently reviewed same-version CLI wire/rail evidence. Preserve chat priority/deny, discovery-only app entries, known effort mappings and context field locations; do not infer rights from the newer desktop-facing reference."
+    },
+    {
+      "id": "R6-OBS-01",
+      "status": "fixture_verified",
+      "scope": "Qoder portion. Normalized source request and final prepared model_config produce bounded requested/effective diagnostics on four ingresses, both modes and three rails, including same-account recovery and failed preparation."
+    }
+  ],
+  "localCorrections": {
+    "disable": "Source Claude disabled and Gemini zero budget become the existing none directive before generic bridges; models without an audited disable capability reject before generation.",
+    "preciseBudgets": "Reject exact token budgets instead of changing them into effort; Gemini -1 remains unspecified/dynamic and is an existing passing regression.",
+    "validation": "Reject invalid/unknown/conflicting efforts before catalog or generation; accept only bounded reviewed aliases and do not echo unknown input.",
+    "upstream": "No new vendor field, identity, transport, entitlement, retry branch, rail fallback, state writer or Router/Web schema."
+  },
+  "diagnostics": {
+    "fields": [
+      "requested_reasoning_effort",
+      "effective_reasoning_effort"
+    ],
+    "source": "Existing normalized directive; effective comes only from final prepared model_config is_reasoning/reasoning_effort.",
+    "semantics": "Preparation is not dispatch or vendor execution. An enabled toggle without a known level stays unknown. Unknown catalog strings do not become labels. Each retry clears the previous effective result.",
+    "mapping": "The audited gm51model high-to-max mapping remains; qmodel toggle-only does not invent a concrete effort; omitted controls may expose a known declared catalog default."
+  },
+  "cases": [
+    {
+      "id": "source-off-mapping-toggle-and-catalog-defaults",
+      "tests": [
+        "qoder_r6_diagnostics_follow_final_wire_controls_without_inventing_toggle_effort"
+      ]
+    },
+    {
+      "id": "same-account-recovery-preserves-wire-and-diagnostics",
+      "tests": [
+        "qoder_r6_same_account_auth_recovery_retains_prepared_diagnostics_and_mapping"
+      ]
+    },
+    {
+      "id": "failed-preparation-has-no-effective-control",
+      "tests": [
+        "qoder_r6_failed_preparation_does_not_claim_an_effective_effort"
+      ]
+    },
+    {
+      "id": "budgets-invalid-unknown-and-conflicting-source-controls",
+      "tests": [
+        "qoder_r6_exact_budgets_invalid_and_conflicting_controls_do_not_generate"
+      ]
+    },
+    {
+      "id": "dynamic-budget-is-not-an-effort",
+      "tests": [
+        "qoder_r6_gemini_dynamic_budget_does_not_invent_an_effort"
+      ]
+    },
+    {
+      "id": "unreviewed-catalog-does-not-authorize-disable",
+      "tests": [
+        "qoder_r6_unreviewed_catalog_thinking_does_not_authorize_disable"
+      ]
+    }
+  ],
+  "redEvidence": {
+    "passed": 1,
+    "failed": 4,
+    "log": "/tmp/cc-r6-qoder-red3.log",
+    "sourceDigest": "4020dcc3f0c203dfcbd60d1b40e74ce62ea3b8504a29e18477ba7c532b1a0a96",
+    "result": "Native disabled was sent enabled; exact budget generated; failed preparation and successful auth recovery omitted requested diagnostics.",
+    "excluded": "red1 fixture type errors and red2 fixed-model auto admission mismatch are not product failure evidence."
+  },
+  "validation": {
+    "rustFilter": "qoder",
+    "passed": 193,
+    "failed": 0,
+    "ignored": 0,
+    "r6Tests": 6,
+    "nodeOracleMutationTests": 16,
+    "strictAllTargetClippy": "passed",
+    "cargoFmt": "passed",
+    "explicitIncludeRustfmt": "passed",
+    "rustInputCount": 505,
+    "rustInputDigest": "451724fdee7fbd199b77d7bf05e1f2b4098ea3a8139e9a955fc0366572cb3d9c",
+    "rustInputDigestMethod": "sha256 of sorted canonical path/sha256 array with sort_keys and compact separators",
+    "testBinaryPath": "target/debug/deps/cc_switch_server-0fd71eb143350f8d",
+    "testBinarySha256": "9ac6044e384a5ab158320ad16bb02e53f95443b05cdd7c3078ade607fb8a52be",
+    "sourceState": "uncommitted_r6_class_snapshot",
+    "finalIntegration": "separate_current_worktree_freeze_required"
+  },
+  "limitations": [
+    "Fixtures do not prove real vendor acceptance; Global OAuth/Global PAT/CN OAuth each remain live_pending.",
+    "Nested thinking_config/context_config capability adoption remains blocked by independent same-rail/version evidence. No static fallback or another rail supplies that authority.",
+    "Known catalog defaults are prepared wire values, not evidence that an unsupported requested effort was executed.",
+    "No UI automation, deployment tests, real-account operation, commit or push."
+  ]
+}

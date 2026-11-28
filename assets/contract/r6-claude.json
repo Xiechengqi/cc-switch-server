@@ -1,0 +1,164 @@
+{
+  "schemaVersion": 1,
+  "kind": "conditional_protocol_review",
+  "round": "R6",
+  "providerClass": "claude",
+  "baseline": "f1e3e0dbb77fbe3d21c4ce52d12da05771db179f",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "referencePolicy": "read_only_committed_objects_never_build_test_runtime_or_release_dependency",
+  "references": [
+    {
+      "repository": "CLIProxyAPI",
+      "commit": "47f18e4d82bd72f7d2b5ecf5ede93e4837a4625e",
+      "tree": "1c6c82df0d0364387bcd84751ac5ee6a0a2da8d3",
+      "files": [
+        {
+          "path": "internal/runtime/executor/claude_executor.go",
+          "sha256": "5cc836125d01d215b10d64fb4c95f96ce2dd0e45d1033c13d3915c57f728082f"
+        },
+        {
+          "path": "internal/runtime/executor/claude_executor_execute.go",
+          "sha256": "8cc8bd877ad70698a40c396e50a7cea31755813684a2a18673e722016ddba6dd"
+        },
+        {
+          "path": "internal/runtime/executor/claude_executor_stream.go",
+          "sha256": "b566cb7dd099ab16d656da8f834233208eefd33d52ff2832c6a1012dfa92f127"
+        },
+        {
+          "path": "internal/runtime/executor/helps/claude_advisor_state.go",
+          "sha256": "b7a88c8d3aececfa6fd679dee3daf7521080ee5f85faba47aa006aa94c36d5a3"
+        }
+      ]
+    }
+  ],
+  "planItems": [
+    {
+      "id": "R6F-CL-01",
+      "status": "reviewed_gated_no_wire_delta",
+      "reason": "The reference owner store implements a gateway credential-migration policy; no independent vendor receipt proves that Advisor ciphertext is credential-bound in this Server. Use the plan exit to retain current opaque forwarding. Do not introduce a speculative owner cache or silently strip blocks."
+    }
+  ],
+  "referenceBehavior": {
+    "exactShapes": [
+      "server_tool_use(name=advisor)",
+      "advisor_tool_result",
+      "advisor_redacted_result",
+      "tool_result.content containing exact advisor_redacted_result"
+    ],
+    "ordinaryClientTool": "tool_use(name=advisor) is not a server Advisor call",
+    "knownOwner": "first writer wins, scope plus tool ID; 4096 local entries, sliding 24-hour TTL, optional shared KV",
+    "unknown": "kept on first send, registered after accepted JSON response or SSE message_start; emitted response IDs are also recorded",
+    "foreign": "exact matching advisor state is stripped, sometimes removing an entire message; this policy is not adopted",
+    "limits": "SSE message_start and CountTokens acceptance are not independent proof of complete inference, block ownership, cross-account portability or correct treatment after controlled token refresh."
+  },
+  "decisionStates": [
+    {
+      "state": "accepted_same_owner",
+      "currentBehavior": "Preserve opaque content; existing explicit native-tool beta policy and final CCH order remain. No new Advisor provenance is recorded.",
+      "candidateIfProven": "Record only scoped ID digests after valid operation-specific upstream acceptance; CountTokens must not establish inference ownership."
+    },
+    {
+      "state": "known_foreign",
+      "currentBehavior": "There is no independent Advisor provenance store. Existing Thread metadata scope rejection does not classify all blocks in client-supplied full history. No new local foreign detector or deletion is claimed.",
+      "candidateIfProven": "Reject before upstream send with a controlled recoverable conflict; no silent block/history deletion. Exact error wire requires a separately reviewed implementation."
+    },
+    {
+      "state": "unknown",
+      "currentBehavior": "Preserve current opaque forwarding; unknown origin, process restart, missing evidence and an ordinary client tool name never imply a foreign owner.",
+      "candidateIfProven": "Do not infer owner from plaintext, encrypted bytes, names or token-string differences. A later accepted result may record bounded metadata under the proven scope."
+    }
+  ],
+  "futureScope": [
+    "product/Profile and operation",
+    "Provider revision/runtime and fixed endpoint",
+    "Account durable owner/incarnation/auth identity generation",
+    "Share, authenticated caller and explicit session"
+  ],
+  "refreshPolicy": "Controlled token refresh alone is not owner change; explicit rebinding/incarnation change is independently fenced by existing binding/Thread metadata, but full opaque-history portability remains unproven.",
+  "operationEvidence": [
+    {
+      "operation": "messages_json",
+      "state": "live_pending",
+      "required": "Independent same-rail redacted request/response/next-turn acceptance for same identity, controlled refresh, explicit rebinding and restart-unknown as applicable."
+    },
+    {
+      "operation": "messages_sse",
+      "state": "live_pending",
+      "required": "Independent same-rail redacted request/response/next-turn acceptance for same identity, controlled refresh, explicit rebinding and restart-unknown as applicable."
+    },
+    {
+      "operation": "count_tokens",
+      "state": "live_pending",
+      "required": "Independent same-rail redacted request/response/next-turn acceptance for same identity, controlled refresh, explicit rebinding and restart-unknown as applicable."
+    },
+    {
+      "operation": "advisor_tool_next_turn",
+      "state": "live_pending",
+      "required": "Independent same-rail redacted request/response/next-turn acceptance for same identity, controlled refresh, explicit rebinding and restart-unknown as applicable."
+    },
+    {
+      "operation": "thread_omitted_history",
+      "state": "live_pending",
+      "required": "Independent same-rail redacted request/response/next-turn acceptance for same identity, controlled refresh, explicit rebinding and restart-unknown as applicable."
+    },
+    {
+      "operation": "thread_full_client_history",
+      "state": "live_pending",
+      "required": "Independent same-rail redacted request/response/next-turn acceptance for same identity, controlled refresh, explicit rebinding and restart-unknown as applicable."
+    }
+  ],
+  "cases": [
+    {
+      "id": "advisor_tool_beta_is_exact_shape_gated_and_ordered",
+      "tests": [
+        "advisor_tool_beta_is_exact_shape_gated_and_ordered"
+      ]
+    },
+    {
+      "id": "count_tokens_supports_advisor_but_strips_generation_fallback_fields",
+      "tests": [
+        "count_tokens_supports_advisor_but_strips_generation_fallback_fields"
+      ]
+    },
+    {
+      "id": "claude_r5_cache_betas_and_two_turn_alias_keep_business_payload_opaque",
+      "tests": [
+        "claude_r5_cache_betas_and_two_turn_alias_keep_business_payload_opaque"
+      ]
+    },
+    {
+      "id": "claude_thread_alias_nonstream_continuation_is_scoped_and_restored",
+      "tests": [
+        "claude_thread_alias_nonstream_continuation_is_scoped_and_restored"
+      ]
+    },
+    {
+      "id": "claude_thread_alias_stream_state_commits_at_message_stop",
+      "tests": [
+        "claude_thread_alias_stream_state_commits_at_message_stop"
+      ]
+    },
+    {
+      "id": "claude_thread_alias_provider_error_does_not_commit_state",
+      "tests": [
+        "claude_thread_alias_provider_error_does_not_commit_state"
+      ]
+    }
+  ],
+  "validation": {
+    "rustFilter": "claude",
+    "passed": 370,
+    "failed": 0,
+    "testLog": "/tmp/cc-r6-claude-existing.log",
+    "testBinarySha256": "d8514f17df8486637fc8a09a637fd63728957cb0c554e8895e4f0488a82055bf",
+    "scope": "Existing beta/CountTokens/opaque payload/Thread behavior only; no new Advisor-owner fixture or vendor acceptance is claimed. Provider sources match the reviewed class binary; unrelated Router/API edits are reserved for final integration.",
+    "newRustCode": false,
+    "clippy": "not_repeated_without_rust_change; preceding Antigravity class strict check remains historical"
+  },
+  "limitations": [
+    "The conditional research item is closed under its explicit no-proof exit, not a claim that a credential-owner feature was enabled.",
+    "No Advisor ciphertext is decoded, rewritten, persisted or logged. No automatic credential change or body cleaning.",
+    "No real account, UI automation, deployment, commit or push."
+  ]
+}

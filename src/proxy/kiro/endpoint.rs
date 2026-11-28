@@ -150,18 +150,25 @@ fn token_type_header(account: &KiroAccountData) -> Option<&'static str> {
 }
 
 fn cli_body(mut body: Value, origin: &str) -> Value {
-    replace_origin(&mut body, origin);
     if let Some(state) = body
         .get_mut("conversationState")
         .and_then(Value::as_object_mut)
     {
         state.remove("agentContinuationId");
+        if let Some(user) = state
+            .get_mut("currentMessage")
+            .and_then(|message| message.get_mut("userInputMessage"))
+            .and_then(Value::as_object_mut)
+        {
+            replace_user_origin(user, origin);
+        }
         if let Some(history) = state.get_mut("history").and_then(Value::as_array_mut) {
             for message in history {
                 if let Some(user) = message
                     .get_mut("userInputMessage")
                     .and_then(Value::as_object_mut)
                 {
+                    replace_user_origin(user, origin);
                     user.remove("modelId");
                 }
             }
@@ -170,21 +177,11 @@ fn cli_body(mut body: Value, origin: &str) -> Value {
     body
 }
 
-fn replace_origin(value: &mut Value, origin: &str) {
-    match value {
-        Value::Object(object) => {
-            for (key, child) in object {
-                if key == "origin" && child.as_str() == Some("AI_EDITOR") {
-                    *child = Value::String(origin.to_string());
-                } else {
-                    replace_origin(child, origin);
-                }
-            }
-        }
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| replace_origin(item, origin)),
-        _ => {}
+// origin belongs to the protocol's user message, never to a tool argument,
+// schema literal, tool result, or nested business object of the same name.
+fn replace_user_origin(user: &mut serde_json::Map<String, Value>, origin: &str) {
+    if user.get("origin").and_then(Value::as_str) == Some("AI_EDITOR") {
+        user.insert("origin".to_string(), Value::String(origin.to_string()));
     }
 }
 

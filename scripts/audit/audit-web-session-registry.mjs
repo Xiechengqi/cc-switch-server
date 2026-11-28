@@ -146,7 +146,12 @@ function validateImplementationTokens() {
   );
   for (const token of [
     "pub(super) async fn execute",
-    "pub(crate) fn preflight_actual_model",
+    "pub(super) fn prepare",
+    "struct PreparedWebSessionRequest",
+    "WebSessionExecutionContext",
+    "RequestMemoryBudget",
+    "output_memory",
+    "accumulator.reserve_event",
     "fn build_grok_request",
     "fn build_perplexity_request",
     "fn parse_grok_ndjson",

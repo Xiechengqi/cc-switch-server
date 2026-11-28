@@ -530,6 +530,24 @@ fn normalize_generation_controls_with_limit(
     Ok(())
 }
 
+/// These fields describe preparation only; absence does not assert that the
+/// upstream default disabled reasoning or that a prepared request was sent.
+pub(super) fn requested_effort_for_diagnostics(canonical: &Value) -> Option<String> {
+    canonical
+        .as_object()
+        .and_then(|fields| requested_reasoning_level(fields).ok().flatten())
+}
+
+pub(super) fn wire_effort_for_diagnostics(payload: &Value, raw: bool) -> Option<String> {
+    let value = if raw {
+        payload.pointer("/parameters/reasoning_effort_level")
+    } else {
+        payload.get("reasoning_effort_level")
+    };
+    let effort = value.and_then(Value::as_str)?;
+    matches!(effort, "low" | "medium" | "high" | "xhigh").then(|| effort.to_string())
+}
+
 fn apply_reasoning_fields(
     payload: &mut Map<String, Value>,
     capability: &TraeModelCapability,
@@ -562,7 +580,7 @@ fn apply_reasoning_fields(
         return Ok(());
     };
     if level == "none" {
-        return Ok(());
+        return Err("Trae explicit reasoning disable is unsupported for this channel".to_string());
     }
     if !capability.supports_reasoning || capability.reasoning_efforts.is_empty() {
         return Err(format!(

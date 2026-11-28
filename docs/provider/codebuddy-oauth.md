@@ -1003,3 +1003,8 @@ deepseek harness 经 WorkBuddy OAuth Provider 的 OpenAI Chat 接口调用时，
 - 账号 `extraHeaders` 对 Buddy 增加专用身份头阻断，防止覆盖渠道判定头。
 
 探针 body **不改**：把指纹串写进 Router 消费的探针 wire 会把字串固化进合同，并使清洗回归变成集群健康全红；改由本地 fixture 覆盖。参考证据与本地 fixture 都不等于双产品双站真实接受性，CN / Intl × CodeBuddy / WorkBuddy 仍各自 `live_pending`。
+
+
+## 2026-11-27 R6 prepared 目录围栏
+
+CodeBuddy 与 WorkBuddy 共用精确目录世代 lease：同 scope 的权威替换/撤权会阻止旧 prepared 请求继续发包，当前新鲜结果不依赖可选 payload 缓存留存。相同内容刷新、TTL、缓存淘汰/预算拒绝、ABA 与已观察 usage 的政策见 [WorkBuddy 合同](workbuddy-oauth.md#2026-11-27-r6-目录世代与发送围栏)。本轮保留受审 CLI 2.142.0 身份与目录默认 reasoning，未移植新版参考的冲突 turn/root 头关系或增加账号/产品/站点 fallback。离线证明与历史真实抓包属于不同证据，见 [R6 证据](../../assets/contract/r6-buddy.json)。

@@ -1,0 +1,252 @@
+{
+  "schemaVersion": 1,
+  "round": "R7",
+  "recordedOn": "2026-11-27",
+  "policy": {
+    "readOnlyProtocolResearch": true,
+    "grantsCapabilities": false,
+    "runtimeChanges": false,
+    "independentRailEvidenceRequired": true
+  },
+  "exits": [
+    {
+      "category": "DeepSeek Web / API",
+      "planItem": "R7-NATIVE-02-deepseek",
+      "status": "reviewed_gated_no_wire_delta",
+      "reference": {
+        "alias": "OmniRoute",
+        "commit": "443d66996d69d7ecf887fd61158404a3cca1b192",
+        "files": [
+          {
+            "path": "open-sse/config/providers/registry/deepseek/index.ts",
+            "sha256": "5fbbde6048170e7a478813859437bd94361772397b62a547e2db942fb8c655be"
+          },
+          {
+            "path": "open-sse/executors/base.ts",
+            "sha256": "86e14570360544c44135c3f8d141d5bc1f566beac38a76e400c94b765f320563"
+          },
+          {
+            "path": "open-sse/executors/default.ts",
+            "sha256": "e28d9de2a8ad69c9e81880986e2750d29c28d4fdad991a7508cd65063f84003c"
+          },
+          {
+            "path": "open-sse/executors/index.ts",
+            "sha256": "45d5c9b324624328518df82f5c2efd43fae03da0d518b099aad72ba1481d1c0d"
+          },
+          {
+            "path": "open-sse/executors/deepseek-web.ts",
+            "sha256": "8557a3911b4525b81399e799c09769fb0327eefe5307128d5469a4327fa911a0"
+          },
+          {
+            "path": "tests/unit/alternate-formats.test.ts",
+            "sha256": "c5f5dffc821599f6cff4840890e4a2f3813396a9afe14f867f2c3d122b099e94"
+          },
+          {
+            "path": "tests/unit/strip-reasoning-blobs-agentic-context-1599.test.ts",
+            "sha256": "f44b3b78db2756e5e230df5ae83dea7b1ae0734e48606e34ec379afc60a383ea"
+          }
+        ]
+      },
+      "finding": "Registry and DefaultExecutor route DeepSeek V4 key requests to https://api.deepseek.com/responses with Bearer and expose a separate x-api-key Anthropic URL. The available snapshot tests assert URL/headers; they do not independently prove an accepted account/model Responses lifecycle. Its reasoning policy strips opaque fields on non-OpenAI Responses; this is not a replay oracle for this Server.",
+      "unmetEvidence": [
+        "matching API-key/model accepted Responses receipt",
+        "complete terminal/incomplete/error/usage/custom-tool schema",
+        "encrypted reasoning and continuation identity/retention semantics"
+      ],
+      "retainedContract": [
+        "API Claude /anthropic/v1/messages, Codex Chat bridge with Provider-owned key",
+        "Web import-only Bearer and Claude-only surface; fixed chat.deepseek.com, bounded session/PoW, nonce tool replies, strict terminal",
+        "no Web/API credential mixing, password refresh, endpoint fallback or post-commit replay"
+      ],
+      "validation": {
+        "filter": "deepseek",
+        "passed": 34,
+        "ignored": 0,
+        "logSha256": "7716330a642a92c8d64f878707703610b27548eb0bb097cce4f919e56303f50c",
+        "binarySha256": "b8a9620fa5aae9d3daf96aeb354c21207ec49b5afc61d37b30dd983041535d21",
+        "sourceDigest": "c2c325c28fe909f444027ff21fda95e3d58cc1b378f5604b0579f76c67f8bce4",
+        "liveState": "live_pending"
+      },
+      "runtimeChanges": false
+    },
+    {
+      "category": "Ollama Cloud",
+      "planItem": "R7-NATIVE-02-ollama-cloud",
+      "status": "reviewed_gated_no_wire_delta",
+      "references": [
+        {
+          "alias": "Ollama/ollama",
+          "commit": "b68b112bd8868d6278250d7d4bdfafa5cbf035c8",
+          "files": [
+            {
+              "path": "server/routes.go",
+              "sha256": "650d29738473bdf31aa122e71943d1bec5f45cfdd2bbc383ea88f70927eb7dfd"
+            },
+            {
+              "path": "server/cloud_proxy.go",
+              "sha256": "4051194f504ca2f624e375a4b7b27cc5fe45ad2cc19ead086fc759fe518ca151"
+            },
+            {
+              "path": "server/cloud_proxy_test.go",
+              "sha256": "cdf86993893b2b1817da3fb06446e0625df2050e72cccbef37d1b99990382ed3"
+            },
+            {
+              "path": "openai/responses.go",
+              "sha256": "f7a7d3dac11f637a3c9ecf9e55d906eb5f8f742a1a5d684986746e09b756d822"
+            },
+            {
+              "path": "openai/openai.go",
+              "sha256": "425c68495c50a6f5020466d01e1f588ac8ebcf112e223b2fba29ca99aec72b3b"
+            }
+          ]
+        },
+        {
+          "alias": "OmniRoute",
+          "commit": "443d66996d69d7ecf887fd61158404a3cca1b192",
+          "files": [
+            {
+              "path": "open-sse/config/providers/registry/ollama-cloud/index.ts",
+              "sha256": "466fef0b9a51b844f27c0119a60a0b4c66d3ff66c720fee6b3a91df3bf4d3da7"
+            }
+          ]
+        }
+      ],
+      "finding": "Official local /v1/responses has a real :cloud passthrough branch to ollama.com:443, but it replaces Authorization using auth.Sign over a daemon challenge. It is not an independent acceptance proof for this Server Provider-owned API-key rail. Local Responses handling explicitly has no stored previous_response_id and treats Ollama-native encrypted_content as plain text. OmniRoute Cloud independently declares only Chat/tags with Bearer.",
+      "unmetEvidence": [
+        "same Cloud API-key/model Responses acceptance",
+        "cloud terminal/incomplete/custom-tool/usage contract",
+        "opaque reasoning and continuation ownership with this key identity"
+      ],
+      "retainedContract": [
+        "Provider-owned Cloud key, Chat bridge, per-section tags/profile/usage state",
+        "reviewed effort aliases and conflicts, nonempty finish_reason + DONE + EOF",
+        "no daemon signing identity migration, cloud/local fallback, silent effort downgrade or inferred model permission"
+      ],
+      "validation": {
+        "filter": "ollama",
+        "passed": 36,
+        "ignored": 1,
+        "ignoredReason": "OLLAMA_API_KEY live usage test; intentionally not run",
+        "logSha256": "41bbe77e6693aceb48416f127ded744c67346c651151c4e13fbd9e4584ca1547",
+        "binarySha256": "b8a9620fa5aae9d3daf96aeb354c21207ec49b5afc61d37b30dd983041535d21",
+        "sourceDigest": "c2c325c28fe909f444027ff21fda95e3d58cc1b378f5604b0579f76c67f8bce4",
+        "liveState": "live_pending"
+      },
+      "runtimeChanges": false
+    },
+    {
+      "category": "Antigravity / Agy / Gemini",
+      "planItem": "R7-GM-01",
+      "status": "reviewed_gated_no_wire_delta",
+      "reference": {
+        "alias": "CLIProxyAPI",
+        "commit": "47f18e4d82bd72f7d2b5ecf5ede93e4837a4625e",
+        "files": [
+          {
+            "path": "internal/runtime/executor/gemini_executor.go",
+            "sha256": "d92e033199810259566e92729c8d23d40d4d107f6ffa10d9a44e4f81d8421b46"
+          },
+          {
+            "path": "internal/runtime/executor/helps/gemini_interactions.go",
+            "sha256": "53cd9fdceaba3680bd701183fbd4dbd3bce6de6741d932725e7f0bb204d54347"
+          },
+          {
+            "path": "internal/runtime/executor/helps/antigravity_interactions_state.go",
+            "sha256": "99c56c805de8131c0a4904a1e7878050f3432aa530ebccdb70f103b40a45fdbc"
+          },
+          {
+            "path": "internal/runtime/executor/gemini_interactions_continuation_test.go",
+            "sha256": "19752dfd89fc4c22e62dfc611734e307fb8c89e0a52d21252113e938067e1783"
+          }
+        ]
+      },
+      "finding": "Interactions executor and key-auth v1beta/interactions exist, with environment/previous-interaction continuation state and synthetic tool-round tests. The current three-App Registry has no declared Interactions client scenario. Existing Antigravity IDE, Agy CLI and Gemini API-key routes cannot inherit that protocol or its continuation identifiers solely from the executor name.",
+      "unmetEvidence": [
+        "specific three-App subscription proxy use case requiring Interactions",
+        "independent matching fixed key or OAuth identity and supported model evidence",
+        "separate Profile/Driver/route/revision/continuation/lifecycle design with Share/principal/generation fences and resource accounting"
+      ],
+      "retainedContract": [
+        "generateContent/streamGenerateContent/countTokens and existing grounding/tools/thinking/usage paths",
+        "Antigravity IDE and Agy CLI account/product/client/project/version identities kept separate",
+        "official Gemini API-key rail independent; retired GeminiCli remains reader-only",
+        "R6 conservative rejection of unknown nameless tool continuation retained"
+      ],
+      "validation": {
+        "filters": {
+          "antigravity": {
+            "passed": 166,
+            "ignored": 0,
+            "logSha256": "edb1793c1772d9a00d8f5dccc55784fe08132fe274542a9fa328747c54ba091e"
+          },
+          "gemini": {
+            "passed": 192,
+            "ignored": 0,
+            "logSha256": "1471f8570870d034a294d5ec951fb93aabd6baed3c4f8adb31d20f14c9274992"
+          }
+        },
+        "countsMayOverlap": true,
+        "binarySha256": "b8a9620fa5aae9d3daf96aeb354c21207ec49b5afc61d37b30dd983041535d21",
+        "sourceDigest": "c2c325c28fe909f444027ff21fda95e3d58cc1b378f5604b0579f76c67f8bce4",
+        "liveState": "live_pending"
+      },
+      "runtimeChanges": false
+    },
+    {
+      "planItem": "R7-NATIVE-01",
+      "status": "reviewed_gated_no_wire_delta",
+      "reason": "Direct reference Responses URL/executors, terminal/usage handling and tool-output reordering reviewed; no independent matching account/device/model endpoint and full lifecycle acceptance.",
+      "source": {
+        "path": "assets/contract/r7-kimi.json",
+        "sha256": "f5b9c72313c6fecf2c8ebe2b50f48fa32e477ad09a0d5546a06ba924bdd13970"
+      },
+      "runtimeChanges": false
+    },
+    {
+      "planItem": "R7-KM-02",
+      "status": "reviewed_gated_no_wire_delta",
+      "reason": "Separate .ai auth/API URLs reviewed; no independent account/issuer/tenant/operation acceptance. No suffix/file-name inference or automatic site migration.",
+      "source": {
+        "path": "assets/contract/r7-kimi.json",
+        "sha256": "f5b9c72313c6fecf2c8ebe2b50f48fa32e477ad09a0d5546a06ba924bdd13970"
+      },
+      "runtimeChanges": false
+    },
+    {
+      "planItem": "R7-WEB-02",
+      "status": "reviewed_gated_no_wire_delta",
+      "source": {
+        "path": "assets/contract/r7-web-claude.json",
+        "sha256": "119068aec094a67452e3f01bf0ede009158c707dbc795a275317171327cd2849"
+      },
+      "research": {
+        "reference": "OmniRoute",
+        "commit": "443d66996d69d7ecf887fd61158404a3cca1b192",
+        "files": [
+          {
+            "path": "open-sse/executors/grok-web.ts",
+            "sha256": "fd3b5c10dee1574b94e1d7274a675b40ce7dcd1a1564e70f05099173c55b526f"
+          },
+          {
+            "path": "open-sse/executors/perplexity-web.ts",
+            "sha256": "de16700312731e26b6cfdcabeaf0ba318411e214a3b74e424be27c5b77bb4b9a"
+          },
+          {
+            "path": "open-sse/executors/perplexity-web/protocol.ts",
+            "sha256": "683795104a43b967819b31df6c790504bc211c85e96d8491156d0ed1493ca28f"
+          }
+        ],
+        "gate": "R7-WEB-02",
+        "status": "reviewed_gated_no_wire_delta",
+        "reasons": [
+          "Grok streams token and final fullMessage; reviewed snapshot equality/replacement and citation semantics are not proven",
+          "Perplexity emits by longest reconstructed length without prefix equality and attempts EOF fallback without COMPLETED",
+          "start/enqueue loops do not establish bounded demand-driven backpressure or full cancellation and strict EOF acceptance",
+          "No independent matching Cookie/account/model accepted lifecycle receipt; fixed buffered contracts remain"
+        ]
+      },
+      "runtimeChanges": false
+    }
+  ],
+  "oldGates": "Eight R6 gates retain their original research exits; no new independent evidence and no reopening. Antigravity unknown-call conservative rejection is already implemented."
+}

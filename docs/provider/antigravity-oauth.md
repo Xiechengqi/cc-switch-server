@@ -57,3 +57,11 @@ Manager 的模块职责可作设计参考；不迁入其追加“继续”再生
 R5 推荐来源固定为 CLIProxyAPI `681ce41b6e44c45b15b79378b003909d6ba29e68` 与 Manager `b601f5e7375343343922ccab5e50653bc3450c3b`，不改写上方 R4 的历史来源。`assets/contract/r5-antigravity.json` 保存已登记的 Claude/Gemini 四个 Profile、完整身份边界、脱敏输入/终态和逐文件摘要；默认测试独立于外仓。两 rail 的 grounding、签名工具、cache/usage 和 generation 变化逐绑定验证，结果见增强计划 §22.9，合成结果不能提升真实权限。
 
 原生 prompt、固定模型和历史保持原合同；不因普通 model-not-found/signature 字符串清洗 prompt、删历史、追加继续生成、拼接输出或换号。未知余额不自动启用 paid credits，付费能力继续要求单独显式选择及官方接受回执。连接池仍默认关闭、idle 30 秒、每 host 2 个空闲连接；无真实隔离压测不修改默认或报告延迟收益。真实状态仍为 live_pending。
+
+## 2026-11-27 R6 响应与工具身份
+
+Claude 桥接保留上游合法 responseId/response_id 原字节；缺失、空白或非字符串时，为当前响应生成128位随机本地 msg_ 关联ID，流内仅生成一次，已发送后不受迟到ID影响。合成搜索 use/result 每响应共用一个新的 srvtoolu_ ID。这些ID不代表上游持久资源、续接许可或签名归属；原函数ID和历史隔离继续使用原合同。
+
+缺名参数不能制造默认可执行工具。只有已知且未输出的显式函数ID能继承已确定名称；未知无名、非法类型、同ID改名和终态后的调用数据均失败，错误后 finish 不补出缓存工具。合法名称 tool、零参数、显式ID分片、签名和普通内容中的 functionCall:null 保留。未取得独立同rail线格式证据前，不猜最近工具或按slot拼接。
+
+冻结来源、九组本仓adapter/codec回归与本类验证见 assets/contract/r6-antigravity.json 和增强总账§24.4。测试不提升两条rail的真实接受性，仍live_pending。

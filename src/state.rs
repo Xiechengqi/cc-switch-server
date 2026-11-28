@@ -9369,10 +9369,10 @@ impl ServerStateInner {
             tracing::warn!(account_id, error = ?error, "Amazon Q model discovery token refresh failed");
             return unavailable_model_catalog("amazon_q_token_refresh_failed");
         }
-        let Some(mut account) = self
-            .find_account_for_provider(ProviderType::AmazonQOAuth, account_id)
+        let Some((mut account, account_incarnation)) = self
+            .find_account_for_provider_with_incarnation(ProviderType::AmazonQOAuth, account_id)
             .await
-            .filter(|account| {
+            .filter(|(account, _)| {
                 account.auth_identity_generation == expected_auth_identity_generation
             })
         else {
@@ -9383,6 +9383,7 @@ impl ServerStateInner {
             provider_id,
             provider_revision,
             runtime_fingerprint,
+            account_incarnation,
         );
         let http = self.http_client().await;
         let mut catalog =
@@ -9416,11 +9417,12 @@ impl ServerStateInner {
             {
                 return unavailable_model_catalog("amazon_q_runtime_changed_after_refresh");
             }
-            let Some(refreshed) = self
-                .find_account_for_provider(ProviderType::AmazonQOAuth, account_id)
+            let Some((refreshed, _)) = self
+                .find_account_for_provider_with_incarnation(ProviderType::AmazonQOAuth, account_id)
                 .await
-                .filter(|current| {
-                    current.auth_identity_generation == expected_auth_identity_generation
+                .filter(|(current, incarnation)| {
+                    *incarnation == account_incarnation
+                        && current.auth_identity_generation == expected_auth_identity_generation
                 })
             else {
                 return unavailable_model_catalog("amazon_q_bound_account_changed_after_refresh");
@@ -9430,11 +9432,13 @@ impl ServerStateInner {
                 model_catalog_scoped(&http, &account, &scope, endpoint_override, timeout).await;
         }
         let current = self
-            .find_account_for_provider(ProviderType::AmazonQOAuth, account_id)
+            .find_account_for_provider_with_incarnation(ProviderType::AmazonQOAuth, account_id)
             .await;
-        if current.as_ref().is_none_or(|current| {
-            current.auth_identity_generation != expected_auth_identity_generation
-                || current.token_refresh_generation != account.token_refresh_generation
+        if current.as_ref().is_none_or(|(current, incarnation)| {
+            *incarnation != account_incarnation
+                || !crate::clients::oauth::amazon_q_runtime::catalog_identity_matches(
+                    current, &account,
+                )
         }) || !self
             .amazon_q_catalog_runtime_matches(
                 app,
@@ -9463,7 +9467,7 @@ impl ServerStateInner {
         model_id: &str,
         endpoint_override: Option<&str>,
         timeout: std::time::Duration,
-    ) -> Option<(String, Option<u64>)> {
+    ) -> Result<Option<(String, Option<u64>)>, crate::proxy::ProxyError> {
         let catalog = self
             .amazon_q_model_catalog(
                 app,
@@ -9476,6 +9480,9 @@ impl ServerStateInner {
                 timeout,
             )
             .await;
+        if catalog.is_capacity_rejected() {
+            return Err(crate::proxy::ProxyError::request_memory_exhausted());
+        }
         let selected = if model_id.eq_ignore_ascii_case("auto") {
             catalog
                 .default_model_id
@@ -9483,8 +9490,8 @@ impl ServerStateInner {
                 .and_then(|default| catalog.model(default))
         } else {
             catalog.model(model_id)
-        }?;
-        Some((selected.model_id.clone(), selected.max_input_tokens))
+        };
+        Ok(selected.map(|selected| (selected.model_id.clone(), selected.max_input_tokens)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -12424,6 +12431,10 @@ impl ServerStateInner {
         *self.accounts.write().await = candidate;
         self.accounts_persistence.mark_published();
 
+        if expected.provider_type == ProviderType::AmazonQOAuth {
+            crate::clients::oauth::amazon_q_runtime::clear_account(&expected.id).await;
+        }
+
         if let Err(error) = persist_result {
             self.schedule_credential_persistence_retry();
             return Err(NativeRefreshCommitError::Persistence(error));
@@ -12508,6 +12519,10 @@ impl ServerStateInner {
         }
         *self.accounts.write().await = candidate;
         self.accounts_persistence.mark_published();
+
+        if expected.provider_type == ProviderType::AmazonQOAuth {
+            crate::clients::oauth::amazon_q_runtime::clear_account(&expected.id).await;
+        }
 
         if let Err(error) = persist_result {
             self.schedule_credential_persistence_retry();
@@ -12945,12 +12960,33 @@ impl ServerStateInner {
             .rebuild_runtime_index(&candidate)
             .context("rebuild Provider runtime index for account commit")?;
 
+        let obsolete_amazon_q_catalogs = current
+            .accounts
+            .iter()
+            .filter(|old| old.provider_type == ProviderType::AmazonQOAuth)
+            .filter(|old| {
+                candidate
+                    .find_for_provider(ProviderType::AmazonQOAuth, Some(&old.id))
+                    .is_none_or(|new| {
+                        current.account_incarnation(&old.id)
+                            != candidate.account_incarnation(&old.id)
+                            || !crate::clients::oauth::amazon_q_runtime::catalog_identity_matches(
+                                old, new,
+                            )
+                    })
+            })
+            .map(|old| old.id.clone())
+            .collect::<Vec<_>>();
+
         #[cfg(test)]
         self.accounts_persistence.apply_test_persist_delay().await;
         persist_state_snapshot(&self.config_dir, candidate.clone()).await?;
         *self.providers.write().await = candidate_providers;
         *self.accounts.write().await = candidate;
         self.accounts_persistence.mark_published();
+        for account_id in obsolete_amazon_q_catalogs {
+            crate::clients::oauth::amazon_q_runtime::clear_account(&account_id).await;
+        }
         Ok(Ok(result))
     }
 
@@ -18986,7 +19022,11 @@ impl ServerStateInner {
         token_refresh_generation: u64,
         account_incarnation: u64,
         scope: &crate::proxy::codebuddy_runtime::CodeBuddyRuntimeScope,
+        catalog: &crate::proxy::codebuddy_runtime::CodeBuddyModelCatalog,
     ) -> bool {
+        if !catalog.epoch_is_current(scope) {
+            return false;
+        }
         let Some(provider_type) = self
             .providers
             .read()
@@ -19015,7 +19055,8 @@ impl ServerStateInner {
         {
             return false;
         }
-        self.find_account_for_provider_with_incarnation(provider_type, account_id)
+        let identity_matches = self
+            .find_account_for_provider_with_incarnation(provider_type, account_id)
             .await
             .is_some_and(|(account, incarnation)| {
                 account.auth_identity_generation == auth_identity_generation
@@ -19044,7 +19085,8 @@ impl ServerStateInner {
                     })
                     .as_ref()
                         == Some(scope)
-            })
+            });
+        identity_matches && catalog.epoch_is_current(scope)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -19137,18 +19179,9 @@ impl ServerStateInner {
 
         let mut now_ms = crate::infra::time::now_ms().min(i64::MAX as u128) as i64;
         let catalog = if provider_type == ProviderType::TraeIntl {
-            // No CN/static entitlement fallback for international accounts.
+            // This rail has no authenticated directory to grant or revoke.
             self.trae_runtime
-                .insert_catalog(
-                    scope.clone(),
-                    crate::proxy::trae_runtime::FetchedTraeModelCatalog {
-                        enabled_models: Vec::new(),
-                        raw_configs: std::collections::BTreeMap::new(),
-                        capabilities: std::collections::BTreeMap::new(),
-                    },
-                    now_ms,
-                )
-                .await
+                .uncatalogued_catalog(now_ms)
                 .map_err(|_| TraeRuntimeError::Capacity)?
         } else if let Some(catalog) = self.trae_runtime.catalog(&scope, now_ms).await {
             catalog
@@ -19183,18 +19216,22 @@ impl ServerStateInner {
                 .await;
                 match fetched {
                     Ok(value) => {
-                        let parsed = (if provider_type == ProviderType::TraeRaw {
+                        let parsed = if provider_type == ProviderType::TraeRaw {
                             crate::proxy::trae_runtime::parse_trae_raw_catalog(&value)
                         } else {
                             parse_trae_model_catalog(&value)
-                        })
-                        .map_err(|message| {
-                            TraeRuntimeError::Upstream {
-                                status_code: 502,
-                                message,
-                                retryable: false,
+                        };
+                        let parsed = match parsed {
+                            Ok(parsed) => parsed,
+                            Err(message) => {
+                                self.invalidate_trae_runtime_scope(&scope).await;
+                                return Err(TraeRuntimeError::Upstream {
+                                    status_code: 502,
+                                    message,
+                                    retryable: false,
+                                });
                             }
-                        })?;
+                        };
                         if !self
                             .trae_runtime_snapshot_matches(
                                 app,
@@ -28159,16 +28196,11 @@ mod tests {
                 .installation_id,
             "inst-heartbeat-remapped"
         );
-        let share_syncs = counts.share_syncs.lock().await;
-        assert_eq!(
-            share_syncs.len(),
-            ROUTER_HEARTBEAT_SUSTAINED_FAILURES as usize
-        );
-        assert!(share_syncs.iter().all(|request| {
-            let operations = request["ops"].as_array().unwrap();
-            operations.len() == 1 && operations[0]["kind"] == "upsert"
-        }));
-        drop(share_syncs);
+        assert!(counts.share_syncs.lock().await.is_empty());
+        assert!(!client_control_tunnel_ready(&state).await);
+        assert!(state
+            .router_registration_reconcile_pending
+            .load(AtomicOrdering::Acquire));
         let shares = state.shares.read().await;
         assert!(!shares.router_registered);
         assert!(shares

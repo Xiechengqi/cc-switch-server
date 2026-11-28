@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { validateOperationEvidence } from "./provider-operation-evidence.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const readJson = (relativePath) =>
@@ -95,4 +96,5 @@ for (const forbidden of ["authorization", "cookie", "accessToken", "refreshToken
   assert(!serialized.toLowerCase().includes(forbidden.toLowerCase()), `conformance evidence contains forbidden field ${forbidden}`);
 }
 
-console.log(`Provider conformance evidence ok (${seen.size} governed drivers, all live gates pending)`);
+const operationEvidence = validateOperationEvidence(evidence.operationEvidence, registry, repoRoot);
+console.log(`Provider conformance evidence ok (${seen.size} governed drivers; operation evidence ${JSON.stringify(operationEvidence)}; coarse gates unchanged)`);

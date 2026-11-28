@@ -11,7 +11,10 @@ use crate::domain::providers::runtime::{ProviderRuntimePlan, RuntimeAuthRef, Run
 use super::adapters::AdapterRequest;
 use super::ProxyError;
 
+mod controls;
 mod tool_schema;
+
+pub(super) use controls::SourceControls;
 
 pub const KIMI_MODEL_ALIASES: &[&str] = &[
     "kimi",
@@ -166,72 +169,47 @@ enum RequestedThinking {
     Enabled(Option<String>),
 }
 
-fn requested_thinking(body: &Map<String, Value>) -> RequestedThinking {
-    for value in [
-        body.get("reasoning_effort"),
-        body.get("reasoning").and_then(|value| value.get("effort")),
-        body.get("thinking").and_then(|value| value.get("effort")),
-        body.get("output_config")
-            .and_then(|value| value.get("effort")),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(effort) = normalized_effort(value) {
-            return effort;
+fn requested_thinking(body: &Map<String, Value>) -> Result<RequestedThinking, ProxyError> {
+    Ok(SourceControls::from_object(AppKind::Codex, body)?.thinking)
+}
+
+pub(super) fn requested_effort_for_diagnostics(
+    plan: &ProviderRuntimePlan,
+    body: &[u8],
+) -> Option<String> {
+    let mut input = controls::diagnostic_fields(body)?;
+    if let RuntimeModelPolicy::Single { upstream_model } = &plan.model_policy {
+        input.insert("model".into(), Value::String(upstream_model.clone()));
+    }
+    SourceControls::from_object(plan.provider_key.app, &input)
+        .ok()?
+        .diagnostic_effort()
+        .map(str::to_string)
+}
+
+pub(super) fn wire_effort_for_diagnostics(app: AppKind, body: &[u8]) -> Option<String> {
+    let wire = Value::Object(controls::diagnostic_fields(body)?);
+    match wire.pointer("/thinking/type").and_then(Value::as_str)? {
+        "disabled" => Some("none".into()),
+        "enabled" => {
+            let effort = if app == AppKind::Claude {
+                wire.pointer("/output_config/effort")
+            } else {
+                wire.pointer("/thinking/effort")
+            };
+            match effort {
+                None => Some("enabled".into()),
+                Some(value) => {
+                    let effort = value.as_str()?;
+                    matches!(
+                        effort,
+                        "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                    )
+                    .then(|| effort.to_string())
+                }
+            }
         }
-    }
-
-    let thinking = body.get("thinking").and_then(Value::as_object);
-    if thinking
-        .and_then(|value| value.get("type"))
-        .and_then(Value::as_str)
-        .is_some_and(|value| value.eq_ignore_ascii_case("disabled"))
-    {
-        return RequestedThinking::Disabled;
-    }
-    if let Some(budget) = thinking
-        .and_then(|value| value.get("budget_tokens"))
-        .and_then(Value::as_u64)
-    {
-        return if budget == 0 {
-            RequestedThinking::Disabled
-        } else {
-            RequestedThinking::Enabled(Some(budget_effort(budget).to_string()))
-        };
-    }
-    if thinking
-        .and_then(|value| value.get("type"))
-        .and_then(Value::as_str)
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "enabled" | "adaptive" | "auto"
-            )
-        })
-    {
-        return RequestedThinking::Enabled(None);
-    }
-    RequestedThinking::Unspecified
-}
-
-fn normalized_effort(value: &Value) -> Option<RequestedThinking> {
-    let effort = value.as_str()?.trim().to_ascii_lowercase();
-    if effort.is_empty() {
-        return None;
-    }
-    Some(match effort.as_str() {
-        "none" | "off" | "disabled" => RequestedThinking::Disabled,
-        "on" | "auto" | "enabled" => RequestedThinking::Enabled(None),
-        _ => RequestedThinking::Enabled(Some(effort)),
-    })
-}
-
-fn budget_effort(budget: u64) -> &'static str {
-    match budget {
-        0..=1_024 => "low",
-        1_025..=24_576 => "high",
-        _ => "max",
+        _ => None,
     }
 }
 
@@ -261,7 +239,7 @@ fn normalize_chat_request(body: &mut Map<String, Value>, model: &str) -> Result<
     }
     body.remove("max_tokens");
 
-    let requested = requested_thinking(body);
+    let requested = requested_thinking(body)?;
     body.remove("reasoning_effort");
     body.remove("reasoning");
     body.remove("output_config");
@@ -310,7 +288,7 @@ fn normalize_anthropic_request(
     body: &mut Map<String, Value>,
     model: &str,
 ) -> Result<(), ProxyError> {
-    let requested = requested_thinking(body);
+    let requested = requested_thinking(body)?;
     body.remove("reasoning_effort");
     body.remove("reasoning");
     match requested {
@@ -669,8 +647,8 @@ mod tests {
             body: Bytes::from_static(
                 br#"{
                     "model":"k3",
-                    "thinking":{"type":"enabled","budget_tokens":30000,"vendor":"keep"},
-                    "output_config":{"vendor":"keep"},
+                    "thinking":{"type":"enabled","vendor":"keep"},
+                    "output_config":{"effort":"max","vendor":"keep"},
                     "context_management":{"vendor":"keep","edits":[
                         {"type":"caller_edit","value":1},
                         {"type":"clear_thinking_20251015","keep":"last"}

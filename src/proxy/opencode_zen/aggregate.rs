@@ -20,7 +20,10 @@ fn append(target: &mut Value, fragment: &Value) -> Result<(), ProxyError> {
     if fragment.is_null() {
         return Ok(());
     }
-    let fragment = fragment.as_str().ok_or_else(invalid)?;
+    append_text(target, fragment.as_str().ok_or_else(invalid)?)
+}
+
+fn append_text(target: &mut Value, fragment: &str) -> Result<(), ProxyError> {
     if target.is_null() {
         *target = Value::String(String::new());
     }
@@ -168,7 +171,10 @@ impl ZenAggregation {
         if delta.get("role").is_some_and(|v| v != "assistant") {
             return Err(invalid());
         }
-        for key in ["content", "reasoning_content", "reasoning", "refusal"] {
+        if let Some((_, text)) = crate::proxy::chat_reasoning::select_fields(delta) {
+            append_text(&mut message["reasoning_content"], text)?;
+        }
+        for key in ["content", "refusal"] {
             if let Some(fragment) = delta.get(key) {
                 append(&mut message[key], fragment)?;
             }

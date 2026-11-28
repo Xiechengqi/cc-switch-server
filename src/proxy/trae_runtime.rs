@@ -11,6 +11,9 @@ use crate::infra::resident_memory::{
     process_resident_memory, retained_json_bytes, ResidentMemoryBudget, ResidentMemoryReservation,
 };
 
+mod lease;
+use lease::CatalogEpoch;
+
 const MAX_RUNTIME_ENTRIES: usize = 128;
 const MAX_ACTIVE_CATALOG_FLIGHTS: usize = 64;
 const MAX_RUNTIME_BYTES: usize = 32 * 1024 * 1024;
@@ -96,6 +99,7 @@ pub struct TraeModelCapability {
 #[derive(Debug, Clone)]
 pub struct TraeModelCatalog {
     data: Arc<TraeModelCatalogData>,
+    epoch: Option<Arc<CatalogEpoch>>,
     pub fetched_at_ms: i64,
     pub stale: bool,
     expires_at_ms: i64,
@@ -129,6 +133,15 @@ impl PartialEq for TraeModelCatalog {
 }
 
 impl TraeModelCatalog {
+    pub(crate) fn admits_generation(&self, now_ms: i64) -> bool {
+        self.epoch.as_ref().is_some_and(|epoch| epoch.is_current())
+            && if self.stale {
+                self.is_usable_stale(now_ms)
+            } else {
+                self.is_fresh(now_ms)
+            }
+    }
+
     pub(crate) fn resolve_raw_model(&self, requested: &str) -> Result<String, String> {
         raw_passthrough_capability(requested)?;
         if !self.raw_configs.contains_key(requested) {
@@ -233,6 +246,7 @@ impl std::fmt::Debug for PreparedTraeRuntime {
 pub struct TraeRuntimeCache {
     catalogs: RwLock<BTreeMap<TraeRuntimeScope, TraeModelCatalog>>,
     catalog_flights: ResidentFlights<TraeRuntimeScope>,
+    epochs: std::sync::Mutex<BTreeMap<TraeRuntimeScope, Arc<CatalogEpoch>>>,
     parent: ResidentMemoryBudget,
 }
 
@@ -255,6 +269,7 @@ impl TraeRuntimeCache {
         Self {
             catalogs: RwLock::new(BTreeMap::new()),
             catalog_flights: ResidentFlights::new(parent.clone(), MAX_ACTIVE_CATALOG_FLIGHTS),
+            epochs: std::sync::Mutex::new(BTreeMap::new()),
             parent,
         }
     }
@@ -262,6 +277,7 @@ impl TraeRuntimeCache {
     pub async fn catalog(&self, scope: &TraeRuntimeScope, now_ms: i64) -> Option<TraeModelCatalog> {
         let mut catalogs = self.catalogs.write().await;
         catalogs.retain(|_, catalog| catalog.is_usable_stale(now_ms));
+        lease::prune(&mut self.epochs.lock().unwrap_or_else(|e| e.into_inner()));
         catalogs
             .get(scope)
             .filter(|catalog| catalog.is_fresh(now_ms))
@@ -275,6 +291,7 @@ impl TraeRuntimeCache {
     ) -> Option<TraeModelCatalog> {
         let mut catalogs = self.catalogs.write().await;
         catalogs.retain(|_, catalog| catalog.is_usable_stale(now_ms));
+        lease::prune(&mut self.epochs.lock().unwrap_or_else(|e| e.into_inner()));
         catalogs
             .get(scope)
             .filter(|catalog| catalog.is_usable_stale(now_ms))
@@ -288,54 +305,42 @@ impl TraeRuntimeCache {
         now_ms: i64,
     ) -> Result<TraeModelCatalog, TraeCatalogCapacity> {
         let mut catalogs = self.catalogs.write().await;
-        catalogs.remove(&scope);
-        catalogs.retain(|_, catalog| catalog.is_usable_stale(now_ms));
-        let bytes = catalog_bytes(&scope, &fetched);
-        let Some(memory) = self.parent.reserve(bytes) else {
+        lease::publish(self, &mut catalogs, scope, fetched, now_ms).inspect_err(|_| {
             crate::metrics::record_resident_retention_refused("trae_catalog");
-            return Err(TraeCatalogCapacity);
-        };
-        let catalog = TraeModelCatalog {
-            data: Arc::new(TraeModelCatalogData {
-                enabled_models: fetched.enabled_models,
-                raw_configs: fetched.raw_configs,
-                capabilities: fetched.capabilities,
-                retained_bytes: bytes,
-                _memory: Some(memory),
-            }),
-            fetched_at_ms: now_ms,
-            stale: false,
-            expires_at_ms: now_ms.saturating_add(TRAE_MODEL_CATALOG_TTL_MS),
-        };
-        if bytes > MAX_RUNTIME_BYTES {
-            // A valid live catalog can serve this call without being cached.
-            // Its actual shared owner still holds the process reservation.
-            crate::metrics::record_resident_retention_refused("trae_catalog");
-            return Ok(catalog);
-        }
-        while catalogs.len() >= MAX_RUNTIME_ENTRIES
-            || catalogs
-                .values()
-                .map(|catalog| catalog.retained_bytes)
-                .sum::<usize>()
-                .saturating_add(bytes)
-                > MAX_RUNTIME_BYTES
-        {
-            let Some(oldest) = catalogs
-                .iter()
-                .min_by_key(|(_, catalog)| catalog.fetched_at_ms)
-                .map(|(scope, _)| scope.clone())
-            else {
-                break;
-            };
-            catalogs.remove(&oldest);
-        }
-        catalogs.insert(scope, catalog.clone());
-        Ok(catalog)
+        })
     }
 
     pub async fn invalidate_scope(&self, scope: &TraeRuntimeScope) {
-        self.catalogs.write().await.remove(scope);
+        let mut catalogs = self.catalogs.write().await;
+        let mut epochs = self.epochs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(epoch) = epochs.remove(scope) {
+            epoch.revoke();
+        }
+        catalogs.remove(scope);
+        lease::prune(&mut epochs);
+    }
+
+    // Intl has no authenticated catalog. Its syntax-only snapshot neither
+    // consumes a CN epoch slot nor grants directory-based permission.
+    pub(crate) fn uncatalogued_catalog(
+        &self,
+        now_ms: i64,
+    ) -> Result<TraeModelCatalog, TraeCatalogCapacity> {
+        let bytes = std::mem::size_of::<TraeModelCatalogData>().saturating_add(32);
+        let memory = self.parent.reserve(bytes).ok_or(TraeCatalogCapacity)?;
+        Ok(TraeModelCatalog {
+            data: Arc::new(TraeModelCatalogData {
+                enabled_models: Vec::new(),
+                raw_configs: BTreeMap::new(),
+                capabilities: BTreeMap::new(),
+                retained_bytes: bytes,
+                _memory: Some(memory),
+            }),
+            epoch: None,
+            fetched_at_ms: now_ms,
+            stale: false,
+            expires_at_ms: now_ms.saturating_add(TRAE_MODEL_CATALOG_TTL_MS),
+        })
     }
 
     pub(crate) async fn catalog_lock(
@@ -860,6 +865,7 @@ mod tests {
                 retained_bytes: 0,
                 _memory: None,
             }),
+            epoch: None,
             fetched_at_ms: 0,
             stale: false,
             expires_at_ms: i64::MAX,
@@ -999,6 +1005,7 @@ fn trae_raw_catalog_requires_exact_names_without_solo_aliases() {
             retained_bytes: 0,
             _memory: None,
         }),
+        epoch: None,
         fetched_at_ms: 0,
         stale: false,
         expires_at_ms: 1,

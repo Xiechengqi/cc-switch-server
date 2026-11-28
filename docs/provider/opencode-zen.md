@@ -135,3 +135,25 @@ Registry 已开放正式 test/connectivity。固定模型策略是检测模型�
 2026-11-18 本轮实施及整体 review 已完成：合入后的 Rust 库 4566 通过 / 0 失败 / 3 项既有可选忽略，API 集成 139/139、独立集成 2/2；Zen 名称/模块匹配的 58 项回归通过。Node 审计与 smoke 脚本测试 2218/2218，Web 60 文件 / 429 项测试、类型检查与生产构建通过。严格 Clippy、完整格式检查、check/build、10 步本地 HTTP smoke、生成清单和文档索引均通过。review 同时修正免密钥运行时鉴权、受约束请求的续写条件和 debug 检测入口栈溢出；没有遗留本轮实现阻断项。源码摘要、二进制身份及离线 readiness 的真实输入边界见根 PROTOCOL_EVIDENCE.md 最新 Zen 条目。
 
 提交前已纳入主分支 `907a178` 的分享 UI 更新并重建 Web 产物：类型检查、60 文件 / 436 项测试、生产构建和更新后嵌入资源的 cargo check 全部通过。Rust 源码与上述全量验证摘要一致；此前 429 项 Web 测试记录对应更新前的 UI 快照。
+
+## 2026-11-27 R6 推理一致性、模块边界与资源基线
+
+三个已支持的纯文本别名共用选择器：按 reasoning_content、reasoning_text、reasoning 的既有优先级选首个非空白值；只有空白分片时保留其原字节。每帧只取一个值，跨帧按顺序累加；空别名不遮蔽后续有效内容。Zen 在精确 delta 路径规范为 reasoning_content，转换、非流聚合、首语义、终态检查和既有一次续写都使用同一规则。工具参数中的同名业务值保持，thinking/reasoning_details/未知对象不拼成推理文本。公开的其他 Chat 完整响应保留原 reasoning.summary 兼容边界。
+
+缓冲解码生命周期移入真正的 Rust 模块 forwarder/opencode_zen_document.rs，初次请求与续写均调用其显式接口。解码函数主体在仅规范名称/引用路径后与迁移前一致；预算、deadline、终态、用量及返回 reservation 保留，不新增 state writer、重试层或性能承诺。
+
+资源实验使用固定 Bun1.4.4 和生产 lane/stdio transport，回环上游；每轮独立 cgroup，hard max4GiB，正常 high=max 对照 high=384MiB。下表是正常轮采样峰值，MiB：
+
+| 场景 | Rust测试宿主 | 同时存活Bun合计 | 最大观测child数 |
+| --- | ---: | ---: | ---: |
+| 单并发1 | 55.8 | 22.9 | 1 |
+| 并发4 | 70.1 | 88.5 | 4 |
+| 配置上限32 | 71.7 | 713.6 | 32 |
+| 慢消费4 | 73.5 | 139.6 | 4 |
+| 传输正文128MiB | 430.9 | 340.8 | 1 |
+
+高压轮128MiB阶段到达现有30秒deadline，返回typed504；probe退出码101且probePassed=false，保留失败事实。该阶段外部采样宿主约201.5MiB、Bun约290.3MiB，cgroup high计数8377，OOM/max事件均0。两轮均无存活进程、无强制清理，私有cgroup已移除；逻辑预算拒绝独立验证零child。
+
+宿主含回环夹具，合计RSS会重复计算共享页；内/外采样目标5/10ms会遗漏瞬时峰值。启动基线、lane等待和完整fetch/header耗时分开记录，但未测真实TLS/厂商网络、运行时下载或纯Server部署RSS；首轮/后续进程启动没有清空OS页缓存。128MiB是传输组件边界，不能当作API/driver实际准入上限。维持每请求Bun、默认并发4和现有逻辑预算；这份基线不支持直接切换进程池或声称延迟收益。
+
+复现入口为 scripts/bench/opencode-zen-resources.py，需显式提供已编译library测试binary和匹配仓内SHA的Bun，通过 --output-dir 保存逐轮日志/采样/真实退出码。脚本只创建私有cgroup，不改父controller；只在实测high事件、typed504、无OOM且自然清理全部成立时记录负向容量观察，失败不会被标成测试通过。原始方法和数据见 [资源基线](../../assets/contract/r6-zen-resources.json)；正式路径/源码快照见 [R6 Zen合同](../../assets/contract/r6-opencode-zen.json) 与增强总账§24.6。所有真实操作仍live_pending。

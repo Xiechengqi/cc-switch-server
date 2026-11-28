@@ -318,3 +318,11 @@ Claude OAuth 流只有在 `message_start`、至少一条含对象 `delta` 且 us
 Claude OAuth 的 Messages、Chat、Responses、Gemini 流/非流和独立 `count_tokens` 路径接入共享 request/attempt 观察器。HTTP 从转发入口开始，API 收包和鉴权不在该时段；既有 `first_token_ms`、deadline、用量、重试和提交判定保持。准入、发出、headers、首语义内容、body handoff、终态和末次已核算 request owner 释放分别观测，取消到释放也独立计时。HTTP body handoff 只表示框架交出正文，不代表 socket 写成功或客户端已消费。
 
 首语义内容排除空 block、ping、签名、usage 与停止原因；有效零 `count_tokens` 仍算结果。`max_tokens`、`pause_turn` 和 `model_context_window_exceeded` 仅将当前 attempt 观察为 incomplete。指标标签使用固定 Provider/surface/phase/result，不含账号、模型、会话、正文或工具参数。JSON 生成响应复用既有语义/usage 解析结果；非权威观察失败不新增响应拒绝。此观察器不构成厂商接受性或性能提升证据，五项真实 operation 继续分别保持 `live_pending`。
+
+## 2026-11-27 R6 Advisor 归属研究结论
+
+R6F-CL-01 按计划的“无法证明约束时保留当前透传”退出。推荐 CLIProxyAPI 47f18e4d 的 owner store 是网关凭据迁移策略：只识别明确 server Advisor 块；未知首次保留，上游接受后登记，已知 foreign 才删。它不能单独证明厂商密文绑定规则，也不能证明普通 client tool 名 advisor 属于此机制。Server 保留精确 advisor_20260301 beta、CountTokens 独立集合、opaque 历史和最终 CCH 顺序，不引入猜测归属或删块逻辑。
+
+若未来独立证据确认 owner 约束，同 owner 保留；已知 foreign 应在发网前给出可恢复冲突，unknown 不猜、不删。最多记录受产品/Profile、Provider/runtime、Account durable owner/身份代次、Share/调用者/session 约束的 ID 摘要，沿既有父预算；不得存正文/密文，不能因 token 字符串刷新就判换 owner。CountTokens 成功不能登记推理归属。当前尚未实现这份候选设计。
+
+既有 Thread 省略历史会按绑定及协议元数据隔离；客户端完整历史没有独立 Advisor provenance 记录，不能宣称被同一机制全面保护。JSON/SSE/CountTokens、工具续轮、显式重绑与重启未知来源的真实接受性各自 live_pending。冻结来源、三状态设计和本轮已有测试验证见 assets/contract/r6-claude.json 与增强总账§24.5。

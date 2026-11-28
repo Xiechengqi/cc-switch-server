@@ -195,6 +195,7 @@ pub struct CodeBuddyModelCatalog {
     pub fetched_at_ms: i64,
     pub stale: bool,
     expires_at_ms: i64,
+    epoch: Option<resident::CatalogEpoch>,
 }
 
 impl std::ops::Deref for CodeBuddyModelCatalog {
@@ -215,6 +216,24 @@ impl PartialEq for CodeBuddyModelCatalog {
 }
 
 impl CodeBuddyModelCatalog {
+    pub(crate) fn epoch_is_current(&self, scope: &CodeBuddyRuntimeScope) -> bool {
+        self.epoch
+            .as_ref()
+            .is_some_and(|epoch| epoch.is_current(scope))
+    }
+
+    // TTL fences new admission; an admitted response is not retroactively
+    // cancelled merely because time passed. Authoritative revocation still
+    // invalidates its epoch and existing settlement preserves observed usage.
+    pub(crate) fn admits_generation(&self, scope: &CodeBuddyRuntimeScope, now_ms: i64) -> bool {
+        self.epoch_is_current(scope)
+            && if self.stale {
+                self.is_usable_stale(now_ms)
+            } else {
+                self.is_fresh(now_ms)
+            }
+    }
+
     pub(crate) fn same_snapshot(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.data, &other.data)
     }
@@ -286,6 +305,7 @@ impl CodeBuddyModelCatalog {
                     )
             });
         enabled_models
+            .saturating_add(std::mem::size_of::<Option<resident::CatalogEpoch>>())
             .saturating_add(
                 self.preferred_models
                     .capacity()

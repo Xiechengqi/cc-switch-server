@@ -253,6 +253,7 @@ pub(crate) async fn runtime_is_current(
             prepared_runtime.token_refresh_generation,
             prepared_runtime.account_incarnation,
             &prepared_runtime.scope,
+            &prepared_runtime.catalog,
         )
         .await
 }

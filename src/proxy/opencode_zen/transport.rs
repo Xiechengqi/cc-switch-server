@@ -296,6 +296,7 @@ impl Drop for FamilyProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("resource_probe.rs");
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,

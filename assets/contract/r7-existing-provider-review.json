@@ -1,0 +1,448 @@
+{
+  "schemaVersion": 1,
+  "round": "R7",
+  "recordedOn": "2026-11-27",
+  "policy": {
+    "readOnlyReview": true,
+    "grantsCapabilities": false,
+    "promotesCoarseGate": false,
+    "countsMayOverlap": true
+  },
+  "sourceDigest": "c2c325c28fe909f444027ff21fda95e3d58cc1b378f5604b0579f76c67f8bce4",
+  "binarySha256": "b8a9620fa5aae9d3daf96aeb354c21207ec49b5afc61d37b30dd983041535d21",
+  "reviews": [
+    {
+      "category": "Claude API-key / bearer / OAuth",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Preserve Messages/count_tokens, final CCH/beta/signature/thread/strict tool and terminal contracts. Advisor opaque ownership remains gated.",
+      "sourceFiles": [
+        {
+          "path": "src/proxy/claude_oauth.rs",
+          "sha256": "7dde292f6f7220e5ca48f53f73e46db8b6349c57de2ab1b138a874c353cb3813"
+        },
+        {
+          "path": "src/proxy/claude_thread_alias.rs",
+          "sha256": "dcbf44a99a5b5a391864a9ee0e48b1764b852f65fcacbe4b25ca89d455a374f5"
+        },
+        {
+          "path": "src/proxy/anthropic_semantics.rs",
+          "sha256": "a0e0958ab725ab2f10e0a1b3f223008f3872e964a0e6a1ff7edef7068beeabde"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/r6-claude.json",
+          "sha256": "a99a4bc3572142581ce55f3ce437565ff1a9192775b8c90bfeec79603b8ac0d7"
+        }
+      ],
+      "validation": {
+        "filter": "claude",
+        "passed": 370,
+        "ignored": 0,
+        "logSha256": "f70f544164f853eb20372695921fa95fa6389fc8357a237d4c2d8c522db3e4f7",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "OpenAI API-key / Codex OAuth",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "WS cache identity follows final handshake headers; this is idle Responses WebSocket reuse, not a generic application HTTP pool. Sent uncertainty, incomplete, interrupt, usage and history scope remain.",
+      "sourceFiles": [
+        {
+          "path": "src/proxy/codex_negotiation.rs",
+          "sha256": "d8b0ab0edc15d3de5fb215d1b97790ac49a485d9de111e9b1fb47995d80ea7c3"
+        },
+        {
+          "path": "src/proxy/codex_http.rs",
+          "sha256": "0a06b90958aa7fe50ffedabe396e51e1e4646206738bc979cf42f9990b8aaaf6"
+        },
+        {
+          "path": "src/proxy/forwarder.rs",
+          "sha256": "cf246523d7223d9c5d6718e9cb691fa7d591b241a40047b002ec650631f4cad1"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/r6-codex-oauth.json",
+          "sha256": "f61c78ac11c0e84400e25f9bd2982a99d1ee0874d3e45955044deeb6cd71dc2e"
+        }
+      ],
+      "validation": {
+        "filter": "codex",
+        "passed": 565,
+        "ignored": 1,
+        "logSha256": "b201f3e57148ce1f409d42670bffbddb55de13a9344d1d857d89a2c1fdce986b",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "GitHub Copilot public / GHES",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Current descriptor, exact token/generations/origin and TTL gate every send. Do not route by model name or send the long-lived GitHub credential to inference.",
+      "sourceFiles": [
+        {
+          "path": "src/state.rs",
+          "sha256": "14f600d9232538e262494e7b5837e21b09ce156fbd0a1553bb9a7d8ff7baf377"
+        },
+        {
+          "path": "src/clients/oauth/copilot_models.rs",
+          "sha256": "c61ad9c06a81f61b76a4bdd8697785d066f24189a6be4443822f47f46817df80"
+        },
+        {
+          "path": "src/proxy/forwarder/copilot_native_tests.rs",
+          "sha256": "290f3c35c8871cf6a0e28f864b3e6860ce4f746da1e493a1805793a1cee7d7fb"
+        }
+      ],
+      "priorEvidence": [],
+      "validation": {
+        "filter": "copilot",
+        "passed": 76,
+        "ignored": 0,
+        "logSha256": "cb96db6de4a423b9bc870abc4a7d385a889136980794aeec0d723309b310d15d",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "Cursor OAuth CLI / API-key SDK",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Separate exchange/identity rails and scoped parked h2/KV/tool rounds; no text heuristic executes tools or authorizes builtins.",
+      "sourceFiles": [
+        {
+          "path": "src/proxy/providers/cursor/mod.rs",
+          "sha256": "c3e4e55e8a0eee9095c92469108aca39186bcc77c93a0b1a63fede97dae00ec0"
+        },
+        {
+          "path": "src/proxy/cursor/session.rs",
+          "sha256": "1990d380841ce154449e4d2283efc48f117407e6d5520f7a629158dd35686165"
+        },
+        {
+          "path": "src/proxy/cursor/h2_client.rs",
+          "sha256": "73c8cd572b4543915a9f9e04b412d9607980ddafbf26b55bc884cc5f896497d9"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/r5-cursor.json",
+          "sha256": "0763f6b5941b04a2cd440283ebfe854a76ae8e101927e572f0bc08b77db63926"
+        }
+      ],
+      "validation": {
+        "filter": "cursor",
+        "passed": 373,
+        "ignored": 0,
+        "logSha256": "aae08b115ed1d14102b43f1a563425061302993903415e9d0bf7e57ea558aac9",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "Grok direct OAuth / media; Build gated",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Only direct known protocol input IDs are stripped; business schemas/arguments/results stay opaque. Build full identity and model-rate scopes remain gated. Cookie Web is independently reviewed.",
+      "sourceFiles": [
+        {
+          "path": "src/proxy/grok.rs",
+          "sha256": "8ff4ffc940027a19d7eb001e144e498e00ae4e3946b91dbb82168f5d12b65bb3"
+        },
+        {
+          "path": "src/proxy/providers/grok/mod.rs",
+          "sha256": "7861d684ceb1f2a03479539d19747562d747f9123941427501704e49b26fef95"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/r6-grok.json",
+          "sha256": "473df61e5c4f9bec175f1da9be8c6ab9e00ec22fe8b32815395ba0d3d74d884c"
+        }
+      ],
+      "validation": {
+        "filter": "grok",
+        "passed": 313,
+        "ignored": 0,
+        "logSha256": "b1e598c1a8281e54d1e4ab3a3535790783e96be7c661373a957dc0f97b67bf7b",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "Qoder PAT / legacy import, site-bound",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Exact model/scenario/lease and reviewed controls remain; no nested catalog or CLI wire inference, precise unsupported budget rejection retained.",
+      "sourceFiles": [
+        {
+          "path": "src/proxy/qoder_runtime.rs",
+          "sha256": "a2636bcba11b751f91ac89ee6449493d911c4925805859029da469c229bdddb2"
+        },
+        {
+          "path": "src/proxy/qoder_runtime/parameters.rs",
+          "sha256": "828bf60b9efb25dd3643269f89c3722f5655bf15ed27a88d71249a8666a33493"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/r6-qoder.json",
+          "sha256": "9999eb28199217b5f2d55dccb27169f0dd9dd3e142466e4b9077d4f5258c9615"
+        }
+      ],
+      "validation": {
+        "filter": "qoder",
+        "passed": 193,
+        "ignored": 0,
+        "logSha256": "6effc431c6f927450756f66701a79f79f926061060629c3a2044a8dfa1bd2dee",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "CodeBuddy / WorkBuddy product x CN/Intl",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Fixed product/site/login/CLI identities, pre-Sent epoch revocation and same-credential recovery. Official quota scan completeness remains distinct from model permission. Full identity expansion stays gated.",
+      "sourceFiles": [
+        {
+          "path": "src/domain/codebuddy.rs",
+          "sha256": "cb45ba7fb1416f8352475ae811466a4fa2517752548c60e03fe05178ac27eda8"
+        },
+        {
+          "path": "src/proxy/codebuddy_runtime.rs",
+          "sha256": "061479de5cbe4b55544562cb25a641d5fe2cd99089ade5f8ab1fe01956808559"
+        },
+        {
+          "path": "src/proxy/codebuddy_runtime/resident.rs",
+          "sha256": "1d60cd95040b25c7dde11ae011a422b9abdc3fda7c3e70862ea610e0454c9e5f"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/r6-buddy.json",
+          "sha256": "28c2328c8091c94f6122cd2d532a81afa02773891ba0998dad834288fca9d25f"
+        }
+      ],
+      "validation": {
+        "filter": "codebuddy",
+        "passed": 224,
+        "ignored": 0,
+        "logSha256": "b30a087cfd496b72260954fa465dd9d6e40d0a9d1eafa8c84c968e260402f06f",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "WorkBuddy-named subset",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Overlaps CodeBuddy module tests; not a second independent product verification total.",
+      "sourceFiles": [
+        {
+          "path": "src/proxy/providers/codebuddy/mod.rs",
+          "sha256": "715d89bf564b5c7061fe9da13514bd8dce60c4442a573896a169b6da30a9f389"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/r6-buddy.json",
+          "sha256": "28c2328c8091c94f6122cd2d532a81afa02773891ba0998dad834288fca9d25f"
+        }
+      ],
+      "validation": {
+        "filter": "workbuddy",
+        "passed": 19,
+        "ignored": 0,
+        "logSha256": "b53308f15193ebf77733cab804c799903c98fa7b84a2442999266a31b85b092e",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "OpenCode Zen public/free",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Keep per-request Bun 1.4.4, bounded lanes, strict three-wire decoder, controls and actual owners. No new process pool or pressure/performance claim.",
+      "sourceFiles": [
+        {
+          "path": "src/proxy/opencode_zen/transport.rs",
+          "sha256": "b40e4bcb3772128ddd3004289989bf5a85d8b17ab88d8e4f6e3db7c74cbe430a"
+        },
+        {
+          "path": "src/proxy/opencode_zen/stream.rs",
+          "sha256": "2eb230f97bc9f061f2e014a8ce002ec5c68f918ce76b57a1cdab0e621b8db61e"
+        },
+        {
+          "path": "src/proxy/opencode_zen/controls.rs",
+          "sha256": "2eb9e95a50cfd95d946a0a35c986868e1b4afeb2e1fa837203d9f8d047380cda"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/r6-opencode-zen.json",
+          "sha256": "8a5cfce44dec65ccc2ce2e67a15c25f88b48554af7fcd3bb016825c3a95d313d"
+        },
+        {
+          "path": "assets/contract/r6-zen-resources.json",
+          "sha256": "67968ef3d3415e50990782d9053c7d5ca291cabd04fbcf99f5a87d938333ec48"
+        }
+      ],
+      "validation": {
+        "filter": "opencode_zen",
+        "passed": 99,
+        "ignored": 3,
+        "logSha256": "d9f41c39eb994362fff79f4ff6219d2ab355de42b98801548495cf95f94f16b7",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "Bedrock AKSK/session / bearer",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Both typed Claude drivers exist; bearer actual forwarding and both-rail adapter fixtures do not imply real AWS acceptance.",
+      "sourceFiles": [
+        {
+          "path": "src/proxy/bedrock.rs",
+          "sha256": "19f4c07718d72057b6543898bdb26c98a0b70ab3a2d65fc50d42c91443f612a7"
+        },
+        {
+          "path": "src/proxy/forwarder/bedrock_r5_tests.rs",
+          "sha256": "c38a79f4ed15ad88be344070ef5674f136e7bfd83f0d744241eb0956c7c5cc36"
+        },
+        {
+          "path": "src/proxy/adapters/bedrock_r5_tests.rs",
+          "sha256": "6c3bfd4d60c25782a52624e32b95eef85404e0ec50cc0a602d4dd231559ddf38"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/r5-static-profiles.json",
+          "sha256": "f1ca332007609ab7484f1324c976bc91fcfdeae48bb7570e6ddc5a27a5ee5564"
+        }
+      ],
+      "validation": {
+        "filter": "bedrock",
+        "passed": 27,
+        "ignored": 0,
+        "logSha256": "cb48faf71516fd93eadbec1dd500cc05b9cc106324f3acc02e3addf558d9f781",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "26 static Profile fixture subset",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Exact fixed origin/auth/credential role/route/model; 20 regional Coding Plans are Provider-owned keys, not new OAuth accounts.",
+      "sourceFiles": [
+        {
+          "path": "src/proxy/provider_ops/static_r5_tests.rs",
+          "sha256": "2cb21799ff90a154c9462f37b817a97fa1cf1e63cd5ef639ad1364cf7f1942ae"
+        },
+        {
+          "path": "src/domain/providers/static_auth.rs",
+          "sha256": "82ce5cc94c97600d2e0df0bc61a9866000db1208ada8a076e66fcd621091c007"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/r5-static-profiles.json",
+          "sha256": "f1ca332007609ab7484f1324c976bc91fcfdeae48bb7570e6ddc5a27a5ee5564"
+        }
+      ],
+      "validation": {
+        "filter": "static_",
+        "passed": 37,
+        "ignored": 0,
+        "logSha256": "3f3db1cc244eeba03fc583c90f1ab674d86421b74a69dc3de2098a49fe16e0c7",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "20 Coding Plan Profiles",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Ten product/region plans x C/O; inference vs quota credential roles remain separate. No public models-to-key-validation inference.",
+      "sourceFiles": [
+        {
+          "path": "src/domain/providers/coding_plan.rs",
+          "sha256": "fec68cb62c6dd19696276155386892005c43bae9e2cd02b85406ad7079f594ff"
+        },
+        {
+          "path": "src/clients/coding_plan_quota.rs",
+          "sha256": "3aeef5693ace952b8b2bc31993f8d3de07d413fc70b694ef68ace85df3b8ec7b"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/coding-plan-registry-manifest.json",
+          "sha256": "d627575f22dbbbf40bbc9c188dbdfc1c085fa2e9a2df46a423b499de8d30e169"
+        }
+      ],
+      "validation": {
+        "filter": "coding_plan",
+        "passed": 29,
+        "ignored": 0,
+        "logSha256": "f92facce0b6c0676074c547c700ce0bdf8a137f37ecccaf716e5954793197999",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "OpenRouter API key",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Discovery alone is not key validity; inference probe and quota key-info keep their existing roles.",
+      "sourceFiles": [
+        {
+          "path": "src/proxy/provider_ops.rs",
+          "sha256": "2c683527d94e8252333ecf77a1c746263fc54f32cae15c4ca758a8f3197717c6"
+        }
+      ],
+      "priorEvidence": [],
+      "validation": {
+        "filter": "openrouter",
+        "passed": 3,
+        "ignored": 0,
+        "logSha256": "0135a4a55c29ff5dd2740c74b54c69627b975ae2f67f2816d80118862506d3c1",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "NVIDIA API key",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Do not grant tools/vision from a model name or external comments; keep declared local bridge and pending real model acceptance.",
+      "sourceFiles": [
+        {
+          "path": "src/proxy/provider_ops.rs",
+          "sha256": "2c683527d94e8252333ecf77a1c746263fc54f32cae15c4ca758a8f3197717c6"
+        }
+      ],
+      "priorEvidence": [
+        {
+          "path": "assets/contract/r5-static-profiles.json",
+          "sha256": "f1ca332007609ab7484f1324c976bc91fcfdeae48bb7570e6ddc5a27a5ee5564"
+        }
+      ],
+      "validation": {
+        "filter": "nvidia",
+        "passed": 3,
+        "ignored": 0,
+        "logSha256": "32157c89d5659e1bdc1941742b04639ea7959a83cfa7213929f8b637dd2ee131",
+        "liveState": "live_pending"
+      }
+    },
+    {
+      "category": "Retired GeminiCli and legacy readers",
+      "status": "reviewed_no_new_wire_delta",
+      "finding": "Reader-only tombstones/metadata are not inference support and cannot be re-enabled by the Interactions research.",
+      "sourceFiles": [
+        {
+          "path": "src/domain/accounts/managers.rs",
+          "sha256": "101736996b7d30a3733feb66fc6860c35f44aece326a6d85f817f9af39694c9f"
+        },
+        {
+          "path": "src/domain/providers/registry.rs",
+          "sha256": "9b5c3075d80bf1650af3d7efac68470c84c1e0f0c96d5ab19ac3455851ea35c0"
+        }
+      ],
+      "priorEvidence": [],
+      "validation": {
+        "filter": "retired",
+        "passed": 17,
+        "ignored": 0,
+        "logSha256": "4ad15727065e726b7c11822d7559c16f3218f01f72ea4bd32a364400502f60c9",
+        "liveState": "live_pending"
+      }
+    }
+  ],
+  "zenExplicitBunValidation": {
+    "passed": 2,
+    "logSha256": "336347db3c6d9a174adc0a0336d1d0832b3bb34e7e86a6248b6ee223a4d3fecc",
+    "runtimeVersion": "1.4.4",
+    "runtimeBinarySha256": "10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235",
+    "scope": "local incremental/disconnect and metadata/deadline contracts only; no pressure rerun or vendor traffic"
+  },
+  "oldResearchGates": "Eight R6 research exits remain unchanged; no new independent identity/wire evidence to reopen them. Antigravity conservative rejection is already implemented."
+}

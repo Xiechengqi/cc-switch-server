@@ -63,6 +63,9 @@ Kimi refresh 使用固定 token endpoint、client ID、Kimi CLI User-Agent 和�
 ## Thinking 与工具续接
 
 - K3 reasoning effort 只允许规范化后的 `low`、`high`、`max`，缺省为 `max`；启用 thinking 时固定 `thinking.keep=all`。
+- `kimi_code` 在通用格式桥前校验源请求的 thinking、reasoning、output_config 和输出 token 同义项。坏容器/类型、未知或空 effort、启用与关闭冲突、不同输出上限返回 400，零生成/刷新。K3 的 minimal/low、medium/high、xhigh/max 可合并；其他模型的两个不同档位不按 K3 规则视为等价。
+- 正的精确 thinking token budget 返回 400，并引导选择 effort，不再近似成离散档位。零预算明确关闭；Gemini `thinkingBudget=-1` 表示动态启用。驼峰/下划线字段逐项校验，冲突不按优先级丢弃；省略仍使用既有模型默认。
+- `requested_reasoning_effort` 保留合法源档位，`effective_reasoning_effort` 只从最终准备的 Kimi body 读取，并在每次准备前清空；这些字段不证明上游已经执行。schema/default、工具正文和 signed history 中的同名业务字段不参与源控制解析。
 - Claude Messages 使用 Kimi 所有的 `clear_thinking_20251015` edit；Chat bridge 只在 Kimi thinking 合同下回填 reasoning history。
 - signed thinking replay 必须同时匹配 App、Provider revision/runtime、Account identity generation、token refresh generation、Share、签名用户哈希、session 和 model family。缓存只接受带签名 thinking 与 tool-use 的完整 assistant turn，单条/总容量、block 数量和 TTL 都有上限。
 - 非流与流式写入都在提交前重新验证 Provider、Account binding 与两个 credential generations；流式只在 `message_stop` 提交，因此即使上游连接暂不 EOF，也能保存完整合法 turn。错误、未知 delta、截断或代际漂移不写入。
@@ -88,3 +91,7 @@ Kimi Chat 的 function parameters（含 legacy functions）在已有四入站桥
 - 日志、控制面和持久化文件不泄露 token。
 
 缺少真实账号证据时只能标记 offline/fixture verified，不能标记 live verified。
+
+## R7 条件能力研究
+
+CLIProxyAPI `47f18e4d82bd72f7d2b5ecf5ede93e4837a4625e` 有直接 `/coding/v1/responses` 的 JSON/SSE executor 和 `.ai` 的授权/API host，但其 helper/fixture 不能证明本项目固定设备、账号、模型与完整 Responses 生命周期的接受性。Server 继续使用上述 Messages/Chat 路由及固定 `.com` 身份，不在 404 后换协议，也不根据文件名、域名 suffix 或错误自动迁移站点。NATIVE-01、KM-02 按增强计划 §26.3 记录为 `reviewed_gated_no_wire_delta`；重开需独立同 rail 证据。这些结论不适用于静态 Kimi Coding API key Profile 的认证合同。

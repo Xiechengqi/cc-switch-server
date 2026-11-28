@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "qoder_enhancement_http_tests.rs"]
 mod enhancement;
+#[path = "qoder_r6_tests.rs"]
+mod r6;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -209,3 +209,41 @@ async fn codex_r4_pool_capacity_ttl_acquire_and_peer_close_release_owners() {
     wait_for(|| parent.snapshot().used_bytes == 0).await;
     server.abort();
 }
+
+#[tokio::test]
+async fn codex_r6_cached_completion_conflict_is_scoped_and_expires_with_its_socket() {
+    let parent = ResidentMemoryBudget::new(None);
+    let (raw, commands, server) = socket_pair().await;
+    let mut socket = ResponsesUpstreamWebSocket::with_parent(raw, parent.clone()).unwrap();
+    socket.completed_response_ids.remember("resp-known");
+    let mut pool = ResponsesWebSocketPool::default();
+    pool.release_with_policy(
+        "scope-a:options-a".into(),
+        CachedResponsesWebSocket {
+            socket,
+            created_at: Instant::now(),
+            last_used_at: Instant::now(),
+        },
+        ResponsesWebSocketPoolPolicy {
+            max_connections: 2,
+            idle_timeout: Duration::from_secs(300),
+            max_age: Duration::from_secs(3300),
+        },
+    );
+    assert!(!pool.known_continuation_mismatch("scope-a:options-a", "resp-known"));
+    assert!(pool.known_continuation_mismatch("scope-a:options-b", "resp-known"));
+    assert!(!pool.known_continuation_mismatch("scope-b:options-b", "resp-known"));
+    assert!(!pool.known_continuation_mismatch("scope-a:options-b", "resp-unknown"));
+    let entry = pool
+        .entries
+        .get_mut("scope-a:options-a")
+        .unwrap()
+        .front_mut()
+        .unwrap();
+    entry.last_used_at = Instant::now() - Duration::from_secs(7200);
+    assert!(!pool.known_continuation_mismatch("scope-a:options-b", "resp-known"));
+    assert_eq!(pool.total, 0);
+    drop(commands);
+    wait_for(|| parent.snapshot().used_bytes == 0).await;
+    server.abort();
+}

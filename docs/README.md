@@ -61,6 +61,9 @@
 | [api-key-coding-plans.md](provider/api-key-coding-plans.md) | 权威 | 20 个 region × Surface typed API Key Plan、外部证据漂移门禁与 Ollama Cloud |
 | [web-session.md](provider/web-session.md) | 权威 | Grok/Perplexity Web Session 隐藏 typed Provider、独立 Cookie rail、严格终态、作用域隔离与 live-pending 门禁 |
 | [opencode-zen.md](provider/opencode-zen.md) | 权威 | OpenCode Zen 免 Key 免费车道：固定 Bearer public、铸造 session、三条推理路径与 live-pending 门禁 |
+| [proxy-comparison-plan-2026-11-27.md](provider/proxy-comparison-plan-2026-11-27.md) | 权威（研究快照，实施见总账 §24） | R6：OpenCode/Zen 与 15 个推荐参考仓的提交态对比、当前缺口、分阶段增强及验收条件 |
+| [proxy-provider-focus-plan-2026-11-27.md](provider/proxy-provider-focus-plan-2026-11-27.md) | 权威（研究快照，实施见总账 §24） | R6F：Claude、OpenAI/Codex、Grok、Antigravity/Agy、Buddy 的深入对比；四项静态确认缺口、条件协议研究与逐项验收计划 |
+| [proxy-implementation-review-2026-11-27.md](provider/proxy-implementation-review-2026-11-27.md) | 权威（本轮离线实施与 review 完成） | R6/R6F 21 项实施/条件退出、冻结源完整测试、验证方法与真实门禁 |
 | [cursor.md](provider/cursor.md) | 权威 | Cursor AgentService 验收 |
 | [code-plan-delta-2026-08-23.md](provider/code-plan-delta-2026-08-23.md) | 权威 | 2026-08-23 Code Plan 协议增量、证据边界与 live 缺口 |
 | [code-plan-enhancement-2026-08-24.md](provider/code-plan-enhancement-2026-08-24.md) | 权威 | 七类低于 9 分 Code Plan 的参考、实施、拒绝项、不变量证明与 live gates |
@@ -124,6 +127,7 @@
 | [../README.md](../README.md) | 权威 | 产品定位、能力矩阵、快速入口 |
 | [../AGENTS.md](../AGENTS.md) | 权威 | 开发约定：产品边界、依赖方向、状态写入、UI 独立性、验证清单 |
 | [../PROTOCOL_EVIDENCE.md](../PROTOCOL_EVIDENCE.md) | 权威 | Provider 合同权威与外部协议证据边界 |
+| [../cc-switch-server-enhance.md](../cc-switch-server-enhance.md) | 计划 / 历史记录 | 反代增强总账；§23 为 R6/R6F 研究快照，§24 为逐类实施及最终离线 review，旧回执仅代表各自快照 |
 | [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | 权威 | 第三方代码、资产许可证与归属 |
 
 ## 外部真值来源

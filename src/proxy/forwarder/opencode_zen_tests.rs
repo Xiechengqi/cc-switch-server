@@ -1,4 +1,6 @@
 // Repository-owned loopback receipts, never a vendor live acceptance receipt.
+include!("opencode_zen_r6_tests.rs");
+
 async fn zen_test_options(state: &ServerState, body: Value) -> OpencodeZenForwardOptions {
     zen_test_options_for(state, AppKind::Codex, body).await
 }

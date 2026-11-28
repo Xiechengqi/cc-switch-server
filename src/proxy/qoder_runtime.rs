@@ -902,6 +902,11 @@ pub(crate) fn build_qoder_payload_with_continuation(
     add_ephemeral_cache_control(&mut messages);
     let max_tokens = qoder_max_tokens(request, &model_config);
     let reasoning = qoder_reasoning_directive(request);
+    if reasoning == ReasoningDirective::Disabled
+        && thinking_capability(site, model_key) == ThinkingCapability::Unsupported
+    {
+        return Err("Qoder model has no audited reasoning-disable control; omit the control to use its default".into());
+    }
     apply_reasoning_directive(site, model_key, reasoning, &mut model_config);
     let context_capability = parameters::select_context(
         request,
@@ -1600,6 +1605,37 @@ fn qoder_reasoning_directive(request: &Map<String, Value>) -> ReasoningDirective
         Some("high") => ReasoningDirective::Enabled("high"),
         Some("xhigh" | "very_high" | "very-high" | "max") => ReasoningDirective::Enabled("max"),
         Some(_) => ReasoningDirective::Unspecified,
+    }
+}
+
+pub(super) fn requested_effort_for_diagnostics(request: &Value) -> Option<&'static str> {
+    match qoder_reasoning_directive(request.as_object()?) {
+        ReasoningDirective::Unspecified => None,
+        ReasoningDirective::Disabled => Some("none"),
+        ReasoningDirective::Enabled(effort) => Some(effort),
+    }
+}
+
+/// Read only the final prepared wire. An enabled toggle does not name an
+/// effort, and unknown catalog strings must never become log labels.
+pub(super) fn wire_effort_for_diagnostics(body: &Value) -> Option<&'static str> {
+    match body
+        .pointer("/model_config/is_reasoning")
+        .and_then(Value::as_bool)
+    {
+        Some(false) => Some("none"),
+        Some(true) => match body
+            .pointer("/model_config/reasoning_effort")
+            .and_then(Value::as_str)
+        {
+            Some("low") => Some("low"),
+            Some("medium") => Some("medium"),
+            Some("high") => Some("high"),
+            Some("xhigh") => Some("xhigh"),
+            Some("max") => Some("max"),
+            _ => None,
+        },
+        None => None,
     }
 }
 

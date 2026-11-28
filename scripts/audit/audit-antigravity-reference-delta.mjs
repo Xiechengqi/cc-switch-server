@@ -299,6 +299,20 @@ const expectedCapabilities = new Map([
   ["AG-N11", "fixture_verified"],
   ["CORE-N2-ANTIGRAVITY", "fixture_verified"],
 ]);
+// Historical names stay immutable in their recorded artifacts. The current
+// forwarding admission was expanded from type-only to exact Driver policy by
+// R7 WEB-01; require its executable definition, call and existing type guard.
+function hasCurrentContractAnchor(source, contractPath, anchor) {
+  if (contractPath === "src/proxy/forwarder.rs" && anchor === "request_memory_provider_type_for_request") {
+    return [
+      "async fn request_memory_enabled_for_request(",
+      "request_memory_enabled_for_request(&state, app, &headers, &attempt_context).await",
+      "request_memory_enabled_for_provider(app, Some(execution.stored.provider_type))",
+      "attempt_context.initialize_request_memory(",
+    ].every((current) => source.includes(current));
+  }
+  return source.includes(anchor);
+}
 for (const capability of baseline.capabilities ?? []) {
   assert(
     expectedCapabilities.get(capability.id) === capability.status,
@@ -310,7 +324,7 @@ for (const capability of baseline.capabilities ?? []) {
     assert(localPath.startsWith(`${root}${path.sep}`) && fs.existsSync(localPath), `${capability.id} path is unavailable`);
     const source = fs.readFileSync(localPath, "utf8");
     for (const anchor of contract.anchors ?? []) {
-      assert(source.includes(anchor), `${capability.id} is missing local anchor ${anchor}`);
+      assert(hasCurrentContractAnchor(source, contract.path, anchor), `${capability.id} is missing local anchor ${anchor}`);
     }
   }
   assert((capability.contracts ?? []).length > 0, `${capability.id} has no local contracts`);
@@ -449,7 +463,7 @@ for (const review of baseline.r4Reviews ?? []) {
   for (const contract of review.target.contracts) {
     assert(contract.path && !path.isAbsolute(contract.path) && !contract.path.split("/").includes(".."), `${review.id} target path is unsafe`);
     const content = fs.readFileSync(path.join(root, contract.path), "utf8");
-    assert(Array.isArray(contract.anchors) && contract.anchors.length > 0 && contract.anchors.every((anchor) => content.includes(anchor)), `${review.id} fixture anchor is unavailable`);
+    assert(Array.isArray(contract.anchors) && contract.anchors.length > 0 && contract.anchors.every((anchor) => hasCurrentContractAnchor(content, contract.path, anchor)), `${review.id} fixture anchor is unavailable`);
   }
 }
 assert(r4Ids.size === 0, "Antigravity R4 fixture coverage is incomplete");

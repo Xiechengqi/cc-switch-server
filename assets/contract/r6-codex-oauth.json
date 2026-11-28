@@ -1,0 +1,163 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "round": "R6",
+  "providerClass": "codex_oauth",
+  "baseline": "f1e3e0dbb77fbe3d21c4ce52d12da05771db179f",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "referencePolicy": "read_only_committed_objects_never_build_test_runtime_or_release_dependency",
+  "references": [
+    {
+      "repository": "CLIProxyAPI",
+      "commit": "47f18e4d82bd72f7d2b5ecf5ede93e4837a4625e",
+      "tree": "1c6c82df0d0364387bcd84751ac5ee6a0a2da8d3",
+      "files": [
+        {
+          "path": "internal/runtime/executor/codex_websockets_session.go",
+          "sha256": "aa40d66edc972a18093d0142b0969dde18c87b36576ba752c2bdb29ca16e8717"
+        }
+      ]
+    },
+    {
+      "repository": "Codex/codex2api",
+      "commit": "c6aecea48d43f625dd4f7d6838f3fd8b3f3d0d47",
+      "tree": "c862e69c4e26351237ac0bd845d9a567801e36cb",
+      "files": [
+        {
+          "path": "proxy/wsrelay/client_identity.go",
+          "sha256": "cff7eb0181dea05ce886f712d7966b9d706c4db20b5d18da6093e0cc18776eee"
+        },
+        {
+          "path": "proxy/executor.go",
+          "sha256": "d8a767ba2c8230c4b1b5c7c81485763ffc05c8c96342d1e3eab1751cd5cbeb25"
+        },
+        {
+          "path": "proxy/invalid_input_image.go",
+          "sha256": "0025a790158ef09ccefd1126787479596f4df80d1ade2851519a32b180bf0bd5"
+        }
+      ]
+    }
+  ],
+  "planItems": [
+    {
+      "id": "R6F-OA-01",
+      "status": "fixture_verified",
+      "scope": "final handshake cache identity; explicit Share/user isolation; known cached completion conflict only; diagnostic headers do not fragment idle reuse"
+    },
+    {
+      "id": "R6F-OA-02",
+      "status": "fixture_verified",
+      "scope": "managed Responses only; canonical tools / usage.attribution; no root usage suppression; HTTP/WS/auth rebuild/fallback"
+    },
+    {
+      "id": "R6F-OA-03",
+      "status": "fixture_verified",
+      "scope": "Evidence for existing deterministic bad-image behavior across JSON/SSE/WS/fallback with capacity wording; existing interrupt/liveness/replay boundaries preserved; no production bad-image classifier change."
+    }
+  ],
+  "cases": [
+    {
+      "id": "native-entry-final-handshake-and-trace-reuse",
+      "tests": [
+        "codex_r6_native_entry_reuses_only_matching_handshake_options"
+      ]
+    },
+    {
+      "id": "known-completion-options-conflict-no-generation",
+      "tests": [
+        "codex_r6_native_entry_rejects_known_continuation_with_changed_handshake"
+      ]
+    },
+    {
+      "id": "exclude-canonical-change-and-omission-ws",
+      "tests": [
+        "codex_r6_native_exclusion_changes_and_omission_have_distinct_handshakes"
+      ]
+    },
+    {
+      "id": "managed-http-negative-controls-and-billing",
+      "tests": [
+        "codex_r6_http_exclusion_is_managed_bounded_and_keeps_usage"
+      ]
+    },
+    {
+      "id": "fallback-preserves-canonical-negotiation",
+      "tests": [
+        "codex_r6_fallback_preserves_final_negotiation_and_root_usage"
+      ]
+    },
+    {
+      "id": "deterministic-input-failure-with-overload-words",
+      "tests": [
+        "codex_r6_bad_image_with_overload_words_never_replays_http_or_ws"
+      ]
+    },
+    {
+      "id": "parser-bound-and-identity-ring-isolation",
+      "tests": [
+        "codex_r6_exclusions_are_bounded_canonical_and_preserve_billing_fields",
+        "codex_r6_identity_is_canonical_but_negotiation_and_tenants_are_separate"
+      ]
+    },
+    {
+      "id": "bad-image-fallback-sse-single-submit",
+      "tests": [
+        "codex_r6_bad_image_fallback_sse_does_not_retry_its_overload_diagnostic"
+      ]
+    },
+    {
+      "id": "same-account-401-final-handshake-and-cache-reuse",
+      "tests": [
+        "codex_r6_same_account_401_rebuild_keeps_exclusion_and_final_handshake_key"
+      ]
+    },
+    {
+      "id": "generated-tools-and-usage-survive-exclusion",
+      "tests": [
+        "codex_r6_exclusion_preserves_generated_tools_and_usage_on_all_transports"
+      ]
+    },
+    {
+      "id": "cached-completion-expiry-and-tenant-scope",
+      "tests": [
+        "codex_r6_cached_completion_conflict_is_scoped_and_expires_with_its_socket"
+      ]
+    }
+  ],
+  "redEvidence": {
+    "kind": "synthetic_actual_forwarder",
+    "passed": 0,
+    "failed": 2,
+    "log": "/tmp/cc-r6-codex-red2.log",
+    "result": "feature-b reused a feature-a handshake; known completion plus changed options submitted a new generation"
+  },
+  "limitations": [
+    "No real vendor/account acceptance receipt, deployment or UI automation.",
+    "Unknown, expired or evicted response IDs do not gain remote continuation or history replay.",
+    "Existing interrupt, Ping/Pong, fragmented write and create-after-send no-replay boundaries are preserved."
+  ],
+  "fixtureIterationNotes": [
+    "Corrected input shape assertions and Response-vs-Rust-Err contract before counting counterexamples.",
+    "Synthetic WS errors close at EOF rather than stalling.",
+    "Test account writes can rebuild runtime plans: the native ingress fixture restores only its loopback plan and asserts the exact loopback endpoint before forwarding. Earlier default-origin connection timeouts are discarded as fixture failures."
+  ],
+  "validation": {
+    "rustFilter": "codex",
+    "passed": 565,
+    "failed": 0,
+    "ignored": 1,
+    "r6Tests": 12,
+    "sharedGrokFilterPassed": 310,
+    "filtersOverlapAndAreNotAdditive": true,
+    "backendNodePassed": 2207,
+    "strictAllTargetClippy": "passed",
+    "cargoFmt": "passed",
+    "explicitIncludeRustfmt": "passed",
+    "rustInputCount": 495,
+    "rustInputDigest": "b1a160fd0e37d7b8b43a7d63fc6c1da2eec91ad11ec4dfc9603fbc07144b71fc",
+    "rustInputDigestMethod": "sha256 of canonical path/sha256 array; src/tests Rust plus Cargo.toml/Cargo.lock/build.rs",
+    "testBinarySha256": "ee860c55be10ab0e7ccb7bfbebbfc5fe70c25522429b1bd03e9984fa7ea791b4",
+    "sourceState": "uncommitted_r6_class_snapshot"
+  }
+}

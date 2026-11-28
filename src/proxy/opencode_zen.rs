@@ -1763,12 +1763,7 @@ pub fn continuation_kind(payload: &Value) -> Option<ContinuationKind> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    let reasoning = message
-        .get("reasoning_content")
-        .or_else(|| message.get("reasoning"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
+    let reasoning = super::chat_reasoning::text(message).unwrap_or("").trim();
     let finish = choice
         .get("finish_reason")
         .and_then(Value::as_str)
@@ -1810,10 +1805,7 @@ pub fn continuation_messages(
             messages.push(serde_json::json!({"role":"user","content": CONTINUATION_INSTRUCTION}));
         }
         ContinuationKind::PureReasoning | ContinuationKind::ReasoningOnly => {
-            let reasoning = message
-                .get("reasoning_content")
-                .or_else(|| message.get("reasoning"))
-                .and_then(Value::as_str)?;
+            let reasoning = super::chat_reasoning::text(message)?;
             messages.push(serde_json::json!({
                 "role": "user",
                 "content": format!("{RECOVERY_INSTRUCTION}{reasoning}"),

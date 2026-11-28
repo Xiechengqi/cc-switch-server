@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "round": "R7-AQ-01-followup",
+  "recordedOn": "2026-11-27",
+  "providerClass": "amazon_q_oauth",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "sourceCommit": "848be22958ee1499d02ce374f571b0241b558dc3",
+  "sourceDigest": "9434ed2bb0eaf887c20a0d53d57ac3eed60da35a9f2724cad1fac9403de577cf",
+  "binarySha256": "a259a43a5ea07043ef13f7a33e0abec99d3ddea29514afc4e74f0c838f3ef7c0",
+  "sourceFiles": [
+    {
+      "path": "src/clients/oauth/amazon_q_runtime.rs",
+      "sha256": "16840bb4334838b2a9d58713dc35b171934f157aa97665285fe1c6e84a724ef3"
+    },
+    {
+      "path": "src/clients/oauth/amazon_q_runtime/resident.rs",
+      "sha256": "40c5ba90b139616a17dd2a1e625127b5e5bb3617f9bae72f686f30196a88a98c"
+    },
+    {
+      "path": "src/clients/oauth/amazon_q_runtime/r7_tests.rs",
+      "sha256": "bd184d8117e149b75fb166daa0ded3e0daae8ed8051b587edd21505618ec9738"
+    },
+    {
+      "path": "src/state.rs",
+      "sha256": "ea6b6fd0ddf0d97bef9156540b275e7afecc87e451b2c0225713af84fb858e92"
+    }
+  ],
+  "planItems": [
+    {
+      "id": "R7-AQ-01",
+      "status": "fixture_verified",
+      "scope": "actual credential fingerprint joins existing scope; independent of invalidation callback completion"
+    }
+  ],
+  "cases": [
+    {
+      "id": "same-generation-credential-isolation",
+      "tests": [
+        "r7_amazon_q_same_generation_credentials_have_independent_catalogs"
+      ],
+      "observations": "two successful discovery HTTP requests; each credential retains its own immutable catalog; returning to old credential reuses only its own Arc; final parent charge zero"
+    }
+  ],
+  "validation": {
+    "results": {
+      "build": {
+        "passed": 1,
+        "ignored": 0,
+        "logSha256": "8ce7370651c7ef04789f93e2cef73d9c56588977c2056f9fa01057a7795efb67"
+      },
+      "regression": {
+        "passed": 29,
+        "ignored": 1,
+        "logSha256": "a78d379e1c961ddf90909faa812929e53976733a2d9dae5e7e8129bef473ec10"
+      },
+      "kiro": {
+        "passed": 286,
+        "ignored": 0,
+        "logSha256": "7c31575c7ce16433806ed96827516633d097fc40e97c2567d27c5e4bac9b0b52"
+      },
+      "capacity": {
+        "passed": 1,
+        "ignored": 0,
+        "logSha256": "5eae1bb67f91cc3f750245bedefefaf11a112fbe42b862d6c44e0939ff7a4d65"
+      }
+    },
+    "countsMayOverlap": true,
+    "strictAllTargetClippy": "passed",
+    "clippyLogSha256": "93a8a83180df4b8353eb633d96ac27993773f376badaf590f2ce85164b18f3a1",
+    "cargoFmt": "passed",
+    "allSrcIncludeRustfmt": "passed",
+    "originalFailingRun": "not_executed_for_this_followup",
+    "gapBasis": "static key-field comparison; do not attribute this case to the earlier red3"
+  },
+  "invariants": {
+    "rawTokenInKey": false,
+    "wireChange": false,
+    "generationCounterScopesRetained": true,
+    "fixedProviderAccountAndProduct": true,
+    "cacheAndFlightBoundsRetained": true,
+    "realAcceptance": "live_pending",
+    "uiAutomation": false,
+    "deploymentTest": false
+  }
+}

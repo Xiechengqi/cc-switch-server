@@ -1,0 +1,157 @@
+{
+  "schemaVersion": 1,
+  "round": "R7",
+  "recordedOn": "2026-11-27",
+  "providerClass": "amazon_q_oauth",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "sourceCommit": "848be22958ee1499d02ce374f571b0241b558dc3",
+  "sourceDigest": "2a7a5fdb68b938f0865b88d73f1b3d35be4aa2ffb331bf61bbf1b521a22281bd",
+  "binarySha256": "351731353f54d3bb98a40370751d6ec4b313d0779373a64e61b36dc32cdfdf6e",
+  "sourceFiles": [
+    {
+      "path": "src/proxy/kiro/endpoint.rs",
+      "sha256": "9e0db5922389b0e0110b066895e1c872d2c47fc1ad87a34baf35acc691d1f4e1"
+    },
+    {
+      "path": "src/proxy/forwarder/kiro_r7_tests.rs",
+      "sha256": "30638c0fc661d666f118aeedd3b754c5666ab94fd637323942d15d11dd3f318b"
+    },
+    {
+      "path": "src/clients/oauth/amazon_q_runtime.rs",
+      "sha256": "915db86e31cef085253e2fa84c59b6d166284c31a778d070f78dd7a4aae52000"
+    },
+    {
+      "path": "src/clients/oauth/amazon_q_runtime/resident.rs",
+      "sha256": "496f8c26e912d32082c63e94121b0a06bdc4c93e3b92621dd5046b1f490c86f8"
+    },
+    {
+      "path": "src/clients/oauth/amazon_q_runtime/r7_tests.rs",
+      "sha256": "1062855e03f240db09c466a15f1a0b0a8c0584fef543cb4b5f460d5e49922646"
+    },
+    {
+      "path": "src/state.rs",
+      "sha256": "ea6b6fd0ddf0d97bef9156540b275e7afecc87e451b2c0225713af84fb858e92"
+    },
+    {
+      "path": "src/proxy/providers/kiro/mod.rs",
+      "sha256": "2749a55cf5cfa2e6d304e8e8d75b135ca8c5c91529de523df6a002fcd6110497"
+    }
+  ],
+  "planItems": [
+    {
+      "id": "R7-KI-01",
+      "status": "fixture_verified"
+    },
+    {
+      "id": "R7-AQ-01",
+      "status": "fixture_verified"
+    }
+  ],
+  "cases": [
+    {
+      "id": "cli-origin-business-preservation",
+      "tests": [
+        "r7_kiro_amazon_q_origin_keeps_business_payload"
+      ]
+    },
+    {
+      "id": "cli-origin-single-recovery",
+      "tests": [
+        "r7_kiro_amazon_q_origin_recovery_keeps_business_payload_and_single_replay"
+      ]
+    },
+    {
+      "id": "cold-catalog-one-flight",
+      "tests": [
+        "r7_amazon_q_parallel_cold_discovery_is_one_flight",
+        "r7_amazon_q_failed_flight_is_shared_but_later_request_retries"
+      ]
+    },
+    {
+      "id": "revocation-and-incarnation",
+      "tests": [
+        "r7_amazon_q_state_recreation_fences_a_paused_discovery",
+        "r7_amazon_q_revocation_blocks_old_flight_and_incarnation_isolates_new_one"
+      ]
+    },
+    {
+      "id": "catalog-memory-and-lifecycle",
+      "tests": [
+        "r7_amazon_q_snapshot_last_owner_survives_cache_and_flight_removal",
+        "r7_amazon_q_catalog_count_expiry_and_byte_bounds_are_independent",
+        "r7_amazon_q_flight_capacity_and_waiter_cancellation_preserve_leader",
+        "r7_amazon_q_optional_cache_refusal_keeps_live_payload_and_charge"
+      ]
+    },
+    {
+      "id": "stale-validation-and-deadline",
+      "tests": [
+        "r7_amazon_q_transient_stale_is_exact_scope_and_denial_revokes_it",
+        "r7_amazon_q_pagination_uses_one_deadline",
+        "r7_amazon_q_authoritative_empty_and_discovery_bounds"
+      ]
+    },
+    {
+      "id": "local-parent-capacity",
+      "tests": [
+        "r7_amazon_q_local_capacity_is_distinct_from_auth_and_sends_nothing",
+        "r7_amazon_q_forwarder_parent_capacity_is_local_503_without_network"
+      ]
+    }
+  ],
+  "validation": {
+    "results": {
+      "kiro-final-build": {
+        "passed": 17,
+        "ignored": 1,
+        "log": "/tmp/cc-r7-kiro-final-build.log",
+        "logSha256": "e3364cd72bbcf7cd62b9af3dfc82606583fda9143e4e34fa48ac1c328b2a3d47"
+      },
+      "kiro-regression": {
+        "passed": 286,
+        "ignored": 0,
+        "log": "/tmp/cc-r7-kiro-regression.log",
+        "logSha256": "583251f31f57cd31a774405801aa62caa36e6d224b429f3e85fdf502a0e87286"
+      },
+      "amazon-q-regression": {
+        "passed": 28,
+        "ignored": 1,
+        "log": "/tmp/cc-r7-amazon-q-regression.log",
+        "logSha256": "d9b9e3295a6557c5087a33eb9e2b21c9321b3a3e773c21fe1406de73281bbec1"
+      },
+      "kiro-final-capacity": {
+        "passed": 1,
+        "ignored": 0,
+        "log": "/tmp/cc-r7-kiro-final-capacity.log",
+        "logSha256": "59cfa64008500bdb91542226cda5d5a9bb1619a00d02d939d7dd5325db35e37f"
+      }
+    },
+    "countsMayOverlap": true,
+    "strictAllTargetClippy": "passed",
+    "phase0Tests": 6,
+    "realAcceptance": "live_pending"
+  },
+  "invariants": {
+    "fixedProviderAccountShareAndProduct": true,
+    "crossAccountFallback": false,
+    "postCommitReplay": false,
+    "uiAutomation": false,
+    "deploymentTest": false,
+    "realEvidenceClaim": false
+  },
+  "localPolicy": {
+    "cachedCatalogCount": 128,
+    "cachedBytes": 33554432,
+    "activeDiscoveryKeys": 64,
+    "bodyBytes": 2097152,
+    "pages": 16,
+    "models": 1000,
+    "freshTtlMs": 300000,
+    "staleTtlMs": 86400000,
+    "processHardLimit": "only when configured",
+    "memoryMeasurement": "logical estimates, not RSS",
+    "discoveryRefresh": "existing same-account 401/403 behavior",
+    "generationRefresh": "eligible pre-commit 401 only"
+  }
+}

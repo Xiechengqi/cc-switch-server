@@ -1,0 +1,155 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "round": "R6",
+  "providerClass": "trae",
+  "baseline": "f1e3e0dbb77fbe3d21c4ce52d12da05771db179f",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "referencePolicy": "read_only_committed_objects_never_build_test_runtime_or_release_dependency",
+  "references": [
+    {
+      "repository": "Trae/trae2api-hub",
+      "commit": "f7b75787680c7aded6b277aee05ddfc7fbac4ba8",
+      "tree": "0189b5239a23e67803887bac4cbde76223db069b",
+      "files": [
+        {
+          "path": "trae_proxy.py",
+          "sha256": "4f549a2c47c15dbb2881cfe9616dd832fb48eb8b6e8e86bff890e414eab26cc7"
+        },
+        {
+          "path": "trae_catalog.py",
+          "sha256": "677663b53f3f6ca339956f26db1ed5bf811b09a7b4efb698d30581c243a97254"
+        },
+        {
+          "path": "test_issue_solo_groups.py",
+          "sha256": "857bebaf5f24fc4f9f1daa4628af9a45e7e5c5674769fb513ca97e1792f50a3b"
+        },
+        {
+          "path": "test_issue_solo_images.py",
+          "sha256": "f101a9c6927c03c57a937f1ba8e87db9582fbaf6a746e9b50a50d509f55a2491"
+        }
+      ]
+    }
+  ],
+  "planItems": [
+    {
+      "id": "R6-TR-01",
+      "status": "fixture_verified",
+      "scope": "CN SOLO/CN raw/Intl raw, four ingresses, both streaming modes: normalized explicit disable is rejected before generation; omitted controls preserve upstream default."
+    },
+    {
+      "id": "R6-OBS-01",
+      "status": "fixture_verified",
+      "scope": "Trae portion only. Requested effort comes from validated canonical controls, effective effort from the final prepared wire. Same-account refresh preserves controls; failed preparation has no invented effective value. Qoder is tracked separately."
+    },
+    {
+      "id": "R6-TR-02",
+      "status": "reviewed_gated_no_wire_delta",
+      "scope": "The committed Hub line-oriented synthetic bytes fail explicitly in the production forwarder. A reference mock is not independent same-endpoint/function/client vendor evidence; do not enable another dialect or relax terminal/EOF."
+    },
+    {
+      "id": "R6-TR-03",
+      "status": "reviewed_gated_no_wire_delta",
+      "scope": "No independently accepted model/function/catalog relation. Keep solo_work_lite and exact current catalog admission; caller function input cannot select a new rail, unknown group models do not generate."
+    },
+    {
+      "id": "R6-TR-04",
+      "status": "reviewed_gated_no_wire_delta",
+      "scope": "Depends on accepted dialect and model/function evidence. SOLO image input remains rejected with unchanged Registry/Share capabilities; raw image support is unchanged."
+    }
+  ],
+  "futureEvidence": {
+    "dialect": "Independent sanitized bytes or official contract for the exact endpoint, function and client identity; replay through the complete lifecycle, including fragmentation, tools, embedded/late usage, unique terminal and clean EOF.",
+    "groups": "Bound-account model-to-function-to-catalog-version evidence and revocation/credential fences; no static reference whitelist or fallback probing.",
+    "images": "Model/function acceptance and demonstrated understanding, then media/Share authorization and request-memory/MIME/count/size/order checks before enabling capabilities."
+  },
+  "diagnostics": {
+    "fields": [
+      "requested_reasoning_effort",
+      "effective_reasoning_effort"
+    ],
+    "meaning": "Preparation diagnostics, not a claim that the request was sent or the upstream executed that control. Omitted effective value is unknown/default, not disabled.",
+    "allowedEfforts": [
+      "none",
+      "low",
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "privacy": "Only normalized bounded values; no unknown input strings, prompt, tool data or credentials. Existing wire/log contracts remain unchanged."
+  },
+  "cases": [
+    {
+      "id": "unsupported-off-zero-generation",
+      "tests": [
+        "trae_r6_explicit_off_is_rejected_before_generation_on_all_rails_and_surfaces"
+      ]
+    },
+    {
+      "id": "default-enabled-invalid-and-conflicting-controls",
+      "tests": [
+        "trae_r6_requested_and_effective_diagnostics_match_final_wire_controls"
+      ]
+    },
+    {
+      "id": "same-identity-refresh-controls-and-attempts",
+      "tests": [
+        "trae_r6_diagnostics_survive_one_same_identity_auth_refresh"
+      ]
+    },
+    {
+      "id": "unsupported-level-has-no-effective-value",
+      "tests": [
+        "trae_r6_unsent_unsupported_level_has_no_invented_effective_value"
+      ]
+    },
+    {
+      "id": "reference-solo-dialect-remains-an-explicit-failure",
+      "tests": [
+        "trae_r6_reference_solo_dialect_does_not_become_unproven_success"
+      ]
+    },
+    {
+      "id": "fixed-function-entitlement-and-image-boundaries",
+      "tests": [
+        "trae_r6_solo_function_entitlement_and_image_boundaries_stay_closed"
+      ]
+    },
+    {
+      "id": "existing-terminal-failure-corpus",
+      "tests": [
+        "eof_duplicate_done_and_event_after_done_fail_closed"
+      ],
+      "scope": "Existing decoder regression actually executed in the recorded 69-test class filter; not a new R6 test."
+    }
+  ],
+  "redEvidence": {
+    "passed": 0,
+    "failed": 2,
+    "log": "/tmp/cc-r6-trae-red1.log",
+    "result": "Old code generated for explicit off and omitted prepared requested/effective diagnostics."
+  },
+  "validation": {
+    "rustFilter": "trae",
+    "passed": 69,
+    "failed": 0,
+    "ignored": 0,
+    "r6Tests": 6,
+    "strictAllTargetClippy": "passed",
+    "cargoFmt": "passed",
+    "explicitIncludeRustfmt": "passed",
+    "rustInputCount": 504,
+    "rustInputDigest": "89c4bf02f07e84399b93900f4388b802bd6a7798366b2e622dca4adb6c34d726",
+    "rustInputDigestMethod": "sha256 of sorted canonical path/sha256 array with sort_keys and compact separators",
+    "testBinarySha256": "5434236495290332b09fbd5c046fef3aaa46773705f73dd710a6c607c1e3af19",
+    "sourceState": "uncommitted_r6_class_snapshot",
+    "finalIntegration": "separate_current_worktree_freeze_required"
+  },
+  "limitations": [
+    "Synthetic loopback fixtures are not real vendor acceptance; all three rails remain live_pending.",
+    "Reference line-oriented samples are mocks, not independently recorded vendor bytes.",
+    "No new SOLO dialect, function group, media permission, retry, credential/rail fallback or state writer.",
+    "No UI automation, deployment tests, real-account operation, commit or push."
+  ]
+}

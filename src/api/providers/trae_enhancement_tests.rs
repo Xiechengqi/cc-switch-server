@@ -626,6 +626,8 @@ async fn trae_all_channels_four_protocols_stream_and_nonstream_two_tool_roundtri
                 for round in 1..=3 {
                     let mut body =
                         trae_test_tool_request(route, stream, &history, previous.as_deref());
+                    // The final tool-disabled turn leaves effort unspecified.
+                    // R6 separately rejects an explicit reasoning-off request.
                     match route {
                         proxy::ProxyRoute::CodexChatCompletions
                         | proxy::ProxyRoute::CodexResponses => {
@@ -637,9 +639,9 @@ async fn trae_all_channels_four_protocols_stream_and_nonstream_two_tool_roundtri
                             body["parallel_tool_calls"] = json!(false);
                             if round == 3 {
                                 if route == proxy::ProxyRoute::CodexResponses {
-                                    body["reasoning"] = json!({"effort":"none"});
+                                    body.as_object_mut().unwrap().remove("reasoning");
                                 } else {
-                                    body["reasoning_effort"] = json!("none");
+                                    body.as_object_mut().unwrap().remove("reasoning_effort");
                                 }
                             }
                         }
@@ -649,7 +651,7 @@ async fn trae_all_channels_four_protocols_stream_and_nonstream_two_tool_roundtri
                             body["stop_sequences"] = json!(["halt"]);
                             body["tool_choice"] = json!({"type":if round == 3 {"none"} else {"any"},"disable_parallel_tool_use":true});
                             if round == 3 {
-                                body["thinking"] = json!({"type":"disabled"});
+                                body.as_object_mut().unwrap().remove("thinking");
                             }
                         }
                         proxy::ProxyRoute::Gemini => {
@@ -658,8 +660,10 @@ async fn trae_all_channels_four_protocols_stream_and_nonstream_two_tool_roundtri
                             body["generationConfig"]["stopSequences"] = json!(["halt"]);
                             body["toolConfig"] = json!({"functionCallingConfig":{"mode":if round == 3 {"NONE"} else {"ANY"}}});
                             if round == 3 {
-                                body["generationConfig"]["thinkingConfig"] =
-                                    json!({"thinkingBudget":0});
+                                body["generationConfig"]
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .remove("thinkingConfig");
                             }
                         }
                         _ => unreachable!(),

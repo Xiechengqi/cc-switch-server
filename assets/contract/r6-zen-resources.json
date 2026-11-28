@@ -1,0 +1,829 @@
+{
+  "schemaVersion": 1,
+  "kind": "offline_resource_measurement",
+  "round": "R6",
+  "planItem": "R6-ZEN-02",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "testBinarySha256": "9a0f56407bfeb74b530be66373cce4d0e4f9032f1c71d6535927a7a6963fdb21",
+  "runtimeVersion": "1.4.4",
+  "runtimeBinarySha256": "10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235",
+  "wireProfile": "opencode-1.19.5-bun-1.4.4-v1",
+  "runner": {
+    "path": "scripts/bench/opencode-zen-resources.py",
+    "sha256": "4fc9246712badba4a849d1133259c1b4da7ce7d808cf938eb3cfd8633ddf7ab9",
+    "syntax": "passed",
+    "outcomeClassificationControls": 7,
+    "actualInvocation": "both normal and pressure runs executed through the checked-in runner"
+  },
+  "method": {
+    "scope": "production lane and Bun stdio transport; host includes loopback fixture; summed RSS counts shared pages; phase boundaries are sampled; localhost has no TLS",
+    "innerTargetSampleIntervalMs": 5,
+    "outerTargetSampleIntervalMs": 10,
+    "coldWarmMeaning": "first observed and subsequent fresh-process launches; OS page cache was not flushed and runtime provisioning/download is excluded",
+    "queue": "actual shared lane; benchmark config32; requests1/4/32 and36-over32; production default4 remains",
+    "startup": "six independent pinned-runtime process exits; separate baseline, not subtracted from full fetch/header timing",
+    "transportHeaders": "includes fresh runtime, stdio body handoff and loopback HTTP; no TLS or actual upstream network",
+    "bodyMaximum": "128MiB is the transport component cap, not the API/driver admitted maximum; the logical budget rejection is separately observed",
+    "hostRss": "includes the in-process controlled upstream fixture; not a pure Server RSS baseline",
+    "childRss": "sum at a sampling instant; shared pages can be counted multiple times; transient peaks and phase boundaries have sampling error",
+    "cgroup": "fresh private sibling group per run; hardmax4GiB, swap disabled; normal memory.high=max versus384MiB; parent controller policy unchanged; all created groups removed",
+    "negativePressure": "128MiB transport request hits existing30s typed504; preserve test exit101 and probePassed=false. No OOM or forced child cleanup. This is a measured capacity limit, not a green pressure test."
+  },
+  "runs": [
+    {
+      "mode": "normal",
+      "outcome": "normal_probe_passed",
+      "probeExitCode": 0,
+      "probePassed": true,
+      "memoryHighBytes": "max",
+      "memoryMaxBytes": 4294967296,
+      "remainingBeforeForcedCleanup": [],
+      "forcedCleanup": false,
+      "remainingAfterCleanup": [],
+      "memoryEventsAfter": {
+        "low": 0,
+        "high": 0,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0
+      },
+      "sampleErrors": [],
+      "summaries": [
+        {
+          "phase": "runtime_startup",
+          "samples": 339,
+          "hostPeakRssKiB": 127344,
+          "summedChildPeakRssKiB": 8288,
+          "cgroupPeakObservedBytes": 115642368,
+          "maxObservedChildren": 1,
+          "windowMs": 3519.8651551036164
+        },
+        {
+          "phase": "serial_first",
+          "samples": 12,
+          "hostPeakRssKiB": 57168,
+          "summedChildPeakRssKiB": 23436,
+          "cgroupPeakObservedBytes": 14757888,
+          "maxObservedChildren": 1,
+          "windowMs": 117.7184950793162
+        },
+        {
+          "phase": "serial_repeat",
+          "samples": 12,
+          "hostPeakRssKiB": 66808,
+          "summedChildPeakRssKiB": 23576,
+          "cgroupPeakObservedBytes": 14471168,
+          "maxObservedChildren": 1,
+          "windowMs": 115.45217095408589
+        },
+        {
+          "phase": "parallel_4",
+          "samples": 11,
+          "hostPeakRssKiB": 71788,
+          "summedChildPeakRssKiB": 90604,
+          "cgroupPeakObservedBytes": 31363072,
+          "maxObservedChildren": 4,
+          "windowMs": 109.49512792285532
+        },
+        {
+          "phase": "parallel_configured_max_32",
+          "samples": 14,
+          "hostPeakRssKiB": 74280,
+          "summedChildPeakRssKiB": 730776,
+          "cgroupPeakObservedBytes": 184496128,
+          "maxObservedChildren": 32,
+          "windowMs": 185.75026700273156
+        },
+        {
+          "phase": "queued_36_over_32",
+          "samples": 21,
+          "hostPeakRssKiB": 75216,
+          "summedChildPeakRssKiB": 733420,
+          "cgroupPeakObservedBytes": 184229888,
+          "maxObservedChildren": 32,
+          "windowMs": 256.6390379797667
+        },
+        {
+          "phase": "slow_consumer_4",
+          "samples": 250,
+          "hostPeakRssKiB": 75264,
+          "summedChildPeakRssKiB": 142956,
+          "cgroupPeakObservedBytes": 85749760,
+          "maxObservedChildren": 4,
+          "windowMs": 2736.027573933825
+        },
+        {
+          "phase": "cancel_before_headers_4",
+          "samples": 8,
+          "hostPeakRssKiB": 75364,
+          "summedChildPeakRssKiB": 89404,
+          "cgroupPeakObservedBytes": 32235520,
+          "maxObservedChildren": 4,
+          "windowMs": 76.10362698324025
+        },
+        {
+          "phase": "cancel_unread_body_4",
+          "samples": 4,
+          "hostPeakRssKiB": 75428,
+          "summedChildPeakRssKiB": 76440,
+          "cgroupPeakObservedBytes": 44355584,
+          "maxObservedChildren": 4,
+          "windowMs": 32.07398799713701
+        },
+        {
+          "phase": "cancel_read_body_4",
+          "samples": 4,
+          "hostPeakRssKiB": 75436,
+          "summedChildPeakRssKiB": 84436,
+          "cgroupPeakObservedBytes": 31608832,
+          "maxObservedChildren": 4,
+          "windowMs": 31.67136001866311
+        },
+        {
+          "phase": "transport_maximum_body_128m",
+          "samples": 52,
+          "hostPeakRssKiB": 429092,
+          "summedChildPeakRssKiB": 348988,
+          "cgroupPeakObservedBytes": 708341760,
+          "maxObservedChildren": 1,
+          "windowMs": 533.9775100583211
+        }
+      ],
+      "privateCgroupRemoved": true,
+      "events": [
+        {
+          "phase": "runtime_startup",
+          "version": "1.4.4",
+          "milliseconds": [
+            3.928809,
+            4.020359,
+            3.107664,
+            3.227098,
+            3.122212,
+            3.942936
+          ],
+          "coldMeaning": "first observed launch; OS page cache was not flushed",
+          "cgroupBefore": {
+            "memory.current": "7991296",
+            "memory.max": "4294967296",
+            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0",
+            "memory.pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0"
+          }
+        },
+        {
+          "phase": "serial_first",
+          "concurrency": 1,
+          "requestBytes": 1024,
+          "responseBytes": 8192,
+          "hostPeakRssKiB": 57168,
+          "summedChildPeakRssKiB": 23468,
+          "maxObservedChildren": 1,
+          "sampleCount": 24,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 1,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.29630900000000004,
+              "max": 0.29630900000000004
+            },
+            "transportHeadersMs": {
+              "p50": 19.619500000000002,
+              "max": 19.619500000000002
+            },
+            "bodyMs": {
+              "p50": 101.829567,
+              "max": 101.829567
+            }
+          }
+        },
+        {
+          "phase": "serial_repeat",
+          "concurrency": 1,
+          "requestBytes": 1024,
+          "responseBytes": 8192,
+          "hostPeakRssKiB": 66808,
+          "summedChildPeakRssKiB": 23604,
+          "maxObservedChildren": 1,
+          "sampleCount": 23,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 1,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.17776,
+              "max": 0.17776
+            },
+            "transportHeadersMs": {
+              "p50": 18.966279,
+              "max": 18.966279
+            },
+            "bodyMs": {
+              "p50": 102.420433,
+              "max": 102.420433
+            }
+          }
+        },
+        {
+          "phase": "parallel_4",
+          "concurrency": 4,
+          "requestBytes": 1024,
+          "responseBytes": 8192,
+          "hostPeakRssKiB": 71788,
+          "summedChildPeakRssKiB": 90604,
+          "maxObservedChildren": 4,
+          "sampleCount": 23,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 4,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.3625585,
+              "max": 0.41279499999999997
+            },
+            "transportHeadersMs": {
+              "p50": 19.306704500000002,
+              "max": 19.652361
+            },
+            "bodyMs": {
+              "p50": 102.6460715,
+              "max": 103.110803
+            }
+          }
+        },
+        {
+          "phase": "parallel_configured_max_32",
+          "concurrency": 32,
+          "requestBytes": 1024,
+          "responseBytes": 8192,
+          "hostPeakRssKiB": 73460,
+          "summedChildPeakRssKiB": 730776,
+          "maxObservedChildren": 32,
+          "sampleCount": 22,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 32,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.150028,
+              "max": 0.56569
+            },
+            "transportHeadersMs": {
+              "p50": 69.9395155,
+              "max": 75.277504
+            },
+            "bodyMs": {
+              "p50": 102.35776200000001,
+              "max": 104.281837
+            }
+          }
+        },
+        {
+          "phase": "queued_36_over_32",
+          "concurrency": 36,
+          "requestBytes": 1024,
+          "responseBytes": 8192,
+          "hostPeakRssKiB": 75216,
+          "summedChildPeakRssKiB": 774620,
+          "maxObservedChildren": 32,
+          "sampleCount": 45,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 36,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.127597,
+              "max": 112.594188
+            },
+            "transportHeadersMs": {
+              "p50": 36.944694,
+              "max": 46.486377000000005
+            },
+            "bodyMs": {
+              "p50": 101.61427699999999,
+              "max": 103.846588
+            }
+          }
+        },
+        {
+          "phase": "slow_consumer_4",
+          "concurrency": 4,
+          "requestBytes": 1024,
+          "responseBytes": 4194304,
+          "hostPeakRssKiB": 75260,
+          "summedChildPeakRssKiB": 142956,
+          "maxObservedChildren": 4,
+          "sampleCount": 510,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 4,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.426681,
+              "max": 0.514555
+            },
+            "transportHeadersMs": {
+              "p50": 23.6665395,
+              "max": 23.672881
+            },
+            "bodyMs": {
+              "p50": 2712.483733,
+              "max": 2712.6396919999997
+            }
+          }
+        },
+        {
+          "phase": "cancel_before_headers_4",
+          "concurrency": 4,
+          "requestBytes": 1024,
+          "responseBytes": 4194304,
+          "hostPeakRssKiB": 75364,
+          "summedChildPeakRssKiB": 89404,
+          "maxObservedChildren": 4,
+          "sampleCount": 18,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 4,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.439345,
+              "max": 0.44775099999999995
+            }
+          }
+        },
+        {
+          "phase": "cancel_unread_body_4",
+          "concurrency": 4,
+          "requestBytes": 1024,
+          "responseBytes": 4194304,
+          "hostPeakRssKiB": 75428,
+          "summedChildPeakRssKiB": 84272,
+          "maxObservedChildren": 4,
+          "sampleCount": 7,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 4,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.5285055000000001,
+              "max": 0.579456
+            },
+            "transportHeadersMs": {
+              "p50": 21.908507,
+              "max": 22.552652
+            }
+          }
+        },
+        {
+          "phase": "cancel_read_body_4",
+          "concurrency": 4,
+          "requestBytes": 1024,
+          "responseBytes": 4194304,
+          "hostPeakRssKiB": 75428,
+          "summedChildPeakRssKiB": 113448,
+          "maxObservedChildren": 4,
+          "sampleCount": 7,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 4,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.362422,
+              "max": 0.43628900000000004
+            },
+            "transportHeadersMs": {
+              "p50": 21.4168,
+              "max": 21.506201
+            },
+            "bodyMs": {
+              "p50": 0.07199849999999999,
+              "max": 0.11832000000000001
+            }
+          }
+        },
+        {
+          "phase": "transport_maximum_body_128m",
+          "concurrency": 1,
+          "requestBytes": 134217728,
+          "responseBytes": 8192,
+          "hostPeakRssKiB": 441236,
+          "summedChildPeakRssKiB": 348988,
+          "maxObservedChildren": 1,
+          "sampleCount": 105,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 1,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.106487,
+              "max": 0.106487
+            },
+            "transportHeadersMs": {
+              "p50": 349.439133,
+              "max": 349.439133
+            },
+            "bodyMs": {
+              "p50": 128.184874,
+              "max": 128.184874
+            }
+          }
+        },
+        {
+          "phase": "request_budget_pressure",
+          "reservationAccepted": false,
+          "remainingChildren": 0,
+          "scope": "logical request budget; no cgroup limit was changed and no OS OOM was induced",
+          "cgroupAfter": {
+            "memory.current": "11505664",
+            "memory.max": "4294967296",
+            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0",
+            "memory.pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0"
+          }
+        }
+      ],
+      "rawLog": "/tmp/cc-r6-zen-resources-final/normal.log",
+      "rawLogSha256": "29798b9a25965a71b6beb7bc7242b36ede27ea247c11237d95e45380dea6d105",
+      "rawTrace": "/tmp/cc-r6-zen-resources-final/normal-samples.json",
+      "rawTraceSha256": "6d76c8d5e698a69f76783eabc4afe6f46a72b53207ea35732834c3cc25b557e9"
+    },
+    {
+      "mode": "pressure",
+      "outcome": "observed_controlled_504_under_memory_high",
+      "probeExitCode": 101,
+      "probePassed": false,
+      "memoryHighBytes": "402653184",
+      "memoryMaxBytes": 4294967296,
+      "remainingBeforeForcedCleanup": [],
+      "forcedCleanup": false,
+      "remainingAfterCleanup": [],
+      "memoryEventsAfter": {
+        "low": 0,
+        "high": 8377,
+        "max": 0,
+        "oom": 0,
+        "oom_kill": 0
+      },
+      "sampleErrors": [],
+      "summaries": [
+        {
+          "phase": "runtime_startup",
+          "samples": 338,
+          "hostPeakRssKiB": 127076,
+          "summedChildPeakRssKiB": 10700,
+          "cgroupPeakObservedBytes": 115650560,
+          "maxObservedChildren": 1,
+          "windowMs": 3500.5963559960946
+        },
+        {
+          "phase": "serial_first",
+          "samples": 11,
+          "hostPeakRssKiB": 57404,
+          "summedChildPeakRssKiB": 23672,
+          "cgroupPeakObservedBytes": 14229504,
+          "maxObservedChildren": 1,
+          "windowMs": 106.41044599469751
+        },
+        {
+          "phase": "serial_repeat",
+          "samples": 12,
+          "hostPeakRssKiB": 68240,
+          "summedChildPeakRssKiB": 23404,
+          "cgroupPeakObservedBytes": 14831616,
+          "maxObservedChildren": 1,
+          "windowMs": 115.58487801812589
+        },
+        {
+          "phase": "parallel_4",
+          "samples": 13,
+          "hostPeakRssKiB": 71616,
+          "summedChildPeakRssKiB": 90064,
+          "cgroupPeakObservedBytes": 31027200,
+          "maxObservedChildren": 4,
+          "windowMs": 130.36371697671711
+        },
+        {
+          "phase": "parallel_configured_max_32",
+          "samples": 14,
+          "hostPeakRssKiB": 72668,
+          "summedChildPeakRssKiB": 728284,
+          "cgroupPeakObservedBytes": 183701504,
+          "maxObservedChildren": 32,
+          "windowMs": 182.6365189626813
+        },
+        {
+          "phase": "queued_36_over_32",
+          "samples": 22,
+          "hostPeakRssKiB": 74832,
+          "summedChildPeakRssKiB": 737024,
+          "cgroupPeakObservedBytes": 183685120,
+          "maxObservedChildren": 32,
+          "windowMs": 268.61776295118034
+        },
+        {
+          "phase": "slow_consumer_4",
+          "samples": 249,
+          "hostPeakRssKiB": 75060,
+          "summedChildPeakRssKiB": 140700,
+          "cgroupPeakObservedBytes": 86892544,
+          "maxObservedChildren": 4,
+          "windowMs": 2725.2343189902604
+        },
+        {
+          "phase": "cancel_before_headers_4",
+          "samples": 9,
+          "hostPeakRssKiB": 75160,
+          "summedChildPeakRssKiB": 89336,
+          "cgroupPeakObservedBytes": 33722368,
+          "maxObservedChildren": 4,
+          "windowMs": 86.21577802114189
+        },
+        {
+          "phase": "cancel_unread_body_4",
+          "samples": 3,
+          "hostPeakRssKiB": 75288,
+          "summedChildPeakRssKiB": 87396,
+          "cgroupPeakObservedBytes": 33202176,
+          "maxObservedChildren": 4,
+          "windowMs": 21.616184967570007
+        },
+        {
+          "phase": "cancel_read_body_4",
+          "samples": 4,
+          "hostPeakRssKiB": 75288,
+          "summedChildPeakRssKiB": 82508,
+          "cgroupPeakObservedBytes": 43008000,
+          "maxObservedChildren": 4,
+          "windowMs": 32.21466892864555
+        },
+        {
+          "phase": "transport_maximum_body_128m",
+          "samples": 2867,
+          "hostPeakRssKiB": 206364,
+          "summedChildPeakRssKiB": 297252,
+          "cgroupPeakObservedBytes": 426209280,
+          "maxObservedChildren": 1,
+          "windowMs": 30261.064185062423
+        }
+      ],
+      "privateCgroupRemoved": true,
+      "events": [
+        {
+          "phase": "runtime_startup",
+          "version": "1.4.4",
+          "milliseconds": [
+            4.933743,
+            3.964976,
+            3.65462,
+            3.764374,
+            3.3548050000000003,
+            3.5525700000000002
+          ],
+          "coldMeaning": "first observed launch; OS page cache was not flushed",
+          "cgroupBefore": {
+            "memory.current": "7995392",
+            "memory.max": "4294967296",
+            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0",
+            "memory.pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0"
+          }
+        },
+        {
+          "phase": "serial_first",
+          "concurrency": 1,
+          "requestBytes": 1024,
+          "responseBytes": 8192,
+          "hostPeakRssKiB": 57404,
+          "summedChildPeakRssKiB": 23672,
+          "maxObservedChildren": 1,
+          "sampleCount": 24,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 1,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.272796,
+              "max": 0.272796
+            },
+            "transportHeadersMs": {
+              "p50": 20.691549,
+              "max": 20.691549
+            },
+            "bodyMs": {
+              "p50": 102.353599,
+              "max": 102.353599
+            }
+          }
+        },
+        {
+          "phase": "serial_repeat",
+          "concurrency": 1,
+          "requestBytes": 1024,
+          "responseBytes": 8192,
+          "hostPeakRssKiB": 68240,
+          "summedChildPeakRssKiB": 23404,
+          "maxObservedChildren": 1,
+          "sampleCount": 24,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 1,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.127086,
+              "max": 0.127086
+            },
+            "transportHeadersMs": {
+              "p50": 19.407656999999997,
+              "max": 19.407656999999997
+            },
+            "bodyMs": {
+              "p50": 102.825084,
+              "max": 102.825084
+            }
+          }
+        },
+        {
+          "phase": "parallel_4",
+          "concurrency": 4,
+          "requestBytes": 1024,
+          "responseBytes": 8192,
+          "hostPeakRssKiB": 71616,
+          "summedChildPeakRssKiB": 90128,
+          "maxObservedChildren": 4,
+          "sampleCount": 25,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 4,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.269169,
+              "max": 0.356101
+            },
+            "transportHeadersMs": {
+              "p50": 24.725539,
+              "max": 28.897994999999998
+            },
+            "bodyMs": {
+              "p50": 102.39710000000001,
+              "max": 102.876179
+            }
+          }
+        },
+        {
+          "phase": "parallel_configured_max_32",
+          "concurrency": 32,
+          "requestBytes": 1024,
+          "responseBytes": 8192,
+          "hostPeakRssKiB": 72668,
+          "summedChildPeakRssKiB": 728284,
+          "maxObservedChildren": 32,
+          "sampleCount": 23,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 32,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.178231,
+              "max": 0.4691
+            },
+            "transportHeadersMs": {
+              "p50": 72.6199885,
+              "max": 78.716144
+            },
+            "bodyMs": {
+              "p50": 101.5121825,
+              "max": 102.690295
+            }
+          }
+        },
+        {
+          "phase": "queued_36_over_32",
+          "concurrency": 36,
+          "requestBytes": 1024,
+          "responseBytes": 8192,
+          "hostPeakRssKiB": 74832,
+          "summedChildPeakRssKiB": 737024,
+          "maxObservedChildren": 32,
+          "sampleCount": 45,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 36,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.1177085,
+              "max": 121.382293
+            },
+            "transportHeadersMs": {
+              "p50": 37.215886999999995,
+              "max": 49.318472
+            },
+            "bodyMs": {
+              "p50": 102.105028,
+              "max": 104.47317100000001
+            }
+          }
+        },
+        {
+          "phase": "slow_consumer_4",
+          "concurrency": 4,
+          "requestBytes": 1024,
+          "responseBytes": 4194304,
+          "hostPeakRssKiB": 75060,
+          "summedChildPeakRssKiB": 140700,
+          "maxObservedChildren": 4,
+          "sampleCount": 508,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 4,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.32362500000000005,
+              "max": 0.379954
+            },
+            "transportHeadersMs": {
+              "p50": 20.6115555,
+              "max": 20.686851
+            },
+            "bodyMs": {
+              "p50": 2708.844396,
+              "max": 2709.020648
+            }
+          }
+        },
+        {
+          "phase": "cancel_before_headers_4",
+          "concurrency": 4,
+          "requestBytes": 1024,
+          "responseBytes": 4194304,
+          "hostPeakRssKiB": 75160,
+          "summedChildPeakRssKiB": 89336,
+          "maxObservedChildren": 4,
+          "sampleCount": 18,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 4,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.38548000000000004,
+              "max": 0.476002
+            }
+          }
+        },
+        {
+          "phase": "cancel_unread_body_4",
+          "concurrency": 4,
+          "requestBytes": 1024,
+          "responseBytes": 4194304,
+          "hostPeakRssKiB": 75288,
+          "summedChildPeakRssKiB": 99196,
+          "maxObservedChildren": 4,
+          "sampleCount": 7,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 4,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.297227,
+              "max": 0.389042
+            },
+            "transportHeadersMs": {
+              "p50": 22.105378,
+              "max": 23.329664
+            }
+          }
+        },
+        {
+          "phase": "cancel_read_body_4",
+          "concurrency": 4,
+          "requestBytes": 1024,
+          "responseBytes": 4194304,
+          "hostPeakRssKiB": 75288,
+          "summedChildPeakRssKiB": 114800,
+          "maxObservedChildren": 4,
+          "sampleCount": 7,
+          "sampleIntervalMs": 5,
+          "remainingChildren": 0,
+          "observedChildProcessCount": 4,
+          "timingSummary": {
+            "queueMs": {
+              "p50": 0.35333099999999995,
+              "max": 0.376749
+            },
+            "transportHeadersMs": {
+              "p50": 21.824742,
+              "max": 21.957368000000002
+            },
+            "bodyMs": {
+              "p50": 0.1210495,
+              "max": 0.17715799999999998
+            }
+          }
+        }
+      ],
+      "rawLog": "/tmp/cc-r6-zen-resources-final/pressure.log",
+      "rawLogSha256": "254f95c7206b87f4aa6e056e6bca803de58bfca83bdd3a6cbabebc07ff5c6e1f",
+      "rawTrace": "/tmp/cc-r6-zen-resources-final/pressure-samples.json",
+      "rawTraceSha256": "db95554f743e1b413c296a7e69f436fa05330ed912dc8871c9e3746dc38d3b1f"
+    }
+  ],
+  "decision": "Keep per-request Bun, default concurrency4, maximum32 and existing logical request/body admission. No runtime pool, RSS estimate reservation, transport replacement or performance gain is introduced. Physical capacity depends on deployment limits and payload; normal loopback data does not promise real TLS/model or production RSS bounds."
+}

@@ -1,5 +1,5 @@
-use std::collections::{BTreeSet, HashMap};
-use std::sync::LazyLock;
+use std::collections::BTreeSet;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -11,7 +11,13 @@ pub(crate) use crate::domain::providers::amazon_q::{
     AMAZON_Q_LIST_MODELS_TARGET, AMAZON_Q_ORIGIN, AMAZON_Q_RUNTIME_REGIONS, AMAZON_Q_USAGE_TARGET,
 };
 use crate::domain::providers::model::ProviderType;
+use crate::infra::resident_flights::CatalogFetchMemory;
+use crate::infra::resident_memory::{ResidentMemoryBudget, ResidentMemoryReservation};
 use crate::infra::time::now_ms;
+
+#[cfg(test)]
+mod r7_tests;
+mod resident;
 
 const CACHE_TTL_MS: i64 = 5 * 60 * 1000;
 const STALE_CACHE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -38,17 +44,36 @@ pub struct AmazonQModelDescriptor {
     pub supports_prompt_cache: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
-pub struct AmazonQModelCatalog {
+#[derive(Debug)]
+pub struct AmazonQModelCatalogData {
     pub descriptors: Vec<AmazonQModelDescriptor>,
     pub default_model_id: Option<String>,
+    retained_bytes: usize,
+    _memory: Option<ResidentMemoryReservation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AmazonQModelCatalog {
+    data: Arc<AmazonQModelCatalogData>,
     pub source: &'static str,
     pub stale: bool,
     pub fetched_at_ms: Option<i64>,
     failure_status: Option<reqwest::StatusCode>,
+    capacity_rejected: bool,
+}
+
+impl std::ops::Deref for AmazonQModelCatalog {
+    type Target = AmazonQModelCatalogData;
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
 }
 
 impl AmazonQModelCatalog {
+    pub(crate) fn is_capacity_rejected(&self) -> bool {
+        self.capacity_rejected
+    }
+
     pub fn is_unauthorized(&self) -> bool {
         matches!(
             self.failure_status,
@@ -63,8 +88,9 @@ impl AmazonQModelCatalog {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AmazonQModelCatalogScope {
+    account_incarnation: u64,
     app: String,
     provider_id: String,
     provider_revision: u64,
@@ -77,8 +103,10 @@ impl AmazonQModelCatalogScope {
         provider_id: &str,
         provider_revision: u64,
         runtime_fingerprint: &str,
+        account_incarnation: u64,
     ) -> Self {
         Self {
+            account_incarnation,
             app: app.trim().to_string(),
             provider_id: provider_id.trim().to_string(),
             provider_revision,
@@ -88,12 +116,13 @@ impl AmazonQModelCatalogScope {
 
     #[cfg(test)]
     fn fixture() -> Self {
-        Self::derive("claude", "amazon-q-fixture", 1, "runtime-fixture")
+        Self::derive("claude", "amazon-q-fixture", 1, "runtime-fixture", 1)
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct CacheKey {
+    account_incarnation: u64,
     app: String,
     provider_id: String,
     provider_revision: u64,
@@ -101,31 +130,22 @@ struct CacheKey {
     account_id: String,
     auth_identity_generation: u64,
     token_refresh_generation: u64,
+    credential_fingerprint: [u8; 32],
     profile_scope: String,
     runtime_region: String,
 }
 
-#[derive(Debug, Clone)]
-struct CachedCatalog {
-    descriptors: Vec<AmazonQModelDescriptor>,
-    default_model_id: Option<String>,
-    fetched_at_ms: i64,
-}
-
-#[derive(Debug, Default)]
-struct RuntimeCache {
-    catalogs: HashMap<CacheKey, CachedCatalog>,
-}
-
-static CACHE: LazyLock<Mutex<RuntimeCache>> = LazyLock::new(|| Mutex::new(RuntimeCache::default()));
+static CACHE: LazyLock<resident::RuntimeCache> = LazyLock::new(resident::RuntimeCache::default);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureKind {
     Transient,
     Unavailable,
+    Capacity,
+    Invalidated,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DiscoveryFailure {
     kind: FailureKind,
     message: String,
@@ -133,6 +153,21 @@ struct DiscoveryFailure {
 }
 
 impl DiscoveryFailure {
+    fn capacity() -> Self {
+        Self {
+            kind: FailureKind::Capacity,
+            message: "Amazon Q catalog memory or flight capacity exhausted".into(),
+            status: None,
+        }
+    }
+    fn invalidated() -> Self {
+        Self {
+            kind: FailureKind::Invalidated,
+            message: "Amazon Q catalog identity invalidated during discovery".into(),
+            status: None,
+        }
+    }
+
     fn transient(message: impl Into<String>) -> Self {
         Self {
             kind: FailureKind::Transient,
@@ -175,6 +210,25 @@ pub async fn model_catalog_scoped(
     endpoint_override: Option<&str>,
     request_timeout: Duration,
 ) -> AmazonQModelCatalog {
+    model_catalog_cached(
+        &CACHE,
+        http,
+        account,
+        scope,
+        endpoint_override,
+        request_timeout,
+    )
+    .await
+}
+
+async fn model_catalog_cached(
+    cache: &resident::RuntimeCache,
+    http: &reqwest::Client,
+    account: &Account,
+    scope: &AmazonQModelCatalogScope,
+    endpoint_override: Option<&str>,
+    request_timeout: Duration,
+) -> AmazonQModelCatalog {
     if account.provider_type != ProviderType::AmazonQOAuth {
         return unavailable_catalog("amazon_q_account_type_mismatch", None);
     }
@@ -190,11 +244,12 @@ pub async fn model_catalog_scoped(
     let identity = match runtime_identity(account) {
         Ok(identity) => identity,
         Err(error) => {
-            tracing::warn!(account_id = %account.id, %error, "Amazon Q runtime identity rejected");
+            tracing::warn!(account_id=%account.id,%error,"Amazon Q runtime identity rejected");
             return unavailable_catalog("amazon_q_identity_unresolved", None);
         }
     };
     let key = CacheKey {
+        account_incarnation: scope.account_incarnation,
         app: scope.app.clone(),
         provider_id: scope.provider_id.clone(),
         provider_revision: scope.provider_revision,
@@ -202,72 +257,127 @@ pub async fn model_catalog_scoped(
         account_id: account.id.clone(),
         auth_identity_generation: account.auth_identity_generation,
         token_refresh_generation: account.token_refresh_generation,
+        credential_fingerprint: {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(access_token.as_bytes()).into()
+        },
         profile_scope: identity
             .profile_arn
             .clone()
-            .unwrap_or_else(|| "builder_id_profileless".to_string()),
+            .unwrap_or_else(|| "builder_id_profileless".into()),
         runtime_region: identity.region.clone(),
     };
-    let now = now_ms().min(i64::MAX as u128) as i64;
-    if let Some(cached) = CACHE
-        .lock()
-        .await
-        .catalogs
-        .get(&key)
-        .filter(|cached| now.saturating_sub(cached.fetched_at_ms) < CACHE_TTL_MS)
-        .cloned()
-    {
-        return catalog_from_cache(cached, false);
+    let deadline = tokio::time::Instant::now() + request_timeout;
+    let current_time = || now_ms().min(i64::MAX as u128) as i64;
+    if let Some(snapshot) = cache.snapshot(&key, current_time(), CACHE_TTL_MS).await {
+        return catalog_from_snapshot(snapshot, false, "amazon_q_account_cache");
     }
+    let Some(lease) = cache.flight(&key).await else {
+        return catalog_from_failure(cache, &key, DiscoveryFailure::capacity(), current_time())
+            .await;
+    };
+    let _flight_guard = match tokio::time::timeout_at(deadline, lease.lock()).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            return catalog_from_failure(
+                cache,
+                &key,
+                DiscoveryFailure::transient(
+                    "Amazon Q catalog deadline exceeded waiting for discovery",
+                ),
+                current_time(),
+            )
+            .await
+        }
+    };
+    if !lease.is_current() {
+        return catalog_from_failure(cache, &key, DiscoveryFailure::invalidated(), current_time())
+            .await;
+    }
+    let outcome = if let Some(outcome) = lease.outcome() {
+        outcome
+    } else {
+        if let Some(snapshot) = cache.snapshot(&key, current_time(), CACHE_TTL_MS).await {
+            return catalog_from_snapshot(snapshot, false, "amazon_q_account_cache");
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let mut outcome = match tokio::time::timeout_at(
+            deadline,
+            fetch_catalog(
+                http,
+                access_token,
+                &identity,
+                endpoint_override,
+                remaining,
+                &cache.parent,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(data)) => Ok(resident::CatalogSnapshot {
+                data,
+                fetched_at_ms: current_time(),
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(DiscoveryFailure::transient(
+                "Amazon Q catalog pagination exceeded the discovery deadline",
+            )),
+        };
+        if !lease.is_current() {
+            outcome = Err(DiscoveryFailure::invalidated());
+        }
+        if let Err(error) = &outcome {
+            // One sanitized diagnostic per leader, rather than one per waiter.
+            // Do not include tokens, upstream bodies or pagination cursors.
+            tracing::warn!(account_id=%account.id, kind=?error.kind,
+                status=?error.status, "Amazon Q model discovery did not produce a catalog");
+        }
+        if let Ok(snapshot) = &outcome {
+            cache.publish(key.clone(), snapshot, &lease).await;
+        }
+        if !lease.is_current() {
+            outcome = Err(DiscoveryFailure::invalidated());
+        }
+        // Concurrent callers share failures as well as successful catalogs.
+        // Last-lease drop clears this result, so no permanent negative cache.
+        lease.complete(outcome.clone());
+        outcome
+    };
+    if !lease.is_current() {
+        return unavailable_catalog("amazon_q_catalog_invalidated", None);
+    }
+    match outcome {
+        Ok(snapshot) => catalog_from_snapshot(snapshot, false, "amazon_q_list_available_models"),
+        Err(error) => catalog_from_failure(cache, &key, error, current_time()).await,
+    }
+}
 
-    match fetch_catalog(
-        http,
-        access_token,
-        &identity,
-        endpoint_override,
-        request_timeout,
-    )
-    .await
-    {
-        Ok((descriptors, default_model_id)) => {
-            CACHE.lock().await.catalogs.insert(
-                key,
-                CachedCatalog {
-                    descriptors: descriptors.clone(),
-                    default_model_id: default_model_id.clone(),
-                    fetched_at_ms: now,
-                },
-            );
-            AmazonQModelCatalog {
-                descriptors,
-                default_model_id,
-                source: "amazon_q_list_available_models",
-                stale: false,
-                fetched_at_ms: Some(now),
-                failure_status: None,
+async fn catalog_from_failure(
+    cache: &resident::RuntimeCache,
+    key: &CacheKey,
+    error: DiscoveryFailure,
+    now: i64,
+) -> AmazonQModelCatalog {
+    match error.kind {
+        FailureKind::Transient => {
+            if let Some(snapshot) = cache.snapshot(key, now, STALE_CACHE_TTL_MS).await {
+                return catalog_from_snapshot(snapshot, true, "amazon_q_account_cache");
             }
+            unavailable_catalog(
+                "amazon_q_model_discovery_transient_without_cache",
+                error.status,
+            )
         }
-        Err(error) if error.kind == FailureKind::Unavailable => {
-            tracing::warn!(account_id = %account.id, error = %error, "Amazon Q model discovery rejected");
+        FailureKind::Capacity => {
+            crate::metrics::record_resident_retention_refused("amazon_q_catalog");
+            let mut result = unavailable_catalog("amazon_q_models_capacity_rejected", None);
+            result.capacity_rejected = true;
+            result
+        }
+        FailureKind::Invalidated => unavailable_catalog("amazon_q_catalog_invalidated", None),
+        FailureKind::Unavailable => {
+            cache.discard(key).await;
             unavailable_catalog("amazon_q_model_access_unavailable", error.status)
-        }
-        Err(error) => {
-            tracing::warn!(account_id = %account.id, error = %error, "Amazon Q model discovery failed transiently");
-            if let Some(cached) = CACHE
-                .lock()
-                .await
-                .catalogs
-                .get(&key)
-                .filter(|cached| now.saturating_sub(cached.fetched_at_ms) < STALE_CACHE_TTL_MS)
-                .cloned()
-            {
-                catalog_from_cache(cached, true)
-            } else {
-                unavailable_catalog(
-                    "amazon_q_model_discovery_transient_without_cache",
-                    error.status,
-                )
-            }
         }
     }
 }
@@ -331,21 +441,30 @@ pub async fn usage_snapshot(
 }
 
 pub async fn clear_account(account_id: &str) {
-    CACHE
-        .lock()
-        .await
-        .catalogs
-        .retain(|key, _| key.account_id != account_id);
+    CACHE.clear_account(account_id).await;
 }
 
-fn catalog_from_cache(cached: CachedCatalog, stale: bool) -> AmazonQModelCatalog {
+pub(crate) fn catalog_identity_matches(left: &Account, right: &Account) -> bool {
+    left.provider_type == right.provider_type
+        && left.auth_identity_generation == right.auth_identity_generation
+        && left.token_refresh_generation == right.token_refresh_generation
+        && left.access_token == right.access_token
+        && left.needs_relogin == right.needs_relogin
+        && runtime_identity(left).ok() == runtime_identity(right).ok()
+}
+
+fn catalog_from_snapshot(
+    snapshot: resident::CatalogSnapshot,
+    stale: bool,
+    source: &'static str,
+) -> AmazonQModelCatalog {
     AmazonQModelCatalog {
-        descriptors: cached.descriptors,
-        default_model_id: cached.default_model_id,
-        source: "amazon_q_account_cache",
+        data: snapshot.data,
+        source,
         stale,
-        fetched_at_ms: Some(cached.fetched_at_ms),
+        fetched_at_ms: Some(snapshot.fetched_at_ms),
         failure_status: None,
+        capacity_rejected: false,
     }
 }
 
@@ -353,13 +472,21 @@ fn unavailable_catalog(
     source: &'static str,
     failure_status: Option<reqwest::StatusCode>,
 ) -> AmazonQModelCatalog {
+    static EMPTY: LazyLock<Arc<AmazonQModelCatalogData>> = LazyLock::new(|| {
+        Arc::new(AmazonQModelCatalogData {
+            descriptors: Vec::new(),
+            default_model_id: None,
+            retained_bytes: 0,
+            _memory: None,
+        })
+    });
     AmazonQModelCatalog {
-        descriptors: Vec::new(),
-        default_model_id: None,
+        data: EMPTY.clone(),
         source,
         stale: false,
         fetched_at_ms: None,
         failure_status,
+        capacity_rejected: false,
     }
 }
 
@@ -375,7 +502,7 @@ pub fn model_discovery_url(account: &Account) -> Result<String, String> {
     runtime_endpoint(&identity.region, None).map_err(|error| error.to_string())
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct RuntimeIdentity {
     region: String,
     profile_arn: Option<String>,
@@ -416,15 +543,30 @@ async fn fetch_catalog(
     identity: &RuntimeIdentity,
     endpoint_override: Option<&str>,
     request_timeout: Duration,
-) -> Result<(Vec<AmazonQModelDescriptor>, Option<String>), DiscoveryFailure> {
+    parent: &ResidentMemoryBudget,
+) -> Result<Arc<AmazonQModelCatalogData>, DiscoveryFailure> {
     let endpoint = runtime_endpoint(&identity.region, endpoint_override)?;
     let mut descriptors = Vec::new();
     let mut seen_models = BTreeSet::new();
     let mut seen_tokens = BTreeSet::new();
     let mut next_token: Option<String> = None;
     let mut default_model_id = None;
+    let mut retained = parent.reserve(0).ok_or_else(DiscoveryFailure::capacity)?;
+    let deadline = tokio::time::Instant::now() + request_timeout;
 
     for page in 0..MAX_PAGES {
+        let memory = CatalogFetchMemory::new(parent.clone(), MAX_RESPONSE_BYTES)
+            .ok_or_else(DiscoveryFailure::capacity)?;
+        let _request_memory = memory
+            .payload(
+                next_token
+                    .as_ref()
+                    .map_or(0, String::capacity)
+                    .saturating_mul(3)
+                    .saturating_add(16384),
+            )
+            .ok_or_else(DiscoveryFailure::capacity)?;
+
         let mut body = json!({
             "origin": AMAZON_Q_ORIGIN,
             "maxResults": DEFAULT_PAGE_SIZE,
@@ -441,7 +583,7 @@ async fn fetch_catalog(
             access_token,
             AMAZON_Q_LIST_MODELS_TARGET,
             &body,
-            request_timeout,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
         )
         .await?;
         if !response.status.is_success() {
@@ -459,6 +601,9 @@ async fn fetch_catalog(
                 format!("ListAvailableModels returned {}", response.status),
             ));
         }
+        let _parsing = memory
+            .parsing(response.body.len())
+            .ok_or_else(DiscoveryFailure::capacity)?;
         let value: Value = serde_json::from_slice(&response.body).map_err(|error| {
             DiscoveryFailure::unavailable(format!(
                 "parse Amazon Q ListAvailableModels page {}: {error}",
@@ -512,12 +657,38 @@ async fn fetch_catalog(
                     "Amazon Q defaultModel is not present in the paginated model catalog",
                 ));
             }
-            return Ok((descriptors, default_model_id));
+            drop(seen_models);
+            drop(seen_tokens);
+            let bytes = resident::payload_bytes(&descriptors, default_model_id.as_ref());
+            if !retained.try_resize(bytes) {
+                return Err(DiscoveryFailure::capacity());
+            }
+            return Ok(Arc::new(AmazonQModelCatalogData {
+                descriptors,
+                default_model_id,
+                retained_bytes: bytes,
+                _memory: Some(retained),
+            }));
         };
         if !seen_tokens.insert(token.clone()) {
             return Err(DiscoveryFailure::unavailable(
                 "Amazon Q model pagination repeated nextToken",
             ));
+        }
+        let lookup_bytes =
+            seen_models
+                .iter()
+                .chain(seen_tokens.iter())
+                .fold(0_usize, |n, value| {
+                    n.saturating_add(crate::infra::resident_flights::node_bytes::<String, ()>(
+                        value.capacity(),
+                    ))
+                });
+        let bytes = resident::payload_bytes(&descriptors, default_model_id.as_ref())
+            .saturating_add(lookup_bytes)
+            .saturating_add(token.capacity());
+        if !retained.try_resize(bytes) {
+            return Err(DiscoveryFailure::capacity());
         }
     }
     Err(DiscoveryFailure::unavailable(
@@ -718,7 +889,11 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    fn account(provider_type: ProviderType, generation: u64, account_id: &str) -> Account {
+    pub(super) fn account(
+        provider_type: ProviderType,
+        generation: u64,
+        account_id: &str,
+    ) -> Account {
         Account {
             id: account_id.to_string(),
             provider_type,
@@ -795,6 +970,57 @@ mod tests {
             requests
         });
         (format!("http://{address}/"), task)
+    }
+
+    #[tokio::test]
+    async fn r7_amazon_q_parallel_cold_discovery_is_one_flight() {
+        use axum::response::IntoResponse;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app=axum::Router::new().fallback(axum::routing::post(move || {
+            let seen=seen.clone();
+            async move {
+                seen.fetch_add(1,Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(75)).await;
+                axum::Json(json!({"models":[{"modelId":"r7-cold-model"}],"defaultModel":{"modelId":"r7-cold-model"}})).into_response()
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let barrier = Arc::new(tokio::sync::Barrier::new(9));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let barrier = barrier.clone();
+            let endpoint = endpoint.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                model_catalog(
+                    &reqwest::Client::new(),
+                    &account(ProviderType::AmazonQOAuth, 1, "r7-amazon-q-cold-flight"),
+                    Some(&endpoint),
+                )
+                .await
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            let catalog = task.await.unwrap();
+            assert_eq!(
+                catalog.model("r7-cold-model").unwrap().model_id,
+                "r7-cold-model"
+            );
+        }
+        server.abort();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "same scoped cold discovery must share one upstream request"
+        );
     }
 
     #[tokio::test]

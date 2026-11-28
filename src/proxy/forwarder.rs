@@ -172,6 +172,7 @@ const MAX_FORWARD_RETRY_ELAPSED_MS: u128 = 10_000;
 const DEFAULT_UPSTREAM_RATE_LIMIT_COOLDOWN_MS: i64 = 60_000;
 const DEFAULT_UPSTREAM_AUTH_FAILURE_COOLDOWN_MS: i64 = 60_000;
 const DEFAULT_CODEX_WEBSOCKET_CACHE_MAX_CONNECTIONS: usize = 64;
+const CODEX_RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const DEFAULT_CODEX_WEBSOCKET_MAX_CONNECTIONS: usize = 128;
 const DEFAULT_CODEX_WEBSOCKET_CACHE_IDLE_MS: u64 = 5 * 60 * 1000;
 const DEFAULT_CODEX_WEBSOCKET_CACHE_MAX_AGE_MS: u64 = 55 * 60 * 1000;
@@ -370,6 +371,8 @@ struct ResponsesUpstreamWebSocket {
     parent: crate::infra::resident_memory::ResidentMemoryBudget,
     _memory: crate::infra::resident_memory::ResidentMemoryReservation,
     pool_memory: Option<crate::infra::resident_memory::ResidentMemoryReservation>,
+    // Accounted in size_of::<Self>() for active and idle ownership alike.
+    completed_response_ids: super::codex_negotiation::CompletedResponseIds,
 }
 
 enum ResponsesWebSocketTrySendError {
@@ -502,6 +505,7 @@ impl ResponsesUpstreamWebSocket {
             parent,
             _memory: socket_memory,
             pool_memory: None,
+            completed_response_ids: Default::default(),
         })
     }
 
@@ -768,6 +772,22 @@ impl ResponsesWebSocketPool {
                 .saturating_sub(before.saturating_sub(entries.len()));
         }
         self.entries.retain(|_, entries| !entries.is_empty());
+    }
+
+    fn known_continuation_mismatch(&mut self, key: &str, response_id: &str) -> bool {
+        self.prune_expired_with_policy(ResponsesWebSocketPoolPolicy::current());
+        let Some((scope, _)) = key.split_once(':') else {
+            return false;
+        };
+        self.entries.iter().any(|(other_key, entries)| {
+            other_key != key
+                && other_key
+                    .split_once(':')
+                    .is_some_and(|(other_scope, _)| other_scope == scope)
+                && entries
+                    .iter()
+                    .any(|entry| entry.socket.completed_response_ids.contains(response_id))
+        })
     }
 
     fn evict_oldest(&mut self) -> bool {
@@ -2504,23 +2524,36 @@ fn request_memory_enabled_for_provider(app: AppKind, provider_type: Option<Provi
         })
 }
 
-async fn request_memory_provider_type_for_request(
+async fn request_memory_enabled_for_request(
     state: &ServerState,
     app: AppKind,
     headers: &HeaderMap,
     attempt_context: &ForwardAttemptContext,
-) -> Option<ProviderType> {
-    if let Some(execution) = attempt_context.execution.as_ref() {
-        return Some(execution.stored.provider_type);
+) -> bool {
+    if app == AppKind::Codex {
+        return true;
     }
-    let share_id = request_context_from_headers(headers).share_id?;
-    // Keep the documented store lock order (providers before shares). Any
-    // selection error is intentionally left to the authoritative path below.
+    if let Some(execution) = attempt_context.execution.as_ref() {
+        return request_memory_enabled_for_provider(app, Some(execution.stored.provider_type))
+            || super::web_session::is_web_session_driver(execution.plan.driver_id.as_str());
+    }
+    let Some(share_id) = request_context_from_headers(headers).share_id else {
+        return false;
+    };
+    // Provider before Share: preserve the store lock order. Selection errors
+    // are left to the authoritative forwarding path.
     let providers = state.providers.read().await;
     let shares = state.shares.read().await;
     select_share_provider(&providers, &shares, app, &share_id)
         .ok()
-        .map(|(stored, _)| stored.provider_type)
+        .is_some_and(|(stored, _)| {
+            request_memory_enabled_for_provider(app, Some(stored.provider_type))
+                || providers
+                    .runtime_plan(stored.app, &stored.provider.id)
+                    .is_some_and(|plan| {
+                        super::web_session::is_web_session_driver(plan.driver_id.as_str())
+                    })
+        })
 }
 
 async fn forward_with_attempt(
@@ -2564,12 +2597,7 @@ async fn forward_with_attempt_inner(
     let raw_body_for_retry = body;
     let retry_gemini_path = gemini_path;
     let app = route.app();
-    let request_memory_provider_type = if app == AppKind::Codex {
-        None
-    } else {
-        request_memory_provider_type_for_request(&state, app, &headers, &attempt_context).await
-    };
-    if request_memory_enabled_for_provider(app, request_memory_provider_type) {
+    if request_memory_enabled_for_request(&state, app, &headers, &attempt_context).await {
         attempt_context.initialize_request_memory(
             state.request_body_limits.memory_budget_bytes,
             raw_body_for_retry.len(),
@@ -2700,7 +2728,8 @@ async fn forward_with_attempt_inner(
             return Err(ProxyError{status:StatusCode::SERVICE_UNAVAILABLE,
                 message:"quota_unavailable: the configured runtime binding cannot execute this operation".into()});
         }
-        if request_memory_enabled_for_provider(app, Some(execution.stored.provider_type))
+        if (request_memory_enabled_for_provider(app, Some(execution.stored.provider_type))
+            || super::web_session::is_web_session_driver(execution.plan.driver_id.as_str()))
             && attempt_context.request_memory().is_none()
         {
             attempt_context.initialize_request_memory(
@@ -2776,6 +2805,11 @@ async fn forward_with_attempt_inner(
         } else {
             super::codex_request_policy::CodexRequestIntent::default()
         };
+        if execution.driver_is("oauth.kimi_code") {
+            request_context.requested_reasoning_effort =
+                super::kimi::requested_effort_for_diagnostics(&execution.plan, &body);
+            request_context.effective_reasoning_effort = None;
+        }
         ensure_managed_credential_persistence_available(&state, &execution)?;
         super::router::ensure_codex_oauth_binding(&stored, &accounts_for_selection)?;
         validate_codex_allowed_client(
@@ -2896,6 +2930,7 @@ async fn forward_with_attempt_inner(
                 account_in_flight_guard,
                 share_invocation_guard,
                 started,
+                request_memory: attempt_context.request_memory().cloned(),
                 timing: attempt_context.timing.clone(),
             })
             .await;
@@ -3278,6 +3313,10 @@ async fn forward_with_attempt_inner(
             )
         } else {
             execution.finalize_request(&mut adapter_request)?;
+            if execution.driver_is("oauth.kimi_code") {
+                request_context.effective_reasoning_effort =
+                    super::kimi::wire_effort_for_diagnostics(app, &adapter_request.body);
+            }
             if execution.driver_is("oauth.openai_codex") {
                 let metadata = execution.apply_openai_codex_final_request_contract(
                     route,
@@ -3326,6 +3365,13 @@ async fn forward_with_attempt_inner(
                     &headers,
                     codex_responses_lite,
                 );
+                if let Some(exclude) = super::codex_negotiation::response_exclusions(&headers)? {
+                    replace_or_push_header(
+                        &mut target_headers,
+                        super::codex_negotiation::EXCLUDE_HEADER,
+                        exclude,
+                    );
+                }
                 append_codex_oauth_session_headers(
                     &mut target_headers,
                     codex_oauth_session_id.as_deref(),
@@ -7581,25 +7627,23 @@ pub async fn forward_codex_responses_ws(
     } else {
         None
     };
-    let mut target = prepare_responses_websocket_target(
+    let client_headers = if matches!(ws_mode, ResponsesWebsocketMode::Codex) {
+        codex_responses_client_headers(&headers)?
+    } else {
+        let mut forwarded = Vec::new();
+        append_codex_client_request_headers_owned(&mut forwarded, &headers, false);
+        forwarded
+    };
+    let target = prepare_responses_websocket_target_with_client_headers(
         &state,
         &execution,
         ws_mode,
         session_id.as_deref(),
         grok_turn_index,
+        &client_headers,
+        Some(&request_context),
     )
     .await?;
-    append_codex_client_request_headers_owned(&mut target.headers, &headers, false);
-    if matches!(ws_mode, ResponsesWebsocketMode::Codex) {
-        let accounts = state.accounts_snapshot().await;
-        if let Some(scope) = codex_metadata_scope(&execution, &accounts) {
-            let decision = super::codex_metadata::scrub_owned_headers(&mut target.headers, &scope);
-            crate::metrics::record_codex_metadata_decision(decision.as_str());
-        }
-        target
-            .headers
-            .retain(|(name, _)| !name.eq_ignore_ascii_case(super::codex_http::ROUTING_HINT_HEADER));
-    }
     let websocket_upstream_model = match &execution.plan.model_policy {
         crate::domain::providers::runtime::RuntimeModelPolicy::Single { upstream_model } => {
             Some(upstream_model.clone())
@@ -13656,12 +13700,34 @@ async fn lock_responses_websocket_turn_accounts<'a>(
     Ok(accounts)
 }
 
+#[cfg(test)]
 async fn prepare_responses_websocket_target(
     state: &ServerState,
     execution: &ProviderExecution,
     mode: ResponsesWebsocketMode,
     session_id: Option<&str>,
     grok_turn_index: Option<u64>,
+) -> Result<PreparedResponsesWebSocketTarget, ProxyError> {
+    prepare_responses_websocket_target_with_client_headers(
+        state,
+        execution,
+        mode,
+        session_id,
+        grok_turn_index,
+        &[],
+        None,
+    )
+    .await
+}
+
+async fn prepare_responses_websocket_target_with_client_headers(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    mode: ResponsesWebsocketMode,
+    session_id: Option<&str>,
+    grok_turn_index: Option<u64>,
+    client_headers: &[(String, String)],
+    request_context: Option<&UsageLogContext>,
 ) -> Result<PreparedResponsesWebSocketTarget, ProxyError> {
     ensure_managed_credential_persistence_available(state, execution)?;
     let stored = execution.runtime_stored_view();
@@ -13687,9 +13753,32 @@ async fn prepare_responses_websocket_target(
     execution.apply_auth(&mut headers, &mut ws_url, &materialized_auth)?;
     apply_account_header_overrides(&mut headers, &stored, &accounts)?;
     execution.finalize_outbound_identity(&mut headers)?;
+    // Build the key from exactly the handshake that will be sent, including
+    // client negotiation and scope scrubbing. All rebuilds use this boundary.
+    merge_owned_headers(&mut headers, client_headers.to_vec());
+    if matches!(mode, ResponsesWebsocketMode::Codex) {
+        replace_or_push_owned_header(
+            &mut headers,
+            "openai-beta".to_string(),
+            CODEX_RESPONSES_WEBSOCKET_BETA.to_string(),
+        );
+        if let Some(scope) = codex_metadata_scope(execution, &accounts) {
+            let decision = super::codex_metadata::scrub_owned_headers(&mut headers, &scope);
+            crate::metrics::record_codex_metadata_decision(decision.as_str());
+        }
+        headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(super::codex_http::ROUTING_HINT_HEADER));
+    }
     let pool_key = if matches!(mode, ResponsesWebsocketMode::Codex) {
         session_id.map(|session_id| {
-            responses_websocket_pool_key(state, execution, session_id, &ws_url, &headers)
+            scoped_responses_websocket_pool_key(
+                state,
+                execution,
+                session_id,
+                &ws_url,
+                &headers,
+                request_context,
+            )
         })
     } else {
         None
@@ -13727,6 +13816,7 @@ fn grok_responses_websocket_url(_execution: &ProviderExecution) -> String {
     super::grok::websocket_url().to_string()
 }
 
+#[cfg(test)]
 fn responses_websocket_pool_key(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -13734,26 +13824,33 @@ fn responses_websocket_pool_key(
     ws_url: &str,
     headers: &[(String, String)],
 ) -> String {
-    use sha2::{Digest, Sha256};
+    scoped_responses_websocket_pool_key(state, execution, session_id, ws_url, headers, None)
+}
 
-    let mut digest = Sha256::new();
-    for value in [
-        state.process_instance_id.as_str(),
-        execution.stored.provider.id.as_str(),
-        execution.plan.runtime_fingerprint.as_str(),
-        session_id,
-        ws_url,
-    ] {
-        digest.update(value.as_bytes());
-        digest.update([0]);
-    }
-    for (name, value) in headers {
-        digest.update(name.as_bytes());
-        digest.update([0]);
-        digest.update(value.as_bytes());
-        digest.update([0]);
-    }
-    hex::encode(digest.finalize())
+fn scoped_responses_websocket_pool_key(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    session_id: &str,
+    ws_url: &str,
+    headers: &[(String, String)],
+    request_context: Option<&UsageLogContext>,
+) -> String {
+    super::codex_negotiation::websocket_cache_key(
+        &[
+            state.process_instance_id.as_str(),
+            execution.stored.provider.id.as_str(),
+            execution.plan.runtime_fingerprint.as_str(),
+            session_id,
+            ws_url,
+            request_context
+                .and_then(|context| context.share_id.as_deref())
+                .unwrap_or(""),
+            request_context
+                .and_then(|context| context.user_email.as_deref())
+                .unwrap_or(""),
+        ],
+        headers,
+    )
 }
 
 fn bridge_responses_websocket<'a>(
@@ -13996,6 +14093,22 @@ async fn bridge_responses_websocket_inner(
                                     .flatten()
                             });
                         let raw_starts_response = original_response_body.is_some();
+                        if matches!(mode, ResponsesWebsocketMode::Codex) && raw_starts_response {
+                            let mismatch = pool_key.as_deref().zip(
+                                original_response_body.as_ref().and_then(previous_response_id_from_value)
+                            ).is_some_and(|(key, id)| {
+                                responses_websocket_pool().lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .known_continuation_mismatch(key, id)
+                            });
+                            if mismatch {
+                                state.record_previous_response_context_unavailable();
+                                let error = ProxyError::response_context_unavailable();
+                                downstream.send(AxumWsMessage::Text(websocket_proxy_error_body(&error)))
+                                    .await.map_err(|error| ProxyError::bad_gateway(error.to_string()))?;
+                                continue;
+                            }
+                        }
                         if raw_starts_response {
                             if codex_interrupt.awaiting_ack() {
                                 let error = ProxyError::bad_request("response.create cannot start while an interrupt acknowledgement is pending");
@@ -14422,16 +14535,17 @@ async fn bridge_responses_websocket_inner(
                             if entry.is_none() {
                                 if refresh_target_before_connect {
                                     let forwarded_headers = codex_client_headers_from_owned(&headers);
-                                    let target = prepare_responses_websocket_target(
+                                    let target = prepare_responses_websocket_target_with_client_headers(
                                         state,
                                         &execution,
                                         mode,
                                         grok_session_id.as_deref(),
                                         grok_turn_index,
+                                        &forwarded_headers,
+                                        Some(&request_context),
                                     )
                                     .await?;
                                     headers = target.headers;
-                                    merge_owned_headers(&mut headers, forwarded_headers);
                                     ws_url = target.ws_url;
                                     pool_key = target.pool_key;
                                     refresh_target_before_connect = false;
@@ -14444,7 +14558,7 @@ async fn bridge_responses_websocket_inner(
                                     &mut execution,
                                     mode,
                                     grok_session_id.as_deref(),
-                                    request_context.share_id.as_deref(),
+                                    &request_context,
                                     codex_session_model.as_deref(),
                                     connect_timeout,
                                     &mut headers,
@@ -14513,6 +14627,7 @@ async fn bridge_responses_websocket_inner(
                                             body,
                                             grok_session_id.as_deref(),
                                             grok_turn_index,
+                                            &headers,
                                             first_byte_timeout,
                                             stream_idle_timeout,
                                             source,
@@ -14735,6 +14850,7 @@ async fn bridge_responses_websocket_inner(
                                     body,
                                     grok_session_id.as_deref(),
                                     grok_turn_index,
+                                    &headers,
                                     first_byte_timeout,
                                     stream_idle_timeout,
                                     source,
@@ -14830,6 +14946,7 @@ async fn bridge_responses_websocket_inner(
                                         body,
                                         grok_session_id.as_deref(),
                                         grok_turn_index,
+                                        &headers,
                                         first_byte_timeout,
                                         stream_idle_timeout,
                                         "first_byte_timeout",
@@ -14919,6 +15036,7 @@ async fn bridge_responses_websocket_inner(
                                     body,
                                     grok_session_id.as_deref(),
                                     grok_turn_index,
+                                    &headers,
                                     first_byte_timeout,
                                     stream_idle_timeout,
                                     source,
@@ -15023,6 +15141,7 @@ async fn bridge_responses_websocket_inner(
                                     body,
                                     grok_session_id.as_deref(),
                                     grok_turn_index,
+                                    &headers,
                                     first_byte_timeout,
                                     stream_idle_timeout,
                                         source,
@@ -15150,6 +15269,7 @@ async fn bridge_responses_websocket_inner(
                                     body,
                                     grok_session_id.as_deref(),
                                     grok_turn_index,
+                                    &headers,
                                     first_byte_timeout,
                                     stream_idle_timeout,
                                     source,
@@ -15241,6 +15361,7 @@ async fn bridge_responses_websocket_inner(
                                                 body,
                                                 grok_session_id.as_deref(),
                                                 grok_turn_index,
+                                                &headers,
                                                 first_byte_timeout,
                                                 stream_idle_timeout,
                                                 "semantic_protocol_error",
@@ -15666,6 +15787,7 @@ async fn bridge_responses_websocket_inner(
                                         body,
                                         grok_session_id.as_deref(),
                                         grok_turn_index,
+                                        &headers,
                                         first_byte_timeout,
                                         stream_idle_timeout,
                                         "semantic_failure",
@@ -15764,9 +15886,12 @@ async fn bridge_responses_websocket_inner(
                                 && responses_websocket_response_is_terminal(&message));
                         if matches!(mode, ResponsesWebsocketMode::Codex) && response_in_flight && terminal {
                                 if let (Some(entry), Some(id)) =
-                                    (entry.as_ref(), codex_interrupt.response_id())
+                                    (entry.as_mut(), codex_interrupt.response_id())
                                 {
                                     terminal_response_ids.remember(entry.created_at, id);
+                                    if matches!(semantic_terminal, Some(SemanticTerminal::Success)) {
+                                        entry.socket.completed_response_ids.remember(id);
+                                    }
                                 }
                                 codex_interrupt.finish_generation();
                         }
@@ -16323,7 +16448,7 @@ async fn connect_responses_websocket(
     execution: &mut ProviderExecution,
     mode: ResponsesWebsocketMode,
     session_id: Option<&str>,
-    share_id: Option<&str>,
+    request_context: &UsageLogContext,
     model: Option<&str>,
     connect_timeout: Duration,
     headers: &mut Vec<(String, String)>,
@@ -16332,6 +16457,7 @@ async fn connect_responses_websocket(
     attempt_context: &mut ForwardAttemptContext,
     active_usage_turn: &mut Option<ResponsesWebsocketUsageTurn>,
 ) -> Result<CachedResponsesWebSocket, ResponsesWebsocketConnectFailure> {
+    let share_id = request_context.share_id.as_deref();
     let mut retrying_handshake = false;
     loop {
         if retrying_handshake {
@@ -16365,7 +16491,7 @@ async fn connect_responses_websocket(
         if matches!(mode, ResponsesWebsocketMode::Codex) {
             request.headers_mut().insert(
                 HeaderName::from_static("openai-beta"),
-                HeaderValue::from_static("responses_websockets=2026-02-06"),
+                HeaderValue::from_static(CODEX_RESPONSES_WEBSOCKET_BETA),
             );
         }
 
@@ -16492,7 +16618,8 @@ async fn connect_responses_websocket(
                 if let Some(turn) = active_usage_turn.as_mut() {
                     turn.record_retry("auth", "websocket_unauthorized");
                 }
-                let target = prepare_responses_websocket_target(
+                let forwarded_headers = codex_client_headers_from_owned(headers);
+                let target = prepare_responses_websocket_target_with_client_headers(
                     state,
                     execution,
                     mode,
@@ -16502,15 +16629,15 @@ async fn connect_responses_websocket(
                     } else {
                         None
                     },
+                    &forwarded_headers,
+                    Some(request_context),
                 )
                 .await
                 .map_err(|error| ResponsesWebsocketConnectFailure {
                     error,
                     fallback_source: None,
                 })?;
-                let forwarded_headers = codex_client_headers_from_owned(headers);
                 *headers = target.headers;
-                merge_owned_headers(headers, forwarded_headers);
                 *ws_url = target.ws_url;
                 *pool_key = target.pool_key;
             }
@@ -16651,6 +16778,7 @@ fn run_codex_websocket_http_fallback<'a>(
     response_body: &'a Value,
     session_id: Option<&'a str>,
     grok_turn_index: Option<u64>,
+    client_headers: &'a [(String, String)],
     first_event_timeout: Option<Duration>,
     stream_idle_timeout: Option<Duration>,
     source: &'static str,
@@ -16734,13 +16862,14 @@ fn run_codex_websocket_http_fallback<'a>(
                     timing
                 });
             let stored = execution.runtime_stored_view();
-            let prepared_request = prepare_codex_http_fallback_target(
+            let prepared_request = prepare_codex_http_fallback_target_with_client_headers(
                 state,
                 execution,
                 response_body,
                 session_id,
                 grok_turn_index,
                 intent,
+                client_headers,
             )
             .await
             .and_then(|target| {
@@ -17771,6 +17900,7 @@ async fn terminate_codex_http_fallback_with_error(
     .map(|()| CodexHttpFallbackOutcome::Completed)
 }
 
+#[cfg(test)]
 async fn prepare_codex_http_fallback_target(
     state: &ServerState,
     execution: &ProviderExecution,
@@ -17778,6 +17908,27 @@ async fn prepare_codex_http_fallback_target(
     session_id: Option<&str>,
     grok_turn_index: Option<u64>,
     intent: &super::codex_request_policy::CodexRequestIntent,
+) -> Result<PreparedCodexHttpFallbackTarget, ProxyError> {
+    prepare_codex_http_fallback_target_with_client_headers(
+        state,
+        execution,
+        response_body,
+        session_id,
+        grok_turn_index,
+        intent,
+        &[],
+    )
+    .await
+}
+
+async fn prepare_codex_http_fallback_target_with_client_headers(
+    state: &ServerState,
+    execution: &ProviderExecution,
+    response_body: &Value,
+    session_id: Option<&str>,
+    grok_turn_index: Option<u64>,
+    intent: &super::codex_request_policy::CodexRequestIntent,
+    client_headers: &[(String, String)],
 ) -> Result<PreparedCodexHttpFallbackTarget, ProxyError> {
     let stored = execution.runtime_stored_view();
     let grok = execution.driver_is("oauth.grok_responses");
@@ -17896,6 +18047,10 @@ async fn prepare_codex_http_fallback_target(
     apply_account_header_overrides(&mut headers, &stored, &accounts)?;
     execution.finalize_outbound_identity(&mut headers)?;
     if !grok {
+        merge_owned_headers(
+            &mut headers,
+            codex_client_headers_from_owned(client_headers),
+        );
         if let Some(scope) = codex_metadata_scope(execution, &accounts) {
             let (body, body_decision) =
                 super::codex_metadata::scrub_body_bytes(&adapter_request.body, &scope)?;
@@ -20477,6 +20632,9 @@ async fn maybe_update_grok_entitlement(
         .await;
 }
 
+#[path = "forwarder/opencode_zen_document.rs"]
+mod opencode_zen_document;
+use opencode_zen_document::read_document as zen_read_document;
 include!("forwarder/opencode_zen_support.rs");
 
 struct WebSessionForwardOptions {
@@ -20489,20 +20647,8 @@ struct WebSessionForwardOptions {
     account_in_flight_guard: Option<AccountInFlightGuard>,
     share_invocation_guard: Option<ShareInFlightGuard>,
     started: Instant,
+    request_memory: Option<RequestMemoryBudget>,
     timing: TimingSlot,
-}
-
-fn web_session_requested_model(body: &[u8]) -> Option<String> {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .map(str::to_string)
-        })
-        .filter(|model| !model.is_empty())
 }
 
 #[allow(clippy::too_many_arguments)] // Failure accounting carries the fixed request/model context.
@@ -20516,7 +20662,9 @@ async fn finish_web_session_failure(
     upstream_attempted: bool,
     error: ProxyError,
 ) -> Result<Response, ProxyError> {
-    let provider_failure = upstream_attempted
+    let capacity = error.is_request_memory_exhausted();
+    let provider_failure = !capacity
+        && upstream_attempted
         && matches!(
             error.status,
             StatusCode::UNAUTHORIZED
@@ -20540,7 +20688,9 @@ async fn finish_web_session_failure(
         UsageLogContext {
             is_streaming: request_context.is_streaming,
             stream_status: request_context.is_streaming.then(|| {
-                if upstream_attempted {
+                if capacity {
+                    "memory_capacity"
+                } else if upstream_attempted {
                     "upstream_error"
                 } else {
                     "rejected"
@@ -20552,12 +20702,18 @@ async fn finish_web_session_failure(
             } else {
                 UsageState::NotApplicable
             }),
-            outcome: Some(if upstream_attempted {
+            outcome: Some(if capacity {
+                UsageOutcome::InternalError
+            } else if upstream_attempted {
                 UsageOutcome::from_status(error.status.as_u16())
             } else {
                 UsageOutcome::ClientError
             }),
-            failure_kind: Some(error.error_code().to_string()),
+            failure_kind: Some(if capacity {
+                "memory_capacity".to_string()
+            } else {
+                error.error_code().to_string()
+            }),
             error_message: Some(error.client_message().to_string()),
             ..request_context.clone()
         },
@@ -20602,6 +20758,7 @@ async fn forward_web_session_metered(
         account_in_flight_guard: _account_in_flight_guard,
         share_invocation_guard: _share_invocation_guard,
         started,
+        request_memory,
         timing,
     } = options;
     if !matches!(
@@ -20616,7 +20773,7 @@ async fn forward_web_session_metered(
             &stored,
             &request_context,
             started,
-            web_session_requested_model(&body),
+            None,
             None,
             false,
             ProxyError::bad_request(
@@ -20626,27 +20783,41 @@ async fn forward_web_session_metered(
         .await;
     }
 
-    let requested_model = web_session_requested_model(&body);
-    request_context.is_streaming = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|value| value.get("stream").and_then(Value::as_bool))
-        .unwrap_or(false);
-    let actual_model = match super::web_session::preflight_actual_model(&execution, route, &body) {
-        Ok(model) => model,
-        Err(error) => {
-            return finish_web_session_failure(
-                &state,
-                &stored,
-                &request_context,
-                started,
-                requested_model,
-                None,
-                false,
-                error,
+    let prepared =
+        match super::web_session::prepare(&execution, route, &body, request_memory.as_ref()) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return finish_web_session_failure(
+                    &state,
+                    &stored,
+                    &request_context,
+                    started,
+                    None,
+                    None,
+                    false,
+                    error,
+                )
+                .await
+            }
+        };
+    let _model_metadata_memory = request_memory
+        .as_ref()
+        .map(|budget| {
+            budget.reserve(
+                RequestMemoryComponent::NormalizedBody,
+                prepared
+                    .requested_model()
+                    .len()
+                    .saturating_add(prepared.actual_model().len())
+                    .saturating_mul(4)
+                    .saturating_add(512),
             )
-            .await
-        }
-    };
+        })
+        .transpose()
+        .map_err(|error| error.into_proxy_error())?;
+    let requested_model = Some(prepared.requested_model().to_string());
+    let actual_model = prepared.actual_model().to_string();
+    request_context.is_streaming = prepared.stream_requested();
     if let Err(error) = ensure_share_model_available(
         &state,
         &execution,
@@ -20678,13 +20849,18 @@ async fn forward_web_session_metered(
         )
         .await?;
     }
+    let mut web_context = super::web_session::WebSessionExecutionContext {
+        memory: request_memory.as_ref(),
+        upstream_attempted: false,
+    };
     let result = match super::web_session::execute(
         &state,
         &execution,
         route,
-        body,
+        prepared,
         value_attempt.as_ref(),
         &timing,
+        &mut web_context,
     )
     .await
     {
@@ -20697,7 +20873,7 @@ async fn forward_web_session_metered(
                 started,
                 requested_model,
                 Some(actual_model),
-                true,
+                web_context.upstream_attempted,
                 error,
             )
             .await
@@ -21449,9 +21625,13 @@ async fn send_codebuddy_generation(
     value_attempt_guard: Option<&crate::state::ValueAttemptGuard>,
     raw_usage: &mut StreamUsageAccumulator,
 ) -> Result<PreparedCodeBuddyWireResponse, CodeBuddyForwardAttemptError> {
-    if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
+    if !runtime.catalog.admits_generation(
+        &runtime.scope,
+        crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+    ) || !codebuddy_provider::runtime_is_current(state, execution, runtime).await
+    {
         return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
-            "CodeBuddy Provider or bound account changed before inference",
+            "CodeBuddy Provider, bound account or catalog changed before inference",
         )));
     }
     let serialized_body_bytes = serialized_json_bytes(payload);
@@ -21534,6 +21714,17 @@ async fn send_codebuddy_generation(
         timing.mark(Milestone::SendStarted);
     }
     let headers_wait = timing.as_ref().map(|timing| timing.wait(WaitKind::Headers));
+    // Recheck after request construction/http-client acquisition, immediately
+    // before the existing conservative Sent boundary. No cache/state lock is
+    // held over network I/O, and no generation is replayed after revocation.
+    if !runtime.catalog.admits_generation(
+        &runtime.scope,
+        crate::infra::time::now_ms().min(i64::MAX as u128) as i64,
+    ) {
+        return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
+            "CodeBuddy catalog changed or expired before inference",
+        )));
+    }
     if let Some(guard) = value_attempt_guard {
         guard.mark_sent();
     }
@@ -21566,7 +21757,7 @@ async fn send_codebuddy_generation(
     }
     if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
         return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
-            "CodeBuddy Provider or bound account changed while inference was starting",
+            "CodeBuddy Provider, bound account or catalog changed while inference was starting",
         )));
     }
     let mut response = response;
@@ -21628,7 +21819,7 @@ async fn send_codebuddy_generation(
             decoder.sync_value_usage(raw_usage);
             if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
                 return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
-                    "CodeBuddy Provider or bound account changed before response commit",
+                    "CodeBuddy Provider, bound account or catalog changed before response commit",
                 )));
             }
             return Ok(PreparedCodeBuddyWireResponse {
@@ -21646,7 +21837,7 @@ async fn send_codebuddy_generation(
         if !canonical.is_empty() || decoder.is_terminal() {
             if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
                 return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
-                    "CodeBuddy Provider or bound account changed before response commit",
+                    "CodeBuddy Provider, bound account or catalog changed before response commit",
                 )));
             }
             return Ok(PreparedCodeBuddyWireResponse {
@@ -21859,7 +22050,7 @@ async fn aggregate_codebuddy_nonstream(
         wire.decoder.sync_value_usage(raw_usage);
         if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
             return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
-                "CodeBuddy Provider or bound account changed during inference",
+                "CodeBuddy Provider, bound account or catalog changed during inference",
             )));
         }
         aggregator
@@ -21868,7 +22059,7 @@ async fn aggregate_codebuddy_nonstream(
     }
     if !codebuddy_provider::runtime_is_current(state, execution, runtime).await {
         return Err(CodeBuddyForwardAttemptError::Proxy(ProxyError::conflict(
-            "CodeBuddy Provider or bound account changed before response commit",
+            "CodeBuddy Provider, bound account or catalog changed before response commit",
         )));
     }
     aggregator
@@ -22068,7 +22259,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
                     wire.decoder.sync_value_usage(&mut interrupt_guard.usage);
                     if !codebuddy_provider::runtime_is_current(&state, &execution, &runtime).await {
                         let error = ProxyError::conflict(
-                            "CodeBuddy Provider or bound account changed before response commit",
+                            "CodeBuddy Provider, bound account or catalog changed before response commit",
                         );
                         if let Some(frame) = finish_qoder_observed_stream_failure(
                             &mut interrupt_guard,
@@ -22183,7 +22374,7 @@ async fn forward_codebuddy_stream(options: CodeBuddyStreamOptions) -> Result<Res
             wire.decoder.sync_value_usage(&mut interrupt_guard.usage);
             if !codebuddy_provider::runtime_is_current(&state, &execution, &runtime).await {
                 let error = ProxyError::conflict(
-                    "CodeBuddy Provider or bound account changed during inference",
+                    "CodeBuddy Provider, bound account or catalog changed during inference",
                 );
                 if let Some(frame) = finish_qoder_observed_stream_failure(
                     &mut interrupt_guard,
@@ -22354,9 +22545,12 @@ async fn forward_trae_metered(
     )?;
     let canonical_chat_request = serde_json::from_slice::<Value>(&adapter_request.body)
         .map_err(|error| ProxyError::bad_request(format!("invalid Trae Chat request: {error}")))?;
+    request_context.requested_reasoning_effort =
+        super::trae::requested_effort_for_diagnostics(&canonical_chat_request);
 
     let mut auth_recovery_attempted = false;
     loop {
+        request_context.effective_reasoning_effort = None;
         if auth_recovery_attempted {
             if let Some(previous) = timing.get() {
                 if let Some(next) = timing.begin_for_driver(
@@ -22486,6 +22680,26 @@ async fn forward_trae_metered(
                 .await;
             }
         };
+        request_context.effective_reasoning_effort = super::trae::wire_effort_for_diagnostics(
+            &payload,
+            provider_type != ProviderType::TraeSolo,
+        );
+        let reasoning_reason = match (
+            request_context.requested_reasoning_effort.as_deref(),
+            request_context.effective_reasoning_effort.as_deref(),
+        ) {
+            (None, None) => "upstream_default_unobserved",
+            (Some(requested), Some(effective)) if requested == effective => "explicit",
+            (Some(_), Some(_)) => "reviewed_mapping",
+            _ => "unobserved",
+        };
+        tracing::debug!(
+            provider_type = provider_type.as_str(),
+            requested_effort = ?request_context.requested_reasoning_effort,
+            effective_effort = ?request_context.effective_reasoning_effort,
+            reason = reasoning_reason,
+            "Trae reasoning controls prepared"
+        );
         adapter_request.actual_model = Some(model_id.clone());
         adapter_request.actual_model_source = Some(
             if provider_type == ProviderType::TraeIntl {
@@ -22682,6 +22896,22 @@ struct TraeGenerationOptions<'a> {
     timing: &'a TimingSlot,
 }
 
+fn ensure_trae_catalog_before_send(
+    execution: &ProviderExecution,
+    runtime: &super::trae_runtime::PreparedTraeRuntime,
+) -> Result<(), TraeForwardAttemptError> {
+    if execution.stored.provider_type != ProviderType::TraeIntl
+        && !runtime
+            .catalog
+            .admits_generation(crate::infra::time::now_ms().min(i64::MAX as u128) as i64)
+    {
+        return Err(TraeForwardAttemptError::Proxy(ProxyError::conflict(
+            "Trae model catalog changed or expired before generation send",
+        )));
+    }
+    Ok(())
+}
+
 async fn send_trae_generation(
     options: TraeGenerationOptions<'_>,
 ) -> Result<PreparedTraeWireResponse, TraeForwardAttemptError> {
@@ -22705,6 +22935,7 @@ async fn send_trae_generation(
             "Trae Provider or bound account changed before inference",
         )));
     }
+    ensure_trae_catalog_before_send(execution, runtime)?;
     let _body_memory = trae_reserve(
         request_memory,
         RequestMemoryComponent::NormalizedBody,
@@ -22733,6 +22964,9 @@ async fn send_trae_generation(
     let header_timeout = execution
         .stream_first_byte_timeout()
         .map_or(remaining, |timeout| timeout.min(remaining));
+    // The client lookup above can yield. Check the same lease once more at
+    // the actual pre-Sent boundary, before value metering or network polling.
+    ensure_trae_catalog_before_send(execution, runtime)?;
     if let Some(attempt) = value_attempt {
         attempt.mark_sent();
     }
@@ -23553,6 +23787,8 @@ async fn forward_qoder_metered(
             }
         };
     canonical.declared_history_names = declared_history_names;
+    request_context.requested_reasoning_effort =
+        super::qoder_runtime::requested_effort_for_diagnostics(&canonical.body).map(str::to_string);
     if previous_response_id.is_none() {
         if let Some(chat_id) = responses_chat_id.as_ref() {
             canonical.downstream_session_id.clone_from(chat_id);
@@ -23627,6 +23863,7 @@ async fn forward_qoder_metered(
         .ensure_binding(&execution, &binding_accounts)
         .map_err(binding_snapshot_error_to_proxy_error)?;
     let (runtime, runtime_memory, model_key, continuation_base, wire) = loop {
+        request_context.effective_reasoning_effort = None;
         let runtime_result = if let Some((runtime, _, _)) = continuation_runtime.as_ref() {
             Ok(runtime.clone())
         } else {
@@ -23749,6 +23986,31 @@ async fn forward_qoder_metered(
                 .await;
             }
         };
+        request_context.effective_reasoning_effort =
+            super::qoder_runtime::wire_effort_for_diagnostics(&prepared.payload.body)
+                .map(str::to_string);
+        let reasoning_reason = match (
+            request_context.requested_reasoning_effort.as_deref(),
+            request_context.effective_reasoning_effort.as_deref(),
+        ) {
+            (None, Some(_)) => "declared_default",
+            (Some("none"), Some("none")) => "explicit_disabled",
+            (Some(requested), Some(effective)) if requested == effective => "explicit",
+            (Some(_), Some(_)) => "prepared_value_differs",
+            (_, None)
+                if prepared.payload.body.pointer("/model_config/is_reasoning")
+                    == Some(&Value::Bool(true)) =>
+            {
+                "enabled_without_known_effort"
+            }
+            _ => "effective_unobserved",
+        };
+        tracing::debug!(
+            requested_effort = ?request_context.requested_reasoning_effort,
+            effective_effort = ?request_context.effective_reasoning_effort,
+            reason = reasoning_reason,
+            "Qoder reasoning controls prepared"
+        );
         request_context.attempt_count = Some(recovery_attempt.attempt().saturating_add(1));
         let value_payload =
             serde_json::to_vec(&prepared.payload.body).map_err(ProxyError::bad_gateway)?;
@@ -29962,13 +30224,26 @@ fn append_codex_client_request_headers_owned(
     merge_owned_headers(target, forwarded);
 }
 
+fn codex_responses_client_headers(client: &HeaderMap) -> Result<Vec<(String, String)>, ProxyError> {
+    let mut forwarded = Vec::new();
+    append_codex_client_request_headers_owned(&mut forwarded, client, false);
+    if let Some(exclude) = super::codex_negotiation::response_exclusions(client)? {
+        forwarded.push((
+            super::codex_negotiation::EXCLUDE_HEADER.to_string(),
+            exclude,
+        ));
+    }
+    Ok(forwarded)
+}
+
 fn codex_client_headers_from_owned(headers: &[(String, String)]) -> Vec<(String, String)> {
     headers
         .iter()
         .filter(|(name, _)| {
-            CODEX_ALLOWED_CLIENT_REQUEST_HEADERS
-                .iter()
-                .any(|allowed| name.eq_ignore_ascii_case(allowed))
+            name.eq_ignore_ascii_case(super::codex_negotiation::EXCLUDE_HEADER)
+                || CODEX_ALLOWED_CLIENT_REQUEST_HEADERS
+                    .iter()
+                    .any(|allowed| name.eq_ignore_ascii_case(allowed))
         })
         .cloned()
         .collect()
@@ -33541,11 +33816,13 @@ fn count_tokens_metric_outcome(status: StatusCode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    include!("forwarder/trae_r6_tests.rs");
     include!("forwarder/opencode_zen_tests.rs");
     include!("forwarder/codex_claude_history_tests.rs");
     include!("forwarder/codex_message_content_tests.rs");
     include!("forwarder/codex_tool_result_error_tests.rs");
     include!("forwarder/codex_r4_tests.rs");
+    include!("forwarder/codex_r6_tests.rs");
     include!("forwarder/codex62_tests.rs");
     include!("forwarder/codex_images_policy_tests.rs");
     include!("forwarder/claude_timing_tests.rs");
@@ -33557,10 +33834,15 @@ mod tests {
     include!("forwarder/antigravity_native_tests.rs");
     include!("forwarder/grok_r4_tests.rs");
     include!("forwarder/grok_r5_tests.rs");
+    include!("forwarder/grok_r6_tests.rs");
     include!("forwarder/grok_timing_tests.rs");
     include!("forwarder/kiro_timing_tests.rs");
     include!("forwarder/kiro_image_tests.rs");
     include!("forwarder/kiro_feature_tests.rs");
+    include!("forwarder/kiro_r7_tests.rs");
+    include!("forwarder/kimi_r7_tests.rs");
+    include!("forwarder/trae_r7_tests.rs");
+    include!("forwarder/web_r7_tests.rs");
     include!("forwarder/gemini_onboarding_tests.rs");
     include!("forwarder/ollama_r5_tests.rs");
     include!("forwarder/bedrock_r5_tests.rs");

@@ -48,7 +48,10 @@ pub(super) fn apply_account_header_overrides(
 pub(super) fn account_header_override_blocked(name: &str, provider_type: ProviderType) -> bool {
     let normalized = name.to_ascii_lowercase();
     if provider_type == ProviderType::CodexOAuth
-        && normalized == "x-openai-internal-codex-responses-lite"
+        && matches!(
+            normalized.as_str(),
+            "x-openai-internal-codex-responses-lite" | "x-codex-exclude"
+        )
     {
         return true;
     }

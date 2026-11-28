@@ -776,7 +776,13 @@ fn normalize_grok_response_tool(
             }
         })]),
         "web_search_preview" | "web_search_preview_2025_03_11" | "web_search_2025_08_26" => {
-            Ok(vec![json!({"type": "web_search"})])
+            let mut normalized = json!({"type": "web_search"});
+            // Preserve this permission control until the Grok wire boundary
+            // validates it. Dropping false here would silently broaden access.
+            if let Some(control) = object.get("external_web_access") {
+                normalized["external_web_access"] = control.clone();
+            }
+            Ok(vec![normalized])
         }
         _ => Ok(vec![tool.clone()]),
     }
@@ -2192,6 +2198,7 @@ pub(crate) fn openai_chat_response_to_responses_with_tool_context(
 }
 
 pub fn gemini_response_to_anthropic(input: &Value) -> Result<Value, TransformError> {
+    let response_id = super::gemini_response_identity::message_id(input);
     if input
         .get("candidates")
         .and_then(Value::as_array)
@@ -2199,7 +2206,7 @@ pub fn gemini_response_to_anthropic(input: &Value) -> Result<Value, TransformErr
         && gemini_prompt_block_reason(input).is_some()
     {
         return Ok(json!({
-            "id": input.get("responseId").and_then(Value::as_str).unwrap_or("gemini"),
+            "id": response_id,
             "type": "message",
             "role": "assistant",
             "model": input.get("modelVersion").and_then(Value::as_str).unwrap_or_default(),
@@ -2231,6 +2238,34 @@ pub fn gemini_response_to_anthropic(input: &Value) -> Result<Value, TransformErr
             ))
         }
     };
+    // A completed response contains full calls, not unidentified deltas. Do
+    // not turn an absent/blank name into an executable synthetic `tool`.
+    for part in parts {
+        if let Some(call) = part
+            .get("functionCall")
+            .or_else(|| part.get("function_call"))
+        {
+            // JSON null is an unset optional protobuf field when another
+            // actual part payload is present. Keep that payload unchanged.
+            let has_other_payload = part.get("text").is_some_and(Value::is_string)
+                || part.get("thought").and_then(Value::as_bool) == Some(true)
+                || ["inlineData", "inline_data", "fileData", "file_data"]
+                    .iter()
+                    .any(|name| part.get(name).is_some_and(Value::is_object));
+            if call.is_null() && has_other_payload {
+                continue;
+            }
+            if call
+                .get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| name.trim().is_empty())
+            {
+                return Err(TransformError::new(
+                    "Gemini function call is missing its tool identity",
+                ));
+            }
+        }
+    }
     let grounding = GroundingAccumulator::from_candidate(first);
     let mappings = parts
         .iter()
@@ -2249,6 +2284,16 @@ pub fn gemini_response_to_anthropic(input: &Value) -> Result<Value, TransformErr
         .collect::<Vec<_>>();
     let citations = grounding.citations_by_block(&mappings);
     let mut content = gemini_parts_to_anthropic(parts, true);
+    if parts.iter().zip(&content).any(|(part, block)| {
+        part.get("functionCall")
+            .or_else(|| part.get("function_call"))
+            .is_some_and(Value::is_null)
+            && block.get("type").and_then(Value::as_str) == Some("tool_use")
+    }) {
+        return Err(TransformError::new(
+            "Gemini null function call has no other response content",
+        ));
+    }
     for (block_index, block_citations) in citations {
         let Some(block) = usize::try_from(block_index)
             .ok()
@@ -2264,14 +2309,7 @@ pub fn gemini_response_to_anthropic(input: &Value) -> Result<Value, TransformErr
         );
     }
     if grounding.has_web_grounding() {
-        let tool_use_id = format!(
-            "srvtoolu_{}",
-            input
-                .get("responseId")
-                .or_else(|| input.get("response_id"))
-                .and_then(Value::as_str)
-                .unwrap_or("gemini_search")
-        );
+        let tool_use_id = super::gemini_response_identity::search_tool_id();
         content.splice(
             0..0,
             [
@@ -2289,9 +2327,11 @@ pub fn gemini_response_to_anthropic(input: &Value) -> Result<Value, TransformErr
             ],
         );
     }
-    let has_tool_calls = parts
-        .iter()
-        .any(|part| part.get("functionCall").is_some() || part.get("function_call").is_some());
+    let has_tool_calls = parts.iter().any(|part| {
+        part.get("functionCall")
+            .or_else(|| part.get("function_call"))
+            .is_some_and(|call| !call.is_null())
+    });
     let mapped_stop_reason = gemini_finish_reason_to_anthropic(finish_reason);
     let stop_reason = if matches!(mapped_stop_reason, "max_tokens" | "refusal") {
         mapped_stop_reason
@@ -2309,7 +2349,7 @@ pub fn gemini_response_to_anthropic(input: &Value) -> Result<Value, TransformErr
         usage["server_tool_use"] = json!({"web_search_requests": 1});
     }
     Ok(json!({
-        "id": input.get("responseId").and_then(Value::as_str).unwrap_or("gemini"),
+        "id": response_id,
         "type": "message",
         "role": "assistant",
         "model": input.get("modelVersion").and_then(Value::as_str).unwrap_or_default(),
@@ -3963,17 +4003,9 @@ fn openai_chat_tool_output_to_string(content: Option<&Value>) -> String {
 }
 
 fn openai_chat_message_reasoning_text(message: &Value) -> Option<String> {
-    for key in ["reasoning_content", "reasoning_text"] {
-        if let Some(value) = message.get(key).and_then(Value::as_str) {
-            if !value.trim().is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    if let Some(value) = message.get("reasoning").and_then(Value::as_str) {
-        if !value.trim().is_empty() {
-            return Some(value.to_string());
-        }
+    if let Some(text) = super::chat_reasoning::text(message).filter(|text| !text.trim().is_empty())
+    {
+        return Some(text.to_string());
     }
     message
         .get("reasoning")

@@ -1,0 +1,182 @@
+{
+  "schemaVersion": 1,
+  "round": "R7",
+  "recordedOn": "2026-11-27",
+  "providerClass": "kimi_code",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "sourceCommit": "848be22958ee1499d02ce374f571b0241b558dc3",
+  "sourceDigest": "e59f505eb92b413f2679e24695338c2add297c577d5b43f166ad737dc12dad30",
+  "binarySha256": "e4b8b18391377c6ea3babc4a79858d9e52989f3c74993a22b430362cff06d9c8",
+  "sourceFiles": [
+    {
+      "path": "src/proxy/kimi.rs",
+      "sha256": "fa02e1e2868a131c4f6b5b3f49a58a4ad18496a03d3dce17f3a213867a4b2d17"
+    },
+    {
+      "path": "src/proxy/kimi/controls.rs",
+      "sha256": "4eb52f2d911a748566338cc42f1f38858f7135170a1ac1ff33fcf4c6bfe958fd"
+    },
+    {
+      "path": "src/proxy/adapters.rs",
+      "sha256": "66866b9b5856fb9a5cb65445532abde0a0bb85bd0a51c27c1de757744b857c5c"
+    },
+    {
+      "path": "src/proxy/forwarder.rs",
+      "sha256": "099265a8682a1502165ce9143f231cf301883ed863bae2234fba499b0e0ae157"
+    },
+    {
+      "path": "src/proxy/forwarder/kimi_r7_tests.rs",
+      "sha256": "babf87821969a4d84a486f093747b285131efcedbdfe6bda407f4287cfe960ab"
+    }
+  ],
+  "referenceSnapshot": {
+    "referenceCommit": "47f18e4d82bd72f7d2b5ecf5ede93e4837a4625e",
+    "files": [
+      {
+        "path": "internal/auth/kimi/kimi.go",
+        "sha256": "09454ae3e783ab7beea5085f27e649eacdf004106c5cde52a1e4d87f3311156a"
+      },
+      {
+        "path": "internal/auth/kimi/token.go",
+        "sha256": "993e1fbc22205cfe1162cd5a13c8389e50c88e676c92480e26af4d81cd7a8b2e"
+      },
+      {
+        "path": "internal/runtime/executor/kimi_executor.go",
+        "sha256": "0f6631e4d399c2d685c8040e01fb63f45de34810fe734625e1faa510fdff3589"
+      },
+      {
+        "path": "internal/runtime/executor/helps/kimi_responses.go",
+        "sha256": "7eefa6e9a4cb0fbf18a90766343b3b5c1ca4b4c05189913935fff6d1de4fdab1"
+      },
+      {
+        "path": "internal/runtime/executor/helps/kimi_responses_test.go",
+        "sha256": "a841709c4ceffb3c4f56fb77289c2311c3ca3f045fa4edc3519c14b5fcc6eb6b"
+      }
+    ],
+    "nativeResponsesDisposition": "reviewed_gated_no_wire_delta",
+    "regionalIdentityDisposition": "reviewed_gated_no_wire_delta"
+  },
+  "planItems": [
+    {
+      "id": "R7-KM-01",
+      "status": "fixture_verified"
+    },
+    {
+      "id": "R7-NATIVE-01",
+      "status": "reviewed_gated_no_wire_delta",
+      "reason": "Direct reference Responses URL/executors, terminal/usage handling and tool-output reordering reviewed; no independent matching account/device/model endpoint and full lifecycle acceptance."
+    },
+    {
+      "id": "R7-KM-02",
+      "status": "reviewed_gated_no_wire_delta",
+      "reason": "Separate .ai auth/API URLs reviewed; no independent account/issuer/tenant/operation acceptance. No suffix/file-name inference or automatic site migration."
+    }
+  ],
+  "cases": [
+    {
+      "id": "source-control-conflicts",
+      "tests": [
+        "r7_kimi_conflicting_source_controls_fail_before_network"
+      ]
+    },
+    {
+      "id": "source-control-types",
+      "tests": [
+        "r7_kimi_malformed_source_controls_fail_before_network"
+      ]
+    },
+    {
+      "id": "exact-thinking-budgets-rejected",
+      "tests": [
+        "r7_kimi_exact_positive_budgets_are_not_approximated"
+      ]
+    },
+    {
+      "id": "valid-wire-schema-and-diagnostics",
+      "tests": [
+        "r7_kimi_valid_controls_survive_all_source_bridges",
+        "r7_kimi_prepared_diagnostics_distinguish_request_from_effective"
+      ]
+    },
+    {
+      "id": "same-account-device-recovery",
+      "tests": [
+        "r7_kimi_same_account_recovery_keeps_controls_device_and_diagnostics"
+      ]
+    },
+    {
+      "id": "gemini-control-aliases-and-dynamic-budget",
+      "tests": [
+        "r7_kimi_gemini_native_control_aliases_and_dynamic_budget"
+      ]
+    },
+    {
+      "id": "non-k3-alias-equivalence-rejected",
+      "tests": [
+        "r7_kimi_non_k3_efforts_do_not_borrow_k3_alias_equivalence"
+      ]
+    }
+  ],
+  "localPolicy": {
+    "precisePositiveThinkingBudget": "reject_400",
+    "zeroThinkingBudget": "disabled",
+    "geminiMinusOneBudget": "dynamic_enabled",
+    "omittedThinking": "existing model default",
+    "modelSpecificAliases": true,
+    "businessTreeInspection": false,
+    "diagnostics": "source intent and final prepared wire only; no execution attestation",
+    "nativeResponsesEnabled": false,
+    "regionalSiteMigration": false
+  },
+  "validation": {
+    "results": {
+      "green1": {
+        "passed": 8,
+        "ignored": 0,
+        "log": "/tmp/cc-r7-kimi-green1.log",
+        "logSha256": "c882088e1230bdb337c6079b9528525454b8b171d3feb44d5cdcb66dd530f9ec"
+      },
+      "regression": {
+        "passed": 61,
+        "ignored": 0,
+        "log": "/tmp/cc-r7-kimi-regression.log",
+        "logSha256": "fad6a6e9808514d5a6c3b2bb11a92adc77fe8568cc921815686a43e2951d70a4"
+      },
+      "adapters": {
+        "passed": 144,
+        "ignored": 0,
+        "log": "/tmp/cc-r7-kimi-adapters.log",
+        "logSha256": "f9b1f5279307287c6d0c671a9c543175c9cdc8e6f82888444b5f9b9bc892a414"
+      },
+      "transforms": {
+        "passed": 128,
+        "ignored": 0,
+        "log": "/tmp/cc-r7-kimi-transforms.log",
+        "logSha256": "c57aae80f029d5c294b3dae6898d3233eec45a178cc22dc3bf7c4c9bc47369ad"
+      },
+      "stream-transforms": {
+        "passed": 103,
+        "ignored": 0,
+        "log": "/tmp/cc-r7-kimi-stream-transforms.log",
+        "logSha256": "441574ff757f7233e9e8a777494c0488fc472a1d60b93702d563b0c13ae97ac9"
+      }
+    },
+    "countsMayOverlap": true,
+    "rustPaths": 503,
+    "strictAllTargetClippy": "passed",
+    "clippyLogSha256": "af3b703966fffb35a0b319216cd6fb53d865b50e4ad9c0d7954d8a550accc852",
+    "nodeAuditsPassed": 2216,
+    "nodeAuditLogSha256": "06dd03ba3d534b10f668ce15efcc03a5b1c540e9115cf2d92d7109ddb651afcc",
+    "realAcceptance": "live_pending"
+  },
+  "invariants": {
+    "fixedProviderAccountShareAndDevice": true,
+    "crossAccountFallback": false,
+    "endpointFallback": false,
+    "postCommitReplay": false,
+    "realEvidenceClaim": false,
+    "uiAutomation": false,
+    "deploymentTest": false
+  }
+}

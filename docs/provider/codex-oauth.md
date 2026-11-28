@@ -245,7 +245,13 @@ Cloudflare 524 是否消失、Worker 是否实际 flush 小 chunk、订阅账号
 
 ## WebSocket 与 HTTP Fallback
 
-Codex Responses WebSocket 使用有界连接池，pool key 包含进程、Provider/runtime、session、upstream URL、credential generation 和 workspace headers。
+Codex Responses WebSocket 会有界保留闲置的上游物理 WS，供后续下游连接复用；这是连接缓存，与供应商账号池无关。默认最多 64 条、闲置 5 分钟、寿命 55 分钟；`CC_SWITCH_CODEX_WS_CACHE_MAX_CONNECTIONS=0` 禁止留存。
+
+R6 的缓存身份由最终握手快照生成：完成账号覆盖、客户端协商合并、metadata 清洗和 routing hint 移除后，再按进程、Provider/runtime、Share/已认证用户、session、endpoint、凭据/workspace/CLI 身份及协商值隔离。Header 名与顺序归一化；beta、turn-state、timing-metrics、attestation、响应裁剪参与协商身份，逐轮 `x-client-request-id` 与 `x-codex-turn-metadata` 不导致连接碎片。正常建连、目标重建和同账号 401 刷新共用此边界。
+
+每个缓存 socket 仅保留至多 32 个成功 response ID 的 SHA-256 摘要。客户端引用仍在缓存中的同作用域 ID，但更改协商条件时，在上下文注入和生成提交前返回 `409 response_context_unavailable`，保留原连接；过期、已淘汰或未知 ID 不因本机制获得远程续接能力。原有 `previous_response_id` 清理与可选本地工具上下文策略继续适用。
+
+仅 managed Codex Responses 生成支持 `X-Codex-Exclude` 的受限集合 `tools`、`usage.attribution`：合并多值、去空白/重复并输出固定顺序；空白等同省略，总大小最多 1 KiB；未知项和 `usage` 等宽裁剪在发包前拒绝。HTTP、WS、同账号重建和 WS→HTTP 共用规范值，根 usage 的 token 与本地计量仍保留。账号 extra headers 不可覆盖此协商；models/search 与普通 OpenAI-compatible Provider 不接入该头。R6 当前回归与 review 状态见增强总账 §24.2，所有真实厂商接受性仍为 `live_pending`。
 
 - 同一下游连接中的每个 `response.create` 串行执行。
 - connect/timeout、握手 5xx、stale cached socket，以及成功发送 `response.create` 前的 send 错误可以回退到 HTTP/SSE。

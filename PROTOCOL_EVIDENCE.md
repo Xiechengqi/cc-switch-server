@@ -1,5 +1,17 @@
 # Protocol evidence policy
 
+## 2026-11-27 R6 Grok request data boundaries
+
+Reviewed Server baseline `f1e3e0dbb77fbe3d21c4ce52d12da05771db179f`. Read-only recommended references remain grok2api `8535932b0783db2033657f36e2e1a84196c4e151` and sub2api `ab99d56e9626e6cd731592dae8553c9758a0efa2`; the latter's six uncommitted Codex files are excluded. grok2api's `responses_reasoning_recovery.go` (SHA-256 `5379850b4a929a89d7b4f839d658579d31f91a6f4f54c3c2bd27f8559546709c`) restricts recovery to typed reasoning input items and preserves compaction/non-reasoning fields. `responses_tool_types.go` (`a76e83fb39868f836d155bdddf1978ab25369d596286e0347a99902a700cc90a`) limits external-web compatibility to search declarations and treats disabled external access as a permission boundary. Server does not adopt portable-summary rewriting, broad replay or reference upstream-plane fallback. External checkouts never become build/test/runtime inputs.
+
+Two independent production-path loopback regressions failed before the repair: an ordinary Claude function schema containing a property named `encrypted_content` lost its entire outbound tool declaration; native WS preparation dropped both opaque reasoning and compaction items and the same tool. The source also recursively deleted business `id`, `external_web_access`, `background` and `stream_options` fields. The repair limits server-item ID cleanup to direct native `input[]` item envelopes and keeps tool schemas/defaults/examples/arguments/results opaque. WS transport controls are removed only at the request envelope.
+
+Native `input[]` reasoning/compaction `encrypted_content`, when present, is checked only for nonempty string type and the existing 8 MiB bound. Valid bytes are preserved, including padding, unfamiliar prefixes, low-entropy or future formats; Server does not decode, re-sign or drop opaque client history. Invalid shapes fail before sending with the input path, without echoing content or removing a whole turn. Existing rejection recovery remains restricted to a Server-injected scoped proof, the same binding/rail/plane, one pre-commit attempt and the shared budget. Client-supplied opaque history does not acquire transparent recovery rights.
+
+Final local candidate: 310 keyword-filtered Grok library tests, 128 transform tests and 5 protocol-compatibility tests pass on the same binary (counts overlap); all seven R6 behavior groups execute. Backend Node audits pass 2207/2207. Strict all-target Clippy, cargo fmt, explicit all-src/include rustfmt, Phase 0, generated coverage, reference-delta, static UI matrix and docs checks pass. The 493 Rust/Cargo/build source digest is `713df000d3395d80600e6e528adcacac088bc9a33e079270be9dd165d20095d2`; the test binary digest is `51e9a9b6cbf7fde838fb7872289d14185fa32f59ed945249563d35bbbcf71afd`. This is the Grok class validation, not the final full-worktree integration.
+
+The R6 identity/limit review retains the current direct-XAI policy: Build 1.0.60/group headers and model-specific cooldown are not activated without independent same-rail evidence. The negative-control forwarder test verifies conservative unknown-429 handling and single-attempt client-cipher rejection. `assets/contract/r6-grok.json` records these two `reviewed_gated_no_wire_delta` dispositions, the seven-operation identity matrix and immutable source snapshots separately from the implemented GR-01 repair. This does not authorize a new model/media operation or claim newly enabled identity/limit functionality. All vendor acceptance remains `live_pending`; no real request, UI automation or deployment test was performed.
+
 ## 2026-11-26 Codex Images text driver and direct transport
 
 Read-only references: CLIProxyAPI `38fe929502f19f7cce03c69c19aacddf30f1ef5e` (`internal/runtime/executor/codex_openai_images.go`, `helps/codex_hosted_images.go`; direct Images introduced/expanded by `dfe8b182c54de`) and codex2api `8ecd1860ddfe3f29edbc2cb1fc7d23cd56b40630` (`proxy/images.go`, `images_settings_test.go`, `images25_test.go`; driver retirement fix `7c8710199a85`, effort fix `f22cbf4e4ddc`). External code and tests are evidence only, never runtime/build inputs. The reported `model_not_found` / `model_not_in_accessible_catalog` names the bridge text driver, not the requested image model.
@@ -3554,3 +3566,163 @@ DeepSeek Harness 完整会话仍为 `live_pending`，未部署、未发起真实
 2026-11-18 发布隔离核对：以已发布的 `92083f6` 为父提交，单独整理 Zen 变更并重新生成契约证据与 Web 产物。完整 Rust 源码（src/tests）摘要为 `5b16caa94f84875df96dde01f4ac40c77709cd23e9a4b9d8b117d0efb022dce4`，Web 产物摘要为 `e58af935702131a6a9d9851813bb83b99616ba0572504768fb5a1c74780fadd2`，二者均与实施阶段全量验证通过的冻结树逐字节一致，复用该冻结树回执：Rust 库 4521 passed / 0 failed / 3 ignored、API 契约 139/139、两个独立集成目标各 1/1，Zen 专项 35/35。该树的 cargo fmt、全部 include 源文件 rustfmt、严格 all-targets Clippy、cargo check/build、10 步本地 HTTP smoke 及完整 static-checks 均通过；后端审计 2205/2205、smoke 脚本测试 13/13。资源参数为 CARGO_PROFILE_TEST_DEBUG=0、CARGO_PROFILE_DEV_DEBUG=0、CARGO_INCREMENTAL=0、RUST_MIN_STACK=67108864、单编译任务、4 测试线程。
 
 本次在隔离发布树重新执行 Node 20.20.2 Web 类型检查、59 文件 / 414 测试和生产构建，均通过；Provider writer 证据、覆盖/UI 矩阵及文档索引再校验通过。发布树另保留既有 Codex 配置项查询的等价 Clippy 修正：双向迭代器 `.last()` 改为 `.next_back()`。离线 readiness 无检查失败，因真实 Router/账号/部署输入不齐而保持 blocked_inputs；本轮未部署、未发起真实推理。并行额度工作保留在主工作区，按其独立源码与回执验收。
+
+
+## 2026-11-27 R6 Codex：最终 WS 握手缓存身份与受限响应裁剪
+
+本轮只读核对 Codex/AGENTS.md 推荐的 CLIProxyAPI `47f18e4d82bd72f7d2b5ecf5ede93e4837a4625e`（tree `1c6c82df0d0364387bcd84751ac5ee6a0a2da8d3`）与 codex2api `c6aecea48d43f625dd4f7d6838f3fd8b3f3d0d47`（tree `c862e69c4e26351237ac0bd845d9a567801e36cb`）。来源 SHA-256：
+
+- CLIProxyAPI `internal/runtime/executor/codex_websockets_session.go`：`aa40d66edc972a18093d0142b0969dde18c87b36576ba752c2bdb29ca16e8717`。
+- codex2api `proxy/wsrelay/client_identity.go`：`cff7eb0181dea05ce886f712d7966b9d706c4db20b5d18da6093e0cc18776eee`。
+- codex2api `proxy/executor.go`：`d8a767ba2c8230c4b1b5c7c81485763ffc05c8c96342d1e3eab1751cd5cbeb25`。
+- codex2api `proxy/invalid_input_image.go`：`0025a790158ef09ccefd1126787479596f4df80d1ade2851519a32b180bf0bd5`。
+
+Server 原有的 `ResponsesWebSocketPool` 是有界闲置上游 WS 缓存，不是供应商账号池，且不在本轮新增。未修复产品逻辑上的正式入口反例确认：同一 session 改 beta 后仍使用旧握手；引用已完成 ID 改协商仍提交生成（`/tmp/cc-r6-codex-red2.log` 两项产品红灯）。最终目标构建统一合头/清洗/key；固定 Share/已认证用户和绑定/凭据/endpoint 身份，连接协商参与 key，逐轮诊断不造成碎片。每 socket 固定 32 个完成 ID 摘要跟随物理连接与现有内存 owner；已知协商冲突在上下文注入与生成前受控拒绝，未知/过期/淘汰 ID 不获得远程续接或历史重放能力。
+
+只接入 managed Responses 的 `X-Codex-Exclude=tools,usage.attribution` 受限集合，规范多值、空白、重复及 1 KiB 上限；拒绝宽 usage/未知字段，账号覆盖不可注入。模型/search 与普通 OpenAI-compatible Provider 不采用此头。HTTP、WS、同账号 401 重建及 WS→HTTP 使用相同规范值；用量与工具生成结果须经正式入口夹具独立核对。新参考的坏图规则用于组合反例，不据此宣称 Server 原有确定性输入错误会重放，也不迁移 catch-all、账号切换或新的恢复预算。
+
+夹具迭代的失败与产品证据分别记录：首轮正文形状断言、HTTP 错误响应与 Rust Err 的混淆、错误帧缺少 EOF，以及账号更新重建索引后丢失模拟端点，都不能计作上述产品缺陷。最后一项曾触发默认地址解析/连接超时；最终夹具在正式入口前强制断言模拟回环 URL，并在每次测试连接前恢复自身测试计划，避免再落入默认 endpoint。当前回归/review 收口以增强总账 §24.2 为准；未进行真实账号、UI 自动化或部署验收，厂商接受性保持 live_pending。外仓不进入构建、测试、发布或运行依赖。
+
+
+## 2026-11-27 R6 Buddy：prepared 目录世代与身份门禁
+
+只读复核 workbuddy2api-hub `99fa0f5707554d2d7520307d3e03cbf9779cd878`（tree `50dc4dc89cadc40c61267109c6d2927d3dddc403`）与 cli2api `ccd4744555060a9b78882f246263c7060d8cb6bb`（tree `2f5233f533194d1260fe0b02d9ac9961c944757a`），未使用后者未跟踪的 proxy.html/proxy.md。Hub `wb_identity.py` SHA-256 `d5dd5cf6882dfa7ffe0155621461fa70f254e55ac0caddf70dbb159356fce7d2`；cli2api `headers.go` 为 `3fae3e39bd29dec666bdab3c1a8bbbcf35581cd1ec50f3abb61d0e5679f026e6`，`credential.go` 为 `24a984fe82d8f4312901c5c8a50d5f4014dff671ae7361b170dabe48f7c446c8`（均在 internal/providers/workbuddy）。外仓不进入构建/CI/运行依赖。
+
+BD-01 三项实际生产 facade 准备/native-send 反例在旧逻辑上先红，空目录/工具撤权/默认推理变化各仍发出 1 POST；此范围不是完整 Router ingress。新 epoch lease 复用既有 bounded flight/父 owner，在 state 身份检查前后与 Sent 前复核精确 scope；权威变化和 invalidate 撤销旧 prepared，独立于可选缓存。Weak 比较不另存正文，且先安装 payload owner 再发布 Weak。相同存续快照保留世代及原 TTL，淘汰保留撤权通道，预算拒绝保持已准入新鲜结果；ABA 不复活旧授权。TTL 仅限制新准入，transient-only stale 与已观察 usage 结算保持原政策，不增加重放、换号或正文改写。state 仅增只读围栏，writer inventory 经规定生成器更新。
+
+BD-02 为 reviewed_gated_no_wire_delta：参考 CLI 默认分别为 2.168.2 / 2.176.0，conversation-request/root 语义互有冲突，不覆盖已受审 2.142.0，也不证明全部产品/站点联合接受性。保留当前身份与默认推理。R6 Buddy 260/260（含新 6 项）、Node 20.20.2 后端 2207/2207、严格 all-target Clippy、cargo fmt、include 格式和相关契约审计通过；496 项 Rust/Cargo/build 输入摘要 `add970b9db1e73689ea9b241d5a20b796658fbcf5c0bbf6fe60a16d0f180e313`、binary `02436786bcb6f7a6661783def60476f61b96b7a185c11c8ae55683d61999cf6b`。见 assets/contract/r6-buddy.json 和增强总账 §24.3。未进行真实账号、UI 自动化或部署验收，未提交/推送；后续类别及整体验证/review 仍进行中。
+
+## 2026-11-27 R6 Antigravity/Agy：响应关联身份与缺名调用
+
+按 Antigravity/AGENTS 推荐，只读核对 CLIProxyAPI `47f18e4d82bd72f7d2b5ecf5ede93e4837a4625e` 的 Claude response translator 及 Manager `148838519e12b2f27aec227a4e789e9bacde2f49` 的 Claude response mapper；tree/逐文件 SHA-256 见 assets/contract/r6-antigravity.json。参考的 trim、最近工具推测和正文修复不作为厂商协议证据。
+
+正式 adapter/StreamEventTransformer 原逻辑三个可运行反例为0/3：两响应共用 gemini，缺名参数还会形成 name=tool 的额外调用。新实现保留合法 camel/snake ID 原字节；缺失、空白、null/非字符串时使用已有 rand+hex 铸造128位本地 msg_ 关联ID，同流仅一次，早期元数据可提供合法ID，后到ID不替换已提交身份。每次合成 grounding 铸造一次 srvtoolu_ 并配对 use/result；它不是上游资源ID或续接授权。已有函数ID和签名边界保持。
+
+未知无名续帧失败关闭，只有已知未输出的显式函数ID可继承既有名称；拒绝错类型/改名，错误锁存阻止 finish 补出工具。真实显式名称 tool、零参数、显式ID分片及签名继续保留。普通文本的 functionCall:null 不制造工具；终态后迟到的非空 functionCall 明确报错。未采纳最近工具/slot猜测、删历史、续写或正文清洗。
+
+最终同一候选 Gemini190、Antigravity166、Agy14、stream transforms103、transforms128均通过（过滤器重叠，不累加），含9项R6；Node2207、严格all-target Clippy、cargo fmt与全部src/include格式通过。498项输入摘要 `8a57679f01c001931df2d4c4d71ba3160f59cee28404fbe2356187969f9be5bc`、binary `d8514f17df8486637fc8a09a637fd63728957cb0c554e8895e4f0488a82055bf`。一次直接运行遗漏大栈环境导致Agy测试stack overflow，不计成功；设置统一RUST_MIN_STACK后最终14/14。细节见总账§24.4。无state writer变化；两rail真实接受性仍live_pending，无UI自动化、部署、真实账号验收或提交/推送。
+
+## 2026-11-27 R6 Claude Advisor：条件研究保留透传
+
+只读冻结 CLIProxyAPI 47f18e4d 的 executor/execute/stream 与 helps/claude_advisor_state.go（完整commit/tree/文件SHA见assets/contract/r6-claude.json）。参考只在已知foreign时删除精确Advisor块，unknown先保留、接受后登记；本仓没有独立厂商证据证明对应密文约束，因此按R6F-CL-01明确退出条件关闭研究，状态reviewed_gated_no_wire_delta。没有新增owner缓存、密文存储/解码、静默删除或自动换凭据。
+
+三状态设计与JSON/SSE/CountTokens/工具续轮/Thread两种历史方式的真实证据分别记录；受控token refresh不因字符串改变自动变owner。未来已知foreign建议发送前可恢复冲突，unknown保留，只有被证实的operation成功可登记有界ID摘要；CountTokens不是推理归属证明。此为候选设计而非已实现检测器。既有Thread元数据隔离不涵盖全部客户端opaque历史。
+
+本轮现有Claude测试370/370，六组beta/CountTokens/业务opaque/Thread锚点均在日志/tmp/cc-r6-claude-existing.log执行；binary `d8514f17df8486637fc8a09a637fd63728957cb0c554e8895e4f0488a82055bf`。未新增Rust，不重复编译或把前类Clippy当成本类新成绩。此验证不包含新owner状态机或厂商接受回执；六类真实operation继续live_pending。无UI自动化、部署、真实账号操作、提交或推送。
+
+## 2026-11-27 R6 Zen：推理别名、显式解码模块与资源实测
+
+按OpenCode/AGENTS只读冻结首选zen-gate58fa1b7及官方OpenCode cd0d037的提交对象，完整pin/tree/逐文件SHA见assets/contract/r6-opencode-zen.json。三个已支持纯文本别名统一选择/每帧去重/跨帧累计/空白片段保留，覆盖公共转换、Zen聚合、首语义、终态和既有一次续写；已知非字符串plain字段不猜文本，工具参数/opaque细节不递归处理。四个正式forwarder反例在原逻辑0/4，原有Zen94/94；最终新增工具opaque场景后正式5/5，Zen99/99。
+
+CORE-01只移动缓冲decoder lifecycle到真实模块opencode_zen_document::read_document，两次调用入口与原reservation/usage/deadline/terminal/body完全保留；规范名称/引用路径/空白后的函数主体摘要`13e1b38fb462959a47debb91803dfc0de61164621d424da2347f934fdc8d4e78`一致。不是整仓IR重写，不新增writer或恢复策略，不以行数或模块名宣称性能收益。
+
+资源实验实际执行正常和私有cgroup high384MiB两轮，Bun1.4.4、hardmax4GiB，生产lane/stdio加回环。正常探针1/1；压力轮传输128MiB触发30秒typed504，原测试exit101/probePassed=false完整保存，high事件增加但无OOM/强制清理/存活进程，临时cgroup已移除。两次额外探索日志和最终仓内runner结果均留存；压力失败是容量观察，不是通过。128MiB不是API/driver准入上限；宿主含fixture，合计RSS重复共享页，采样和无TLS/真实网络限制见assets/contract/r6-zen-resources.json。保留每请求Bun和默认并发4，不添加未经证明的RSS预留或常驻池。
+
+最终Zen99、stream transforms103、transforms128、timing11均绿（过滤器有重叠），原有两个Bun忽略用例显式2/2，正常资源probe显式1/1；严格all-target Clippy与fmt/include通过。binary `9a0f56407bfeb74b530be66373cce4d0e4f9032f1c71d6535927a7a6963fdb21`；编译前503项Rust输入摘要 `c2743ad3420b28879a2896f449d2f378bebca2167dfe2c2462ef8f56fbd0c6aa`，Provider源码验证后不变，另有API/state并发漂移不冒充整仓精确编译证明。green1的并发API私有方法编译错误与主动停止的green2/3均不计产品成绩；全仓集成另行冻结。无UI自动化、部署、真实账号、commit或push。
+
+
+## 2026-11-27 R6 Trae：关闭语义与条件 SOLO 研究
+`assets/contract/r6-trae.json` 冻结首选 Hub `f7b75787680c7aded6b277aee05ddfc7fbac4ba8` 的四份提交态源码及测试摘要。参考行式 SOLO 字节来自 mock，不是独立厂商录制；正式 forwarder 重放得到明确失败，单次生成且不换 function。缺同端点/function/客户端的独立样本前，不启用新 decoder 方言。模型组关系和 SOLO 内联图片同样保留证据门禁；既有 `solo_work_lite`、精确目录与 SOLO images=false 不变。
+
+三条 rail 的显式关闭（`none`/`off`、false、Claude disabled、Gemini 零预算）现在在生成前返回 unsupported control，避免将“省略字段”冒充上游关闭。调用方若接受上游默认，可省略该控制；省略不保证关闭。开启/档位保持既有映射，坏类型、冲突和不可用档位零生成；raw 图片与显式工具政策保持。
+
+复用既有 `requested_reasoning_effort` / `effective_reasoning_effort`：请求值来自归一化控制，实际值取最终 prepared payload 的顶层 SOLO 或 raw parameters 字段；同身份 401 恢复保持一致。它们描述准备结果，不证明已发包或上游执行；未观察到档位保持空，不补成 disabled/default。只记录有限枚举，不泄露未知字符串或正文，不改变 Router/Web 契约。
+
+正式路径旧实现两个反例 0/2；最终 Trae 69/69（含六项新回归），严格 all-target Clippy、cargo fmt 及所有 src/include rustfmt 通过。四入口×流/非流×三通道覆盖关闭/缺省/开启/冲突/坏类型和同身份恢复；既有终态、取消、资源 owner 与多轮工具回归一起执行。完整主仓集成和 Node 全套审计留最终公共阶段，不沿用历史数量冒充当前全套。所有真实 operation 继续 live_pending；无 UI 自动化、部署测试、真实账号操作、提交或推送。
+
+504 项 Rust/Cargo/build 输入摘要 `89c4bf02f07e84399b93900f4388b802bd6a7798366b2e622dca4adb6c34d726` 在候选编译和最终专项后复核未变，binary `5434236495290332b09fbd5c046fef3aaa46773705f73dd710a6c607c1e3af19`。日志 `/tmp/cc-r6-trae-green3.log`、`/tmp/cc-r6-trae-clippy-final.log`；逐项 review `/tmp/cc-r6-trae-review.md`。
+
+## 2026-11-27 R6 Qoder：目录与 CLI wire 分开，准备值诊断
+
+按 Qoder/AGENTS 首选只读核对干净的 Hub `2b0981c99166d681cdc8c9b38629c8c1b7306634` 的 `qoder_proxy.py`、`qoder_catalog.py`，并读取 cli2api `ccd4744555060a9b78882f246263c7060d8cb6bb:internal/providers/qoder/direct.go` 的提交对象。Hub 新目录读取 `thinking_config.enabled.efforts` 和嵌套 `context_config`；cli2api 明确不在 parameters 发 context switch，与本仓冻结的官方 CLI 1.1.32 投影存在差异。它们不能单独覆盖本仓 oracle，也不能将桌面目录字段作为三条 CLI rail 的新授权。
+
+R6-QD-01 研究保持 `reviewed_gated_no_wire_delta`：保留 chat 优先/deny、app-only discovery-only、未知能力不授予控制权限、已审 high→max 和 context 字段位置。新能力须分别取得 Global OAuth / Global PAT / CN OAuth 的同版本目录与独立 wire，再更新 typed capability 与 oracle；不改历史摘要、不以参考兜底目录开放生成。
+
+R6-OBS-01 的 Qoder 部分已完成离线实施。请求档位应来自归一化控制，实际档位必须读取最终 prepared `model_config`；只见 `is_reasoning=true`、未见合法档位时不能虚构 high。省略、声明默认、明确关闭和已审映射须区分，恢复前清空旧准备结果，失败准备不能借上一轮的 effective 值。只使用有限标签，禁止把目录/请求未知字符串复制到诊断；不改变 Router/Web 契约、授权或重试条件。最终候选验证范围见本节末。
+
+正式旧逻辑反例 `/tmp/cc-r6-qoder-red3.log` 为 1 通过 / 4 失败：Claude disabled 最终 `model_config.is_reasoning=true`；精确 budget 被接受且生成；准备失败和同账号恢复均缺 requested 档位。Gemini 动态预算原本通过，只作保留回归。前两轮分别为测试类型错误和未配置固定模型而提前被 auto 权限拦截，均排除，不作为产品失败证据。候选只在 Qoder source-controls 边界修复本地解释：关闭投影到既有 none；精确预算、坏类型、未知值和冲突明确拒绝；不增加厂商控制字段或更改旧 CLI 映射政策。
+
+首候选 Qoder 192/192；随后 review 补出未知模型关闭边界：仅带新 `thinking_config` 的目录不能授权关闭，显式 none 在生成前明确拒绝，省略控制仍允许已准入文本生成。这个围栏不将嵌套目录升级为 typed capability，不改已审模型 high→max、开关或 context 字段位置；最终候选另行验证，192 不冒充补围栏后的成绩。
+
+
+最终 Qoder **193/193**，含六项新正式路径回归；三份既有 Node oracle/目录/能力 mutation 套件 **16/16**，严格 all-target Clippy、cargo fmt、全部 src/include rustfmt 和四项 Qoder 静态门禁通过。505 项 Rust/Cargo/build 输入摘要 `451724fdee7fbd199b77d7bf05e1f2b4098ea3a8139e9a955fc0366572cb3d9c`，测试 binary `9ac6044e384a5ab158320ad16bb02e53f95443b05cdd7c3078ade607fb8a52be`，验证后集合/内容复核未变。首候选 192 是补未知模型关闭围栏前的历史成绩，不混充最终版本；早期夹具失败均排除。完整 Node/整仓集成及整体 review 仍归最终公共阶段。三条真实 rail 保持 live_pending；无 UI 自动化、部署测试、真实账号操作、提交或推送。
+
+## 2026-11-27 R6 EVID-01：现有 conformance 的操作级只读视图
+
+`assets/contract/provider-conformance-evidence.json.operationEvidence` 是 schema v1 的可选扩展；旧的 driver × forward/test/discovery 与 Registry verification level 均保留。既有 conformance 审计调用同目录的小型校验模块，精确查询需要完整 scope，不做模型、rail、Profile/driver revision、传输、stream、客户端或构建身份的模糊匹配；该数据不进入运行时授权、计费、重试或能力开放。
+
+初始 14 条记录为 9 条历史文字证据、5 条本轮实际执行的 fixture，live=0。历史记录细分 2026-11-18 双模型/双 App/流与非流的管理检测，以及 11-20 实际 Codex CLI 的聚合观察；缺独立 receipt、模型细分或源摘要的字段明确为 null，不由当前默认值补齐。每条 fixture 引用本仓 local_complete/pending 资产的精确 case、SHA 与已知 binary/source 身份；截断、重复终态、未读取消和本地拒绝分别记录，不能把预期错误改称生成成功。
+
+未来独立 receipt 的公共摘要必须指向该 driver 的既有私有验收脚本及合同版本，并逐字段匹配 feature、模型、rail、Profile/revision、传输、stream、客户端、源/二进制/绑定摘要、日期、生成请求数和结果。实际私有 receipt 的完整性、新鲜性、身份代次及厂商接受性继续由原有 harness 验证；本视图只保存其受审脱敏索引，不重新验证私有内容、不采集账号、不执行外部参考，也不凭摘要自动提升粗门禁。当前仓库没有新增任何真实通过条目。
+
+操作视图九项离线性质测试通过，覆盖旧数据可省略、历史/fixture 不升真、精确查询与 receipt 跨 scope/版本/构建拒绝、既有 schema/harness 约束、来源漂移、跨 Provider 误归属、敏感字段及源符号链接越界。合成 receipt 仅测试索引结构，没有调用真实 harness 或写入公共 live 条目。首轮夹具漏读扩展 operation、随后选择到 Claude Profile 的错误已修正，不作为产品红灯。最终整仓结果见下节及 [本轮整体 review](docs/provider/proxy-implementation-review-2026-11-27.md)。
+
+## 2026-11-27 R6 / R6F：冻结源最终离线回执
+
+21 个计划条目均完成实施或原计划允许的条件研究退出。完整源快照基于 `73cf158f147d402abed66150dbd5ad77c49e033d`，1225 个输入文件摘要 `c849d724464d44af770f40154bcf41eab4e526137555183b99e82069af034083`；仅四份最终报告 Markdown 被排除以便写回结果。R6 源与主工作区一致，共享 state 中后续 Client 健康/同步方法及生成清单的差异另行列明，不将其纳入本回执。
+
+实际测试按目标为 library 4727 通过/6 忽略、API 140、Cursor fixture 1、lease payload 1、主程序 1、doc-tests 0，合计 4870 通过、0 失败。后端 Node 2216 与 smoke 脚本单测 13 通过；offline check/build、严格 all-target Clippy、全 src/include 格式及后端/静态门禁通过。三处既有测试对同步邮件/Share 更新的假设被改为现有异步时序；测试模块之前的生产代码经字节比较不变，writer inventory 经脚本重建。
+
+完整 library 实际执行二进制 SHA-256 `04f66b5ae885c515ab09397fecf7b42d8709e20e21025f4ac768988d0db06788` 在运行时通过 `/proc/PID/exe` 保存，DWARF 工作目录与隔离源一致；它不同于先行两项回归使用的预编译候选。共享 target 在执行中被删除后，原 Cargo 命令因后续主程序文件缺失退出，未伪记为整段通过；剩余目标在独立缓存补齐，同源分别采用未优化的 debug-info 2/0 构建。所有结果绑定该源快照，不声称源码与构建时间戳共同决定的二进制摘要可跨重编译复用。
+
+本地 HTTP smoke 用原脚本的同一请求序列，在仓外副本仅将 `cargo run` 改为预构建二进制启动；其余步骤逐字一致，仓内脚本不变。原因是 worktree 的 `.git` 文件布局与既有构建监听造成重复编译，30 秒启动等待不足。实际启动二进制 SHA-256 `77f424259e7625da313c2c14dd4aac74ceee7d32ee5d405e68f8532f99d23086`；本地初始化、认证、Provider/Share 创建均通过，临时配置删除且无匹配进程。原启动尝试和构建限制不作为部署通过或性能收益。
+
+离线 readiness 返回 `blocked_inputs`（本地失败 0）；脚本内嵌套件因 `RUN_TESTS=0` 未跑，真实输入和部署验收未提供，另行成功的本地结果不改写该判断。操作视图保持 9 历史 / 5 fixture / 0 live；不升级任何真实 operation、粗门禁或能力权限。Zen 压力 typed 504 / probe exit 101 保留为负向容量限制。完整矩阵与方法见 [整体 review](docs/provider/proxy-implementation-review-2026-11-27.md) 和增强总账 §24.10。未做 UI 自动化、前端测试、部署测试或真实账号验收，本轮执行未发起提交/推送。
+## 2026-11-27 R7 Kiro / Amazon Q：协议 origin 保真与目录 owner
+
+按增强计划 §25.4.7/25.5 核对已冻结的 kiro.rs `c37fe5afe7ee3adba836abfcee9a97aba5ea54f9`；参考中的广域字符串替换不作为安全实现范本。Server CLI 现在只转换当前/直接历史 userInputMessage 的协议 origin，保留工具业务树、schema literal 和引文。Kiro IDE、Kiro CLI、Amazon Q CLI 继续分 rail、固定账号和产品。
+
+Amazon Q 目录采用共享不可变 payload/reservation、128 目录 / 32 MiB 可选留存、64 个活跃发现 key 及独立 waiter charge，使用同一分页 deadline。进程父预算默认观察，只有显式配置才硬拒绝；不是 RSS 估算。成功和失败都按精确 scope 合并，最后 lease 释放结果；认证/畸形目录撤销相同 stale。Account incarnation、防旧 flight 发布、state 完整身份复核及普通提交/native refresh 提交失效避免删重建或旧 token 结果污染。保留原 discovery 401/403 同账号刷新检查；生成仍遵守已有合格 401 恢复合同。
+
+有效红灯旧代码 1 通过 / 5 失败，四个 CLI 用例在首个 Claude 非流反例发现业务参数改写，冷发现 8 次而非 1 次；栈溢出、AWS content-type 测试 extractor 415 与编译失败不计产品反例。最终新专项 17 通过 / 1 默认忽略，Kiro 286、Amazon Q 28 通过；隔离 1 MiB 父预算容量用例显式 1/1，正式 forwarder 返回本地 503、零目录/生成/刷新、不标记重登录。过滤器重叠。严格 all-target Clippy、fmt/include、Phase0 6 项与完整后端审计 2216 项通过；真实验收继续 live_pending。
+
+本类别 501 项 Rust/Cargo 输入摘要 `2a7a5fdb68b938f0865b88d73f1b3d35be4aa2ffb331bf61bbf1b521a22281bd`；二进制 `351731353f54d3bb98a40370751d6ec4b313d0779373a64e61b36dc32cdfdf6e`。`assets/contract/r7-kiro.json` / `r7-amazon-q.json` 保存对应场景和日志校验；操作视图新增 32 条后为 46 条（9 historical、37 fixture、0 live），不提升粗粒度能力。后续类别和整仓最终集成尚待完成。无 UI 自动化、部署、真实账号、commit 或 push。
+
+## 2026-11-27 R7 Kimi：通用桥前的源控制与条件研究退出
+
+Kimi SourceControls 在 C Messages/O Chat/O Responses/G 的通用桥前校验容器、effort、启用/关闭、预算与输出 token 同义项，再把同一结果应用于桥接输出。K3 既有档位 alias 可合并，非 K3 的不同档位不能借其等价关系被吞掉；非法控制在网络生成/刷新前明确 400。正的精确 thinking budget 不再近似，零关闭、Gemini -1 动态启用。schema/default/工具历史中的同名业务字段保持 opaque；原 signed replay、keep/all、context edits、固定账号/设备和同账号恢复合同保留。诊断按有限标签记录请求控制和最终 prepared wire，不证明上游执行，观察过程跳过完整消息/工具正文。
+
+CLIProxyAPI `47f18e4d82bd72f7d2b5ecf5ede93e4837a4625e` 的五个提交态对象重新核对，哈希见 `assets/contract/r7-kimi.json`。原生 Responses 的直接 URL/executor/terminal/usage/工具 output 重排，以及 `.ai` 的 auth/API 路由确实存在；没有独立匹配本站点、账号、设备、模型和生命周期的接受性证据，NATIVE-01/KM-02 按原卡允许规则 `reviewed_gated_no_wire_delta` 退出。保留现有 Messages/Chat 和 `.com`，不做 404 后协议切换或 suffix/文件名站点推测。
+
+旧反例六项失败中，恢复 415 是 OAuth form 被 fixture Json extractor 拒绝，排除；其余分别观察到源冲突/数字 effort 接受、正预算近似、缺诊断及零预算清理差异，不冒充所有循环都已完整执行。最终八项专项、Kimi 61、adapters 144、transforms 128、stream transforms 103 均绿（重叠）；严格 all-target Clippy、后端审计 2216 和追加记录后的操作证据 9 项通过。503 项 Rust/Cargo 摘要 `e59f505eb92b413f2679e24695338c2add297c577d5b43f166ad737dc12dad30`；binary `e4b8b18391377c6ea3babc4a79858d9e52989f3c74993a22b430362cff06d9c8`。新增 54 条操作观察后共 100（9 historical、91 fixture、0 live），粗粒度 gate 与真实 live_pending 不变。没有 UI 自动化、部署、真实账号、commit 或 push；全部类别完成后的整体集成另行执行。
+
+### R7 Amazon Q actual Bearer cache identity follow-up
+
+Post-Kimi review adds a fixed SHA-256 digest of the actual wire Bearer to the existing exact catalog key. Same-generation credential changes are isolated even before account invalidation completes; raw tokens are never retained in the key. The new production-discovery fixture alternates credentials without clear, observes exactly two catalog HTTP requests with independent immutable results, reuses only the old credential's own Arc, and releases the final parent charge. This case was added after the original red3 and is not claimed as part of that failing run.
+
+New case 1/1, Amazon Q 29 (one ignored by default), Kiro 286 and explicit isolated parent-capacity 1/1 pass; filters overlap. Current all-target Clippy and fmt/include pass. Rust/Cargo digest `9434ed2bb0eaf887c20a0d53d57ac3eed60da35a9f2724cad1fac9403de577cf`, binary `a259a43a5ea07043ef13f7a33e0abec99d3ddea29514afc4e74f0c838f3ef7c0`; follow-up artifact `assets/contract/r7-amazon-q-identity.json` preserves this separate snapshot. Operation index is now 101 = 9 historical + 92 fixture + 0 live; discovery records zero generation requests. Wire, account/product binding, bounds, recovery policy and live gates remain as documented above.
+
+## 2026-11-27 R7 Trae：CN prepared catalog lease
+
+Server-owned state.prepare_trae_runtime → independent catalog operation → native send fixtures reproduced four old leaks (empty/capability/invalidate/A→B→A each sent once on the first CN SOLO/Claude case); equal catalog and Intl positive matrices passed. New independently owned epochs revoke old prepared sends while weak payload comparisons preserve the channel after optional-cache eviction. Equal rediscovery shares immutable data/epoch without renewing an older prepared snapshot's own TTL. Existing payload 128/32 MiB and flight 64 bounds remain; epoch scope index is capped at 256 with charged last-owner and lazy cleanup. Fresh/stale keep their 8-minute/24-hour contracts; only existing transient fallback creates stale admission. Checks run before native Sent; sent-request identity/terminal/cancellation/usage follows the original path. Intl has a charged syntax-only snapshot, explicit models and no CN catalog rights.
+
+Final new cases 12/12, Trae keyword regression 81/81 (overlap), strict all-target Clippy, fmt/include, Phase0 6 and Node backend audit 2216 pass. Two first-green resource fixtures lacked display_config and were filtered by the real parser; corrected fixture runs supersede those failures. Digest `c36cc58ad46883c48f34a184ed6ca75cd209d1555847d458fd5fba64bf735983` for 505 Rust/Cargo inputs; binary `289a771ca4050c00a0e360f2749ce64ae1b71c534b6ef478c9484a2f82abeda8`. r7-trae.json preserves this snapshot and links the prior frozen Hub f7b7578 source evidence. The existing three SOLO dialect/function/image research gates have no new independent evidence and remain closed. Adding 33 precise native prepared-send observations gives 134 entries (9 historical, 125 fixture, zero live), without coarse-gate promotion. No UI automation, deployment, live-account requests, commit or push; whole-worktree integration remains pending.
+
+
+## 2026-11-27 R7 隐藏 Web Session：请求生命周期预算
+
+WEB-01 已在四个既有 hidden/experimental Grok/Perplexity Profiles 的正式 pinned/Share 路径落地：解压前按真实 Driver 启用预算、一次 canonical 解析、翻译/出站/响应/Perplexity sparse patch 与内嵌 JSON/最终 JSON-SSE 的分阶段预留，实际 Bytes 最后 clone/slice owner 释放。输入/翻译容量零网络，发送后的响应/输出容量最多一轮原生成；canonical 503/memory_capacity 不作 Cookie 认证失效或 Provider 健康惩罚。原固定 origin、显式 reimport、strict terminal、纯文本缓冲与 estimated usage 保持。
+
+旧路径有效反例 0/3，新专项 10/10、Web 关键字 38/38（含管理员会话、计数重叠）；Node 后端 2217 在登记前通过，登记后 EVID 9 与 conformance 通过；Clippy/fmt/include/Phase0 6 通过。507 Rust/Cargo/build.rs 输入摘要 c2c325c28fe909f444027ff21fda95e3d58cc1b378f5604b0579f76c67f8bce4，二进制 b8a9620fa5aae9d3daf96aeb354c21207ec49b5afc61d37b30dd983041535d21。`assets/contract/r7-web-claude.json` / `r7-web-codex.json` 保存范围与证据；108 条新操作记录后为 242 = 9 historical + 233 fixture + 0 live，无门禁提升。
+
+WEB-02 以冻结 OmniRoute 443d6699 三个 Git 对象重审，因 token/full snapshot、patch 替换、引用、strict EOF 和有界 demand/cancel 合同及匹配真实回执不足，按 `reviewed_gated_no_wire_delta` 退出。旧 source-checkout 检查因当前 HEAD 不等于旧 pin 失败；10 个历史 committed evidence objects 独立 hash 校验一致，不修改参考仓，不冒充 checkout 检查通过。保持 buffered；本轮无真实账号、UI 自动化、部署、commit 或 push，最终整树集成仍待完成。
+
+
+## 2026-11-27 R7 其余类别 review、条件研究退出与全类型对账
+
+DeepSeek 34、Ollama 36/1 ignored、Antigravity 166、Gemini 192、Claude 370、Codex 565/1 ignored、Copilot 76、Cursor 373、Grok 313、Qoder 193、CodeBuddy 224、WorkBuddy 19、Zen 99/3 ignored、Bedrock 27、static 37、coding_plan 29、OpenRouter/NVIDIA 各 3、retired 17 的关键字回归通过，过滤器重叠，不相加。Zen 另外显式执行两项 pinned Bun 1.4.4 loopback transport 合同，2/2 通过；旧压力 probe 未重跑、无新性能声明。源码与日志 hash 见 `assets/contract/r7-existing-provider-review.json`，代码/二进制来源沿本轮 Web 最终候选。
+
+条件研究资产 `assets/contract/r7-conditional-research.json` 记录 6 个独立无 wire delta 退出。Ollama 官方确有 :cloud Responses passthrough，但 daemon auth.Sign 与本项目 Provider API Key rail 分开；DeepSeek registry/URL fixture 不证明完整 API Responses 接受性；Gemini Interactions 尚缺三 App 的独立场景、身份和生命周期合同。Kimi .ai/Responses 与 Web 真增量的前述 gate 均保持，不以参考源或 mock 升能力。
+
+只读 `assets/contract/r7-scope-review.json` 为全部 29 ProviderTypes/61 required App surfaces、93 Profiles/29 drivers/101 expanded bindings、23 Account types、20 codingPlan 与 4 hidden Web Profiles 分类。17 ManagedAccount+6 MetadataOnly 包含 retired GeminiCli；Zen 不在账号枚举。保留空 observation、legacy/custom/retired 与各 rail/操作真实验收义务；242 操作记录仍为 9 historical/233 fixture/0 live。DOC-01 从生成源纠正 Bedrock typed 实现与旧 helper 的 planned 叙述，未修改任何粗粒度门禁。当前整体集成正在开始，不能把这些类别结果当作最终整树通过；无 UI 自动化、部署测试或真实账号调用。
+
+
+## 2026-11-27 R7 最终整树集成与整体 review（本地完成）
+
+实际 dirty/untracked 候选 1248 文件，digest 6f0b813368d6cf43400fca287f3f10c67aa5967ca0326777a6e7f69db64c0167；HEAD 848be22958ee1499d02ce374f571b0241b558dc3 未变化。五项确认修复、DOC/EVID、全部类别 review 与六项条件研究的允许退出完成。最终完整 Rust 4918 passed / 7 默认 ignored、后端 Node 2217、后端 smoke fixture 13、本地 API smoke 10/10、当前 strict all-target Clippy/fmt/include、142 静态检查与 Phase0 6 通过。AQ 1 MiB 容量1、Bun 传输2在最终二进制下另显式通过；不累加重叠过滤器。
+
+首次默认并发 lib 曾有1个 Codex EOF fixture 整段500ms外层截止超时（4774 passed/1 failed/7 ignored）；保留原始日志，同一最终二进制独跑3/3及4线程完整重跑通过。没有修改产品代码或测试断言，也不作性能声明。最终 unit binary 8ae138a72a80c9325d3b7fdf615e7447dc15173bd6d84e7bf15e18007baa4638，server binary 810faf56900e07160ffb054aba5b0d66445b36d805bc87d306bd03324a2c1370；build.rs 对 assets 变化重跑及 build time 使其与类别旧快照分开，旧 hash 未冒充当前。
+
+操作视图仍242=9 historical+233 fixture+0 live，11个粗粒度gate不变。真实订阅/Router/Share/OAuth/模型权限仍live_pending；离线readiness原始blocked_inputs、failures=0，RUN_TESTS=0 的内嵌gate未运行、真实输入缺失、部署未测如实保留。独立测试不改写该脚本状态。汇总 /tmp/cc-r7-final-validation.json，完整候选 /tmp/cc-r7-final-candidate.json，日志 /tmp/cc-r7-final-*；最终详细判定见增强计划§26.12。
+
+验证后仅回填本计划/协议证据的结果文字；代码、契约资产与测试断言无变化。未进行UI自动化、部署或真实账号调用；无外部参考修改、reset、commit或push，已有R6与其他工作均保留。

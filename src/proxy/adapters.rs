@@ -1253,6 +1253,13 @@ fn transform_body_for_upstream(
             "request body must be valid json for transform: {error}"
         ))
     })?;
+    let kimi_controls = if stored.provider_type == ProviderType::KimiCode {
+        Some(super::kimi::SourceControls::from_request(
+            stored.app, &input,
+        )?)
+    } else {
+        None
+    };
     let ollama_chat = stored.provider_type == ProviderType::OllamaCloud
         && upstream_format == UpstreamFormat::OpenAiChat;
     if ollama_chat {
@@ -1408,6 +1415,10 @@ fn transform_body_for_upstream(
         _ => Ok(input),
     }
     .map_err(|error| ProxyError::bad_request(format!("request transform failed: {error}")))?;
+
+    if let Some(controls) = kimi_controls {
+        controls.apply(&mut output, stored.app);
+    }
 
     if ollama_chat {
         super::ollama::normalize_chat(&mut output)

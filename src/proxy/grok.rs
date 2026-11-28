@@ -26,6 +26,7 @@ const GROK_SSE_INSPECTION_MAX_FRAME_LINES: usize = 128;
 const GROK_SSE_MAX_COMPLETED_SEARCHES: usize = 256;
 const GROK_SSE_MAX_SEARCH_KEY_BYTES: usize = 512;
 const GROK_QUALITY_DUMP_MIN_VISIBLE_CHARS: usize = 1024;
+const GROK_ENCRYPTED_HISTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GrokQualityObservation {
@@ -1297,9 +1298,9 @@ fn patch_grok_request_value(
         object.insert("model".to_string(), Value::String(model.clone()));
         model
     };
-    remove_recursive(value, "external_web_access");
     let store_false = value.get("store").and_then(Value::as_bool) == Some(false);
     if let Some(object) = value.as_object_mut() {
+        sanitize_external_web_access(object)?;
         object.remove("stream_options");
         object.remove("background");
         object.remove("metadata");
@@ -1322,7 +1323,7 @@ fn patch_grok_request_value(
             retain_responses_allowlist(object);
         }
     }
-    strip_invalid_encrypted_content(value);
+    validate_encrypted_history(value)?;
     Ok(protocol_transform)
 }
 
@@ -1840,8 +1841,6 @@ fn normalize_ws_response_body(
             );
         }
     }
-    remove_recursive(value, "stream_options");
-    remove_recursive(value, "background");
     if let Some(object) = value.as_object_mut() {
         object.remove("stream");
         object.insert("store".to_string(), Value::Bool(true));
@@ -2050,25 +2049,33 @@ fn grok_model_supports_reasoning_effort(model: &str) -> bool {
 }
 
 fn strip_server_item_ids(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            if object
+    let Some(items) = value.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for object in items.iter_mut().filter_map(Value::as_object_mut) {
+        // Only the direct protocol item ID is server-owned. Schemas, defaults,
+        // arguments and tool outputs can contain arbitrary business IDs.
+        let native_item = object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                super::protocol_compat::GROK_RESPONSES_INPUT_ITEM_TYPES.contains(&kind)
+            })
+            || (object.get("type").is_none()
+                && object
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| {
+                        matches!(role, "user" | "assistant" | "system" | "developer")
+                    }));
+        if native_item
+            && object
                 .get("id")
                 .and_then(Value::as_str)
                 .is_some_and(is_server_item_id)
-            {
-                object.remove("id");
-            }
-            for child in object.values_mut() {
-                strip_server_item_ids(child);
-            }
+        {
+            object.remove("id");
         }
-        Value::Array(items) => {
-            for child in items {
-                strip_server_item_ids(child);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -2429,92 +2436,67 @@ fn remove_keys(object: &mut Map<String, Value>, keys: &[&str]) {
     }
 }
 
-fn remove_recursive(value: &mut Value, key: &str) {
-    match value {
-        Value::Object(object) => {
-            object.remove(key);
-            for value in object.values_mut() {
-                remove_recursive(value, key);
+fn sanitize_external_web_access(object: &mut Map<String, Value>) -> Result<(), ProxyError> {
+    fn remove_enabled_control(
+        object: &mut Map<String, Value>,
+        path: &str,
+    ) -> Result<(), ProxyError> {
+        match object.get("external_web_access") {
+            None => return Ok(()),
+            Some(Value::Bool(true)) => {}
+            Some(Value::Bool(false)) => {
+                return Err(ProxyError::protocol_incompatible(format!(
+                    "Grok {path}.external_web_access=false cannot be represented without broadening search access"
+                )));
+            }
+            Some(_) => {
+                return Err(ProxyError::bad_request(format!(
+                    "Grok {path}.external_web_access must be a boolean"
+                )));
             }
         }
-        Value::Array(items) => {
-            for item in items {
-                remove_recursive(item, key);
-            }
-        }
-        _ => {}
+        object.remove("external_web_access");
+        Ok(())
     }
-}
-
-fn strip_invalid_encrypted_content(value: &mut Value) {
-    strip_invalid_encrypted_content_inner(value);
-}
-
-fn strip_invalid_encrypted_content_inner(value: &mut Value) -> bool {
-    match value {
-        Value::Object(object) => {
-            let mut invalid = object
-                .get("encrypted_content")
-                .is_some_and(|content| !is_valid_grok_encrypted_content(content));
-            if invalid {
-                object.remove("encrypted_content");
+    // The legacy top-level switch and native web-search declaration are the
+    // only reviewed control paths. A same-named schema property is user data.
+    remove_enabled_control(object, "request")?;
+    if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
+        for (index, tool) in tools.iter_mut().enumerate() {
+            if tool.get("type").and_then(Value::as_str) == Some("web_search") {
+                if let Some(tool) = tool.as_object_mut() {
+                    remove_enabled_control(tool, &format!("tools[{index}]"))?;
+                }
             }
-            for value in object.values_mut() {
-                invalid |= strip_invalid_encrypted_content_inner(value);
-            }
-            invalid
         }
-        Value::Array(items) => {
-            items.retain_mut(|item| !strip_invalid_encrypted_content_inner(item));
-            false
-        }
-        _ => false,
     }
+    Ok(())
 }
 
-fn is_valid_grok_encrypted_content(value: &Value) -> bool {
-    let Some(content) = value.as_str() else {
-        return false;
+fn validate_encrypted_history(value: &Value) -> Result<(), ProxyError> {
+    let Some(items) = value.get("input").and_then(Value::as_array) else {
+        return Ok(());
     };
-    let trimmed = content.trim();
-    if trimmed.len() < 50 || trimmed.len() > 8 * 1024 * 1024 {
-        return false;
+    for (index, item) in items.iter().enumerate() {
+        if !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("reasoning" | "compaction")
+        ) {
+            continue;
+        }
+        if let Some(content) = item.get("encrypted_content") {
+            if !content.as_str().is_some_and(|content| {
+                content.len() <= GROK_ENCRYPTED_HISTORY_MAX_BYTES && !content.trim().is_empty()
+            }) {
+                return Err(ProxyError::bad_request(format!(
+                    "Grok input[{index}].encrypted_content must be a nonempty string of at most {GROK_ENCRYPTED_HISTORY_MAX_BYTES} bytes"
+                )));
+            }
+        }
     }
-    if trimmed.contains('=') || trimmed.starts_with("gAAAA") {
-        return false;
-    }
-    let Ok(decoded) = URL_SAFE_NO_PAD.decode(trimmed) else {
-        return false;
-    };
-    if decoded.len() < 32 || decoded.len() > 8 * 1024 * 1024 {
-        return false;
-    }
-    normalized_shannon_entropy(&decoded) >= 0.85
-}
-
-fn normalized_shannon_entropy(bytes: &[u8]) -> f64 {
-    if bytes.is_empty() {
-        return 0.0;
-    }
-    let mut counts = [0usize; 256];
-    for byte in bytes {
-        counts[*byte as usize] += 1;
-    }
-    let len = bytes.len() as f64;
-    let entropy = counts
-        .into_iter()
-        .filter(|count| *count > 0)
-        .map(|count| {
-            let probability = count as f64 / len;
-            -probability * probability.log2()
-        })
-        .sum::<f64>();
-    let max_entropy = len.min(256.0).log2().min(8.0);
-    if max_entropy <= 0.0 {
-        0.0
-    } else {
-        entropy / max_entropy
-    }
+    // Opaque native history is not a base64/entropy format owned by Server.
+    // Upstream rejection does not authorize stripping client history or replay.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2918,7 +2900,7 @@ mod tests {
     }
 
     #[test]
-    fn strips_invalid_encrypted_content_without_rejecting_request() {
+    fn non_reasoning_encrypted_fields_are_not_interpreted() {
         let mut body = json_body(json!({
             "model": "grok",
             "input": [
@@ -2930,9 +2912,134 @@ mod tests {
 
         patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap();
         let value = serde_json::from_slice::<Value>(&body).unwrap();
-        assert_eq!(value["input"].as_array().unwrap().len(), 1);
-        assert_eq!(value["input"][0]["content"], "keep");
+        assert_eq!(value["input"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            value["input"][0]["encrypted_content"],
+            "gAAAAinvalid-from-other-provider"
+        );
+        assert_eq!(value["input"][1]["content"], "keep");
         assert!(value["metadata"].get("encrypted_content").is_none());
+    }
+
+    #[test]
+    fn grok_r6_native_encrypted_history_is_opaque_and_invalid_shapes_are_atomic() {
+        let history = json!([
+            {"type":"reasoning","encrypted_content":" gAAAAfuture-format== ","summary":[]},
+            {"type":"compaction","encrypted_content":"opaque-native-压缩"}
+        ]);
+        let mut body = json_body(json!({"model":"grok-4.6","input":history}));
+        patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap();
+        let sent: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sent["input"], history);
+        for kind in ["reasoning", "compaction"] {
+            for content in [
+                Value::Null,
+                json!(7),
+                json!({}),
+                json!([]),
+                json!(""),
+                json!(" \t"),
+            ] {
+                let mut body = json_body(json!({
+                    "model":"grok-4.6",
+                    "input":[{"type":kind,"encrypted_content":content}]
+                }));
+                let original = body.clone();
+                let error =
+                    patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap_err();
+                assert_eq!(error.status, StatusCode::BAD_REQUEST);
+                assert!(error.message.contains("input[0].encrypted_content"));
+                assert_eq!(
+                    body, original,
+                    "failed preparation must not replace the body"
+                );
+            }
+        }
+        let mut body = json_body(
+            json!({"input":[{"type":"reasoning","encrypted_content":"x".repeat(GROK_ENCRYPTED_HISTORY_MAX_BYTES + 1)}]}),
+        );
+        assert!(patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).is_err());
+    }
+
+    #[test]
+    fn grok_r6_store_false_only_removes_direct_native_item_ids() {
+        let data = json!({"id":"msg_invoice","encrypted_content":{},"external_web_access":false});
+        let arguments = data.to_string();
+        let mut body = json_body(json!({
+            "model":"grok-4.6","store":false,
+            "input":[
+                {"type":"message","id":"msg_upstream","role":"user","content":[{"type":"input_text","text":arguments,"id":"msg_business"}]},
+                {"type":"function_call","id":"fc_upstream","call_id":"fc_client_call","name":"save_record","arguments":arguments},
+                {"type":"function_call_output","call_id":"fc_client_call","output":arguments}
+            ],
+            "tools":[{"type":"function","name":"save_record","parameters":{"type":"object","properties":{"record":{"type":"object","default":data,"examples":[data]}}}}]
+        }));
+        patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap();
+        let sent: Value = serde_json::from_slice(&body).unwrap();
+        assert!(sent["input"][0].get("id").is_none());
+        assert!(sent["input"][1].get("id").is_none());
+        assert_eq!(sent["input"][0]["content"][0]["id"], "msg_business");
+        assert_eq!(sent["input"][1]["call_id"], "fc_client_call");
+        assert_eq!(sent["input"][1]["arguments"], arguments);
+        assert_eq!(sent["input"][2]["output"], arguments);
+        assert_eq!(
+            sent["tools"][0]["parameters"]["properties"]["record"]["default"],
+            data
+        );
+        assert_eq!(
+            sent["tools"][0]["parameters"]["properties"]["record"]["examples"][0],
+            data
+        );
+    }
+
+    #[test]
+    fn grok_r6_external_web_controls_are_typed_and_cannot_broaden_access() {
+        let request = |control| {
+            json!({
+                "model":"grok-4.6","input":"hello",
+                "tools":[{"type":"web_search","external_web_access":control}]
+            })
+        };
+        let mut body = json_body(request(json!(true)));
+        patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap();
+        let sent: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sent["tools"], json!([{"type":"web_search"}]));
+        for control in [json!(false), Value::Null, json!("false"), json!({})] {
+            let expected = if control == json!(false) {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            let mut body = json_body(request(control));
+            let original = body.clone();
+            let error = patch_grok_request_body(&mut body, ProxyRoute::CodexResponses).unwrap_err();
+            assert_eq!(error.status, expected);
+            assert!(error.message.contains("tools[0].external_web_access"));
+            assert_eq!(body, original);
+        }
+        for kind in [
+            "web_search_preview",
+            "web_search_preview_2025_03_11",
+            "web_search_2025_08_26",
+        ] {
+            for deferred in [false, true] {
+                let tools = json!([{"type":kind,"external_web_access":false}]);
+                let request = if deferred {
+                    json!({"model":"grok-4.6","input":[{"type":"additional_tools","tools":tools}]})
+                } else {
+                    json!({"model":"grok-4.6","input":"hello","tools":tools})
+                };
+                let mut body = json_body(request.clone());
+                assert!(
+                    patch_grok_request_body(&mut body, ProxyRoute::CodexResponses)
+                        .unwrap_err()
+                        .is_protocol_incompatible()
+                );
+                assert!(ws_request_body(request, Some("session"))
+                    .unwrap_err()
+                    .is_protocol_incompatible());
+            }
+        }
     }
 
     #[test]
@@ -3233,7 +3340,10 @@ mod tests {
         assert!(response.get("background").is_none());
         assert!(response.get("instructions").is_none());
         assert_eq!(response["store"], true);
-        assert_eq!(response["input"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            response["input"],
+            json!([{"encrypted_content":"gAAAAinvalid"}])
+        );
         assert_eq!(response["prompt_cache_key"], "session-1");
     }
 

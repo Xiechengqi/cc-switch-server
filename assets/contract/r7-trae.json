@@ -1,0 +1,155 @@
+{
+  "schemaVersion": 1,
+  "round": "R7",
+  "recordedOn": "2026-11-27",
+  "providerClass": "trae",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "sourceCommit": "848be22958ee1499d02ce374f571b0241b558dc3",
+  "sourceDigest": "c36cc58ad46883c48f34a184ed6ca75cd209d1555847d458fd5fba64bf735983",
+  "binarySha256": "289a771ca4050c00a0e360f2749ce64ae1b71c534b6ef478c9484a2f82abeda8",
+  "sourceFiles": [
+    {
+      "path": "src/proxy/trae_runtime.rs",
+      "sha256": "b1919ed07bdb386ee4b812c9004463298c1e9db7a2cb42784227cad66eb152e0"
+    },
+    {
+      "path": "src/proxy/trae_runtime/lease.rs",
+      "sha256": "62591ac12407e889b5d1a3aae822f7e52644afa5990c24ca3ee6076a1a14cbc1"
+    },
+    {
+      "path": "src/proxy/forwarder.rs",
+      "sha256": "d544507b8b269e32db0de064addf532d1bfb13a92649fecf24e73960b2675e75"
+    },
+    {
+      "path": "src/proxy/forwarder/trae_r7_tests.rs",
+      "sha256": "532e3df5f1663422d99f0781388cc9c84f035359e4d593071a563146908ba2e1"
+    },
+    {
+      "path": "src/state.rs",
+      "sha256": "14f600d9232538e262494e7b5837e21b09ce156fbd0a1553bb9a7d8ff7baf377"
+    }
+  ],
+  "referenceEvidence": {
+    "path": "assets/contract/r6-trae.json",
+    "sha256": "9521786f2a33a523c981748f890216ef53e40cb04e5d5cfe5392de07fe86df4a",
+    "commit": "f7b75787680c7aded6b277aee05ddfc7fbac4ba8",
+    "scope": "existing frozen source; no new independent wire evidence; old dialect/function/image gates retained"
+  },
+  "planItems": [
+    {
+      "id": "R7-TR-01",
+      "status": "fixture_verified"
+    }
+  ],
+  "cases": [
+    {
+      "id": "prepared-empty",
+      "tests": [
+        "r7_trae_prepared_empty_catalog_is_revoked_before_send",
+        "trae_catalog_keeps_visible_models_and_authoritative_empty"
+      ]
+    },
+    {
+      "id": "prepared-capability",
+      "tests": [
+        "r7_trae_prepared_capability_change_is_revoked_before_send"
+      ]
+    },
+    {
+      "id": "prepared-invalidate",
+      "tests": [
+        "r7_trae_prepared_explicit_invalidation_is_revoked_before_send"
+      ]
+    },
+    {
+      "id": "prepared-aba",
+      "tests": [
+        "r7_trae_prepared_aba_does_not_revive_old_catalog"
+      ]
+    },
+    {
+      "id": "prepared-equal",
+      "tests": [
+        "r7_trae_equal_catalog_rediscovery_keeps_prepared_admission"
+      ]
+    },
+    {
+      "id": "intl-uncatalogued",
+      "tests": [
+        "r7_trae_intl_uncatalogued_explicit_model_keeps_prepared_admission"
+      ]
+    },
+    {
+      "id": "cache-pressure-and-lifecycle",
+      "tests": [
+        "r7_trae_catalog_epoch_survives_payload_index_eviction",
+        "r7_trae_uncached_payload_retains_its_revocation_channel",
+        "r7_trae_epoch_scope_capacity_is_bounded_and_owners_release",
+        "r7_trae_equal_catalog_reuses_charged_data_and_failed_change_revokes",
+        "r7_trae_cancelled_uncached_owner_releases_payload_and_lazy_index"
+      ]
+    },
+    {
+      "id": "snapshot-own-ttl",
+      "tests": [
+        "r7_trae_equal_rediscovery_preserves_each_prepared_snapshot_ttl"
+      ]
+    }
+  ],
+  "localPolicy": {
+    "cachedPayloadCount": 128,
+    "cachedPayloadBytes": 33554432,
+    "activeDiscoveryKeys": 64,
+    "epochScopeLimit": 256,
+    "freshTtlMs": 480000,
+    "staleHardAgeMs": 86400000,
+    "staleAdmission": "only snapshots created through existing transient fallback",
+    "equalRediscovery": "same epoch/data, separate snapshot times",
+    "payloadEvictionRevokes": false,
+    "explicitInvalidationRevokes": true,
+    "abaRevivesOldLease": false,
+    "intlCatalogAuthorization": false,
+    "directoryCheck": "before native Sent; existing sent-request terminal/cancellation/usage behavior retained",
+    "memoryMeasurement": "conservative logical charges, not RSS"
+  },
+  "redEvidence": {
+    "passed": 2,
+    "failed": 4,
+    "scope": "negative loops stop on first CN SOLO/Claude send; equal and Intl positive matrices complete",
+    "logSha256": "cee4333f9a44082595e567fc5d4fa324a58a6fe07dde239346bd6c6ab9afbc7f",
+    "binarySha256": "c1d40ca74fc1c302359ddc18b0f58ed9e9ea81ca7162fa977b27447fac3dc3c4"
+  },
+  "validation": {
+    "results": {
+      "green2": {
+        "passed": 12,
+        "ignored": 0,
+        "logSha256": "e40c2571e5391093e947b556a317fab65765b012389c19c4dfeb31f0e9536706"
+      },
+      "regression": {
+        "passed": 81,
+        "ignored": 0,
+        "logSha256": "11aaeaac84c3aa8ce4da3444dc3b20c53d295c327d8d4fe98254a19e4601056c"
+      }
+    },
+    "countsMayOverlap": true,
+    "nodeAuditsPassed": 2216,
+    "strictAllTargetClippy": "passed",
+    "clippyLogSha256": "0e9c3defaf6eb08cb8cc0373228ff133b40b73d2a62a496e9c9e957e390e0335",
+    "cargoFmt": "passed",
+    "allSrcIncludeRustfmt": "passed",
+    "phase0Tests": 6,
+    "firstCandidate": "10 passed, 2 fixture failures from missing display_config; excluded as product regressions",
+    "realAcceptance": "live_pending"
+  },
+  "invariants": {
+    "fixedProviderAccountRailAndDevice": true,
+    "crossRailFallback": false,
+    "postCommitReplay": false,
+    "newDialectFunctionOrSoloImages": false,
+    "realEvidenceClaim": false,
+    "uiAutomation": false,
+    "deploymentTest": false
+  }
+}

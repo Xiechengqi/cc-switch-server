@@ -776,11 +776,23 @@ mod tests {
             results => panic!("expected exactly one setup success, got {results:?}"),
         };
         assert_eq!(rejected.status, StatusCode::CONFLICT);
+        assert_eq!(
+            outcome.setup_completion_notification_status.as_deref(),
+            Some("waiting_for_claim")
+        );
         assert!(outcome.warnings.iter().any(|warning| {
-            warning.contains("email notifications are disabled")
-                && warning.contains("no email was queued")
+            warning.contains("waiting for an authoritative Router client claim")
         }));
+        assert!(hints.lock().await.is_empty());
+        state.retry_pending_setup_completion_notification().await;
         let config = state.config_snapshot().await;
+        assert!(SetupOutcome::already_complete(&config)
+            .warnings
+            .iter()
+            .any(|warning| {
+                warning.contains("email notifications are disabled")
+                    && warning.contains("no email was queued")
+            }));
         let expected_hint = if config.verify_password("alpha-password-1") {
             assert!(!config.verify_password("beta-password-2"));
             "a******1"

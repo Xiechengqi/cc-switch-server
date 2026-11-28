@@ -228,6 +228,31 @@ impl ZenStream {
         super::validation::stream_usage(&value)?;
         match self.wire {
             ZenWire::Chat => {
+                if let Some(delta) = value.pointer_mut("/choices/0/delta") {
+                    if crate::proxy::chat_reasoning::ALIASES.iter().any(|key| {
+                        delta
+                            .get(*key)
+                            .is_some_and(|v| !v.is_null() && !v.is_string())
+                    }) {
+                        return Err(ProxyError::bad_gateway(
+                            "OpenCode Zen invalid plain reasoning delta",
+                        ));
+                    }
+                    if let Some(key) = delta
+                        .as_object()
+                        .and_then(crate::proxy::chat_reasoning::select_fields)
+                        .map(|(key, _)| key)
+                    {
+                        let fields = delta
+                            .as_object_mut()
+                            .expect("reasoning field belongs to an object");
+                        let text = fields.remove(key).expect("selected reasoning field exists");
+                        for key in crate::proxy::chat_reasoning::ALIASES {
+                            fields.remove(key);
+                        }
+                        fields.insert("reasoning_content".into(), text);
+                    }
+                }
                 if value.pointer("/choices/0/delta/function_call").is_some() {
                     return Err(ProxyError::bad_gateway(
                         "OpenCode Zen returned an unsupported legacy function delta",
@@ -237,9 +262,8 @@ impl ZenStream {
                     return Err(ProxyError::bad_gateway("OpenCode Zen data after [DONE]"));
                 }
                 let semantic = value.pointer("/choices/0/delta").is_some_and(|delta| {
-                    ["content", "reasoning_content", "reasoning", "refusal"]
-                        .iter()
-                        .any(|key| {
+                    crate::proxy::chat_reasoning::text(delta).is_some()
+                        || ["content", "refusal"].iter().any(|key| {
                             delta
                                 .get(*key)
                                 .and_then(Value::as_str)

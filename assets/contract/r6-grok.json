@@ -1,0 +1,194 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "round": "R6",
+  "providerClass": "grok_oauth",
+  "baseline": "f1e3e0dbb77fbe3d21c4ce52d12da05771db179f",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "referencePolicy": "read_only_committed_objects_never_build_test_runtime_or_release_dependency",
+  "references": [
+    {
+      "repository": "grok2api",
+      "commit": "8535932b0783db2033657f36e2e1a84196c4e151",
+      "tree": "8a6744f38251b7c4411356d113e99242477be053",
+      "files": [
+        {
+          "path": "backend/internal/infra/config/config.go",
+          "sha256": "219cf703228b7a4532efbd36f6a022511455f7faf91a1ac133ec69fc61478fe1"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/responses_reasoning_recovery.go",
+          "sha256": "5379850b4a929a89d7b4f839d658579d31f91a6f4f54c3c2bd27f8559546709c"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/responses_tool_types.go",
+          "sha256": "a76e83fb39868f836d155bdddf1978ab25369d596286e0347a99902a700cc90a"
+        },
+        {
+          "path": "backend/internal/infra/provider/cli/adapter.go",
+          "sha256": "4bffffb891d2c022533b8241fb72b32dbe92cb82c94131014aebf0bd12838fc6"
+        },
+        {
+          "path": "backend/internal/application/gateway/failure.go",
+          "sha256": "b670230dbd181466de32c5ff8f63d801f38908a90ee577b17eb72dbced817930"
+        }
+      ]
+    },
+    {
+      "repository": "sub2api",
+      "commit": "ab99d56e9626e6cd731592dae8553c9758a0efa2",
+      "tree": "eb5691dbf93e303b3fddcf16370c7ae0bbb7190a",
+      "files": [
+        {
+          "path": "backend/internal/service/grok_model_quota_block.go",
+          "sha256": "e8975bcee3fd2040415aaee82940cd29bbbd48d14472773a0239c8a37a1aa8a1"
+        }
+      ]
+    }
+  ],
+  "planItems": [
+    {
+      "id": "R6F-GR-01",
+      "status": "fixture_verified",
+      "scope": "protocol-path-only cleanup; business schemas/defaults/examples/arguments/results stay opaque; native encrypted history is not decoded or dropped by entropy heuristics"
+    },
+    {
+      "id": "R6F-GR-02",
+      "status": "reviewed_gated_no_wire_delta",
+      "scope": "capture endpoint and identity per operation; retain reviewed identity until independently accepted same-rail evidence; version number alone grants no rights",
+      "reason": "Reference Build 1.0.60 is a different generation origin; existing 1.0.13 minimum is backed by the frozen explicit user-reported upstream rejection. No independent same-account catalog-and-inference receipt authorizes replacement identity or a group header. The seven-operation matrix and executable current-identity negative controls preserve the reviewed default."
+    },
+    {
+      "id": "R6F-GR-03",
+      "status": "reviewed_gated_no_wire_delta",
+      "scope": "distinguish model and account limits only on sufficient same-rail evidence; unknown 429 stays conservative; no alternate model/account/plane or additional replay",
+      "reason": "Both recommended references recognize Build free-usage text and broad model hints. No independent target direct-XAI sample proves that text authorizes model-only admission. Unknown 429 remains account-scoped with reset evidence; the new actual-forwarder negative control verifies a single submission and no relogin/alternate plane."
+    }
+  ],
+  "identityMatrix": [
+    {
+      "operation": "oauth_device",
+      "endpoint": "auth.x.ai",
+      "source": "src/clients/oauth/grok_device.rs",
+      "identity": "reviewed version plus client-surface ui; fixed production auth endpoints"
+    },
+    {
+      "operation": "models",
+      "endpoint": "cli-chat-proxy.grok.com/v1/models",
+      "source": "src/clients/oauth/grok_models.rs",
+      "identity": "grok-shell/version with xai-grok-cli and grok-shell client identifier; exact account catalog"
+    },
+    {
+      "operation": "quota",
+      "endpoint": "cli-chat-proxy.grok.com and separately scoped Grok subscription/task usage origins",
+      "source": "src/clients/oauth/quota.rs",
+      "identity": "CLI quota carries grok-cli surface/headless mode; do not copy those onto every generation operation"
+    },
+    {
+      "operation": "http_inference",
+      "endpoint": "api.x.ai/v1/responses",
+      "source": "src/proxy/grok.rs",
+      "identity": "reviewed fixed OAuth CLI profile; no Build origin fallback"
+    },
+    {
+      "operation": "ws_inference",
+      "endpoint": "api.x.ai/v1/responses (wss)",
+      "source": "src/proxy/grok.rs",
+      "identity": "fixed session and optional validated client turn; no unverified conversation-group header"
+    },
+    {
+      "operation": "direct_media_and_task_control",
+      "endpoint": "api.x.ai/v1",
+      "source": "src/proxy/forwarder.rs",
+      "identity": "fixed bound OAuth and durable task owner/plane; chat does not grant media acceptance"
+    },
+    {
+      "operation": "web_session",
+      "endpoint": "separate hidden Web credential rail",
+      "source": "docs/provider/web-session.md",
+      "identity": "no OAuth/CLI acceptance inheritance"
+    }
+  ],
+  "cases": [
+    {
+      "id": "schema-business-keys-http-four-ingress-stream-and-json",
+      "tests": [
+        "grok_r6_http_preserves_schema_business_keys_on_all_surfaces"
+      ]
+    },
+    {
+      "id": "schema-business-keys-and-opaque-history-ws-three-envelopes",
+      "tests": [
+        "grok_r6_websocket_preserves_business_keys_and_opaque_history"
+      ]
+    },
+    {
+      "id": "invalid-native-controls-zero-outbound-and-no-account-penalty",
+      "tests": [
+        "grok_r6_invalid_native_controls_fail_before_network"
+      ]
+    },
+    {
+      "id": "client-cipher-rejection-and-unknown-429-single-attempt",
+      "tests": [
+        "grok_r6_upstream_errors_do_not_replay_or_infer_model_permissions"
+      ]
+    },
+    {
+      "id": "opaque-history-type-size-and-atomic-error",
+      "tests": [
+        "grok_r6_native_encrypted_history_is_opaque_and_invalid_shapes_are_atomic"
+      ]
+    },
+    {
+      "id": "native-item-id-boundary-business-defaults-and-outputs",
+      "tests": [
+        "grok_r6_store_false_only_removes_direct_native_item_ids"
+      ]
+    },
+    {
+      "id": "native-and-alias-search-permission-boundary",
+      "tests": [
+        "grok_r6_external_web_controls_are_typed_and_cannot_broaden_access"
+      ]
+    }
+  ],
+  "invariants": {
+    "fixedProviderAccountShareAndPlane": true,
+    "crossAccountFallback": false,
+    "crossPlaneFallback": false,
+    "postCommitReplay": false,
+    "realEvidenceClaim": false,
+    "uiAutomation": false,
+    "deploymentTest": false
+  },
+  "localPolicy": {
+    "defaultCliVersion": "1.0.13",
+    "referenceBuildVersion": "1.0.60",
+    "defaultIdentityChanged": false,
+    "groupHeaderEnabled": false,
+    "encryptedHistory": "typed direct input reasoning/compaction, nonempty string up to 8 MiB, preserve raw bytes",
+    "recursiveSchemaCleanup": false,
+    "invalidClientHistoryReplay": false,
+    "unrepresentableIndexedOnlySearch": "fail_before_send_422",
+    "malformedNativeCipher": "fail_before_send_400",
+    "unknown429": "bounded account cooldown; no diagnostic-text inference of model rights",
+    "modelScopedLimitActivation": "independent same-rail evidence required; not activated by this review",
+    "performanceClaim": false
+  },
+  "validation": {
+    "rustPaths": 493,
+    "rustSourceDigest": "713df000d3395d80600e6e528adcacac088bc9a33e079270be9dd165d20095d2",
+    "testCount": 310,
+    "testBinarySha256": "51e9a9b6cbf7fde838fb7872289d14185fa32f59ed945249563d35bbbcf71afd",
+    "nodeAuditPassed": 2207,
+    "strictAllTargetClippy": "passed",
+    "cargoFmt": "passed",
+    "allSrcIncludeRustfmt": "passed",
+    "transformsTests": 128,
+    "protocolCompatTests": 5,
+    "countsMayOverlap": true,
+    "realAcceptance": "live_pending"
+  }
+}

@@ -1,0 +1,128 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "round": "R6",
+  "providerClass": "buddy",
+  "baseline": "f1e3e0dbb77fbe3d21c4ce52d12da05771db179f",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "referencePolicy": "read_only_committed_objects_never_build_test_runtime_or_release_dependency",
+  "references": [
+    {
+      "repository": "CodeBuddy/workbuddy2api-hub",
+      "commit": "99fa0f5707554d2d7520307d3e03cbf9779cd878",
+      "tree": "50dc4dc89cadc40c61267109c6d2927d3dddc403",
+      "files": [
+        {
+          "path": "wb_identity.py",
+          "sha256": "d5dd5cf6882dfa7ffe0155621461fa70f254e55ac0caddf70dbb159356fce7d2"
+        }
+      ]
+    },
+    {
+      "repository": "cli2api",
+      "commit": "ccd4744555060a9b78882f246263c7060d8cb6bb",
+      "tree": "2f5233f533194d1260fe0b02d9ac9961c944757a",
+      "files": [
+        {
+          "path": "internal/providers/workbuddy/headers.go",
+          "sha256": "3fae3e39bd29dec666bdab3c1a8bbbcf35581cd1ec50f3abb61d0e5679f026e6"
+        },
+        {
+          "path": "internal/providers/workbuddy/credential.go",
+          "sha256": "24a984fe82d8f4312901c5c8a50d5f4014dff671ae7361b170dabe48f7c446c8"
+        }
+      ]
+    }
+  ],
+  "planItems": [
+    {
+      "id": "R6F-BD-01",
+      "status": "fixture_verified",
+      "scope": "Exact-scope authoritative catalog epochs fence old prepared requests before native send and through the existing currentness/settlement checks; optional cache retention is separate."
+    },
+    {
+      "id": "R6F-BD-02",
+      "status": "reviewed_gated_no_wire_delta",
+      "reason": "Retain reviewed CLI 2.142.0 identity. Hub defaults to CLI 2.168.2 with logical-turn/root equality; cli2api uses CLI 2.176.0 and conversation-request=session without root. No independent same-version/product/site receipt resolves this difference or authorizes a mixed identity bundle. Stable conversation IDs alone do not prove upstream history storage, cache benefit or latency improvement."
+    }
+  ],
+  "snapshotPolicy": {
+    "changed_authoritative_catalog": "advance epoch even when optional payload caching is refused",
+    "equal_catalog_while_snapshot_alive": "preserve epoch; old prepared admission TTL is not extended",
+    "explicit_invalidation": "advance epoch and clear optional cached value; ABA body restoration cannot revive old generations",
+    "optional_cache_eviction": "does not revoke snapshots or remove their scope revocation channel",
+    "fresh_prepared_admission": "original 8-minute TTL checked immediately before the conservative Sent boundary",
+    "transient_stale_prepare": "existing explicit transient-only fallback up to 24 hours; no new stale/static authorization",
+    "failed_management_refresh": "marks retained entry stale; unchanged old fresh prepared grant may finish its original TTL; no invented revocation fact",
+    "already_admitted_response": "TTL alone does not cancel; authoritative epoch changes use existing failure/observed-usage settlement and never replay generation",
+    "resource_bounds": "reuse existing 128-scope/flight bound and parent owner; cached-only leases may be evicted; active snapshots and waiters remain pinned"
+  },
+  "cases": [
+    {
+      "id": "known-empty-before-production-send",
+      "tests": [
+        "buddy_r6_prepared_empty_catalog_is_fenced_before_native_send"
+      ]
+    },
+    {
+      "id": "tool-permission-change-before-production-send",
+      "tests": [
+        "buddy_r6_prepared_tool_permission_is_fenced_before_native_send"
+      ]
+    },
+    {
+      "id": "default-change-and-current-snapshot-positive-control",
+      "tests": [
+        "buddy_r6_prepared_default_change_is_fenced_before_native_send"
+      ]
+    },
+    {
+      "id": "optional-cache-pressure-invalidation-aba-and-scope",
+      "tests": [
+        "buddy_r6_catalog_lease_survives_optional_cache_refusal_and_rejects_aba"
+      ]
+    },
+    {
+      "id": "equal-refresh-ttl-and-explicit-stale-policy",
+      "tests": [
+        "buddy_r6_equal_refresh_preserves_epoch_but_not_the_old_admission_ttl"
+      ]
+    },
+    {
+      "id": "eviction-preserves-revocation-channel",
+      "tests": [
+        "buddy_r6_optional_eviction_preserves_the_later_revocation_channel"
+      ]
+    }
+  ],
+  "redEvidence": {
+    "kind": "production_preparation_and_native_send_boundary",
+    "passed": 0,
+    "failed": 3,
+    "result": "empty/tool/default authoritative replacement each still sent one old prepared POST",
+    "log": "/tmp/cc-r6-buddy-red1.log"
+  },
+  "validation": {
+    "rustFilter": "buddy",
+    "passed": 260,
+    "failed": 0,
+    "r6Tests": 6,
+    "backendNodePassed": 2207,
+    "strictAllTargetClippy": "passed",
+    "cargoFmt": "passed",
+    "explicitIncludeRustfmt": "passed",
+    "phase0WriterEvidence": "regenerated_by_audit_script_and_checked",
+    "rustInputCount": 496,
+    "rustInputDigest": "add970b9db1e73689ea9b241d5a20b796658fbcf5c0bbf6fe60a16d0f180e313",
+    "rustInputDigestMethod": "sha256 of canonical path/sha256 array; src/tests Rust plus Cargo.toml/Cargo.lock/build.rs",
+    "testBinarySha256": "02436786bcb6f7a6661783def60476f61b96b7a185c11c8ae55683d61999cf6b",
+    "sourceState": "uncommitted_r6_class_snapshot"
+  },
+  "limitations": [
+    "Local fixture evidence is not vendor acceptance.",
+    "The new native-send counterexamples use the production facade and send function, not a full Router ingress ceremony.",
+    "No UI automation, deployment, real-account changes, commit or push.",
+    "CodeBuddy and WorkBuddy remain separate products/sites; all new-identity and joint native-login/CLI-inference acceptances remain live_pending."
+  ]
+}

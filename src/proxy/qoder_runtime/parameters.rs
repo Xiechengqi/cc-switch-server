@@ -78,6 +78,13 @@ pub(crate) fn source_controls(
             }
         }
     }
+    // Explicitly clear any effort guessed by a generic bridge when the
+    // source supplied no level (including Gemini's dynamic budget marker).
+    let effort = source_reasoning_effort(app, input)?;
+    controls.insert(
+        "reasoning_effort".into(),
+        effort.map_or(Value::Null, |effort| Value::String(effort.into())),
+    );
     generation_parameters(&controls)?;
     if app == AppKind::Claude {
         if let Some(choice) = input.get("tool_choice").filter(|v| !v.is_null()) {
@@ -119,6 +126,128 @@ pub(crate) fn source_controls(
         }
     }
     Ok(controls)
+}
+
+// Validate before generic bridges can turn an off switch or an exact
+// token budget into an unrelated effort default. This only selects the
+// existing Qoder directive; it introduces no new upstream control field.
+fn source_reasoning_effort(
+    app: crate::domain::providers::model::AppKind,
+    input: &Value,
+) -> Result<Option<&'static str>, String> {
+    use crate::domain::providers::model::AppKind;
+    let mut selected = None;
+    if input
+        .get("reasoning_budget_tokens")
+        .is_some_and(|v| !v.is_null())
+    {
+        return Err("Qoder cannot enforce an exact reasoning token budget; use an effort level or omit the control".into());
+    }
+    if let Some(value) = input.get("reasoning_effort").filter(|v| !v.is_null()) {
+        merge_source_effort(&mut selected, value)?;
+    }
+    if let Some(reasoning) = input.get("reasoning").filter(|v| !v.is_null()) {
+        if !reasoning.is_object() {
+            return Err("Qoder reasoning must be an object".into());
+        }
+        if reasoning.get("budget_tokens").is_some_and(|v| !v.is_null()) {
+            return Err("Qoder cannot enforce an exact reasoning token budget; use an effort level or omit the control".into());
+        }
+        if let Some(value) = reasoning.get("effort").filter(|v| !v.is_null()) {
+            merge_source_effort(&mut selected, value)?;
+        }
+    }
+    if app == AppKind::Claude {
+        if let Some(config) = input.get("output_config").filter(|v| !v.is_null()) {
+            if !config.is_object() {
+                return Err("Qoder output_config must be an object".into());
+            }
+            if let Some(value) = config.get("effort").filter(|v| !v.is_null()) {
+                merge_source_effort(&mut selected, value)?;
+            }
+        }
+        if let Some(thinking) = input.get("thinking").filter(|v| !v.is_null()) {
+            let kind = thinking
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or("Qoder thinking requires an explicit type")?;
+            if thinking.get("budget_tokens").is_some_and(|v| !v.is_null()) {
+                return Err("Qoder cannot enforce an exact reasoning token budget; use an effort level or omit the control".into());
+            }
+            if let Some(value) = thinking.get("effort").filter(|v| !v.is_null()) {
+                merge_source_effort(&mut selected, value)?;
+            }
+            match kind {
+                "disabled" => merge_source_effort(&mut selected, &Value::String("none".into()))?,
+                "enabled" | "adaptive" => {
+                    if selected == Some("none") {
+                        return Err("Qoder reasoning controls conflict".into());
+                    }
+                    // Preserve the existing no-level enabled default.
+                    selected.get_or_insert("medium");
+                }
+                _ => return Err("Qoder thinking type is unsupported".into()),
+            }
+        }
+    }
+    if app == AppKind::Gemini {
+        for name in ["generationConfig", "generation_config"] {
+            let Some(config) = input.get(name).filter(|v| !v.is_null()) else {
+                continue;
+            };
+            if !config.is_object() {
+                return Err("Qoder generationConfig must be an object".into());
+            }
+            for name in ["thinkingConfig", "thinking_config"] {
+                let Some(thinking) = config.get(name).filter(|v| !v.is_null()) else {
+                    continue;
+                };
+                if !thinking.is_object() {
+                    return Err("Qoder thinkingConfig must be an object".into());
+                }
+                for name in ["thinkingLevel", "thinking_level"] {
+                    if let Some(value) = thinking.get(name).filter(|v| !v.is_null()) {
+                        merge_source_effort(&mut selected, value)?;
+                    }
+                }
+                for name in ["thinkingBudget", "thinking_budget"] {
+                    let Some(value) = thinking.get(name).filter(|v| !v.is_null()) else {
+                        continue;
+                    };
+                    match value.as_i64() {
+                        Some(0) => merge_source_effort(&mut selected, &Value::String("none".into()))?,
+                        Some(-1) => (), // Dynamic/default, never a concrete effort.
+                        _ => return Err("Qoder cannot enforce an exact reasoning token budget; use an effort level or omit the control".into()),
+                    }
+                }
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn merge_source_effort(selected: &mut Option<&'static str>, value: &Value) -> Result<(), String> {
+    let raw = value
+        .as_str()
+        .filter(|raw| raw.len() <= 32)
+        .ok_or("Qoder reasoning effort must be a supported short string")?;
+    let effort = match raw.trim().to_ascii_lowercase().as_str() {
+        "none" | "disabled" | "off" => "none",
+        "minimal" | "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" | "very_high" | "very-high" | "max" => "max",
+        _ => {
+            return Err(
+                "Qoder reasoning effort is unsupported; use none, low, medium, high or max".into(),
+            )
+        }
+    };
+    if selected.is_some_and(|old| old != effort) {
+        return Err("Qoder reasoning controls conflict".into());
+    }
+    *selected = Some(effort);
+    Ok(())
 }
 
 pub(super) fn validate_catalog(config: &Map<String, Value>) -> Result<(), String> {

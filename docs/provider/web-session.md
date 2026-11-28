@@ -111,3 +111,12 @@ node scripts/audit/audit-web-session-registry.mjs --check --check-sources
 
 
 R5 公共切片：Grok/Perplexity Web分别用两个固定计时标签，完整严格缓冲之后观察语义/终态；本地count_tokens不伪造send/headers或socket写成功。生产runtime在发送前为每个当前配置scope预留session/auth槽（总数最多1024，session id≤512字节），与进程父预算相连。401/403失效标记没有TTL/容量淘汰；降低父限额后已准入scope仍可写入失效标记，必须显式凭据/配置scope代际变化或删除才释放。容量拒绝为503且发生在发网前。通用task类型没有生产写入口，未新增任务或续接能力。公共合同见 `assets/contract/r5-shared-core.json`；四scope继续live_pending。
+
+
+## R7 请求内存预算与增量流研究（2026-11-27）
+
+四 Profile 的 pinned/Share 请求均在解压前按真实 Driver 启用既有请求预算。原请求、一次 canonical 解析、翻译工作集与编码、严格响应缓冲、Perplexity accumulator/稀疏 patch/内嵌 JSON、最终 JSON/SSE 编码及实际返回 Bytes 均有分阶段 owner。输出直接写入已精确计数的 Vec，clone/slice 持有到最后释放。该预算是保守逻辑计费，进程父限额仍按原配置决定是否硬限制，不能描述为 RSS 测量。
+
+容量拒绝是本地 503/memory_capacity；网络前为零生成，网络后最多原一次生成，不重试、不罚 Provider 健康、不要求 Cookie 重导入。新增十项及 Web 关键字 38 项通过（含其他管理员会话且计数重叠），包括充足预算下同一 sparse/nested 协议的正向检查，证据见 `assets/contract/r7-web-claude.json` / `r7-web-codex.json` 和增强计划 §26.6。
+
+真正增量流的 WEB-02 按 `reviewed_gated_no_wire_delta` 退出：参考 token/全文及 patch/最终快照尚无独立单调一致性、引用、strict EOF、背压和取消合同。继续完整严格缓冲后渲染 SSE；四 Profile 的真实 Cookie/模型接受性、可见性与成熟度门禁保持，不从 SSE 外观推断逐 token 能力。

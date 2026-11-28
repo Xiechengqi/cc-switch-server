@@ -1,0 +1,196 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "round": "R6",
+  "providerClass": "opencode_zen",
+  "baseline": "f1e3e0dbb77fbe3d21c4ce52d12da05771db179f",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "referencePolicy": "read_only_committed_objects_never_build_test_runtime_or_release_dependency",
+  "references": [
+    {
+      "repository": "OpenCode/zen-gate",
+      "commit": "58fa1b7bd98662696ff92777c3c7e4957058b111",
+      "tree": "5add07686303744e3fc376843eb5d6c54d61e2b5",
+      "files": [
+        {
+          "path": "internal/lane/stream.go",
+          "sha256": "fb88a3ba50fc5cbf9d22777c57b00c4056ca044dbcb45fd30735f4fe9a21b957"
+        },
+        {
+          "path": "internal/lane/client.go",
+          "sha256": "782ddb65920c96d33390307f2a38dec881219adebc0dfd21071a3f0639d7bad4"
+        },
+        {
+          "path": "internal/lane/upstream.go",
+          "sha256": "9ceb32c401753d60e3151e7a4d1f59dac9bcb013fc33e3e9cb840b182abb1f3c"
+        }
+      ]
+    },
+    {
+      "repository": "OpenCode/opencode",
+      "commit": "cd0d037d68f389230c6452f846b3a43635cf2bf9",
+      "tree": "eff31efb682e8eda9b65c915f13c8040a731608b",
+      "files": [
+        {
+          "path": "packages/ai/src/protocols/openai-chat.ts",
+          "sha256": "7844a969c3ccb9bf2542333c4ae463711ca2f6beeca2267271225f3ec633ce7b"
+        },
+        {
+          "path": "packages/ai/src/route/executor.ts",
+          "sha256": "774f55a296a4034c80f2caf0e610c273f818f922b76256fe0f59e807804bbb54"
+        }
+      ]
+    }
+  ],
+  "planItems": [
+    {
+      "id": "R6-ZEN-01",
+      "status": "fixture_verified",
+      "scope": "One plain-alias selector feeds common conversion, timing, Zen aggregation, semantic terminal checks and checkpoint selection; per-delta canonicalization deduplicates aliases without touching tool JSON."
+    },
+    {
+      "id": "R6-CORE-01",
+      "status": "fixture_verified",
+      "scope": "Exactly one buffered decoder lifecycle moved from lexical include into a real typed Rust module called by both initial and continuation paths; settlement/retry/state writers remain with their existing owners."
+    },
+    {
+      "id": "R6-ZEN-02",
+      "status": "resource_baseline_measured",
+      "scope": "Pinned Bun/lane/stdio transport normal and isolated-cgroup pressure experiments; negative128MiB/384MiB-high typed504 retained explicitly. Decisions and measurement limits are in r6-zen-resources.json."
+    }
+  ],
+  "aliasPolicy": {
+    "supported": [
+      "reasoning_content",
+      "reasoning_text",
+      "reasoning"
+    ],
+    "priority": "first nonblank in existing Server priority content,text,reasoning; if only whitespace exists, preserve the first nonempty whitespace fragment",
+    "perDelta": "one selected string moved into canonical reasoning_content; do not concatenate simultaneous competing/duplicate aliases",
+    "acrossDeltas": "append the selected fragment once in upstream order, retaining whitespace bytes",
+    "objects": "do not reinterpret thinking/reasoning_details/opaque objects as new text; Zen known plain alias non-string/non-null is an error; existing non-Zen completed reasoning.summary fallback remains",
+    "tools": "only exact choices[0].delta fields are normalized; schema, args and nested same-name values are not traversed",
+    "continuation": "existing buffered Chat one-continuation policy and budget remain; no stream auto-replay is introduced"
+  },
+  "moduleExtraction": {
+    "path": "src/proxy/forwarder/opencode_zen_document.rs",
+    "productionEntrypoint": "read_document",
+    "normalizedBeforeAfterBodySha256": "13e1b38fb462959a47debb91803dfc0de61164621d424da2347f934fdc8d4e78",
+    "normalization": "function visibility/name and crate import roots plus whitespace only; identical function body",
+    "interfaces": "explicit stored provider, prepared request, route, execution deadline, timing, usage and request-memory owners; returns Value plus the original reservation",
+    "newDependencyOrWriter": false
+  },
+  "cases": [
+    {
+      "id": "opencode_zen_r6_aliases_survive_formal_forwarder_on_three_surfaces_and_both_modes",
+      "tests": [
+        "opencode_zen_r6_aliases_survive_formal_forwarder_on_three_surfaces_and_both_modes"
+      ]
+    },
+    {
+      "id": "opencode_zen_r6_alias_normalization_preserves_native_tool_argument_values",
+      "tests": [
+        "opencode_zen_r6_alias_normalization_preserves_native_tool_argument_values"
+      ]
+    },
+    {
+      "id": "opencode_zen_r6_reasoning_text_after_finish_fails_on_formal_forwarder",
+      "tests": [
+        "opencode_zen_r6_reasoning_text_after_finish_fails_on_formal_forwarder"
+      ]
+    },
+    {
+      "id": "opencode_zen_r6_reasoning_text_checkpoint_uses_one_existing_continuation",
+      "tests": [
+        "opencode_zen_r6_reasoning_text_checkpoint_uses_one_existing_continuation"
+      ]
+    },
+    {
+      "id": "opencode_zen_r6_reasoning_text_satisfies_semantic_deadline_in_both_modes",
+      "tests": [
+        "opencode_zen_r6_reasoning_text_satisfies_semantic_deadline_in_both_modes"
+      ]
+    },
+    {
+      "id": "module-lifecycle-golden-corpus",
+      "tests": [
+        "opencode_zen_loopback_continuation_keeps_first_answer_and_sums_usage",
+        "opencode_zen_loopback_is_incremental_and_unread_bodies_settle_cancellation",
+        "opencode_zen_role_only_stream_cannot_extend_first_semantic_deadline"
+      ]
+    },
+    {
+      "id": "opt-in-normal-resource-probe",
+      "tests": [
+        "opencode_zen_r6_bun_resource_probe"
+      ],
+      "log": "/tmp/cc-r6-zen-resources-final/normal.log",
+      "pressureLog": "/tmp/cc-r6-zen-resources-final/pressure.log",
+      "pressureProbePassed": false
+    }
+  ],
+  "redEvidence": {
+    "kind": "formal_forwarder",
+    "passed": 0,
+    "failed": 4,
+    "log": "/tmp/cc-r6-zen-red1.log",
+    "result": "reasoning_text aggregation lost text; post-terminal text was accepted; checkpoint continuation did not run; first-semantic deadline returned504",
+    "existingBaseline": "94 passed /2 ignored on the same red snapshot with R6 tests skipped"
+  },
+  "validation": {
+    "rustFilters": [
+      {
+        "filter": "opencode_zen",
+        "passed": 99,
+        "log": "/tmp/cc-r6-zen-all-final.log"
+      },
+      {
+        "filter": "stream_transforms",
+        "passed": 103,
+        "log": "/tmp/cc-r6-zen-stream-transforms-final.log"
+      },
+      {
+        "filter": "transforms",
+        "passed": 128,
+        "log": "/tmp/cc-r6-zen-transforms-final.log"
+      },
+      {
+        "filter": "request_timing",
+        "passed": 11,
+        "log": "/tmp/cc-r6-zen-timing-final.log"
+      },
+      {
+        "filter": "existing_bun_ignored_explicit",
+        "passed": 2,
+        "log": "/tmp/cc-r6-zen-existing-bun-final.log"
+      }
+    ],
+    "countsOverlap": true,
+    "r6FormalTests": 5,
+    "zenDefaultIgnored": 3,
+    "supplementalNormalResourceProbePassed": 1,
+    "pressureProbeExitCode": 101,
+    "pressureProbePassed": false,
+    "pressureOutcome": "observed_controlled_504_under_memory_high",
+    "strictAllTargetClippy": "passed",
+    "cargoFmt": "passed",
+    "explicitIncludeRustfmt": "passed",
+    "backendNode": "full-worktree audit scheduled under EVID-01; not repeated or claimed for this Rust-only class",
+    "rustInputCountBeforeBuild": 503,
+    "rustInputDigestBeforeBuild": "c2743ad3420b28879a2896f449d2f378bebca2167dfe2c2462ef8f56fbd0c6aa",
+    "sourceState": "provider source files unchanged during validation; unrelated concurrent API/state drift listed, so exact full-worktree build attestation is deferred to final integration",
+    "unrelatedSourceDrift": [
+      "src/api/invoke/handlers.rs",
+      "src/api/router.rs",
+      "src/state.rs"
+    ],
+    "testBinarySha256": "9a0f56407bfeb74b530be66373cce4d0e4f9032f1c71d6535927a7a6963fdb21"
+  },
+  "limitations": [
+    "The pressure probe remains a failed test invocation and a measured capacity boundary, not successful transport or vendor acceptance.",
+    "Resource loopback does not measure TLS, full driver/API maximum body admission, runtime provisioning, pure Server RSS or deployment guarantees.",
+    "No new account/model/paid/media permission, body cleaning, pool, recovery or fallback.",
+    "No UI automation, deployment test, real-account changes, commit or push."
+  ]
+}

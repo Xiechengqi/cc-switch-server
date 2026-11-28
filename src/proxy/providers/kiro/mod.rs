@@ -268,7 +268,7 @@ pub(crate) async fn prepare_bound_request(
                 models_endpoint_override,
                 execution.request_timeout(),
             )
-            .await
+            .await?
     } else {
         state
             .kiro_catalog_model(
@@ -298,7 +298,7 @@ pub(crate) async fn prepare_bound_request(
                 models_endpoint_override,
                 execution.request_timeout(),
             )
-            .await
+            .await?
     } else {
         state
             .kiro_catalog_model(

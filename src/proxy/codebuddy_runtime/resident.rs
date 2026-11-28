@@ -4,6 +4,8 @@ use super::*;
 use crate::infra::resident_memory::{
     process_resident_memory, ResidentMemoryBudget, ResidentMemoryReservation,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex as StdMutex, Weak};
 
 #[derive(Debug)]
 pub(super) struct ResidentCatalog {
@@ -11,8 +13,35 @@ pub(super) struct ResidentCatalog {
     pub(super) _memory: Option<ResidentMemoryReservation>,
 }
 
-pub(super) type CatalogFlights =
-    BTreeMap<CodeBuddyRuntimeScope, Arc<Mutex<ResidentMemoryReservation>>>;
+#[derive(Debug)]
+pub(super) struct CatalogFlight {
+    scope: CodeBuddyRuntimeScope,
+    lock: Arc<Mutex<ResidentMemoryReservation>>,
+    generation: AtomicU64,
+    // Weak comparison preserves identical-refresh leases without retaining a
+    // second catalog body. Its possible Arc allocation is in the small owner.
+    latest: StdMutex<Weak<ResidentCatalog>>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CatalogEpoch {
+    flight: Arc<CatalogFlight>,
+    generation: u64,
+}
+
+impl CatalogEpoch {
+    pub(super) fn is_current(&self, scope: &CodeBuddyRuntimeScope) -> bool {
+        &self.flight.scope == scope
+            && self.flight.generation.load(Ordering::Acquire) == self.generation
+    }
+}
+
+pub(super) type CatalogFlights = BTreeMap<CodeBuddyRuntimeScope, Arc<CatalogFlight>>;
+
+fn retain_active_flights(flights: &mut CatalogFlights) {
+    flights
+        .retain(|_, flight| Arc::strong_count(flight) > 1 || Arc::strong_count(&flight.lock) > 1);
+}
 
 pub(super) fn node_bytes<K, V>(dynamic: usize) -> usize {
     std::mem::size_of::<(K, V)>()
@@ -43,10 +72,13 @@ impl CodeBuddyRuntimeCache {
     ) -> Option<CodeBuddyModelCatalog> {
         let mut catalogs = self.catalogs.write().await;
         catalogs.retain(|_, catalog| catalog.is_usable_stale(now_ms));
-        catalogs
+        let catalog = catalogs
             .get(scope)
             .filter(|catalog| catalog.is_fresh(now_ms))
-            .cloned()
+            .cloned();
+        drop(catalogs);
+        retain_active_flights(&mut *self.catalog_flights.lock().await);
+        catalog
     }
 
     pub async fn stale_catalog(
@@ -56,7 +88,10 @@ impl CodeBuddyRuntimeCache {
     ) -> Option<CodeBuddyModelCatalog> {
         let mut catalogs = self.catalogs.write().await;
         catalogs.retain(|_, catalog| catalog.is_usable_stale(now_ms));
-        catalogs.get(scope).map(CodeBuddyModelCatalog::as_stale)
+        let catalog = catalogs.get(scope).map(CodeBuddyModelCatalog::as_stale);
+        drop(catalogs);
+        retain_active_flights(&mut *self.catalog_flights.lock().await);
+        catalog
     }
 
     pub async fn insert_catalog(
@@ -65,6 +100,8 @@ impl CodeBuddyRuntimeCache {
         fetched: FetchedCodeBuddyModelCatalog,
         now_ms: i64,
     ) -> CodeBuddyModelCatalog {
+        let flight = self.catalog_flight(&scope).await;
+        let mut catalogs = self.catalogs.write().await;
         let mut catalog = CodeBuddyModelCatalog {
             data: Arc::new(ResidentCatalog {
                 value: fetched,
@@ -73,8 +110,8 @@ impl CodeBuddyRuntimeCache {
             fetched_at_ms: now_ms,
             stale: false,
             expires_at_ms: now_ms.saturating_add(CODEBUDDY_MODEL_CATALOG_TTL_MS),
+            epoch: None,
         };
-        let mut catalogs = self.catalogs.write().await;
         // An authoritative replacement, including empty, must never revive
         // an older model authorization when optional caching is refused.
         catalogs.remove(&scope);
@@ -96,15 +133,38 @@ impl CodeBuddyRuntimeCache {
                     .len()
                     .saturating_mul(node_bytes::<String, CodeBuddyModelCapability>(0)),
             );
-        if let Some(memory) = self
-            .parent
-            .reserve(node_bytes::<CodeBuddyRuntimeScope, CodeBuddyModelCatalog>(
-                dynamic,
-            ))
-        {
-            Arc::get_mut(&mut catalog.data)
-                .expect("unpublished catalog has one owner")
-                ._memory = Some(memory);
+        let memory =
+            self.parent
+                .reserve(node_bytes::<CodeBuddyRuntimeScope, CodeBuddyModelCatalog>(
+                    dynamic,
+                ));
+        let cache_admitted = memory.is_some();
+        // Install the payload owner before publishing a Weak pointer: get_mut
+        // requires no weak references as well as one strong owner.
+        Arc::get_mut(&mut catalog.data)
+            .expect("unpublished catalog has one owner")
+            ._memory = memory;
+        catalog.epoch = flight.map(|flight| {
+            let mut latest = flight
+                .latest
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let unchanged = latest
+                .upgrade()
+                .is_some_and(|previous| previous.value == catalog.data.value);
+            let generation = if unchanged {
+                flight.generation.load(Ordering::Acquire)
+            } else {
+                flight
+                    .generation
+                    .fetch_add(1, Ordering::AcqRel)
+                    .wrapping_add(1)
+            };
+            *latest = Arc::downgrade(&catalog.data);
+            drop(latest);
+            CatalogEpoch { flight, generation }
+        });
+        if cache_admitted {
             catalogs.insert(scope, catalog.clone());
             while catalogs.len() > MAX_RUNTIME_ENTRIES {
                 let oldest = catalogs
@@ -121,7 +181,18 @@ impl CodeBuddyRuntimeCache {
     }
 
     pub async fn invalidate_scope(&self, scope: &CodeBuddyRuntimeScope) {
-        self.catalogs.write().await.remove(scope);
+        let flight = self.catalog_flights.lock().await.get(scope).cloned();
+        let mut catalogs = self.catalogs.write().await;
+        if let Some(flight) = flight {
+            flight.generation.fetch_add(1, Ordering::AcqRel);
+            *flight
+                .latest
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Weak::new();
+        }
+        catalogs.remove(scope);
+        drop(catalogs);
+        retain_active_flights(&mut *self.catalog_flights.lock().await);
     }
 
     /// A failed explicit management refresh must not turn its old snapshot
@@ -137,31 +208,57 @@ impl CodeBuddyRuntimeCache {
         &self,
         scope: &CodeBuddyRuntimeScope,
     ) -> Option<OwnedMutexGuard<ResidentMemoryReservation>> {
-        let flight = {
-            let mut flights: tokio::sync::MutexGuard<'_, CatalogFlights> =
-                self.catalog_flights.lock().await;
-            flights.retain(|key, flight| key == scope || Arc::strong_count(flight) > 1);
-            if let Some(flight) = flights.get(scope) {
-                flight.clone()
-            } else {
-                if flights.len() >= MAX_RUNTIME_ENTRIES {
-                    return None;
-                }
-                let bytes =
-                    node_bytes::<CodeBuddyRuntimeScope, Arc<Mutex<ResidentMemoryReservation>>>(
-                        scope
-                            .0
-                            .capacity()
-                            .saturating_add(std::mem::size_of::<Mutex<ResidentMemoryReservation>>())
-                            .saturating_add(std::mem::size_of::<usize>() * 2),
-                    );
-                let memory = self.parent.reserve(bytes)?;
-                let flight = Arc::new(Mutex::new(memory));
-                flights.insert(scope.clone(), flight.clone());
-                flight
+        let flight = self.catalog_flight(scope).await?;
+        Some(flight.lock.clone().lock_owned().await)
+    }
+
+    async fn catalog_flight(&self, scope: &CodeBuddyRuntimeScope) -> Option<Arc<CatalogFlight>> {
+        let mut flights = self.catalog_flights.lock().await;
+        retain_active_flights(&mut flights);
+        if let Some(flight) = flights.get(scope) {
+            return Some(flight.clone());
+        }
+        if flights.len() >= MAX_RUNTIME_ENTRIES {
+            // Optional cache-only leases must not crowd out a new scope. An
+            // external snapshot or fetch guard remains pinned and never loses
+            // its revocation channel merely because an index was evicted.
+            let mut catalogs = self.catalogs.write().await;
+            let oldest = catalogs
+                .iter()
+                .filter(|(_, catalog)| {
+                    catalog.epoch.as_ref().is_some_and(|epoch| {
+                        Arc::strong_count(&epoch.flight) == 2
+                            && Arc::strong_count(&epoch.flight.lock) == 1
+                    })
+                })
+                .min_by_key(|(key, catalog)| (catalog.fetched_at_ms, *key))
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                catalogs.remove(&oldest);
             }
-        };
-        Some(flight.lock_owned().await)
+            drop(catalogs);
+            retain_active_flights(&mut flights);
+        }
+        if flights.len() >= MAX_RUNTIME_ENTRIES {
+            return None;
+        }
+        let bytes = node_bytes::<CodeBuddyRuntimeScope, Arc<CatalogFlight>>(
+            scope.0.capacity().saturating_mul(2).saturating_add(
+                std::mem::size_of::<Mutex<ResidentMemoryReservation>>()
+                    + std::mem::size_of::<CatalogFlight>()
+                    + std::mem::size_of::<ResidentCatalog>()
+                    + std::mem::size_of::<usize>() * 6,
+            ),
+        );
+        let memory = self.parent.reserve(bytes)?;
+        let flight = Arc::new(CatalogFlight {
+            scope: scope.clone(),
+            lock: Arc::new(Mutex::new(memory)),
+            generation: AtomicU64::new(0),
+            latest: StdMutex::new(Weak::new()),
+        });
+        flights.insert(scope.clone(), flight.clone());
+        Some(flight)
     }
 }
 
@@ -211,6 +308,9 @@ mod tests {
         assert!(current.data._memory.is_none());
         assert!(cache.catalog(&scope(0), 3).await.is_none());
         assert!(cache.stale_catalog(&scope(0), 3).await.is_none());
+        assert!(current.epoch_is_current(&scope(0)));
+        drop(current);
+        assert!(cache.catalog(&scope(0), 4).await.is_none());
         assert_eq!(parent.snapshot().used_bytes, 0);
     }
 
@@ -235,6 +335,9 @@ mod tests {
             .await;
         assert!(empty.enabled_models.is_empty());
         assert!(cache.stale_catalog(&scope(0), 3).await.is_none());
+        assert!(empty.epoch_is_current(&scope(0)));
+        drop(empty);
+        assert!(cache.catalog(&scope(0), 4).await.is_none());
         assert_eq!(parent.snapshot().used_bytes, 0);
     }
 
@@ -323,5 +426,75 @@ mod tests {
         assert!(parent.snapshot().used_bytes > 0);
         drop(current);
         assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn buddy_r6_catalog_lease_survives_optional_cache_refusal_and_rejects_aba() {
+        let parent = ResidentMemoryBudget::new(None);
+        let cache = CodeBuddyRuntimeCache::with_parent(parent.clone());
+        let old = cache.insert_catalog(scope(0), fetched("old"), 1).await;
+        assert!(old.admits_generation(&scope(0), 2));
+        parent.configure_limit(Some(parent.snapshot().used_bytes));
+        let new = cache.insert_catalog(scope(0), fetched("new"), 3).await;
+        assert!(new.data._memory.is_none());
+        assert!(new.admits_generation(&scope(0), 4));
+        assert!(!new.admits_generation(&scope(1), 4));
+        assert!(!old.epoch_is_current(&scope(0)));
+        assert!(cache.catalog(&scope(0), 4).await.is_none());
+        cache.invalidate_scope(&scope(0)).await;
+        assert!(!new.epoch_is_current(&scope(0)));
+        parent.configure_limit(None);
+        let restored = cache.insert_catalog(scope(0), fetched("old"), 5).await;
+        assert!(restored.admits_generation(&scope(0), 6));
+        assert!(
+            !old.epoch_is_current(&scope(0)),
+            "restoring a previous body must not revive its old lease"
+        );
+        drop((old, new, restored, cache));
+        assert_eq!(parent.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn buddy_r6_equal_refresh_preserves_epoch_but_not_the_old_admission_ttl() {
+        let cache = CodeBuddyRuntimeCache::with_parent(ResidentMemoryBudget::new(None));
+        let old = cache.insert_catalog(scope(0), fetched("same"), 1).await;
+        let new = cache.insert_catalog(scope(0), fetched("same"), 10).await;
+        assert!(old.epoch_is_current(&scope(0)));
+        assert!(new.epoch_is_current(&scope(0)));
+        assert!(!old.admits_generation(&scope(0), CODEBUDDY_MODEL_CATALOG_TTL_MS + 2));
+        assert!(new.admits_generation(&scope(0), CODEBUDDY_MODEL_CATALOG_TTL_MS + 2));
+        assert!(
+            old.epoch_is_current(&scope(0)),
+            "TTL alone cannot retroactively revoke an admitted response"
+        );
+        cache.mark_catalog_stale(&scope(0)).await;
+        assert!(
+            old.admits_generation(&scope(0), 3),
+            "failed management refresh does not invent new entitlement facts"
+        );
+        let stale = cache.stale_catalog(&scope(0), 11).await.unwrap();
+        assert!(stale.admits_generation(&scope(0), 12));
+        assert!(!stale.admits_generation(&scope(0), MAX_STALE_CATALOG_AGE_MS + 11));
+    }
+
+    #[tokio::test]
+    async fn buddy_r6_optional_eviction_preserves_the_later_revocation_channel() {
+        let cache = CodeBuddyRuntimeCache::with_parent(ResidentMemoryBudget::new(None));
+        let prepared = cache.insert_catalog(scope(0), fetched("old"), 1).await;
+        // The production optional index evicts a value without authoritatively
+        // invalidating its scope. Exercise that exact removal separately.
+        cache.catalogs.write().await.remove(&scope(0));
+        assert!(prepared.admits_generation(&scope(0), 2));
+        let changed = cache.insert_catalog(scope(0), fetched("changed"), 3).await;
+        assert!(!prepared.epoch_is_current(&scope(0)));
+        assert!(changed.epoch_is_current(&scope(0)));
+        assert!(cache
+            .insert_catalog(scope(1), fetched("other"), 4)
+            .await
+            .epoch_is_current(&scope(1)));
+        assert!(
+            changed.epoch_is_current(&scope(0)),
+            "another scope cannot revoke this catalog"
+        );
     }
 }

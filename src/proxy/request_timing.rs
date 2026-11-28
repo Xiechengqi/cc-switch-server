@@ -747,15 +747,10 @@ impl ForwardTiming {
                     .and_then(Value::as_str)
                     .is_some_and(|text| !text.is_empty())
             };
-            let content = [
-                "content",
-                "refusal",
-                "reasoning_content",
-                "reasoning_text",
-                "reasoning",
-            ]
-            .iter()
-            .any(|field| nonempty(delta.get(*field)))
+            let content = ["content", "refusal"]
+                .iter()
+                .any(|field| nonempty(delta.get(*field)))
+                || super::chat_reasoning::text(delta).is_some()
                 || delta
                     .get("tool_calls")
                     .and_then(Value::as_array)

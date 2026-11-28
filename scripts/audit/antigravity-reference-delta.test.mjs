@@ -81,3 +81,13 @@ test("Antigravity historical observations remain immutable after target lookup c
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /AG-OBS-0001 changed after it was recorded/);
 });
+
+
+test("Antigravity current request admission remains required after exact Driver scope relocation", () => {
+  const result = auditFixture((root) => {
+    const file = path.join(root, "src/proxy/forwarder.rs");
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replaceAll("request_memory_enabled_for_request", "unbudgeted_request"));
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /missing local anchor request_memory_provider_type_for_request/);
+});

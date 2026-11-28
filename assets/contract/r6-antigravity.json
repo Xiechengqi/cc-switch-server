@@ -1,0 +1,172 @@
+{
+  "schemaVersion": 1,
+  "kind": "synthetic_server_contract",
+  "round": "R6",
+  "providerClass": "antigravity",
+  "baseline": "f1e3e0dbb77fbe3d21c4ce52d12da05771db179f",
+  "implementationState": "local_complete",
+  "liveState": "live_pending",
+  "referencePolicy": "read_only_committed_objects_never_build_test_runtime_or_release_dependency",
+  "references": [
+    {
+      "repository": "CLIProxyAPI",
+      "commit": "47f18e4d82bd72f7d2b5ecf5ede93e4837a4625e",
+      "tree": "1c6c82df0d0364387bcd84751ac5ee6a0a2da8d3",
+      "files": [
+        {
+          "path": "internal/translator/antigravity/claude/antigravity_claude_response.go",
+          "sha256": "91b574d33d60093f95748ab5c6cfc0c247c7772fdd3e26483e8a8180649f4733"
+        }
+      ]
+    },
+    {
+      "repository": "Antigravity/Antigravity-Manager",
+      "commit": "148838519e12b2f27aec227a4e789e9bacde2f49",
+      "tree": "5c0492ce1d400ac2bfcb377c051c079bbbca3349",
+      "files": [
+        {
+          "path": "src-tauri/src/proxy/mappers/claude/response.rs",
+          "sha256": "a6f0977352c3d7f3d576dc0ba8aea31a5b74e6d462a617de32871a659e8a57ec"
+        }
+      ]
+    }
+  ],
+  "planItems": [
+    {
+      "id": "R6F-AG-01",
+      "status": "fixture_verified",
+      "scope": "Claude response adapter and streaming bridge for Antigravity and Agy mint a 128-bit local message correlation ID only when both reviewed upstream ID spellings are absent, non-string or blank. Valid upstream bytes survive unchanged; an emitted stream identity never changes. Each synthetic grounding use/result pair shares one newly minted local ID."
+    },
+    {
+      "id": "R6F-AG-02",
+      "status": "fixture_verified_conservative_rejection",
+      "scope": "Unidentified args-only calls fail with a latched protocol error. Only a known un-emitted explicit ID may inherit an already fixed tool name. Unknown or conflicting names never become a default executable tool; no most-recent-tool heuristic is enabled without independent same-rail evidence."
+    }
+  ],
+  "bounds": {
+    "idGenerator": "existing rand 0.8 + hex 0.4; 16 random bytes; no new dependency",
+    "messageLifetime": "one ID for one response; retained String charged by existing stream owner",
+    "functionIDs": "existing explicit/synthetic function identities unchanged",
+    "failureLifetime": "transform and finish reject after identity failure; no buffered tool flush or success repair",
+    "terminal": "non-null functionCall after a pending finish marker fails; optional functionCall:null does not turn legitimate text into tool use",
+    "scope": "only local Claude bridge identities; no upstream resource, persistence, remote continuation, account authority or signed-history grant"
+  },
+  "cases": [
+    {
+      "id": "adapter_missing_and_blank_ids_are_unique_and_snake_ids_survive",
+      "tests": [
+        "gemini_r6_adapter_missing_and_blank_ids_are_unique_and_snake_ids_survive"
+      ]
+    },
+    {
+      "id": "stream_missing_ids_are_per_response_and_late_ids_never_rebind",
+      "tests": [
+        "gemini_r6_stream_missing_ids_are_per_response_and_late_ids_never_rebind"
+      ]
+    },
+    {
+      "id": "unidentified_argument_continuation_never_becomes_an_executable_tool",
+      "tests": [
+        "gemini_r6_unidentified_argument_continuation_never_becomes_an_executable_tool"
+      ]
+    },
+    {
+      "id": "identity_shapes_blocked_refusal_and_early_metadata_are_consistent",
+      "tests": [
+        "gemini_r6_identity_shapes_blocked_refusal_and_early_metadata_are_consistent"
+      ]
+    },
+    {
+      "id": "grounding_tool_ids_are_unique_and_pair_on_late_metadata",
+      "tests": [
+        "gemini_r6_grounding_tool_ids_are_unique_and_pair_on_late_metadata"
+      ]
+    },
+    {
+      "id": "explicit_tool_ids_continue_without_a_name_and_empty_calls_remain_valid",
+      "tests": [
+        "gemini_r6_explicit_tool_ids_continue_without_a_name_and_empty_calls_remain_valid"
+      ]
+    },
+    {
+      "id": "unknown_and_conflicting_tool_identities_fail_closed_on_both_adapters",
+      "tests": [
+        "gemini_r6_unknown_and_conflicting_tool_identities_fail_closed_on_both_adapters"
+      ]
+    },
+    {
+      "id": "concurrent_missing_id_responses_never_share_a_synthetic_identity",
+      "tests": [
+        "gemini_r6_concurrent_missing_id_responses_never_share_a_synthetic_identity"
+      ]
+    },
+    {
+      "id": "optional_null_call_keeps_text_and_late_arguments_fail_closed",
+      "tests": [
+        "gemini_r6_optional_null_call_keeps_text_and_late_arguments_fail_closed"
+      ]
+    }
+  ],
+  "redEvidence": {
+    "kind": "production_adapter_and_stream_transformer",
+    "passed": 0,
+    "failed": 3,
+    "result": "missing response IDs reused gemini across responses; unidentified args became an extra executable tool named tool",
+    "log": "/tmp/cc-r6-ag-red2.log",
+    "excluded": "red1 missing trait import was a fixture compilation error, not product evidence"
+  },
+  "validation": {
+    "rustFilters": [
+      {
+        "filter": "gemini",
+        "passed": 190,
+        "log": "/tmp/cc-r6-ag-final-gemini-v2.log"
+      },
+      {
+        "filter": "antigravity",
+        "passed": 166,
+        "log": "/tmp/cc-r6-ag-final-antigravity.log"
+      },
+      {
+        "filter": "agy",
+        "passed": 14,
+        "log": "/tmp/cc-r6-ag-final-agy-v3.log"
+      },
+      {
+        "filter": "stream_transforms",
+        "passed": 103,
+        "log": "/tmp/cc-r6-ag-final-stream-transforms-v2.log"
+      },
+      {
+        "filter": "transforms",
+        "passed": 128,
+        "log": "/tmp/cc-r6-ag-final-transforms-v2.log"
+      }
+    ],
+    "countsOverlap": true,
+    "r6Tests": 9,
+    "backendNodePassed": 2207,
+    "strictAllTargetClippy": "passed",
+    "cargoFmt": "passed",
+    "explicitIncludeRustfmt": "passed",
+    "rustInputCount": 498,
+    "rustInputDigest": "8a57679f01c001931df2d4c4d71ba3160f59cee28404fbe2356187969f9be5bc",
+    "rustInputDigestMethod": "sha256 of sorted canonical path/sha256 array; json sort_keys true and compact separators; src/tests Rust plus Cargo.toml/Cargo.lock/build.rs",
+    "testBinarySha256": "d8514f17df8486637fc8a09a637fd63728957cb0c554e8895e4f0488a82055bf",
+    "sourceState": "observed_class_snapshot_global_compile_attestation_pending",
+    "scopeNote": "Observed source at class validation; unrelated concurrent API/state edits after original freeze are listed, so exact full-worktree rebuild attestation is deferred to final integration. Provider sources unchanged.",
+    "sourceDriftFromOriginalFreeze": [
+      "src/api/mod.rs",
+      "src/api/router.rs",
+      "src/api/types/common.rs",
+      "src/api/types/router.rs",
+      "src/state.rs"
+    ]
+  },
+  "limitations": [
+    "Local adapters/codecs are not real vendor acceptance or Router ingress verification.",
+    "No independent wire evidence authorizes guessing a nameless continuation by slot or most recent tool.",
+    "One direct-binary agy attempt omitted the required large test-thread stack and aborted; the final run sets RUST_MIN_STACK=67108864 and passes.",
+    "No UI automation, deployment, real-account changes, commit or push. Both real rails remain live_pending."
+  ]
+}

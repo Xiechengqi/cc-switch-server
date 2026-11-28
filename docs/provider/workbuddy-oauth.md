@@ -165,3 +165,16 @@ Responses 工具桥接支持 namespace 内混合 function/custom：custom 使用
 `assets/contract/r5-buddy.json` 冻结推荐 Hub/cli2api/workbuddy-switch 的十份 committed source 与十组本仓既有回归。CodeBuddy 双站 platform=CLI；WorkBuddy CN=workbuddy、Intl=workbuddy-ai。两产品推理继续使用受审 CLI 2.142.0，refresh source=plugin；参考 Hub CN=workbuddy 或可切换 Desktop/VSCode/CLI 不构成本仓必须改身份或借权的证据。真实原生登录与 CLI 推理联合接受性按产品×站点独立 live_pending。
 
 本轮无新增生产 wire 缺口。复用精确目录默认 reasoning、namespaced tools/图片、多轮、单账号轮换 journal、计费 paid/free、官方用量连续扫描及取消/预算回归。保留严格 finish_reason、唯一 DONE、EOF 与截断工具拒绝；不采纳 Hub 默认 stop 聚合、WAF/系统提示清洗、跨身份重试、uTLS 变更或原生媒体新操作。实际验证见增强文档 §22.14。
+
+
+## 2026-11-27 R6 目录世代与发送围栏
+
+同身份下，权威目录的模型、工具、图片或默认推理能力变化会换目录世代；已准备请求的 lease 与 App/Provider/runtime/产品/站点/Account/凭据代次的精确 scope 共同复核，不能因旧 Arc 还存在而继续授权。native send 在准备 HTTP client 之后、原 Sent 边界之前再次检查，不持目录/state 锁等待网络，也不以重发生成解决失效。
+
+世代使用原有最多 128 项 flight 和父内存 owner，独立于可选目录 payload 缓存。缓存因预算被拒绝时，已准入的当前新鲜结果仍可使用；普通淘汰不撤权，也不移除存续快照的后续撤权通道。没有活跃请求/等待者的 cache-only lease 可淘汰以让出容量。精确相同内容刷新在旧快照仍存续时保留世代，Weak 比较不另存一份正文；恢复旧内容也不能复活已被撤销的旧世代。
+
+发送前沿用快照原本的 8 分钟 fresh TTL，相同内容刷新不延长旧请求 TTL；transient-only stale 保持原最多 24 小时的显式准备路径。失败管理刷新仅将 cache 标 stale，不凭空制造新的撤权事实。TTL 自然流逝不追溯取消已准入响应；已知权威换代则通过现有 currentness/失败结算结束，保留已观察 usage，不补成功、不重发。
+
+双产品×双站点×三 App 的生产准备/native-send 反例旧实现各发出 1 次旧生成，修复后均为零；最新默认值重新准备后可正常发送。6 项本轮回归及 260 项 Buddy 回归、2207 项后端审计和严格 all-target Clippy 通过；这组新反例不冒充完整 Router ingress 验证或厂商接受性。范围与摘要见 [R6 证据](../../assets/contract/r6-buddy.json) 和[增强总账 §24](../../cc-switch-server-enhance.md#enhance-r6-implementation-20261127)。
+
+身份差分 BD-02 保留受审 CLI 2.142.0：Hub CLI 2.168.2 与 cli2api CLI 2.176.0 对 conversation-request/root 的关系有冲突，缺独立同版本/产品/站点的接受证据，未组合升级请求头。默认推理仍始终使用绑定目录的默认值，不从会话头推断历史存储、缓存或延迟收益；不扩展产品/站点/账号权限。

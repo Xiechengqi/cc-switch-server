@@ -88,13 +88,18 @@ pub(in crate::proxy) fn validate(value: &Value, wire: ZenWire) -> Result<(), Pro
                 && message
                     .get("content")
                     .is_none_or(|v| v.is_null() || v.is_string())
-                && ["reasoning_content", "reasoning", "refusal"]
-                    .iter()
-                    .all(|key| {
-                        message
-                            .get(*key)
-                            .is_none_or(|v| v.is_null() || v.is_string())
-                    })
+                && [
+                    "reasoning_content",
+                    "reasoning_text",
+                    "reasoning",
+                    "refusal",
+                ]
+                .iter()
+                .all(|key| {
+                    message
+                        .get(*key)
+                        .is_none_or(|v| v.is_null() || v.is_string())
+                })
                 && message
                     .get("function_call")
                     .filter(|v| !v.is_null())

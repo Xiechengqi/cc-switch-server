@@ -6844,7 +6844,7 @@ async fn offline_setup_exposes_waiting_notification_without_persisting_plaintext
 }
 
 #[tokio::test]
-async fn setup_completed_delivery_failure_does_not_fail_authoritative_setup() {
+async fn setup_completed_delivery_is_deferred_after_authoritative_setup() {
     async fn available() -> Json<Value> {
         Json(json!({"available": true}))
     }
@@ -6922,20 +6922,24 @@ async fn setup_completed_delivery_failure_does_not_fail_authoritative_setup() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     assert_eq!(body["clientTunnelClaimStatus"], "claimed");
-    assert_eq!(body["setupCompletionNotificationStatus"], "pending");
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        body["setupCompletionNotificationStatus"],
+        "waiting_for_claim"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
     let config = state.config_snapshot().await;
+    assert!(config.is_initialized());
+    assert!(config.verify_password("setup-secret-9"));
     assert_eq!(
         config.client.tunnel_status.as_deref(),
         Some("claimed_remote")
     );
     let notification = config.setup_completion_notification.unwrap();
-    assert_eq!(notification.status.as_str(), "pending");
-    assert_eq!(notification.attempt_count, 1);
-    assert!(notification
-        .last_error
-        .as_deref()
-        .is_some_and(|error| error.contains("503")));
+    assert_eq!(notification.status.as_str(), "waiting_for_claim");
+    assert_eq!(notification.attempt_count, 0);
+    assert!(notification.last_error.is_none());
+    assert!(notification.last_attempt_at_ms.is_none());
+    assert_eq!(notification.password_hint.as_deref(), Some("s******9"));
     router_server.abort();
 }
 

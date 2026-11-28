@@ -161,3 +161,24 @@ SOLO 和 raw 共用以下语义：
 
 
 R5 公共切片：三rail在各自实际发送、headers与既有解码器产出的canonical Chat事件处观察统一计时，queue/progress不能成为首语义，恢复只观察已有同绑定分支。catalog为共享不可变payload，父预算跟随最后快照；本类最多128条/32MiB缓存、64个活动distinct catalog-flight，8分钟fresh/24小时stale保留。超本类可选缓存上限的当前结果可继续使用且仍接父预算，但不发布入cache；父预算/flight拒绝单独为503，不触发鉴权恢复或needsRelogin。见 `assets/contract/r5-shared-core.json`，没有新增真实接受性或性能成绩。
+
+
+## R6：显式关闭语义、出站参数诊断与条件能力（2026-11-27）
+
+`assets/contract/r6-trae.json` 冻结首选 Hub `f7b75787680c7aded6b277aee05ddfc7fbac4ba8` 的四份提交态源码及测试摘要。参考行式 SOLO 字节来自 mock，不是独立厂商录制；正式 forwarder 重放得到明确失败，单次生成且不换 function。缺同端点/function/客户端的独立样本前，不启用新 decoder 方言。模型组关系和 SOLO 内联图片同样保留证据门禁；既有 `solo_work_lite`、精确目录与 SOLO images=false 不变。
+
+三条 rail 的显式关闭（`none`/`off`、false、Claude disabled、Gemini 零预算）现在在生成前返回 unsupported control，避免将“省略字段”冒充上游关闭。调用方若接受上游默认，可省略该控制；省略不保证关闭。开启/档位保持既有映射，坏类型、冲突和不可用档位零生成；raw 图片与显式工具政策保持。
+
+复用既有 `requested_reasoning_effort` / `effective_reasoning_effort`：请求值来自归一化控制，实际值取最终 prepared payload 的顶层 SOLO 或 raw parameters 字段；同身份 401 恢复保持一致。它们描述准备结果，不证明已发包或上游执行；未观察到档位保持空，不补成 disabled/default。只记录有限枚举，不泄露未知字符串或正文，不改变 Router/Web 契约。
+
+正式路径旧实现两个反例 0/2；最终 Trae 69/69（含六项新回归），严格 all-target Clippy、cargo fmt 及所有 src/include rustfmt 通过。四入口×流/非流×三通道覆盖关闭/缺省/开启/冲突/坏类型和同身份恢复；既有终态、取消、资源 owner 与多轮工具回归一起执行。完整主仓集成和 Node 全套审计留最终公共阶段，不沿用历史数量冒充当前全套。所有真实 operation 继续 live_pending；无 UI 自动化、部署测试、真实账号操作、提交或推送。
+
+## R7：CN 目录的 prepared lease（2026-11-27）
+
+CN SOLO/model-detail 与 CN raw/model-list 的 prepared catalog 持有独立 epoch。目录变更、成功空集或明确失效撤销旧 epoch；A→B→A 不复活旧 prepared。相同目录重新发现共享 data/epoch，每份 snapshot 保留自己的发现时间和 TTL。fresh 为 8 分钟，既有 transient fallback 的 stale 最多按原发现时间保留 24 小时。目录解析失败撤销该 scope，不能借旧 stale 继续授权。
+
+可选 payload 仍限 128 项 / 32 MiB、发现 flight 64；另有最多 256 个撤权 scope。弱 payload 比较不保留第二份完整目录，缓存淘汰或超上限不缓存时，活跃 prepared 仍保留撤权通道。payload 与 epoch 的父预算计费跟随各自实际 owner；稀疏索引按访问懒清，取消后释放。这里是保守逻辑计费，不是 RSS。
+
+CN 发送前及实际 `mark_sent` 前复核 lease。已发请求继续遵守既有身份、终态、取消与 usage 规则。Intl 没有认证目录，使用单独计费的语法快照和明确模型，不参与 CN epoch，也不继承 CN 权限。固定 Provider/账号/rail/设备及同账号恢复保持原合同。
+
+旧正式路径反例 2 通过 / 4 失败；最终新专项 12/12、Trae 回归 81/81（重叠），严格 all-target Clippy、fmt/include、Phase0 六项和后端审计 2216 项通过。green1 的两个资源 fixture 缺 `display_config`，被目录解析器过滤，排除为产品失败；补全后重新构建验证。输入/二进制/日志摘要和准确 scope 见 `assets/contract/r7-trae.json` 与增强计划 §26.5。R6 的新 SOLO 方言、function 组和受限图片仍按原证据门禁保留；没有 UI 自动化、部署或真实账号操作。

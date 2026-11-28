@@ -22,6 +22,7 @@ use crate::domain::providers::store::{ProviderStore, StoredProvider};
 include!("workbuddy_value_tests.rs");
 include!("buddy_reasoning_tests.rs");
 include!("buddy_codex_tests.rs");
+include!("buddy_r6_tests.rs");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodeBuddyGenerationReply {

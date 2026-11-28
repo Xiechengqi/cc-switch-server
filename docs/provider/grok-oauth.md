@@ -2,6 +2,18 @@
 
 本文描述 cc-switch-server 对 Grok/xAI OAuth 的生产边界、信任模型、数据面流程和验收方式。目标是把一个 Grok Provider 明确绑定的单个 OAuth 账号稳定暴露为 OpenAI Responses 兼容入口；不提供账号池、轮询、权重调度、配额溢出或跨 Provider 故障转移。
 
+## R6 请求数据边界（2026-11-27，离线完成）
+
+HTTP 四入口及 WebSocket 共用按协议路径的请求清理。只有请求 envelope 的传输控制、已知 web-search 声明中的 external-web 控制和直接 `input[]` 协议 item 的服务端 ID 属于该清理；不会递归删除工具 schema、default/examples、参数或回执里的同名业务字段。WS 的 `background` / `stream_options` 也只作用于请求 envelope。
+
+原生 `reasoning` / `compaction` 的 `encrypted_content` 仅在存在时检查非空字符串与 8 MiB 上限，保留原始字符串，不以 base64、padding、前缀或熵猜测密文格式。非法形状在出站前报带 input 索引的错误，不丢整项历史。客户端提供的 opaque 历史被拒后不获得自动清理/重放；既有 Server proof 的受限恢复规则保持。
+
+当前不能等价表示的 `external_web_access=false` 在出站前以既有 422 协议错误明确拒绝，避免删除限制后扩大搜索访问；原生与 preview alias / additional_tools 使用同一规则，非法类型为 400。`true` 的已审控制可以按兼容规则省略。此规则不解释 schema 中的同名 property。两个正式路径反例在原实现失败后转绿；最终 310 项 Grok 过滤测试、128 项转换、5 项协议兼容及 2207 项后端 Node 审计通过，严格 all-target Clippy/格式/生成资产检查通过。计数存在重叠，详情见增强总账 §24.1，不代表真实厂商接受性或最终全仓集成成绩。
+
+[R6 Grok 证据与操作身份矩阵](../../assets/contract/r6-grok.json) 分开记录七类操作、两个推荐仓的提交态摘要、GR-01 回归及 GR-02/03 的门禁取舍。GR-02 保留有明确最低版本拒绝证据的 1.0.13 lineage，不把另一生成 origin 的 Build 1.0.60 或 group header 当成当前账号接受性证明。GR-03 保留未知 429 的账号级 cooldown，不因错误文本提到某个模型而猜测其他模型仍获准。新增正式路径反例验证此类错误只有一次提交、不会转账号/plane、不要求重新登录。
+
+这两项为 `reviewed_gated_no_wire_delta`：完成当前政策复核和误触发保护，**没有启用新 Build 身份或模型级 cooldown**。若未来取得精确绑定/操作的独立真实证据，应按专项计划继续验证后启用；本地反例不能替代该证据。
+
 ## 能力边界
 
 - 文本入口使用 Router Share URL 下的 `POST /v1/responses` 和 `POST /v1/chat/completions`。

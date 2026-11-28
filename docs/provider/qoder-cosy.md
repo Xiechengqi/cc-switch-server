@@ -148,3 +148,14 @@ R4-QD-02 暂不开放 CN PAT。TokenRouter `d15137eb59d4d85bdc27ae563c37fcf9b0ed
 
 
 CORE-03统一计时见增强计划§20.10.6：COSY send/headers/read与既有同账号恢复分attempt观察；canonical文本/推理/实际工具字段可记首内容，usage、角色、空值和终止原因单独不算内容。终态仍需唯一终态及EOF，取消/失败和末次Bytes owner释放独立；HTTP只记录body handoff。计时不改变用量、站点/rail、历史筛选、续接及恢复门禁，三rail真实验收继续live_pending。
+
+
+## R6：原生控制语义与最终出站诊断（2026-11-27）
+
+`assets/contract/r6-qoder.json` 冻结首选 Hub `2b0981c9` 与 cli2api `ccd4744` 的提交态源。新的嵌套 thinking/context 目录与旧 CLI wire 有证据冲突，R6-QD-01 按原计划退出条件保留 `reviewed_gated_no_wire_delta`；不以较新的桌面参考覆盖官方 CLI oracle、high→max 或 context 字段位置。chat 优先/deny、app-only discovery-only、三条 rail 的身份与权限继续独立。
+
+正式反例另外确认了本地输入解释错误：Claude `thinking.type=disabled` 原经通用桥变成开启；精确预算也会被忽略后生成。现在 Qoder 在通用转换前规范有限 effort 与关闭控制，坏类型、未知值、冲突和精确 token budget 明确返回 400，且不请求目录或生成；可改用支持的 effort 或省略控制接受默认。已审支持关闭的模型发原有 none；没有受审关闭能力的模型在生成前拒绝。未知模型仅带新 thinking_config 不授予关闭权限，省略控制的已准入文本请求仍可用。Gemini -1 动态预算原本正确，保留为回归，不声称修复新缺陷。
+
+日志复用 requested/effective 字段：前者来自归一化控制，后者只读最终 prepared model_config。gm51model 请求 high 实际 max 如实记录；qmodel 只见开关、没有档位时 effective 留空；合法目录默认可显示为准备值，未知目录字符串不入日志。恢复前清空上一轮 effective，失败准备不补值。它们不是发包、执行或真实接受的证明，不改变授权、重试与 Router/Web 契约。
+
+最终 Qoder **193/193**，含六项新正式路径回归；三份既有 Node oracle/目录/能力 mutation 套件 **16/16**，严格 all-target Clippy、cargo fmt、全部 src/include rustfmt 和四项 Qoder 静态门禁通过。505 项 Rust/Cargo/build 输入摘要 `451724fdee7fbd199b77d7bf05e1f2b4098ea3a8139e9a955fc0366572cb3d9c`，测试 binary `9ac6044e384a5ab158320ad16bb02e53f95443b05cdd7c3078ade607fb8a52be`，验证后集合/内容复核未变。首候选 192 是补未知模型关闭围栏前的历史成绩，不混充最终版本；早期夹具失败均排除。完整 Node/整仓集成及整体 review 仍归最终公共阶段。三条真实 rail 保持 live_pending；无 UI 自动化、部署测试、真实账号操作、提交或推送。
